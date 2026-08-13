@@ -1,9 +1,11 @@
 package com.ai.knowledge.config;
 
+import com.openai.client.OpenAIClient;
+import io.micrometer.observation.ObservationRegistry;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
-import org.springframework.ai.openai.api.OpenAiApi;
+import org.springframework.ai.openai.setup.OpenAiSetup;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -39,15 +41,28 @@ public class MultiModelConfig {
         // 构建所有模型实例
         Map<String, ChatModel> built = new LinkedHashMap<>();
         cfgs.forEach((name, cfg) -> {
-            OpenAiApi api = OpenAiApi.builder()
-                    .baseUrl(cfg.getBaseUrl())
-                    .apiKey(StringUtils.hasText(cfg.getApiKey()) ? cfg.getApiKey() : null)
-                    .timeout(cfg.getTimeout())
-                    .build();
+            // Spring AI 2.0 基于官方 com.openai SDK：先用 OpenAiSetup 构建同步客户端，再装配 ChatModel
+            OpenAIClient client = OpenAiSetup.setupSyncClient(
+                    cfg.getBaseUrl(),
+                    StringUtils.hasText(cfg.getApiKey()) ? cfg.getApiKey() : null,
+                    null,                       // credential（非 Azure 场景不需要）
+                    null,                       // microsoft deployment name
+                    null,                       // azure service version
+                    null,                       // organization
+                    false,                      // microsoftFoundry
+                    false,                      // gitHubModels
+                    cfg.getModel(),
+                    cfg.getTimeout(),
+                    1,                          // maxRetries
+                    null,                       // proxy
+                    Map.of(),                   // custom headers
+                    ObservationRegistry.NOOP,
+                    null,                       // meterRegistry
+                    List.of());                 // http client customizers
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
-                    .openAiApi(api)
-                    .defaultOptions(OpenAiChatOptions.builder().model(cfg.getModel()).build())
+                    .openAiClient(client)
+                    .options(OpenAiChatOptions.builder().model(cfg.getModel()).build())
                     .build();
 
             built.put(name, chatModel);

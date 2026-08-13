@@ -28,9 +28,11 @@
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
+        <!-- Lombok：简化配置类的 getter / setter -->
         <dependency>
-            <groupId>org.springframework.ai</groupId>
-            <artifactId>spring-ai-starter</artifactId>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
         </dependency>
 
         <!-- 1. OpenAI 兼容模型 / Embedding（OpenRouter 走 OpenAI 协议） -->
