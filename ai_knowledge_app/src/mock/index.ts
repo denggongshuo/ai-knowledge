@@ -1357,11 +1357,13 @@ register('GET', '/api/system/model/usage', (_req, res) => {
     currency: 'CNY',
     unpricedCount,
     avgLatencySec: 1.6,
+    // 按用途分布：合计必须等于 byModel 的 tokens 合计（4,052,000 = 405.2 万）
+    // 比例固定 48/31/15/6（索引侧 摘要+HyQ = 63%）
     byPurpose: [
-      { name: '文档级摘要 + 内容标签', tokens: 1850000, percent: 48 },
-      { name: '问答生成', tokens: 1200000, percent: 31 },
-      { name: 'HyQ 假设性问题生成', tokens: 580000, percent: 15 },
-      { name: '文档向量化（嵌入）', tokens: 230000, percent: 6 },
+      { name: '文档级摘要 + 内容标签', tokens: 1945000, percent: 48 },
+      { name: '问答生成', tokens: 1256000, percent: 31 },
+      { name: 'HyQ 假设性问题生成', tokens: 608000, percent: 15 },
+      { name: '文档向量化（嵌入）', tokens: 243000, percent: 6 },
     ],
     byModel,
   })

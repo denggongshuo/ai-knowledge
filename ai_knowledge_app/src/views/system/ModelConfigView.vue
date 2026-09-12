@@ -732,7 +732,7 @@ onMounted(async () => {
         <div v-for="p in usage.byPurpose" :key="p.name" class="purpose-row">
           <div class="purpose-head">
             <span class="tiny">{{ p.name }}</span>
-            <span class="tiny mono muted">{{ (p.tokens / 10000).toFixed(0) }} 万 tokens · {{ p.percent }}%</span>
+            <span class="tiny mono muted">{{ (p.tokens / 10000).toFixed(1) }} 万 tokens · {{ p.percent }}%</span>
           </div>
           <div class="progress"><i :style="{ width: p.percent + '%' }"></i></div>
         </div>

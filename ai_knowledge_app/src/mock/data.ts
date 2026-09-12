@@ -625,7 +625,8 @@ export const mockStorageQuota: StorageQuota = {
   kbCount: 8,
   docCount: 1246,
   chunkCount: 38502,
-  monthTokens: 3_860_000,
+  // 全站本月 tokens（与 /system/model/usage 的 tokens 合计一致：405.2 万）
+  monthTokens: 4_052_000,
 }
 
 /** 跨库文档列表（供 09 页；总量取全站口径 1,246） */

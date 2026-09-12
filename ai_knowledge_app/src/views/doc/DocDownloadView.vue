@@ -303,7 +303,7 @@ onBeforeUnmount(() => {
               <div class="qg-item"><b>{{ quota.kbCount }}</b><span>知识库</span></div>
               <div class="qg-item"><b>{{ quota.docCount.toLocaleString() }}</b><span>文档</span></div>
               <div class="qg-item"><b>{{ quota.chunkCount.toLocaleString() }}</b><span>向量分片</span></div>
-              <div class="qg-item"><b>{{ (quota.monthTokens / 10000).toFixed(0) }} 万</b><span>本月索引 tokens</span></div>
+              <div class="qg-item"><b>{{ (quota.monthTokens / 10000).toFixed(1) }} 万</b><span>本月索引 tokens</span></div>
             </div>
           </div>
         </el-card>
