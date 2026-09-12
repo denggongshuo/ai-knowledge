@@ -38,6 +38,41 @@
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
+        <!--
+          Web 服务端容器：Spring MVC（Servlet 栈）
+
+          为什么显式引入 MVC 而不是只用 WebFlux：
+          1) 全项目采用命令式技术栈。JPA（open-in-view=false、ddl-auto）、
+             @Transactional(REQUIRES_NEW) 审计、ThreadLocal 登录上下文、
+             Servlet 过滤器贯穿 traceId、分片续传上传，都是阻塞式语义。
+          2) 若只保留 WebFlux，上述能力全部要改写为响应式，且 JPA 阻塞调用
+             必须自行调度到 boundedElastic，风险与收益不成比例。
+          3) SSE 用 SseEmitter 即可，前端基于 fetch 的流式读取不关心底层容器。
+
+          同时保留 spring-boot-starter-webflux：它提供 WebClient，
+          用于非阻塞地调用 OpenAI 兼容的 LLM / 向量化接口。
+          Spring Boot 的容器判定规则：classpath 上存在 spring-webmvc 时选用
+          Servlet（MVC）作为服务端容器，WebFlux 仅作为客户端能力存在。
+          （见 docs/后端开发文档 与 docs/需求文档/11-非功能需求与技术架构.md §1.1）
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- 参数校验（@Valid / @NotBlank / @Size ...）—— 错误码 1003x 参数类 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- .env 文件加载到环境变量 -->
+        <dependency>
+            <groupId>me.paulschwarz</groupId>
+            <artifactId>springboot4-dotenv</artifactId>
+            <version>5.1.0</version>
+        </dependency>
+
         <!-- JPA + MySQL（业务配置存储） -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -47,6 +82,39 @@
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          数据库迁移（T-011）
+
+          为什么是 Flyway 而不是 Hibernate 的 ddl-auto：
+          schema 是**所有模块共用的契约**，必须能 review、能回滚、能在生产上
+          按版本重放。ddl-auto=update 只能在开发期"猜"结构，改列名会悄悄加新列
+          而不报错，且没有任何变更历史。这里让 Flyway 做 schema 的唯一来源，
+          JPA 退到 ddl-auto=validate —— 它只负责**校验实体与表一致**，
+          不一致就在启动时炸掉，而不是默默改表。
+
+          必须是 spring-boot-starter-flyway，而不是裸的 flyway-core/flyway-mysql：
+          Spring Boot 4 把自动配置按技术拆成了独立模块（spring-boot-flyway），
+          FlywayAutoConfiguration **不在** spring-boot-autoconfigure 里
+          （已解包确认，jar 内无任何 flyway 相关条目）。
+          只引 flyway-core 的话：jar 在 classpath 上，但自动配置压根不加载 ——
+          Flyway 静默不执行，紧接着 ddl-auto=validate 因"找不到表"而启动失败，
+          且日志里连一行 flyway 字样都没有，极难定位。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
+        </dependency>
+        <!--
+          flyway-mysql 必须单独引：Flyway 10+ 把各数据库支持拆成独立模块，
+          spring-boot-starter-flyway 只带 flyway-core（已核对其 pom，依赖仅
+          spring-boot / spring-boot-jdbc / flyway-core）。
+          缺了它启动时会报 "Unsupported Database: MySQL 8.0"。
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
         </dependency>
 
         <!-- Neo4j 图数据库（知识图谱存储） -->
@@ -80,12 +148,70 @@
             <version>8.5.7</version>
         </dependency>
 
+        <!-- 监控 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
         <!--文档处理-->
         <!--pdf-->
         <dependency>
             <groupId>org.opendataloader</groupId>
             <artifactId>opendataloader-pdf-core</artifactId>
             <version>1.11.0</version>
+        </dependency>
+
+        <!-- Apache Tika 文档解析（支持 PDF/DOCX/PPTX/XLSX 等上千种格式） -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-core</artifactId>
+            <version>3.2.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parsers-standard-package</artifactId>
+            <version>3.2.2</version>
+        </dependency>
+
+        <!-- Spring Security -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- JWT (jjwt) -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+            <version>0.12.6</version>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <version>0.12.6</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Hutool 工具包 -->
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.38</version>
         </dependency>
 
         <dependency>
@@ -158,6 +284,14 @@
     </build>
 
     <repositories>
+        <repository>
+            <id>central</id>
+            <name>Maven Central</name>
+            <url>https://repo.maven.apache.org/maven2</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+        </repository>
         <repository>
             <id>vera-dev</id>
             <url>https://artifactory.openpreservation.org/artifactory/vera-dev</url>

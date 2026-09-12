@@ -6,12 +6,46 @@ spring:
     name: ai_knowledge_web
 
   # ============================================================
-  # .env 环境变量文件（Spring Boot 原生导入）
-  # 注意：原 spring-dotenv 4.0.0 在 Spring Boot 4 下不会生效（监听器方法签名不匹配）
-  # 相对路径基于进程工作目录，请从模块目录（ai_knowledge_web/）启动
+  # .env 环境变量文件（由 springboot4-dotenv 自动加载）
+  # springboot4-dotenv 是专为 Spring Boot 4 适配的 dotenv 库，
+  # 会自动读取工作目录下的 .env 文件并注入 Spring Environment。
+  #
+  # 路径相对于**进程工作目录**（user.dir），所以必须保证工作目录是模块目录：
+  #   - 命令行：cd ai_knowledge_web && mvn spring-boot:run
+  #   - IDE：Run/Debug Configurations → Working directory → .../ai_knowledge_web
+  #
+  # 缺 .env 的处理方式通过 springdotenv.ignore-if-missing 控制（默认 false），
+  # 设为 true 可让缺失 .env 时不中断启动（用于 CI 等无 .env 场景），
+  # 设 false（默认）则缺失时报错，避免 ${MYSQL_HOST} 等占位符漏传到下游。
+  # ============================================================
+  # springdotenv:
+  #   ignore-if-missing: false
+
+  # ============================================================
+  # .env 的第二条加载路径（原生 spring.config.import）
+  #
+  # 为什么在 dotenv 之外再挂一条：dotenv 只能读**单个工作目录**下的 .env，
+  # 而工作目录取决于启动方式，两种都常见：
+  #   - cwd = 模块目录 → mvn test / mvn spring-boot:run / IDE 配了模块 cwd
+  #   - cwd = 仓库根   → IDE 直接 Run main（默认 $PROJECT_DIR$ = 仓库根）
+  # 原生 import 支持**多候选**，这里把两种路径都列上，谁命中用谁，
+  # 于是"从哪启动"不再影响能否找到 .env —— 这正是 ${MYSQL_HOST} 这类
+  # 占位符没解析、最后以 MySQL 驱动 "Failed to parse the host:port pair"
+  # 收场的根因。
+  #
+  # 都带 optional:：两个候选是互斥命中，任一缺失属正常，不加 optional
+  # 会让没命中的那个直接中断启动。[.properties] 后缀是必需的 ——
+  # Boot 靠扩展名判断解析器，.env 无扩展名，不写就无法推断格式。
+  #
+  # 若两个候选都不存在：占位符会**原样保留**而不报错
+  # （Boot 的 PropertySourcesPlaceholdersResolver 对不可解析占位符不抛错），
+  # 症状就是 ${MYSQL_HOST} 被当成字面量传给 JDBC 驱动。
+  # 见到那个报错，第一反应应是"工作目录下没有 .env"。
   # ============================================================
   config:
-    import: optional:file:./.env[.properties]
+    import:
+      - optional:file:./.env[.properties]
+      - optional:file:./ai_knowledge_web/.env[.properties]
 
   # ============================================================
   # 数据源 - MySQL（业务数据库）
@@ -22,10 +56,39 @@ spring:
     username: ${MYSQL_USERNAME}
     password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: kb-pool
+      maximum-pool-size: 20
+      minimum-idle: 5
+      # 3s 就失败：让"MySQL 没起来"在启动日志里立刻可见，
+      # 而不是默认 30s 卡住后再抛一句难读的 HikariPool 超时
+      connection-timeout: 3000
+      validation-timeout: 2000
+
+  # ============================================================
+  # 数据库迁移（T-011）
+  # schema 的唯一来源是 db/migration/V*.sql，**不靠实体反推建表**。
+  # 脚本里写了什么，库里就是什么；要改结构就再加一个 V 版本，
+  # 变更过程留在仓库里可 review、可回放。
+  # ============================================================
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 面向"库里有别人的表 / 手工建过表"的场景：非空库也能接管，
+    # 把接管前的状态记为版本 0，V1 起的脚本照常执行。
+    baseline-on-migrate: true
+    baseline-version: 0
+    # 已执行的脚本被改过就报错 —— 防止有人回头改历史脚本造成"本地能跑、别人炸"
+    validate-on-migrate: true
+    # 中文注释与种子数据都带非 ASCII，显式声明编码，避免按平台默认码表读入
+    encoding: UTF-8
 
   jpa:
     hibernate:
-      ddl-auto: update
+      # 只校验、不改表：实体与 V*.sql 不一致时**启动即失败**。
+      # 这正是想要的 —— 让"表结构与代码对不上"在启动时暴露，
+      # 而不是等到某次查询才报 Unknown column。
+      ddl-auto: validate
     show-sql: true
     properties:
       hibernate:
@@ -33,35 +96,37 @@ spring:
     open-in-view: false
 
   # ============================================================
-  # Spring AI - OpenAI 兼容协议
-  # 说明：此处仅用 dummy 值避免启动报错，实际客户端由 Bean 动态注入
+  # Spring AI - OpenAI 兼容协议（T-009）
+  #
+  # 取值**不在这里重复写**，而是引用 app.model.*（唯一的模型口径），
+  # 免得"环境变量 → app.model"和"环境变量 → spring.ai"两处各写一遍后漂移。
+  #
+  # 为什么 chat 与 embedding 各自带 base-url / api-key：
+  #   项目实际用了**两家**供应商 —— 对话走 DeepSeek，向量化走硅基流动 bge-m3。
+  #   Spring AI 2.0 的 resolveCommonProperties(common, specific) 支持逐模型覆盖，
+  #   所以这里用 per-model 段而不是公共段。
+  #
+  # base-url 原样透传给 OpenAI Java SDK（已读 OpenAiSetup.calculateBaseUrl 确认：
+  #   非 OpenAI/GitHub/Azure 分支直接 areturn，不补 /v1），
+  #   所以**接口地址要在 .env 里写全**（硅基流动含 /v1，DeepSeek 两种写法都通）。
   # ============================================================
   ai:
     openai:
-      base-url: none
-      api-key: dummy
       chat:
+        base-url: ${app.model.chat.base-url}
+        api-key: ${app.model.chat.api-key}
+        timeout: 60s
         options:
-          model: none
+          model: ${app.model.chat.model}
           temperature: 0.7
       embedding:
+        base-url: ${app.model.embedding.base-url}
+        api-key: ${app.model.embedding.api-key}
+        timeout: 60s
+        # 不传 dimensions：bge-m3 固定输出 1024，实测确认（G0-6）。
+        # 显式下发 dimensions 反被部分网关拒绝，故留空由模型决定。
         options:
-          model: none
-
-    # ============================================================
-    # Milvus 向量数据库
-    # docker-compose: milvus-standalone (localhost:19530)
-    # ============================================================
-    vectorstore:
-      milvus:
-        client:
-          host: ${MILVUS_HOST}
-          port: ${MILVUS_PORT}
-        collection-name: knowledge_vectors
-        embedding-dimension: 1536
-        metric-type: COSINE
-        index-type: IVF_FLAT
-        initialize-schema: true
+          model: ${app.model.embedding.model}
 
   # ============================================================
   # Neo4j 图数据库（知识图谱存储）
@@ -72,6 +137,8 @@ spring:
     authentication:
       username: ${NEO4J_USERNAME}
       password: ${NEO4J_PASSWORD}
+    # 自检探测要快失败，不要拖住启动报告
+    connection-timeout: 3s
 
   # ============================================================
   # Redis 缓存 / 会话存储
@@ -82,19 +149,105 @@ spring:
       host: ${REDIS_HOST}
       port: ${REDIS_PORT}
       password: ${REDIS_PASSWORD}
+      timeout: 3s
+      connect-timeout: 3s
 
   # ============================================================
-  # 关闭 Spring AI 自动配置（客户端由动态 Bean 管理）
+  # Spring AI 自动配置开关
+  #
+  # **保留 chat + embedding**（T-009）：它们是本次要打通的"真实调用"能力，
+  # 由框架按上面的 spring.ai.openai.* 建 OpenAiChatModel / OpenAiEmbeddingModel，
+  # ChatClientAutoConfiguration 再据此自动产出 ChatClient.Builder —— 不用手写 Bean。
+  # 两者属于"引导默认模型"，后续 T-014 的按库配置模型在其之上再加一层，不冲突。
+  #
+  # **关闭**下面这些：项目用不到的模态（图片/语音/审核）不建无用 Bean；
+  # MilvusVectorStore 的 collection、维度、索引由 MilvusCollectionInitializer
+  # 以代码显式管理（维度/度量是 D-4 的不可逆决策，不适合交给自动配置的默认值）。
   # ============================================================
   autoconfigure:
     exclude:
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
-      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
       - org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreAutoConfiguration
+
+# ============================================================
+# 应用自定义配置（T-008 / T-010）
+# ============================================================
+app:
+  # ------------------------------------------------------------
+  # 模型口径（T-009；T-014 在此基础上加"按库选用 + 客户端缓存"）
+  #
+  # 四组与 ModelType 枚举的四个值一一对应（CHAT / EMBEDDING / RERANK / VL）。
+  # 这里放**唯一来源**，spring.ai.openai.* 用 ${app.model.xxx.yyy} 引用它，
+  # 避免同一件事写两遍后悄悄漂移。
+  #
+  # 环境变量名沿用 .env 既有写法（注意 .env 里是 EMBEDDED_ 而不是 EMBEDDING_，
+  # 那是项目既有命名，此处如实对齐；改名要同步改用户的 .env，不做单方面重命名）。
+  # api-key 全部给空默认值：缺 key 时是"调用时明确报错"，而不是启动时报一堆
+  # 莫名其妙的绑定失败 —— 本地只调存储、不调模型的场景仍然能起来。
+  # ------------------------------------------------------------
+  model:
+    chat:
+      base-url: ${CHAT_BASE_URL:}
+      api-key: ${CHAT_API_KEY:}
+      model: ${CHAT_MODEL:}
+    embedding:
+      base-url: ${EMBEDDED_API_BASE_URL:}
+      api-key: ${EMBEDDED_API_KEY:}
+      model: ${EMBEDDED_API_MODEL:}
+    rerank:
+      base-url: ${RERANKER_API_BASE_URL:}
+      api-key: ${RERANKER_API_KEY:}
+      model: ${RERANKER_API_MODEL:}
+    vl:
+      base-url: ${VL_API_BASE_URL:}
+      api-key: ${VL_API_KEY:}
+      model: ${VL_API_MODEL:}
+
+  # CORS 允许来源（逗号分隔）。开发期前端走 Vite proxy 是同源，此配置为直连 8080 兜底
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+
+  storage:
+    # true = 启动自检发现任一存储不可用就拒绝启动（CI / spike 取证用）
+    # false = 只输出报告并继续启动（本地开发默认，缺容器时不耽误调其它功能）
+    fail-fast: ${STORAGE_FAIL_FAST:false}
+
+  # ------------------------------------------------------------
+  # Milvus：连接 + 集合 schema 的唯一口径
+  # 维度锁死 1024（bge-m3，L2 归一化）—— 决策 D-4 / 风险 R-8
+  # 曾误配为 1536，与 bge-m3 不符会导致写入全部失败
+  # ------------------------------------------------------------
+  milvus:
+    host: ${MILVUS_HOST:127.0.0.1}
+    port: ${MILVUS_PORT:19530}
+    username: ${MILVUS_USERNAME:}
+    password: ${MILVUS_PASSWORD:}
+    database: ${MILVUS_DATABASE:default}
+    collection: knowledge_vectors
+    dimension: 1024
+    metric-type: L2
+    index-type: IVF_FLAT
+    index-nlist: 128
+    index-nprobe: 16
+    initialize-schema: true
+    scalar-index-enabled: true
+    connect-timeout-ms: 5000
+    rpc-deadline-ms: 10000
+
+# ============================================================
+# JWT（T-007）
+# 密钥来自 .env 的 JWT_SECRET，**不给默认值**：缺了就启动失败，
+# 好过用一个"看似能跑"的弱密钥。
+# ============================================================
+jwt:
+  secret: ${JWT_SECRET}
+  issuer: ai-knowledge
+  access-ttl-minutes: 120
+  refresh-ttl-days: 7
+  blacklist-ttl-seconds: 7200
 
 # ============================================================
 # MinIO 对象存储（文档文件归档）
@@ -111,3 +264,33 @@ minio:
 # ============================================================
 server:
   port: ${SERVER_PORT:8080}
+
+# ============================================================
+# 监控配置（Actuator + Micrometer）
+# ============================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,env,loggers
+  endpoint:
+    health:
+      # 展开到"每个组件一行 + 明细"，G0-5 靠这个直接看五个存储
+      show-details: always
+      show-components: always
+  health:
+    # ------------------------------------------------------------
+    # 关掉 Spring Boot 自带的 db / redis / neo4j 贡献者，
+    # 改用 StorageHealthConfig 提供的 mysql / redis / milvus / minio / neo4j，
+    # 与 docker-compose 的容器名口径一致（避免出现两套重复指标）
+    # ------------------------------------------------------------
+    db:
+      enabled: false
+    redis:
+      enabled: false
+    neo4j:
+      enabled: false
+  metrics:
+    export:
+      prometheus:
+        enabled: true
