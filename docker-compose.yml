@@ -1,16 +1,29 @@
 # ============================================================
 # 知识库系统 - 统一数据服务 Docker Compose
-# 包含: MySQL + Milvus + MinIO
-# 数据存储: G:\db\db_data
+#
+# 服务清单（6 个）：MySQL · MinIO · Milvus(etcd + standalone) · Neo4j · Valkey
+# 数据落盘：除 MySQL 走命名卷外，其余全部在 G:\db\db_data\*（bind 挂载）
+#
+# 本文件是本项目基础设施的**编排事实源** —— 改端口 / 改镜像 / 加服务只改这里。
+# 历史上这套容器先后由 rag_service_web、trae-study 两个项目的 compose 创建，
+# 收敛过程与遗留说明见 docs/后端开发文档/01-本地启动与配置.md。
+#
+# 启动前置与常见报错对照表也在这份文档里，遇到启动问题先看它。
 # ============================================================
 
-version: '3.8'
+# 显式声明项目名：compose 默认取**目录名**当项目名，目录一改名就可能
+# 冒出第二套同名容器（本项目踩过：在 ai-knowledge 目录下 up，它以为
+# 要新建 kb-mysql，与既有容器撞名）。写死就不依赖目录名了。
+name: ai-knowledge
 
 services:
   # ============================================================
-  # MySQL 8.0 - 业务数据存储
-  # 数据存储: G:\db\db_data\mysql
+  # MySQL 8.4 - 业务数据存储
+  # 数据卷: 命名卷 kb-mysql-data（内含真实库 knowledge_base）
   # 端口: 3306
+  #
+  # 注意：**故意不用 bind 挂载**。真实业务数据是当初从旧匿名卷复制进
+  # 命名卷的，改成 G:/db/db_data/mysql 会挂到一个空目录上，库直接"消失"。
   # ============================================================
   mysql:
     container_name: kb-mysql
@@ -27,9 +40,6 @@ services:
     ports:
       - "3306:3306"
     volumes:
-      # 数据存储到G盘
-      # - G:/db/db_data/mysql:/var/lib/mysql
-      # 使用包含真实业务数据(knowledge_base)的命名卷
       - kb-mysql-data:/var/lib/mysql
       # 配置文件（可选）
       # - ./mysql/conf.d:/etc/mysql/conf.d
@@ -49,9 +59,16 @@ services:
       - kb-network
 
   # ============================================================
-  # MinIO - 对象存储（文档文件存储）
+  # MinIO - 对象存储（文档文件归档）
   # 数据存储: G:\db\db_data\minio
   # API端口: 9000 | 控制台端口: 9001
+  #
+  # 变量名说明：官方自 2021 起改用 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD，
+  # MINIO_ACCESS_KEY / MINIO_SECRET_KEY 是仍在生效的旧名。此处**保留旧名**
+  # 是有意的 —— 改环境变量会改变该服务的配置指纹，compose 随即重建容器；
+  # 而这两个变量名在用的是同一对值（minioadmin/minioadmin），改动没有收益。
+  # 换新名时请连带确认 MINIO_ACCESS_KEY / MINIO_SECRET_KEY 两个 .env 值同步。
+  # bucket 不用手工建：应用侧 MinioBucketInitializer 启动时按 minio.bucket 建。
   # ============================================================
   minio:
     container_name: kb-minio
@@ -64,7 +81,6 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      # 数据存储到G盘
       - G:/db/db_data/minio/data:/data
       - G:/db/db_data/minio/config:/root/.minio
     command: minio server /data --console-address ":9001"
@@ -77,7 +93,7 @@ services:
       - kb-network
 
   # ============================================================
-  # etcd - Milvus的元数据存储
+  # etcd - Milvus 的元数据存储
   # 数据存储: G:\db\db_data\milvus\etcd
   # ============================================================
   etcd:
@@ -90,7 +106,6 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      # etcd数据存储到G盘
       - G:/db/db_data/milvus/etcd:/etcd
     command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
@@ -105,6 +120,9 @@ services:
   # Milvus Standalone - 向量数据库
   # 数据存储: G:\db\db_data\milvus\milvus
   # API端口: 19530 | 健康检查端口: 9091
+  #
+  # collection 不在这里建：schema（1024 维 / L2 / IVF_FLAT）由应用侧
+  # MilvusCollectionInitializer 以代码显式管理（决策 D-4，建错要重建全量向量）。
   # ============================================================
   standalone:
     container_name: milvus-standalone
@@ -118,7 +136,6 @@ services:
       MINIO_ADDRESS: minio:9000
       MQ_TYPE: woodpecker
     volumes:
-      # Milvus向量数据存储到G盘
       - G:/db/db_data/milvus/milvus:/var/lib/milvus
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
@@ -135,34 +152,58 @@ services:
     networks:
       - kb-network
 
-
   # ============================================================
-  # Neo4j 5.26 - 图数据库（知识图谱存储）
+  # Neo4j 5.26 - 图数据库（知识图谱旁路）
   # 数据存储: G:\db\db_data\neo4j
   # 浏览器端口: 7474 | 驱动连接端口: 7687
+  # 密码: 与 .env 的 NEO4J_PASSWORD 必须一致，改一处要改两处
   # ============================================================
   neo4j:
     container_name: kb-neo4j
     image: neo4j:5.26-community
     restart: unless-stopped
     environment:
-      # 设置用户名和密码 (强烈建议修改默认密码！)
       NEO4J_AUTH: neo4j/your_password_here
-      # 时区设置
       TZ: Asia/Shanghai
     ports:
       - "7474:7474"  # Neo4j Browser 网页管理界面
       - "7687:7687"  # 应用程序连接的 Bolt 协议端口
     volumes:
-      # 数据挂载到G盘 (注意：Windows路径建议使用正斜杠 /)
       - G:/db/db_data/neo4j:/data
-      # 可选：如果需要保存日志或插件，可以挂载以下目录（自动创建）
+      # 可选：日志与插件目录（自动创建）
       # - G:/db/db_data/neo4j/logs:/logs
       # - G:/db/db_data/neo4j/plugins:/plugins
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
       interval: 30s
       timeout: 20s
+      retries: 5
+    networks:
+      - kb-network
+
+  # ============================================================
+  # Valkey 8.1 - Redis 协议兼容的缓存 / 会话存储（T-008 五存储之一）
+  # 数据存储: G:\db\db_data\valkey（含 dump.rdb，RDB 持久化）
+  # 端口: 6379
+  #
+  # ⚠️ 本实例**不只服务本项目**：Python 侧 rag_service 在同一实例上用了
+  #     rag:ingest:stream        —— 文档摄取队列（config/settings.py）
+  #     embed:query:{model}:{sha} —— 查询嵌入缓存（core/retrieval/embed_query_node.py）
+  #   本项目的键有自己的前缀（ak:audit:seq:*），不冲突；但**重启本容器会
+  #   中断对方**，动它之前先确认对方不在跑。
+  # ============================================================
+  valkey:
+    container_name: kb-valkey
+    image: valkey/valkey:8.1.8
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - G:/db/db_data/valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
       retries: 5
     networks:
       - kb-network
@@ -176,7 +217,7 @@ networks:
     driver: bridge
 
 volumes:
-  # MySQL 真实数据卷（含 knowledge_base，从旧匿名卷复制而来）
+  # MySQL 真实数据卷（含 knowledge_base，从旧匿名卷复制而来）——
+  # 显式固定 name，避免 compose 加项目名前缀后找不到旧数据。
   kb-mysql-data:
     name: kb-mysql-data
-
