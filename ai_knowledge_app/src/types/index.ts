@@ -114,7 +114,8 @@ export interface ChunkInfo {
   index: number
   content: string
   tokens: number
-  parentId?: number
+  /** 顶层块（正文/标题/代码/列表/图片/表格父块/摘要）为 `null`；子块指向 `blockType = TABLE` 的父块 id。**禁止用 `0` 表示"无父块"** */
+  parentId?: number | null
   childrenCount?: number
 }
 

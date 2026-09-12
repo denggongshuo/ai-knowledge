@@ -277,9 +277,9 @@ export const mockKbs: KnowledgeBase[] = [
   { id: 8, name: '客户交付资料库', description: '交付文档、验收报告、培训材料', owner: '赵磊', department: '销售中心', docCount: 361, chunkCount: 5694, status: 'ACTIVE', createdAt: '2025-09-20', updatedAt: '2026-09-10 15:45' },
 ]
 
-/** 文档示例（产品技术文档库，白皮书 24 页/214 分片） */
+/** 文档示例（产品技术文档库，白皮书 24 页/222 分片） */
 export const mockDocs: DocInfo[] = [
-  { id: 1, kbId: 1, kbName: '产品技术文档库', title: 'AI 知识库平台白皮书 V3', path: '/产品技术文档/白皮书/AI知识库平台白皮书V3.pdf', type: 'PDF', size: 26_214_400, pageCount: 24, chunkCount: 214, status: 'READY', securityLevel: 'CONFIDENTIAL', owner: '王芳', uploadedAt: '2026-09-11 14:30', version: 'v3.0' },
+  { id: 1, kbId: 1, kbName: '产品技术文档库', title: 'AI 知识库平台白皮书 V3', path: '/产品技术文档/白皮书/AI知识库平台白皮书V3.pdf', type: 'PDF', size: 26_214_400, pageCount: 24, chunkCount: 222, status: 'READY', securityLevel: 'CONFIDENTIAL', owner: '王芳', uploadedAt: '2026-09-11 14:30', version: 'v3.0' },
   { id: 2, kbId: 1, kbName: '产品技术文档库', title: '系统架构设计说明书', path: '/产品技术文档/技术规范/系统架构设计说明书.docx', type: 'DOCX', size: 8_388_608, pageCount: 18, chunkCount: 132, status: 'READY', securityLevel: 'CONFIDENTIAL', owner: '林工', uploadedAt: '2026-09-08 10:00', version: 'v2.1' },
   { id: 3, kbId: 1, kbName: '产品技术文档库', title: 'RAG 检索链路设计稿', path: '/产品技术文档/技术规范/RAG检索链路设计稿.md', type: 'MD', size: 2_097_152, pageCount: 12, chunkCount: 96, status: 'READY', securityLevel: 'INTERNAL', owner: '林工', uploadedAt: '2026-09-05 15:20', version: 'v1.4' },
   { id: 4, kbId: 7, kbName: '研发知识沉淀库', title: '大模型微调实践总结', path: '/研发沉淀/AI实践/大模型微调实践总结.md', type: 'MD', size: 1_048_576, pageCount: 8, chunkCount: 54, status: 'READY', securityLevel: 'INTERNAL', owner: '王芳', uploadedAt: '2026-09-03 09:40', version: 'v1.0' },
@@ -335,10 +335,11 @@ export const RETRIEVAL_COST = {
   total: 1668,
 }
 
-/** 白皮书 v3 分片构成（198 正文 + 12 表格 + 4 摘要 = 214） */
+/** 白皮书 v3 分片构成（198 正文 + 12 表格 + 8 图片 + 4 摘要 = 222，不含表格子块 88） */
 export const WHITEPAPER_CHUNK_MIX = {
   paragraph: 198,
   table: 12,
+  image: 8,
   summary: 4,
   tableSubBlocks: 88,
   unrecognizedTables: 1,
@@ -453,7 +454,7 @@ export const PARSE_CONFIG_VIEW: ParseConfigView = {
 
 /** 知识库文档列表示例（产品技术文档库 kb=1，覆盖四种状态与解析质量） */
 const KB1_DOCS: KbDocRow[] = [
-  { id: 1, title: 'AI 知识库平台白皮书 V3', type: 'PDF', size: 26_214_400, chunkCount: 222, status: 'READY', tableTotal: 12, tableParsed: 11, imageTotal: 5, imageParsed: 5, owner: '王芳', uploadedAt: '2026-09-11 14:30' },
+  { id: 1, title: 'AI 知识库平台白皮书 V3', type: 'PDF', size: 26_214_400, chunkCount: 222, status: 'READY', tableTotal: 12, tableParsed: 11, imageTotal: 8, imageParsed: 8, owner: '王芳', uploadedAt: '2026-09-11 14:30' },
   { id: 2, title: '系统架构设计说明书', type: 'DOCX', size: 8_388_608, chunkCount: 132, status: 'READY', tableTotal: 4, tableParsed: 4, imageTotal: 5, imageParsed: 4, owner: '林工', uploadedAt: '2026-09-08 10:00' },
   { id: 3, title: 'RAG 检索链路设计稿', type: 'MD', size: 2_097_152, chunkCount: 96, status: 'READY', tableTotal: 3, tableParsed: 3, imageTotal: 4, imageParsed: 4, owner: '林工', uploadedAt: '2026-09-05 15:20' },
   { id: 4, title: '服务接口清单', type: 'XLSX', size: 1_572_864, chunkCount: 88, status: 'READY', tableTotal: 6, tableParsed: 6, imageTotal: 0, imageParsed: 0, owner: '张伟', uploadedAt: '2026-09-04 09:12' },
@@ -528,8 +529,8 @@ export function docMetaOf(docId: number): DocMeta {
     storagePath: `kb-prod/${base.id === 1 ? '2026/whitepaper.pdf' : `${base.kbId}/${base.title}.${base.type.toLowerCase()}`}`,
     tableTotal: isWhitepaper ? 12 : 4,
     tableParsed: isWhitepaper ? 11 : 4,
-    imageTotal: isWhitepaper ? 5 : 3,
-    imageParsed: isWhitepaper ? 5 : 3,
+    imageTotal: isWhitepaper ? 8 : 3,
+    imageParsed: isWhitepaper ? 8 : 3,
     citations: isWhitepaper ? 37 : 12,
     downVotes: isWhitepaper ? 2 : 0,
     lastIndexAt: '2026-09-11 14:34:20',
@@ -540,14 +541,14 @@ export function docMetaOf(docId: number): DocMeta {
 
 /** 文档版本（同名上传自动归档，不覆盖） */
 export const mockDocVersions: DocVersion[] = [
-  { version: 'v3', size: 26_214_400, chunkCount: 214, owner: '王芳', at: '2026-09-11 14:30', current: true, note: '新增表格双表示章节' },
+  { version: 'v3', size: 26_214_400, chunkCount: 222, owner: '王芳', at: '2026-09-11 14:30', current: true, note: '新增表格双表示章节' },
   { version: 'v2', size: 22_020_096, chunkCount: 198, owner: '张伟', at: '2026-08-15 10:18', current: false, note: '补充检索链路设计' },
   { version: 'v1', size: 18_874_368, chunkCount: 176, owner: '林工', at: '2026-06-02 14:02', current: false, note: '首次发布' },
 ]
 
 /** 索引任务记录 */
 export const mockIndexTasks: IndexTask[] = [
-  { id: 4, stage: '索引完成', at: '2026-09-11 14:34', version: 'v3', status: 'SUCCESS', durationSec: 74, chunkCount: 214, detail: '切分 + 表格识别 + 向量化' },
+  { id: 4, stage: '索引完成', at: '2026-09-11 14:34', version: 'v3', status: 'SUCCESS', durationSec: 74, chunkCount: 222, detail: '切分 + 表格识别 + 向量化' },
   { id: 3, stage: '开始索引', at: '2026-09-11 14:33', version: 'v3', status: 'RUNNING', detail: '切分 + 表格识别 + 向量化' },
   { id: 2, stage: '索引完成', at: '2026-08-15 10:22', version: 'v2', status: 'SUCCESS', durationSec: 62, chunkCount: 198 },
   { id: 1, stage: '首次索引', at: '2026-06-02 14:05', version: 'v1', status: 'INFO', durationSec: 58, chunkCount: 176 },
@@ -569,10 +570,10 @@ export const mockChunkStat: ChunkStat = {
 export const mockChunks: ChunkInfo[] = [
   { id: 47, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '3. 接口设计 > 3.1 鉴权流程', blockType: 'PARAGRAPH', index: 47, tokens: 312, content: '客户端首次登录成功后，服务端签发一对令牌：访问令牌有效期 2 小时，刷新令牌有效期 7 天。当访问令牌过期时，客户端应使用刷新令牌换取新的访问令牌，而不是重新走登录流程。' },
   { id: 48, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '3. 接口设计 > 3.1 鉴权流程', blockType: 'PARAGRAPH', index: 48, tokens: 286, content: '访问令牌存放于内存或 sessionStorage，避免 XSS 窃取；刷新令牌通过 HttpOnly Cookie 下发，前端不可读取。' },
-  { id: 88, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '3. 接口设计 > 3.2 错误码规范', blockType: 'TABLE', index: 88, tokens: 640, parentId: 0, childrenCount: 8, content: '表 2：接口错误码对照表（14 行 × 3 列）' },
+  { id: 88, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '3. 接口设计 > 3.2 错误码规范', blockType: 'TABLE', index: 88, tokens: 640, parentId: null, childrenCount: 8, content: '表 2：接口错误码对照表（14 行 × 3 列）' },
   { id: 150, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '2. 系统架构 > 2.1 整体链路', blockType: 'IMAGE', index: 150, tokens: 428, content: '图 1：RAG 全链路架构图 —— 上传解析 → 分片与索引增强 → 混合检索（向量 + BM25）→ Rerank 精排 → 生成。图注：检索侧的 Rerank 是延迟最大项（288ms）。\n\n关键词：RAG, 架构图, 混合检索, Rerank, 索引增强' },
   { id: 151, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '4. 检索策略 > 4.2 混合检索与重排', blockType: 'IMAGE', index: 151, tokens: 386, content: '图 2：重排前后 Top1 命中率对比（柱状图）—— 重排前 63%，重排后 81%，净提升 18 个百分点。\n\n关键词：重排效果, Top1 命中率, 63%, 81%, 评测' },
-  { id: 214, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '文档级摘要', blockType: 'SUMMARY', index: 214, tokens: 186, content: '本文档描述 2026 版产品技术架构、接口鉴权与检索策略，涵盖分片增强、混合检索与重排链路。' },
+  { id: 214, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '文档级摘要', blockType: 'SUMMARY', index: 222, tokens: 186, parentId: null, content: '本文档描述 2026 版产品技术架构、接口鉴权与检索策略，涵盖分片增强、混合检索与重排链路。' },
 ]
 
 /** 父子块关系（命中子块 → parent_id → 完整父块） */
