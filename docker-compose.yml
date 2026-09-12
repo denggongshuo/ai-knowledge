@@ -1,0 +1,182 @@
+# ============================================================
+# 知识库系统 - 统一数据服务 Docker Compose
+# 包含: MySQL + Milvus + MinIO
+# 数据存储: G:\db\db_data
+# ============================================================
+
+version: '3.8'
+
+services:
+  # ============================================================
+  # MySQL 8.0 - 业务数据存储
+  # 数据存储: G:\db\db_data\mysql
+  # 端口: 3306
+  # ============================================================
+  mysql:
+    container_name: kb-mysql
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: knowledge_base
+      MYSQL_USER: kb_user
+      MYSQL_PASSWORD: kb_password
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      # 数据存储到G盘
+      # - G:/db/db_data/mysql:/var/lib/mysql
+      # 使用包含真实业务数据(knowledge_base)的命名卷
+      - kb-mysql-data:/var/lib/mysql
+      # 配置文件（可选）
+      # - ./mysql/conf.d:/etc/mysql/conf.d
+      # 初始化SQL（可选，首次启动时执行）
+      # - ./mysql/init:/docker-entrypoint-initdb.d
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --mysql-native-password=ON
+      - --max_connections=200
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kb-network
+
+  # ============================================================
+  # MinIO - 对象存储（文档文件存储）
+  # 数据存储: G:\db\db_data\minio
+  # API端口: 9000 | 控制台端口: 9001
+  # ============================================================
+  minio:
+    container_name: kb-minio
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # 数据存储到G盘
+      - G:/db/db_data/minio/data:/data
+      - G:/db/db_data/minio/config:/root/.minio
+    command: minio server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - kb-network
+
+  # ============================================================
+  # etcd - Milvus的元数据存储
+  # 数据存储: G:\db\db_data\milvus\etcd
+  # ============================================================
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      # etcd数据存储到G盘
+      - G:/db/db_data/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - kb-network
+
+  # ============================================================
+  # Milvus Standalone - 向量数据库
+  # 数据存储: G:\db\db_data\milvus\milvus
+  # API端口: 19530 | 健康检查端口: 9091
+  # ============================================================
+  standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.17
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    volumes:
+      # Milvus向量数据存储到G盘
+      - G:/db/db_data/milvus/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - "etcd"
+      - "minio"
+    networks:
+      - kb-network
+
+
+  # ============================================================
+  # Neo4j 5.26 - 图数据库（知识图谱存储）
+  # 数据存储: G:\db\db_data\neo4j
+  # 浏览器端口: 7474 | 驱动连接端口: 7687
+  # ============================================================
+  neo4j:
+    container_name: kb-neo4j
+    image: neo4j:5.26-community
+    restart: unless-stopped
+    environment:
+      # 设置用户名和密码 (强烈建议修改默认密码！)
+      NEO4J_AUTH: neo4j/your_password_here
+      # 时区设置
+      TZ: Asia/Shanghai
+    ports:
+      - "7474:7474"  # Neo4j Browser 网页管理界面
+      - "7687:7687"  # 应用程序连接的 Bolt 协议端口
+    volumes:
+      # 数据挂载到G盘 (注意：Windows路径建议使用正斜杠 /)
+      - G:/db/db_data/neo4j:/data
+      # 可选：如果需要保存日志或插件，可以挂载以下目录（自动创建）
+      # - G:/db/db_data/neo4j/logs:/logs
+      # - G:/db/db_data/neo4j/plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+    networks:
+      - kb-network
+
+# ============================================================
+# 网络
+# ============================================================
+networks:
+  kb-network:
+    name: kb-network
+    driver: bridge
+
+volumes:
+  # MySQL 真实数据卷（含 knowledge_base，从旧匿名卷复制而来）
+  kb-mysql-data:
+    name: kb-mysql-data
+

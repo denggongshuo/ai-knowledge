@@ -1,0 +1,113 @@
+# ============================================================
+# 应用基础配置
+# ============================================================
+spring:
+  application:
+    name: ai_knowledge_web
+
+  # ============================================================
+  # .env 环境变量文件（Spring Boot 原生导入）
+  # 注意：原 spring-dotenv 4.0.0 在 Spring Boot 4 下不会生效（监听器方法签名不匹配）
+  # 相对路径基于进程工作目录，请从模块目录（ai_knowledge_web/）启动
+  # ============================================================
+  config:
+    import: optional:file:./.env[.properties]
+
+  # ============================================================
+  # 数据源 - MySQL（业务数据库）
+  # docker-compose: kb-mysql (localhost:3306)
+  # ============================================================
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DATABASE}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: ${MYSQL_USERNAME}
+    password: ${MYSQL_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+    open-in-view: false
+
+  # ============================================================
+  # Spring AI - OpenAI 兼容协议
+  # 说明：此处仅用 dummy 值避免启动报错，实际客户端由 Bean 动态注入
+  # ============================================================
+  ai:
+    openai:
+      base-url: none
+      api-key: dummy
+      chat:
+        options:
+          model: none
+          temperature: 0.7
+      embedding:
+        options:
+          model: none
+
+    # ============================================================
+    # Milvus 向量数据库
+    # docker-compose: milvus-standalone (localhost:19530)
+    # ============================================================
+    vectorstore:
+      milvus:
+        client:
+          host: ${MILVUS_HOST}
+          port: ${MILVUS_PORT}
+        collection-name: knowledge_vectors
+        embedding-dimension: 1536
+        metric-type: COSINE
+        index-type: IVF_FLAT
+        initialize-schema: true
+
+  # ============================================================
+  # Neo4j 图数据库（知识图谱存储）
+  # docker-compose: kb-neo4j (localhost:7687)
+  # ============================================================
+  neo4j:
+    uri: ${NEO4J_URI}
+    authentication:
+      username: ${NEO4J_USERNAME}
+      password: ${NEO4J_PASSWORD}
+
+  # ============================================================
+  # Redis 缓存 / 会话存储
+  # docker-compose: kb-valkey (localhost:6379)
+  # ============================================================
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT}
+      password: ${REDIS_PASSWORD}
+
+  # ============================================================
+  # 关闭 Spring AI 自动配置（客户端由动态 Bean 管理）
+  # ============================================================
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
+      - org.springframework.ai.vectorstore.milvus.autoconfigure.MilvusVectorStoreAutoConfiguration
+
+# ============================================================
+# MinIO 对象存储（文档文件归档）
+# docker-compose: kb-minio (localhost:9000)
+# ============================================================
+minio:
+  endpoint: ${MINIO_ENDPOINT}
+  access-key: ${MINIO_ACCESS_KEY}
+  secret-key: ${MINIO_SECRET_KEY}
+  bucket: ${MINIO_BUCKET}
+
+# ============================================================
+# 服务器配置
+# ============================================================
+server:
+  port: ${SERVER_PORT:8080}
