@@ -1,0 +1,182 @@
+import type { ApiResponse } from '@/types'
+
+/**
+ * 请求层 —— fetch 封装
+ * 统一解包 { code, message, data }，code !== 0 抛错；自动带 Authorization。
+ * SSE 流单独走 chatStream()。
+ */
+
+const BASE = '/api'
+
+export class ApiError extends Error {
+  code: number
+  constructor(code: number, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+function getToken() {
+  return localStorage.getItem('ak_token') ?? ''
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const { headers: extraHeaders, ...rest } = options
+  const isForm = extraHeaders instanceof FormData
+  const headers: Record<string, string> = {
+    ...(isForm ? {} : { 'Content-Type': 'application/json' }),
+    ...(extraHeaders as Record<string, string> | undefined),
+  }
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+
+  let resp: Response
+  try {
+    resp = await fetch(`${BASE}${path}`, { ...rest, headers })
+  } catch {
+    throw new ApiError(-1, '网络异常，请检查网络连接')
+  }
+  const text = await resp.text()
+  let parsed: ApiResponse<T>
+  try {
+    parsed = JSON.parse(text) as ApiResponse<T>
+  } catch {
+    throw new ApiError(resp.status, text || `请求失败（${resp.status}）`)
+  }
+  if (parsed.code !== 0) {
+    // 401 统一跳登录
+    if (parsed.code === 401 || resp.status === 401) {
+      localStorage.removeItem('ak_token')
+      if (!location.hash.includes('/login')) location.hash = '#/login'
+    }
+    throw new ApiError(parsed.code, parsed.message)
+  }
+  return parsed.data
+}
+
+export const http = {
+  get<T>(path: string, query?: Record<string, string | number | undefined>) {
+    const qs = query
+      ? '?' +
+        Object.entries(query)
+          .filter(([, v]) => v !== undefined && v !== '')
+          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+          .join('&')
+      : ''
+    return request<T>(path + qs, { method: 'GET' })
+  },
+  post<T>(path: string, body?: unknown) {
+    return request<T>(path, { method: 'POST', body: body == null ? undefined : JSON.stringify(body) })
+  },
+  put<T>(path: string, body?: unknown) {
+    return request<T>(path, { method: 'PUT', body: body == null ? undefined : JSON.stringify(body) })
+  },
+  patch<T>(path: string, body?: unknown) {
+    return request<T>(path, { method: 'PATCH', body: body == null ? undefined : JSON.stringify(body) })
+  },
+  delete<T>(path: string, body?: unknown) {
+    return request<T>(path, { method: 'DELETE', body: body == null ? undefined : JSON.stringify(body) })
+  },
+}
+
+/** SSE 事件回调集合 */
+export interface SSEHandlers {
+  /** 图片理解进度（V2 新增）：带图片时首包即 DESCRIBING */
+  onAttachment?: (data: {
+    stage: 'DESCRIBING' | 'DONE'
+    attachmentId: string
+    desc?: string
+    searchSummary?: string
+    vlModel?: string
+    degraded?: boolean
+  }) => void
+  onRetrieval?: (data: { chunks: unknown[]; trace: unknown; kbCount: number }) => void
+  onDelta?: (data: { content: string }) => void
+  onDone?: (data: {
+    messageId: string
+    modelId?: number
+    modelName?: string
+    tokenUsage: unknown
+    finishReason: string
+    usedVision?: boolean
+  }) => void
+  onError?: (message: string) => void
+}
+
+/** 问答请求可选参数（V2：模型切换 + 图片附件 + 按需读原图） */
+export interface ChatStreamOptions {
+  /** 对话模型 id；与当前会话绑定不一致时服务端会开启新会话 */
+  modelId?: number | null
+  /** 图片附件 id 列表（先经 /chat/attachments 预上传） */
+  attachmentIds?: string[]
+  /** 本轮是否把原图直接传给对话模型（兜底，仅该轮生效） */
+  useVision?: boolean
+}
+
+/**
+ * SSE 流式问答（chat completions）
+ * fetch 流式读取 text/event-stream，按事件分发
+ * 路径与《10-接口约定汇总》§9 一致：POST /api/chat/completions
+ */
+export async function chatStream(message: string, handlers: SSEHandlers, options: ChatStreamOptions = {}): Promise<void> {
+  const token = getToken()
+  const body: Record<string, unknown> = { message }
+  if (options.modelId != null) body.modelId = options.modelId
+  if (options.attachmentIds?.length) body.attachmentIds = options.attachmentIds
+  if (options.useVision) body.useVision = true
+
+  const resp = await fetch(`${BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  if (!resp.ok || !resp.body) {
+    handlers.onError?.(`连接失败（${resp.status}）`)
+    return
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const dispatch = (chunk: string) => {
+    const lines = chunk.split('\n')
+    let event = 'message'
+    for (const line of lines) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) {
+        const payload = line.slice(5).trim()
+        if (!payload) continue
+        try {
+          const data = JSON.parse(payload)
+          if (event === 'attachment') handlers.onAttachment?.(data)
+          else if (event === 'retrieval') handlers.onRetrieval?.(data)
+          else if (event === 'delta') handlers.onDelta?.({ content: data.content ?? '' })
+          else if (event === 'done') handlers.onDone?.(data)
+          else if (event === 'error') handlers.onError?.(data.message ?? '生成出错')
+        } catch {
+          /* 忽略残缺帧 */
+        }
+      }
+    }
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // SSE 帧以空行分隔
+    let idx: number
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, idx)
+      buffer = buffer.slice(idx + 2)
+      if (frame.trim()) dispatch(frame)
+    }
+  }
+  if (buffer.trim()) dispatch(buffer)
+}
+
+export default http
