@@ -10,10 +10,32 @@ const BASE = '/api'
 
 export class ApiError extends Error {
   code: number
-  constructor(code: number, message: string) {
+  /**
+   * true = 后端**未实现**该接口（HTTP 404 未映射路由）。
+   *
+   * 本项目业务错误一律 `HTTP 200 + 非 0 code`，所以真出现 HTTP 404 只有一种可能：
+   * 后端没注册这条路由（前端已 mock、后端尚未实现）。页面据此**降级**而非崩溃（T-3C2）。
+   */
+  notImplemented: boolean
+  constructor(code: number, message: string, notImplemented = false) {
     super(message)
     this.code = code
+    this.notImplemented = notImplemented
   }
+}
+
+/** 已降噪提示过的未实现接口（**每接口只提示一次**，避免每打开一个页面就刷一条）。 */
+const warnedUnimplemented = new Set<string>()
+
+/**
+ * 未实现接口的降噪提示：**只降噪、不静默** —— 留一条可识别日志供人工/自检脚本发现，
+ * 但不再以「未捕获异常」的形态淹没 console（那是 T-3C2 要消除的噪声）。
+ */
+function warnUnimplemented(path: string, method?: string) {
+  const key = `${method ?? 'GET'} ${path.split('?')[0]}`
+  if (warnedUnimplemented.has(key)) return
+  warnedUnimplemented.add(key)
+  console.warn(`[未实现接口] ${key} → 404（后端尚未实现，页面已降级；此提示每个接口只出现一次）`)
 }
 
 function getToken() {
@@ -57,6 +79,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     throw new ApiError(-1, '网络异常，请检查网络连接')
   }
   const text = await resp.text()
+  // 404 = 后端未注册该路由（见 ApiError.notImplemented）。降噪提示一次后**仍抛出**，
+  // 由页面显式 catch 或 main.ts 的统一兜底来降级 —— 不在这里吞掉。
+  if (resp.status === 404) {
+    warnUnimplemented(path, rest.method as string | undefined)
+    throw new ApiError(404, '接口尚未实现（后端未注册该路由）', true)
+  }
   let parsed: ApiResponse<T>
   try {
     parsed = JSON.parse(text) as ApiResponse<T>
