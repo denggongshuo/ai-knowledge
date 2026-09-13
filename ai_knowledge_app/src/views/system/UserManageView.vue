@@ -465,6 +465,7 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div class="user-table-scroll">
         <el-table
           v-loading="loading"
           :data="list"
@@ -509,7 +510,7 @@ onMounted(async () => {
               <span class="muted">{{ row.lastLoginAt || '—' }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="150" fixed="right">
+          <el-table-column label="操作" width="150">
             <template #default="{ row }">
               <div class="ops">
                 <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
@@ -531,6 +532,7 @@ onMounted(async () => {
             </template>
           </el-table-column>
         </el-table>
+        </div>
 
         <div class="table-foot">
           <div class="batch-bar">
@@ -729,25 +731,56 @@ onMounted(async () => {
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
 }
+/* 关键：grid 项默认 min-width:auto，会被卡片头/筛选行的 min-content 撑破轨道
+   → 整页横向溢出、被 .app-main 的 overflow:hidden 裁掉，且底部看不到拖动条 */
+.user-card {
+  min-width: 0;
+}
 .card-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   padding: 13px 16px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .card-title {
   font-size: 14px;
   font-weight: 600;
+  white-space: nowrap;
 }
 .sub {
   font-size: 12px;
   color: var(--el-text-color-secondary);
+  white-space: nowrap;
 }
 .head-right {
   margin-left: auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+/* 列宽不足时让表格在**自己的容器内**横向滚动（拖动条就在表格正下方），而不是把整页撑破 */
+.user-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+.user-table-scroll :deep(.el-table) {
+  min-width: 990px;
+}
+/* 让横向拖动条常显（Windows 的覆盖式滚动条默认自动隐藏，用户会以为"没有拖动条"） */
+.user-table-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+.user-table-scroll::-webkit-scrollbar-thumb {
+  background: #c0c4cc;
+  border-radius: 5px;
+}
+.user-table-scroll::-webkit-scrollbar-thumb:hover {
+  background: #909399;
+}
+.user-table-scroll::-webkit-scrollbar-track {
+  background: #f5f7fa;
 }
 
 /* 部门树 */
@@ -837,6 +870,12 @@ onMounted(async () => {
   border-top: 1px solid var(--el-border-color-lighter);
   flex-wrap: wrap;
   gap: 8px;
+}
+/* 窄屏下分页器（total+sizes+pager）比卡片还宽，允许其内部换行，避免撑破卡片、把整页顶宽 */
+.table-foot :deep(.el-pagination) {
+  max-width: 100%;
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 .batch-bar {
   display: flex;
