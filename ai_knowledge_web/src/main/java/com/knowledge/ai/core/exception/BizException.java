@@ -71,8 +71,28 @@ public class BizException extends RuntimeException {
         return new BizException(errorCode, errorCode.getMessage(), cause);
     }
 
-    /** 是否属于客户端过错（4xx 语义）；用于决定是否打 error 级日志。 */
+    /**
+     * 是否属于客户端过错（4xx 语义）；用于决定是否打 error 级日志。
+     *
+     * <p><b>判定为什么按 HTTP 状态码而不是比数值大小</b>：这里原本写的是
+     * {@code errorCode.getCode() < ErrorCode.SYSTEM_ERROR.getCode()}，即
+     * {@code < 9999}。但业务码是**五位数**（10010~10056），**全部大于 9999** ——
+     * 于是该判断恒为 {@code false}，{@link com.knowledge.ai.core.exception.GlobalExceptionHandler}
+     * 里那条 {@code warn} 分支成了死代码：用户输错一次验证码、令牌正常过期、
+     * 凭证一次性失效，统统按 ERROR 级打**完整堆栈**。
+     *
+     * <p>后果不是"日志难看"，而是两点实质损害：
+     * <ol>
+     *   <li>只收 ERROR 的 {@code -error.log} 被可预期的客户端错误灌满，
+     *       "ERROR 日志里有东西"不再等于"出故障了"，告警失去意义；</li>
+     *   <li>每个被拒的请求都要构造一次堆栈，风控场景下是白白的开销。</li>
+     * </ol>
+     *
+     * <p>改为按 {@code httpStatus} 判定：{@code 4xx} 与业务 200 都属客户端可预期错误，
+     * 只有 {@code 5xx}（当前仅 {@code SYSTEM_ERROR}）才是需要人看的服务端故障。
+     * 这条口径与 {@code ErrorCode} 类注释里那段 HTTP 状态码说明是同一件事。
+     */
     public boolean isClientError() {
-        return errorCode.getCode() < ErrorCode.SYSTEM_ERROR.getCode();
+        return errorCode.getHttpStatus() < 500;
     }
 }
