@@ -38,4 +38,19 @@ public enum DataScope {
         }
         return left.breadth >= right.breadth ? left : right;
     }
+
+    /**
+     * 宽松解析：库里的值不可能非法（写入侧已校验），但历史脏数据不该让列表接口 500。
+     * 解析失败返回 {@code null}，由调用方决定兜底（列表显示原文、鉴权按 SELF）。
+     */
+    public static DataScope parse(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return valueOf(raw);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
 }
