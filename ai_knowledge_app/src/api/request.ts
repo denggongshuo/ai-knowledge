@@ -20,9 +20,29 @@ function getToken() {
   return localStorage.getItem('ak_token') ?? ''
 }
 
+/**
+ * 把 body 转成 fetch 能接受的形态。
+ *
+ * <p><b>FormData 必须原样透传，不能 JSON.stringify</b>：FormData 的字段不可枚举，
+ * 序列化出来是 `"{}"`（不报错，静默丢内容）；而 multipart 端点的 `Content-Type`
+ * 还得带一个 `boundary` 参数 —— 那是浏览器根据实例算出来的，手写不出来，
+ * 所以只能「不设 Content-Type」交给它自己填。
+ *
+ * <p>影响面：`/user/avatar`、`/users/import`（S2）。判错的后果不是报错，
+ * 是上传接口静默发一个空 JSON 出去，然后在后端得到一句很难联想的参数错误。
+ */
+function serializeBody(body: unknown): BodyInit | undefined {
+  if (body == null) return undefined
+  if (body instanceof FormData) return body
+  return JSON.stringify(body)
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const { headers: extraHeaders, ...rest } = options
-  const isForm = extraHeaders instanceof FormData
+  const { headers: extraHeaders, body, ...rest } = options
+  // 判 `body` 而不是 `headers`：headers 永远是个普通对象（或 Headers），
+  // 永远不可能是 FormData。原先写 `headers instanceof FormData` 恒为 false，
+  // 于是 FormData 一律被当成 JSON 处理（见 serializeBody 的说明）。
+  const isForm = body instanceof FormData
   const headers: Record<string, string> = {
     ...(isForm ? {} : { 'Content-Type': 'application/json' }),
     ...(extraHeaders as Record<string, string> | undefined),
@@ -32,7 +52,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   let resp: Response
   try {
-    resp = await fetch(`${BASE}${path}`, { ...rest, headers })
+    resp = await fetch(`${BASE}${path}`, { ...rest, body, headers })
   } catch {
     throw new ApiError(-1, '网络异常，请检查网络连接')
   }
@@ -66,16 +86,16 @@ export const http = {
     return request<T>(path + qs, { method: 'GET' })
   },
   post<T>(path: string, body?: unknown) {
-    return request<T>(path, { method: 'POST', body: body == null ? undefined : JSON.stringify(body) })
+    return request<T>(path, { method: 'POST', body: serializeBody(body) })
   },
   put<T>(path: string, body?: unknown) {
-    return request<T>(path, { method: 'PUT', body: body == null ? undefined : JSON.stringify(body) })
+    return request<T>(path, { method: 'PUT', body: serializeBody(body) })
   },
   patch<T>(path: string, body?: unknown) {
-    return request<T>(path, { method: 'PATCH', body: body == null ? undefined : JSON.stringify(body) })
+    return request<T>(path, { method: 'PATCH', body: serializeBody(body) })
   },
   delete<T>(path: string, body?: unknown) {
-    return request<T>(path, { method: 'DELETE', body: body == null ? undefined : JSON.stringify(body) })
+    return request<T>(path, { method: 'DELETE', body: serializeBody(body) })
   },
 }
 

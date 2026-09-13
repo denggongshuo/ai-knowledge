@@ -75,8 +75,14 @@ export const authApi = {
   checkUsername: (username: string) =>
     http.get<{ available: boolean; reason: string }>('/auth/check-username', { username }),
   checkPhone: (phone: string) => http.get<{ available: boolean; reason: string }>('/auth/check-phone', { phone }),
-  /** 发送短信验证码（`scene` 区分场景，与接口约定 §1 一致） */
-  smsCode: (body: { phone?: string; username?: string; captchaId?: string; captchaCode?: string; scene: 'login' | 'register' | 'reset-password' }) =>
+  /**
+   * 发送短信验证码（`scene` 区分场景，与接口约定 §1 一致）。
+   *
+   * `bind` = 换绑手机 / 邮箱：换绑手机发往**新号**，换绑邮箱发往**当前已绑手机号**
+   * （v1 无邮件通道，只能用短信证明身份）。验证码按 `scene + target` 存键，
+   * 发码与换绑两处的 scene 必须一致，否则校验必然失败。
+   */
+  smsCode: (body: { phone?: string; username?: string; captchaId?: string; captchaCode?: string; scene: 'login' | 'register' | 'reset-password' | 'bind' }) =>
     http.post<{ sent: boolean; debugCode?: string; scene: string }>('/auth/sms-code', body),
   register: (body: { username: string; phone: string; smsCode: string; password: string; realName?: string }) =>
     http.post<{ registered: boolean; username: string }>('/auth/register', body),
@@ -93,7 +99,8 @@ export const userApi = {
   loginLogs: (query: { page?: number; pageSize?: number }) => http.get('/user/login-logs', query),
   updateProfile: (body: { realName?: string; email?: string; position?: string; intro?: string }) =>
     http.put('/user/profile', body),
-  avatar: (form: FormData) => http.post('/user/avatar', form),
+  /** 头像上传：`multipart/form-data`，字段名固定 `file`（后端 `@RequestPart("file")`） */
+  avatar: (form: FormData) => http.post<{ url: string }>('/user/avatar', form),
   permissions: () => http.get<{ codes: string[] }>('/user/permissions'),
   changePhone: (body: { phone: string; code: string }) => http.post('/user/change-phone', body),
   changeEmail: (body: { email: string; code: string }) => http.post('/user/change-email', body),
