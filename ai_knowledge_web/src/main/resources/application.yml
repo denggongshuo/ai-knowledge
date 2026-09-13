@@ -96,37 +96,19 @@ spring:
     open-in-view: false
 
   # ============================================================
-  # Spring AI - OpenAI 兼容协议（T-009）
+  # Spring AI：**已关闭自动装配模型**（T-014 起）
   #
-  # 取值**不在这里重复写**，而是引用 app.model.*（唯一的模型口径），
-  # 免得"环境变量 → app.model"和"环境变量 → spring.ai"两处各写一遍后漂移。
+  # T-009 时这里有一整段 spring.ai.openai.*（引用 app.model.* 喂给自动配置）。
+  # T-014 定案「注册中心是唯一构造点」后，客户端改由 ModelClientRegistry +
+  # ModelClientFactory 按 ModelConfigSpec 自己装配，自动配置产出的 Bean 无人使用，
+  # 于是把那层"引用来引用去"的间接配置一并删掉 —— 模型口径只剩 app.model.* 一处。
   #
-  # 为什么 chat 与 embedding 各自带 base-url / api-key：
-  #   项目实际用了**两家**供应商 —— 对话走 DeepSeek，向量化走硅基流动 bge-m3。
-  #   Spring AI 2.0 的 resolveCommonProperties(common, specific) 支持逐模型覆盖，
-  #   所以这里用 per-model 段而不是公共段。
+  # 开关见下面 spring.autoconfigure.exclude 里的 Chat / Embedding 两项。
   #
-  # base-url 原样透传给 OpenAI Java SDK（已读 OpenAiSetup.calculateBaseUrl 确认：
-  #   非 OpenAI/GitHub/Azure 分支直接 areturn，不补 /v1），
-  #   所以**接口地址要在 .env 里写全**（硅基流动含 /v1，DeepSeek 两种写法都通）。
+  # base-url 仍**不做 /v1 补全**（已读 OpenAiSetup.calculateBaseUrl 确认：非
+  # OpenAI/GitHub/Azure 分支原样返回），所以**接口地址要在 .env 里写全**
+  # （硅基流动含 /v1，DeepSeek 两种写法都通）。
   # ============================================================
-  ai:
-    openai:
-      chat:
-        base-url: ${app.model.chat.base-url}
-        api-key: ${app.model.chat.api-key}
-        timeout: 60s
-        options:
-          model: ${app.model.chat.model}
-          temperature: 0.7
-      embedding:
-        base-url: ${app.model.embedding.base-url}
-        api-key: ${app.model.embedding.api-key}
-        timeout: 60s
-        # 不传 dimensions：bge-m3 固定输出 1024，实测确认（G0-6）。
-        # 显式下发 dimensions 反被部分网关拒绝，故留空由模型决定。
-        options:
-          model: ${app.model.embedding.model}
 
   # ============================================================
   # Neo4j 图数据库（知识图谱存储）
@@ -155,17 +137,20 @@ spring:
   # ============================================================
   # Spring AI 自动配置开关
   #
-  # **保留 chat + embedding**（T-009）：它们是本次要打通的"真实调用"能力，
-  # 由框架按上面的 spring.ai.openai.* 建 OpenAiChatModel / OpenAiEmbeddingModel，
-  # ChatClientAutoConfiguration 再据此自动产出 ChatClient.Builder —— 不用手写 Bean。
-  # 两者属于"引导默认模型"，后续 T-014 的按库配置模型在其之上再加一层，不冲突。
+  # **关闭 chat + embedding**（T-014 起）：客户端统一由 ModelClientRegistry 构造
+  # （决策「注册中心唯一构造点」）。若此处不关，自动配置仍会按已删除的
+  # spring.ai.openai.* 造出一套 ChatModel / EmbeddingModel Bean —— 无人使用却真实存在，
+  # 将来必然有人误注入它们绕过缓存与失效逻辑。
   #
-  # **关闭**下面这些：项目用不到的模态（图片/语音/审核）不建无用 Bean；
-  # MilvusVectorStore 的 collection、维度、索引由 MilvusCollectionInitializer
+  # **关闭其余模态**：图片/语音/审核本项目用不到，不建无用 Bean。
+  #
+  # **关闭 MilvusVectorStore**：collection、维度、索引由 MilvusCollectionInitializer
   # 以代码显式管理（维度/度量是 D-4 的不可逆决策，不适合交给自动配置的默认值）。
   # ============================================================
   autoconfigure:
     exclude:
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
@@ -206,6 +191,16 @@ app:
       api-key: ${VL_API_KEY:}
       model: ${VL_API_MODEL:}
 
+    # ------------------------------------------------------------
+    # 调用参数（T-014）：
+    # 客户端由 ModelClientFactory 构造，超时/重试/温度也归这里 ——
+    # 不再写 spring.ai.openai.*（那层已随自动配置一起删掉）。
+    # ------------------------------------------------------------
+    timeout-seconds: ${MODEL_TIMEOUT_SECONDS:60}
+    max-retries: ${MODEL_MAX_RETRIES:2}
+    # 问答场景的既有取值
+    chat-temperature: ${MODEL_CHAT_TEMPERATURE:0.7}
+
   # CORS 允许来源（逗号分隔）。开发期前端走 Vite proxy 是同源，此配置为直连 8080 兜底
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
@@ -214,6 +209,18 @@ app:
     # true = 启动自检发现任一存储不可用就拒绝启动（CI / spike 取证用）
     # false = 只输出报告并继续启动（本地开发默认，缺容器时不耽误调其它功能）
     fail-fast: ${STORAGE_FAIL_FAST:false}
+
+  # ------------------------------------------------------------
+  # 日志旋钮（结构与格式在 logback-spring.xml，这里只留可调项）
+  # ------------------------------------------------------------
+  logging:
+    # 日志目录。已 gitignore（根 .gitignore 的 `logs/`），不会进仓库
+    dir: ${LOG_DIR:logs}
+    # 保留天数与总量上限，二者谁先到谁生效（SizeAndTimeBasedRollingPolicy）
+    retention-days: ${LOG_RETENTION_DAYS:30}
+    max-history-gb: ${LOG_MAX_HISTORY_GB:3}
+    # 项目包的日志级别。排查链路时用 APP_LOGGING_LEVEL=DEBUG，不必改代码
+    level: ${APP_LOGGING_LEVEL:INFO}
 
   # ------------------------------------------------------------
   # Milvus：连接 + 集合 schema 的唯一口径
@@ -294,3 +301,14 @@ management:
     export:
       prometheus:
         enabled: true
+
+# ============================================================
+# 日志
+#
+# **格式与 appender 见 `src/main/resources/logback-spring.xml`** —— 本文件不再写
+# logging.pattern：同一个 pattern 写两处，必然出现"改了 yml 却不生效"
+# （自定义 logback-spring.xml 会让 Spring Boot 不再使用默认 appender，
+# 此时 yml 里的 logging.pattern.* 就成了死配置）。
+#
+# 可调项（app.logging.*）在下面 app 段里，都是环境变量可覆盖的运维旋钮。
+# ============================================================

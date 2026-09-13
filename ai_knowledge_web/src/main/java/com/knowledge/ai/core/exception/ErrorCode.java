@@ -100,6 +100,8 @@ public enum ErrorCode implements Serializable {
     /** 任务状态冲突（如对已完成的下载任务再次取消）。 */
     TASK_CONFLICT(10046, 200, "任务状态冲突"),
     QUOTA_EXCEEDED(10047, 200, "配额不足"),
+    /** 该类型下没有可用的模型配置（未配 key / 未启用 / 配置被删）。 */
+    MODEL_NOT_CONFIGURED(10048, 200, "模型未配置或不可用"),
 
     // ==================== 兜底 ====================
 

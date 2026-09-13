@@ -19,11 +19,16 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * S0 验收自动化（T-009 · 门 G0-6）。
+ * S0 验收自动化（T-009 / T-014 · 门 G0-6）。
  *
  * <p>G0-6 的原话是「真实调用硅基流动：对话返回内容 + {@code bge-m3} 返回 1024 维向量」。
  * 这句话没法靠看代码或 mock 证明，只能真打一次接口 —— 本测试就是那个"打一次"，
  * 并且把结论固化成断言，换机器 / 换同事 / 改配置后都能重跑。
+ *
+ * <p><b>T-014 后客户端一律经 {@link ModelClientRegistry} 取</b>：
+ * 不再注入 {@code ChatClient.Builder} / {@code EmbeddingModel} Bean（自动配置已关闭）。
+ * 这反而让本测试的证据更硬 —— 它同时证明了「注册中心真的能造出可用的客户端」，
+ * 而不只是"Spring AI 能调通"。
  *
  * <p><b>为什么这组断言是这么写的</b>
  * <ul>
@@ -49,10 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AiCallVerificationTest {
 
     @Autowired
-    private ChatClient.Builder chatClientBuilder;
-
-    @Autowired
-    private EmbeddingModel embeddingModel;
+    private ModelClientRegistry registry;
 
     @Autowired
     private ModelProperties modelProperties;
@@ -64,8 +66,9 @@ class AiCallVerificationTest {
         Assumptions.assumeTrue(chat.hasCredentials(),
                 () -> "未配置 chat 端点（" + chat.describe() + "），跳过真实对话调用");
 
-        ChatResponse response = chatClientBuilder.build()
-                .prompt()
+        ChatClient chatClient = registry.chatClient();
+
+        ChatResponse response = chatClient.prompt()
                 // 用一个有唯一正确答案的问题：能答对才说明模型真的读懂了输入，
                 // 而不是"随便吐了段非空字符串"就算过
                 .user("用一个词回答：中国的首都是哪座城市？")
@@ -86,9 +89,10 @@ class AiCallVerificationTest {
         assertTrue(usedModel.contains(chat.getModel()),
                 "实际调用模型与配置不一致：配置=" + chat.getModel() + "，实际=" + usedModel);
 
-        System.out.printf("%n===== 对话模型（S0 / G0-6）=====%n"
-                        + "  endpoint=%s%n  usedModel=%s%n  content=%s%n",
-                chat.describe(), usedModel, content.strip());
+        System.out.printf("%n===== 对话模型（S0 / G0-6 · 经注册中心）=====%n"
+                        + "  生效规格=%s%n  usedModel=%s%n  content=%s%n",
+                registry.activeSpec(com.knowledge.ai.core.enums.ModelType.CHAT).describe(),
+                usedModel, content.strip());
     }
 
     @Test
@@ -97,6 +101,8 @@ class AiCallVerificationTest {
         ModelProperties.Endpoint embedding = modelProperties.getEmbedding();
         Assumptions.assumeTrue(embedding.hasCredentials(),
                 () -> "未配置 embedding 端点（" + embedding.describe() + "），跳过真实向量化调用");
+
+        EmbeddingModel embeddingModel = registry.embeddingModel();
 
         // 走 embedForResponse 而不是 embed(String)：前者能拿到响应元数据（模型名、用量），
         // 是"配置生效"的直接证据；后者只给一个 float[]
@@ -115,7 +121,6 @@ class AiCallVerificationTest {
                 "嵌入维度与 Milvus 锁死的维度不一致：模型=" + vector.length
                         + "，集合=" + MilvusConstants.DIMENSION + "（改维度等于全库重建 38,502 条向量）");
 
-        assertTrue(modelProperties.getEmbedding().hasCredentials());
         String usedModel = response.getMetadata().getModel();
         assertNotNull(usedModel, "嵌入响应元数据未回传模型名");
         assertTrue(usedModel.contains(embedding.getModel()),
@@ -126,9 +131,10 @@ class AiCallVerificationTest {
         assertEquals(1.0d, norm, 0.02d,
                 "向量未做 L2 归一化（模长=" + norm + "），与「用 L2 度量」的前提不符");
 
-        System.out.printf("%n===== 嵌入模型（S0 / G0-6）=====%n"
-                        + "  endpoint=%s%n  usedModel=%s%n  dim=%d（= MilvusConstants.DIMENSION）L2 模长=%.4f%n",
-                embedding.describe(), usedModel, vector.length, norm);
+        System.out.printf("%n===== 嵌入模型（S0 / G0-6 · 经注册中心）=====%n"
+                        + "  生效规格=%s%n  usedModel=%s%n  dim=%d（= MilvusConstants.DIMENSION）L2 模长=%.4f%n",
+                registry.activeSpec(com.knowledge.ai.core.enums.ModelType.EMBEDDING).describe(),
+                usedModel, vector.length, norm);
     }
 
     @Test
@@ -144,7 +150,7 @@ class AiCallVerificationTest {
                 "文档切片与分块大小的最佳实践",
                 "今天北京天气晴朗适合出门散步");
 
-        List<float[]> vectors = embeddingModel.embed(texts);
+        List<float[]> vectors = registry.embeddingModel().embed(texts);
         assertEquals(3, vectors.size(), "批量嵌入应返回三个向量");
 
         double related = cosine(vectors.get(0), vectors.get(1));

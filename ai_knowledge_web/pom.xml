@@ -164,10 +164,20 @@
 
         <!--文档处理-->
         <!--pdf-->
+        <!--
+            版本 2.5.0（原 1.11.0，T-0S1 spike 后升级）。
+            1.11.0 的 pom 对 veraPDF 用的是**版本区间** `[1.31.0,1.32.0-RC)`，
+            Maven 会取区间内最新版 → 选中 wcag-validation:1.31.171，
+            而它内部引的 wcag-algorithms 解析成 1.31.44（该版本只有无参构造），
+            解析 PDF 时直接 NoSuchMethodError 崩掉：
+              ContrastRatioConsumer.<init>(String, String, boolean, Float)
+            2.5.0 改为**固定版本**（validation-model/wcag-validation 1.31.99、
+            wcag-algorithms 1.31.33），即上游修掉了这个问题；API 与 1.11.0 兼容。
+        -->
         <dependency>
             <groupId>org.opendataloader</groupId>
             <artifactId>opendataloader-pdf-core</artifactId>
-            <version>1.11.0</version>
+            <version>2.5.0</version>
         </dependency>
 
         <!-- Apache Tika 文档解析（支持 PDF/DOCX/PPTX/XLSX 等上千种格式） -->

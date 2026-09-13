@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================
+  日志配置（T-003 · 门 G0-3）
+  ============================================================
+
+  本文件是日志的**唯一结构与格式来源**：appender、pattern、滚动策略、各级别默认值都在这里。
+  application.yml 只留运维旋钮（app.logging.*：目录 / 保留天数 / 级别），
+  避免"格式写两处、改了一处另一处不生效"。
+
+  三条设计约束来自需求：
+  1. 《11》§264「traceId 贯穿：同一请求在响应体、应用日志、审计日志、检索链路中一致」
+     → 每条日志都带 %X{traceId}。注意 TraceContext 只把 traceId 放进 MDC，
+       不写 pattern 就等于"MDC 里有值、日志里看不见"。
+  2. 《11》§218「API Key 加密存储 + **日志脱敏**」
+     → 见下方 com.openai / okhttp3 / io.milvus 的级别压制：这些库在 DEBUG 下会把
+       完整请求头（含 Authorization: Bearer <key>）打进日志，级别一旦放开就是密钥外泄。
+  3. 《11》§290 日志收集（ELK 等）属实现细节，故只做"文件 + 控制台"，
+     不引入 JSON encoder 等额外依赖。
+
+  为什么不用彩色输出：日志要能直接 grep / diff / 进容器 stdout，
+  ANSI 转义码会让 `grep '\[[0-9a-f]\{16\}\]'` 这类按 traceId 检索失效。
+
+  MDC 与异步：AsyncAppender 在**入队前**就把 MDC 快照进日志事件，
+  所以排到异步线程后 traceId 依然在 —— 这点与"业务自建线程池需要手动传递 traceId"不同。
+  ============================================================
+-->
+<configuration>
+
+    <!-- ==================== 从配置读取旋钮 ==================== -->
+    <springProperty scope="context" name="LOG_DIR" source="app.logging.dir" defaultValue="logs"/>
+    <springProperty scope="context" name="RETENTION_DAYS" source="app.logging.retention-days" defaultValue="30"/>
+    <springProperty scope="context" name="MAX_HISTORY_GB" source="app.logging.max-history-gb" defaultValue="3"/>
+    <springProperty scope="context" name="APP_LOG_LEVEL" source="app.logging.level" defaultValue="INFO"/>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="ai-knowledge"/>
+
+    <!-- ==================== 格式 ==================== -->
+    <!-- `:-` 是 logback 的「无值默认」语法：启动期、异步线程未绑定等没有 MDC 的场景
+         输出空串，而不是打出 traceId_IS_UNDEFINED。 -->
+    <property name="TRACE" value="%X{traceId:-}"/>
+    <property name="CONSOLE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${TRACE}] [%15.15t] %-40.40logger{39} : %m%n"/>
+    <property name="FILE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${TRACE}] [%thread] %logger{39} : %m%n"/>
+
+    <!-- ==================== 控制台 ==================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 全量文件（按天 + 按大小滚动） ==================== -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/${APP_NAME}.log</file>
+        <encoder>
+            <pattern>${FILE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>${RETENTION_DAYS}</maxHistory>
+            <totalSizeCap>${MAX_HISTORY_GB}GB</totalSizeCap>
+            <!-- 启动时不清理：排查"上次为什么挂"时，上一个进程的日志正是要看的 -->
+            <cleanHistoryOnStart>false</cleanHistoryOnStart>
+        </rollingPolicy>
+    </appender>
+
+    <!-- ==================== 仅错误文件（排查时先看这个） ==================== -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/${APP_NAME}-error.log</file>
+        <filter class="ch.qos.logback.classic.filter.LevelFilter">
+            <level>ERROR</level>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+        <encoder>
+            <pattern>${FILE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}-error.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <maxHistory>${RETENTION_DAYS}</maxHistory>
+            <totalSizeCap>${MAX_HISTORY_GB}GB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <!--
+      ==================== 异步包装 ====================
+      磁盘 I/O 不该挂在业务线程上（RAG 链路本身已经很慢，日志再同步写盘会雪上加霜）。
+
+      discardingThreshold=0：logback 默认在队列 80% 满时**直接丢弃 INFO 及以下**事件。
+      对这套系统不可接受 —— 审计靠的是"发生过什么"可回溯，INFO 被悄悄丢掉等于证据缺失。
+      队列满时宁可阻塞（neverBlock=false），也不要丢。
+    -->
+    <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="FILE"/>
+        <queueSize>1024</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>false</neverBlock>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <appender name="ASYNC_ERROR" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="ERROR_FILE"/>
+        <queueSize>256</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>false</neverBlock>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!--
+      ==================== 第三方库降噪 + 防密钥外泄 ====================
+      这几条**不只是降噪**：《11》§218 要求日志脱敏，而下面这些库在 DEBUG 下会打印
+      完整 HTTP 请求/响应（含 Authorization 头里的 API Key）。
+      所以这里是安全边界，不是"日志太吵"的偏好问题 —— 不要把它们的级别调回 DEBUG。
+    -->
+    <logger name="com.openai" level="INFO"/>
+    <logger name="okhttp3" level="INFO"/>
+    <logger name="org.apache.hc" level="INFO"/>
+    <logger name="io.milvus" level="WARN"/>
+    <logger name="io.grpc" level="WARN"/>
+    <logger name="org.neo4j" level="WARN"/>
+    <logger name="com.zaxxer.hikari" level="INFO"/>
+    <!-- Hibernate 的 SQL 明细由 application.yml 的 spring.jpa.show-sql 控制，
+         这里压掉它的 DEBUG 噪音（否则一条查询打十几行参数绑定） -->
+    <logger name="org.hibernate.orm.jdbc.bind" level="WARN"/>
+    <logger name="org.hibernate.SQL" level="INFO"/>
+
+    <!--
+      ==================== 项目日志级别 ====================
+      默认 INFO；开发期想看清链路时把 app.logging.level 设为 DEBUG
+      （启动参数或环境变量 APP_LOGGING_LEVEL=DEBUG 均可），不必改代码。
+    -->
+    <logger name="com.knowledge.ai" level="${APP_LOG_LEVEL}"/>
+
+    <!--
+      ==================== 环境差异 ====================
+      开发：控制台 + 文件（控制台方便盯链路）
+      生产：同样两个都开 —— 容器化部署时 stdout 是标准采集入口，文件留作落盘兜底
+      两者差别只在级别与 traceId 之外的信息量，不做两套格式（避免"本地看得见、线上看不见"）。
+    -->
+    <springProfile name="prod">
+        <logger name="com.knowledge.ai" level="INFO"/>
+    </springProfile>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="ASYNC_FILE"/>
+        <appender-ref ref="ASYNC_ERROR"/>
+    </root>
+
+</configuration>

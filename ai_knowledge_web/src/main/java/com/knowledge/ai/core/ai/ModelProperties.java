@@ -39,6 +39,21 @@ public class ModelProperties {
     private Endpoint vl = new Endpoint();
 
     /**
+     * 单次模型调用的超时（秒）。
+     *
+     * <p>以前这个值写在 {@code spring.ai.openai.chat.timeout}，但 T-014 之后客户端由
+     * {@link ModelClientFactory} 自己构造，那层配置不再是唯一来源，故收归此处，
+     * 免得"改了 spring.ai 那处却不生效"。
+     */
+    private int timeoutSeconds = 60;
+
+    /** 失败重试次数。模型网关偶发 5xx 时给一次重试，但不设太多以免放大延迟。 */
+    private int maxRetries = 2;
+
+    /** 对话温度。0.7 是问答场景的既有取值。 */
+    private double chatTemperature = 0.7;
+
+    /**
      * 单个模型端点。
      *
      * <p>没有用 record：{@code @ConfigurationProperties} 的宽松绑定在可变 Bean 上
