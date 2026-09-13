@@ -27,9 +27,17 @@ import java.util.List;
  *   TraceIdFilter（Servlet 层，最早）
  *     └─> Spring Security FilterChain
  *           └─> JwtAuthFilter（本类）
- *                 ├─ 解析成功 → LoginUserContext + SecurityContext
- *                 └─ 解析失败 → 记入 request attribute，交给 EntryPoint 输出 401 JSON
+ *                 ├─ 解析成功 → 查黑名单 → 未撤销才放行（LoginUserContext + SecurityContext）
+ *                 └─ 解析失败 / 已撤销 → 记入 request attribute，交给 EntryPoint 输出 401 JSON
  * </pre>
+ *
+ * <p><b>为什么黑名单校验放在这里而不是 Service 层</b>：撤销是**鉴权语义**，
+ * 不是业务语义。放在过滤器里，"已登出的令牌"与"签名不对的令牌"对外表现完全一致
+ * （都是 401 + 10012），任何接口都不需要自己判一次，也就不会有人漏判。
+ *
+ * <p>撤销判定发生在 JWT 解析**之后** —— 因为 jti 在 claims 里，
+ * 而 claims 只有在验签通过后才能信任。先查 Redis 再验签是错的：
+ * 攻击者可以拿伪造的 jti 去查库，徒增 Redis 压力。
  *
  * <p><b>为什么解析失败不在这里直接写响应</b>：这样"从哪来"（JWT 过期 vs 根本没带 token）
  * 与"怎么回"（HTTP 401 + 统一响应体）解耦，输出格式只有
@@ -55,6 +63,8 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
     private final JwtService jwtService;
 
+    private final TokenBlacklist tokenBlacklist;
+
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
@@ -65,6 +75,10 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         if (token != null) {
             try {
                 user = jwtService.parseAccessToken(token);
+                // 解析成功只说明"签名与有效期没问题"，还要确认它没被登出 / 改密连带撤销
+                if (user.getTokenId() != null && tokenBlacklist.isRevoked(user.getTokenId())) {
+                    throw BizException.of(ErrorCode.TOKEN_INVALID);
+                }
                 LoginUserContext.set(user);
                 SecurityContextHolder.getContext().setAuthentication(buildAuthentication(user, request));
             } catch (BizException ex) {

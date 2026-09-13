@@ -83,8 +83,25 @@ public class JwtService {
 
     /** 签发 accessToken。 */
     public String issueAccessToken(LoginUser user) {
+        return issueAccessToken(user, properties.getAccessTtlMinutes() * 60);
+    }
+
+    /**
+     * 签发 accessToken，并指定有效期（秒）。
+     *
+     * <p>存在的理由：「记住我（7 天免登录）」要让令牌真的活 7 天。
+     * 前端 `request.ts` **没有**自动刷新逻辑（401 就清 token 跳登录页），
+     * 所以若"记住我"只延长 refreshToken，用户刷新页面时 accessToken 早已过期 →
+     * 直接被踢回登录页，"免登录 7 天"名存实亡。
+     *
+     * <p><b>代价要说清</b>：长效 bearer 令牌的泄露暴露面更大。
+     * 因此只有用户**显式勾选**「记住我」才走这条路径，默认仍是 2 小时。
+     * 真正的收敛方案（access 短 + 前端自动 refresh）留到 S9 安全加固，
+     * 那时前端会一并改造，不属 S1 范围。
+     */
+    public String issueAccessToken(LoginUser user, long ttlSeconds) {
         Instant now = Instant.now();
-        Instant expiry = now.plusSeconds(properties.getAccessTtlMinutes() * 60);
+        Instant expiry = now.plusSeconds(ttlSeconds);
         return Jwts.builder()
                 .subject(String.valueOf(user.getUserId()))
                 .id(user.getTokenId() != null ? user.getTokenId() : newTokenId())
@@ -105,6 +122,33 @@ public class JwtService {
     /** accessToken 剩余有效秒数，用于响应体的 {@code expiresIn}。 */
     public long accessTtlSeconds() {
         return properties.getAccessTtlMinutes() * 60;
+    }
+
+    /** refreshToken 有效期（秒）。 */
+    public long refreshTtlSeconds() {
+        return properties.getRefreshTtlDays() * 24 * 3600;
+    }
+
+    /**
+     * 解析令牌的**剩余有效秒数**（登出时用于设置黑名单 TTL）。
+     * 已过期或解析失败返回 0。
+     */
+    public long remainingSeconds(String token) {
+        try {
+            Claims claims = Jwts.parser()
+                    .verifyWith(signingKey)
+                    .build()
+                    .parseSignedClaims(token)
+                    .getPayload();
+            Date expiration = claims.getExpiration();
+            if (expiration == null) {
+                return 0;
+            }
+            long remain = (expiration.getTime() - System.currentTimeMillis()) / 1000;
+            return Math.max(remain, 0);
+        } catch (Exception ex) {
+            return 0;
+        }
     }
 
     public static String newTokenId() {

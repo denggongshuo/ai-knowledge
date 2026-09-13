@@ -3,6 +3,7 @@ package com.knowledge.ai.config;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.JwtAuthFilter;
 import com.knowledge.ai.core.security.JwtService;
+import com.knowledge.ai.core.security.TokenBlacklist;
 import com.knowledge.ai.core.web.ResponseWriter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -55,14 +56,16 @@ public class SecurityConfig {
             "/error",
     };
 
-    @Value("${app.cors.allowed-origins:http://localhost:5173}")
+    @Value("${app.cors.allowed-origins:http://localhost:[*],http://127.0.0.1:[*]}")
     private String allowedOrigins;
 
     @Bean
     public SecurityFilterChain apiFilterChain(HttpSecurity http,
                                               JwtService jwtService,
+                                              TokenBlacklist tokenBlacklist,
                                               ResponseWriter responseWriter) throws Exception {
-        JwtAuthFilter jwtAuthFilter = new JwtAuthFilter(jwtService);
+        // 过滤器不是 Bean：注册成 Bean 会顺带被 Servlet 容器再挂一次，导致每请求跑两遍
+        JwtAuthFilter jwtAuthFilter = new JwtAuthFilter(jwtService, tokenBlacklist);
 
         http
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
@@ -101,10 +104,24 @@ public class SecurityConfig {
     /**
      * CORS。
      *
-     * <p>开发期前端通过 Vite proxy 把 {@code /api} 转发到 8080，是同源请求，
-     * 其实不需要 CORS。但直接访问 8080（例如用 curl / 独立页面调试）时
-     * 浏览器会发预检，所以保留这份最小配置。
-     * 允许的源由 {@code app.cors.allowed-origins} 控制（逗号分隔），生产环境收紧。
+     * <p><b>这里曾写着一句想当然的话</b>：「开发期前端走 Vite proxy，是同源请求，
+     * 其实不需要 CORS」。这句话只对了一半，而且正是它把 S0 的验证带偏了。
+     *
+     * <p>事实是：{@code browser → Vite(5173/5174) → 后端(8080)} 这一跳，
+     * 从**浏览器视角**确实是同源（前端不会做 CORS 预检），但浏览器对本机 dev server
+     * 发出的**非 GET 请求依然会带上 {@code Origin} 头**，而 Vite proxy 是原样转发的
+     * —— 于是后端仍然会拿这个 {@code Origin} 去过白名单，不匹配就
+     * <b>403 {@code Invalid CORS request}</b>（连业务代码都不会进）。
+     *
+     * <p>后果：一旦 dev server 的端口不是白名单里那一个（5173 被占时 Vite 会自动
+     * 落到 5174），**整条前端链路全部 403**，而现象看着像"没权限"。
+     * S0 之所以没发现，是因为当次验证全部用 curl 发出 —— curl 默认不带 {@code Origin}，
+     * 恰好绕过了这道校验。S1 上用真浏览器跑 G1-9 时立刻暴露。
+     *
+     * <p>因此 {@code app.cors.allowed-origins} 的默认值放开本机任意端口
+     * （{@code http://localhost:[*]} 与 {@code http://127.0.0.1:[*]}，
+     * 由 {@link CorsConfiguration#setAllowedOriginPatterns} 的端口通配语法支持）；
+     * 生产环境必须用 {@code CORS_ALLOWED_ORIGINS} 显式指定真实域名。
      */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {

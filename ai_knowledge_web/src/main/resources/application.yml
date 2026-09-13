@@ -201,9 +201,18 @@ app:
     # 问答场景的既有取值
     chat-temperature: ${MODEL_CHAT_TEMPERATURE:0.7}
 
-  # CORS 允许来源（逗号分隔）。开发期前端走 Vite proxy 是同源，此配置为直连 8080 兜底
+  # CORS 允许来源（逗号分隔）。
+  #
+  # 注意一个反直觉点：**走 Vite proxy 并不等于绕开 CORS 校验**。
+  # 浏览器对本机 dev server 发出的**所有非 GET 请求都会带 Origin 头**，
+  # proxy 只是转发、不会剥掉它，于是后端照样会拿这个 Origin 去过白名单 ——
+  # 不在名单里就 403 `Invalid CORS request`。
+  # 因此这里默认放开本机**任意端口**：5173 被占用时 Vite 会自动落到 5174/5175…，
+  # 把默认值写死成 5173 会让"端口被占"直接表现成整条链路 403
+  # （看着像权限问题，实际是配置漂移 —— S1 联调时真实踩到过）。
+  # 生产环境必须用 CORS_ALLOWED_ORIGINS 显式指定真实域名。
   cors:
-    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:[*],http://127.0.0.1:[*]}
 
   storage:
     # true = 启动自检发现任一存储不可用就拒绝启动（CI / spike 取证用）
