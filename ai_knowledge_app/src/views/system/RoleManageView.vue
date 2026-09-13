@@ -351,7 +351,7 @@ onMounted(async () => {
         <el-table-column prop="createdAt" label="创建时间" min-width="130">
           <template #default="{ row }"><span class="muted">{{ row.createdAt }}</span></template>
         </el-table-column>
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
             <div class="ops">
               <el-button link type="primary" size="small" :icon="Key" @click="openEdit(row)">权限</el-button>
