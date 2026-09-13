@@ -310,7 +310,7 @@ onMounted(async () => {
         <el-table-column label="角色名称" min-width="150">
           <template #default="{ row }">
             <span class="role-name">
-              <el-icon v-if="row.builtin" class="shield-ico"><Shield /></el-icon>
+              <el-icon v-if="row.builtin" class="shield-ico"><Lock /></el-icon>
               <b>{{ row.name }}</b>
             </span>
           </template>
