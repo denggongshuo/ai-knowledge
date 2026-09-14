@@ -105,6 +105,9 @@ public final class AuditRiskPolicy {
                 "§4.3 明确排除：普通查看/编辑不属四类，标高危会让标记失效");
         register(AuditModule.USER, "更换头像", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
                 "§4.3 明确排除：同上，纯资料类改动");
+        register(AuditModule.KB, "创建知识库", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3 四类不含建库：新建库不扩大任何既有权限（初始授权只覆盖向导里勾选的角色 + 超管 MANAGE），"
+                        + "《01》§10.1 的建库样例也没有 🚩。标高危会让「高危」退化成「所有写操作」");
     }
 
     // ==================================================================

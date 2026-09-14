@@ -95,6 +95,15 @@ public enum ErrorCode implements Serializable {
     DUPLICATE_DOC(10036, 200, "文档内容重复，已存在相同 MD5 的记录"),
     /** 验证码 scene 取值不在 login / register / reset-password 内。 */
     SMS_SCENE_INVALID(10037, 200, "验证码场景不合法"),
+    /**
+     * 知识库编码已存在（T-401）。
+     *
+     * <p>为什么不复用 {@link #PARAM_INVALID}：创建向导的编码是**用户手填的持久标识**
+     * （{@code uk_kb_code} 唯一约束，创建后不可改）。与"编码格式不合法"分开报，
+     * 前端才能给出可执行的动作 —— 前者提示"换个编码"，后者提示"改成 kb_ 开头的小写"。
+     * 混在一起用户只会反复提交同一个重复的编码。
+     */
+    KB_CODE_EXISTS(10038, 200, "知识库编码已存在，请更换"),
 
     // ==================== 1004x 资源类 ====================
 
