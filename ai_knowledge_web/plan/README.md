@@ -1,6 +1,7 @@
 # plan/ · 批次开工计划
 
 > 每个批次施工前在此立据（1~7 节），施工后回填（8~10 节）。
+> **总览看 [`汇总.md`](./汇总.md)** —— 当前做到哪、哪些账挂着、下一批先看什么，只维护那一份。
 > 工序见 `.claude/skills/batch-plan/SKILL.md`，模板 `plan-template.md`。
 
 ## 命名
@@ -22,6 +23,8 @@ node scripts/gen-diagram.mjs ../ai_knowledge_web/plan/2026-09-14-S3-M03-A.md --c
 `<!-- diagram: …svg -->`。首次运行若提示缺 `scripts/vendor/mermaid.min.js`，按脚本顶部注释补一次（需联网）。
 
 ## 索引
+
+> 状态以 [`汇总.md`](./汇总.md) 为准；本表只列文件与批次。
 
 | 文件 | 批次 | 状态 | 完成日期 |
 |---|---|---|---|
