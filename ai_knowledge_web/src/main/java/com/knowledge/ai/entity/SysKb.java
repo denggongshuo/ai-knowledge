@@ -1,0 +1,125 @@
+package com.knowledge.ai.entity;
+
+import com.knowledge.ai.core.enums.SecretLevel;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+/**
+ * 知识库（表 {@code sys_kb}）。
+ *
+ * <p>字段口径对齐 {@code V7__s2_kb_skeleton_and_grants.sql}（骨架 + 授权种子）、
+ * {@code V8__s3_kb_owner.sql}（创建人）与 {@code V9__s3_kb_governance_and_policies.sql}
+ * （治理标签 + 三类策略）。
+ *
+ * <p><b>本实体存在的首要作用是让 {@code ddl-auto: validate} 生效</b>：在这之前
+ * {@code sys_kb} 没有对应的实体，Hibernate 启动时**根本不看这张表** ——
+ * 于是"迁移写了 7 列"与"实体缺 7 列"这类不一致会一直沉默到某次查询报
+ * {@code Unknown column}。加了本类之后，实体与 V9 对不上就是**启动即失败**，
+ * 这正是 {@code application.yml} 里那句"让表结构与代码对不上在启动时暴露"的意思。
+ *
+ * <p><b>三件刻意的设计</b>（都是"顺手加就会坏事"的地方）：
+ * <ul>
+ *   <li><b>{@code customTags} 与三张 {@code *_policy_json} 字段保持 {@code String}</b>：
+ *       实体是**存储映射**，JSON 的序列化 / 反序列化归 Service。若在这里挂
+ *       {@code AttributeConverter} 声明成 {@code List<String>} / {@code SplitPolicy}，
+ *       则每加一个策略字段都要改实体 + 转换器两处，且失败时抛在 Hibernate 内部
+ *       （错误信息指向 SQL 而不是业务字段）。读侧的兜底规则见 {@code KbConfigDefaults}。</li>
+ *   <li><b>没有 {@code department}（部门全名）字段</b>：与 {@code SysUser} 同一理由 ——
+ *       由 {@code deptId} 关联部门树拼出，落库就会在部门改名后漂移。
+ *       出参里的部门名在 Service 侧现拼。</li>
+ *   <li><b>没有 {@code owner}（创建人姓名）字段</b>：同理，由 {@code ownerId}
+ *       关联 {@code sys_user} 取，落库会随改名漂移。</li>
+ * </ul>
+ *
+ * <p><b>{@code ownerId} 可空且无外键</b>（V8 的决策）：演示库里有匹配不到账号的行，
+ * 且账号被彻底删除后知识库必须保留 —— 加了外键会让删账号级联失败。
+ */
+@Data
+@Entity
+@Table(name = "sys_kb")
+public class SysKb {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    /** 库编码，如 {@code kb_prod_doc}。全站唯一（{@code uk_kb_code}），创建后不可改。 */
+    @Column(name = "code", length = 64, nullable = false, unique = true)
+    private String code;
+
+    @Column(name = "name", length = 128, nullable = false)
+    private String name;
+
+    /** 归属部门（数据范围 ② 的计算基准），{@code 0} = 「未分配」虚拟节点。 */
+    @Column(name = "dept_id", nullable = false)
+    private Long deptId;
+
+    @Column(name = "doc_count", nullable = false)
+    private Integer docCount;
+
+    @Column(name = "chunk_count", nullable = false)
+    private Integer chunkCount;
+
+    /**
+     * 库状态。取值是域内真值 {@code READY / INDEXING}（V7 建表注释、《01》§3），
+     * 与前端历史类型的 {@code ACTIVE / BUILDING / PAUSED} **不是一个词表**（B1 计划 §1.3 W1）。
+     *
+     * <p>B1 的取舍：**保留域内真值**，另出派生字段 {@code statusLabel} 承担展示，
+     * 前端改用 label —— 让枚举迁就展示文案会反过来污染检索链路的判定。
+     * 故此处不建 enum（枚举一建，就等于承认它只有这两个值，而 S3-B3 的重建索引
+     * 还会引入新状态）。
+     */
+    @Column(name = "status", length = 16, nullable = false)
+    private String status;
+
+    /** 创建人。演示数据可能为 {@code NULL}（无对应账号），**无外键**（见类注释）。 */
+    @Column(name = "owner_id")
+    private Long ownerId;
+
+    @Column(name = "description", length = 200)
+    private String description;
+
+    /**
+     * 密级。检索期过滤维度（《11》§2.1 I-9）：用户密级上限低于该值时，本库分片不参与召回。
+     * 用 {@code @Enumerated(STRING)} 与 {@code SysUser#status} 同型 —— 它们是同一类
+     * "取值受控、要参与判定"的列，不适合像 {@code status} 那样留自由字符串。
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "secret_level", length = 16, nullable = false)
+    private SecretLevel secretLevel;
+
+    /** 业务域（治理语义列），取值见前端 {@code BUSINESS_DOMAINS}。可为空串（未设置）。 */
+    @Column(name = "business_domain", length = 64, nullable = false)
+    private String businessDomain;
+
+    /** 自定义标签，JSON 数组字符串；{@code NULL} 表示"没有标签"（不是空数组）。 */
+    @Column(name = "custom_tags", columnDefinition = "TEXT")
+    private String customTags;
+
+    /** 分片策略，JSON 对象字符串；{@code NULL} 时读侧用 {@code KbConfigDefaults} 兜底。 */
+    @Column(name = "split_policy_json", columnDefinition = "TEXT")
+    private String splitPolicyJson;
+
+    /** 表格处理策略，JSON 对象字符串；语义同 {@link #splitPolicyJson}。 */
+    @Column(name = "table_policy_json", columnDefinition = "TEXT")
+    private String tablePolicyJson;
+
+    /** 检索配置，JSON 对象字符串；语义同 {@link #splitPolicyJson}。 */
+    @Column(name = "retrieval_config_json", columnDefinition = "TEXT")
+    private String retrievalConfigJson;
+
+    @Column(name = "created_at", nullable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+}
