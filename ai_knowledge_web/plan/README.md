@@ -8,6 +8,19 @@
 `<建档日期>-<Sprint>-<模块>-<阶段>.md`，例：`2026-09-14-S3-M04-B.md`
 同日重开追加 `-2`、`-3`，**不覆盖**。
 
+## 业务流程图
+
+第 3.2 节的 mermaid 围栏**必须渲染成静态 SVG 并嵌图**（否则读者要自装插件才看得见）：
+
+```bash
+cd ai_knowledge_app
+node scripts/gen-diagram.mjs ../ai_knowledge_web/plan/2026-09-14-S3-M03-A.md          # 生成/更新
+node scripts/gen-diagram.mjs ../ai_knowledge_web/plan/2026-09-14-S3-M03-A.md --check  # 只校验
+```
+
+产物落同目录 `<md名>/NN-<kind>-<slug>.svg`；围栏源码保留（可 diff），围栏下方由脚本自动插入
+`<!-- diagram: …svg -->`。首次运行若提示缺 `scripts/vendor/mermaid.min.js`，按脚本顶部注释补一次（需联网）。
+
 ## 索引
 
 | 文件 | 批次 | 状态 | 完成日期 |
