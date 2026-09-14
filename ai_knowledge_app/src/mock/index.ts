@@ -927,6 +927,25 @@ register('POST', '/api/users/import', async (req, res) => {
   json(res, 0, { success: 46, failed: 2, rows: [{ row: 12, error: '用户名重复' }, { row: 25, error: '部门不存在' }] })
 })
 
+/**
+ * 删除账号（软删）。三道闸与真后端一致（G2-6）：
+ * 不能删自己 / 有业务数据只能禁用 —— mock 侧同步拦截，
+ * 否则切 mock 时删除按钮"看起来能用"、切真后端才被拒，是 S1 同型的联调坑。
+ */
+register('DELETE', '/api/users/:id', async (req, res, ctx) => {
+  void req
+  await delay(320)
+  const id = Number(ctx.params.id)
+  const u = allUsers.find((x) => x.id === id)
+  if (!u) return json(res, 10041, null, '用户不存在')
+  // 「当前登录账号」在 mock 里固定为种子 admin（id=1，与 mockAuthUser 一致）
+  if (u.id === 1) return json(res, 10067, null, '不能删除当前登录账号')
+  if (u.hasBusinessData) return json(res, 10069, null, '该账号存在知识库或文档业务数据，禁止删除，请改为停用')
+  const i = allUsers.indexOf(u)
+  if (i >= 0) allUsers.splice(i, 1)
+  json(res, 0, { deleted: true })
+})
+
 // ============ 系统管理 · 角色 ============
 function roleToRow(r: (typeof mockRoles)[number]) {
   const codes = r.permissions.includes('*') ? ALL_PERMISSION_CODES : (r.permissions as string[])

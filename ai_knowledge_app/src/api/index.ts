@@ -288,6 +288,8 @@ export const sysApi = {
     http.get<PageResult<Record<string, unknown>>>('/users', { ...query }),
   createUser: (body: Record<string, unknown>) => http.post<{ id: number; status: string }>('/users', body),
   updateUser: (id: number | string, body: Record<string, unknown>) => http.put(`/users/${id}`, body),
+  /** 删除账号（软删）。服务端三道闸：不能删自己 / 最后超管 / 有业务数据只能禁用。 */
+  deleteUser: (id: number | string) => http.delete<{ deleted: boolean }>(`/users/${id}`),
   patchUserStatus: (id: number | string, status: string) => http.patch(`/users/${id}/status`, { status }),
   resetPassword: (id: number | string) => http.post(`/users/${id}/reset-password`),
   resendInvite: (id: number | string) => http.post(`/users/${id}/resend-invite`),

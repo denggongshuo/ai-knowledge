@@ -18,6 +18,7 @@ import {
   CircleClose,
   Clock,
   Message,
+  Delete,
 } from '@element-plus/icons-vue'
 import { sysApi } from '@/api'
 import { useAuthStore } from '@/stores/auth'
@@ -296,7 +297,15 @@ async function removeUser(row: UserRow) {
   } catch {
     return
   }
-  ElMessage.success('（演示环境）用户已删除，列表已刷新')
+  // 上面的两道判断是**本地兜底**（不发请求、快），真正的防线在服务端：
+  // 不能删自己 / 最后超管 / 有业务数据 —— 绕过 UI 直调 API 时只有那里能拦。
+  try {
+    await sysApi.deleteUser(row.id)
+  } catch (e) {
+    ElMessage.error((e as Error).message || '删除失败')
+    return
+  }
+  ElMessage.success(`账号「${row.realName}」已删除`)
   loadUsers()
 }
 
@@ -510,7 +519,9 @@ onMounted(async () => {
               <span class="muted">{{ row.lastLoginAt || '—' }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" min-width="210">
+          <!-- 新增「删除」后内容变宽（编辑 重置密码 停用 删除 ≈ 236px）；
+               min-width 若仍是 210 会重演"操作列被裁"那个缺陷（见 445d94a）。 -->
+          <el-table-column label="操作" min-width="265">
             <template #default="{ row }">
               <div class="ops">
                 <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
@@ -528,6 +539,25 @@ onMounted(async () => {
                 >
                   {{ row.status === 'ACTIVE' ? '停用' : '启用' }}
                 </el-button>
+                <!-- 删除（软删、不可逆）。有业务数据的账号服务端会拒，页面禁用并给出原因。 -->
+                <el-tooltip
+                  :disabled="!row.hasBusinessData"
+                  content="该账号存在知识库或文档业务数据，只能停用"
+                  placement="top"
+                >
+                  <span>
+                    <el-button
+                      link
+                      size="small"
+                      type="danger"
+                      :icon="Delete"
+                      :disabled="row.hasBusinessData"
+                      @click="removeUser(row)"
+                    >
+                      删除
+                    </el-button>
+                  </span>
+                </el-tooltip>
               </div>
             </template>
           </el-table-column>
