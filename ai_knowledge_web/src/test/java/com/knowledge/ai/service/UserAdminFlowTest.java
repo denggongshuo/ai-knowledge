@@ -246,6 +246,90 @@ class UserAdminFlowTest extends ApiTestSupport {
         }
     }
 
+    @Test
+    @DisplayName("G2-6 删除账号：有业务数据（创建过知识库）被拒，只能禁用；无业务数据可软删")
+    void deleteUserRespectsBusinessData() {
+        // ① 有业务数据：V8 把 kb_prod_doc 的创建人回填成 lin.gong（dept 11，研发中心子组）
+        Long ownerId = jdbc.queryForObject(
+                "select owner_id from sys_kb where code = 'kb_prod_doc'", Long.class);
+        var denied = call("DELETE", "/api/users/" + ownerId, null, token);
+        assertThat(denied.code()).isEqualTo(ErrorCode.USER_HAS_BUSINESS_DATA.getCode());
+        assertThat(denied.message()).contains("禁止删除");
+        // 被拒后账号仍在（软删未发生）
+        Long stillThere = jdbc.queryForObject(
+                "select count(*) from sys_user where id = ? and deleted_at is null", Long.class, ownerId);
+        assertThat(stillThere).isEqualTo(1L);
+
+        // ② 无业务数据：造一个没有任何知识库的账号，可软删
+        jdbc.update("""
+                insert into sys_user (username, password_hash, real_name, dept_id, status,
+                                      must_change_password, created_at, updated_at)
+                values ('g26.deletable', '$2b$10$XRFAfIgqFeWwRtKENYFwjOZKQDjfz7f7/Ca2tqDgZfIyqlfUQX6O2',
+                        '待删除账号', 0, 'ACTIVE', 0, now(), now())
+                """);
+        trackUser("g26.deletable");
+        Long disposableId = jdbc.queryForObject(
+                "select id from sys_user where username = 'g26.deletable'", Long.class);
+        jdbc.update("insert into sys_user_role (user_id, role_id, created_at) "
+                + "select ?, id, now() from sys_role where code = 'USER'", disposableId);
+
+        var ok = call("DELETE", "/api/users/" + disposableId, null, token);
+        assertThat(ok.code()).isEqualTo(CODE_OK);
+        assertThat((Boolean) ok.data("$.deleted")).isTrue();
+        // 软删：行还在（保留历史），但 deleted_at 已置、列表查不到
+        Long softDeleted = jdbc.queryForObject(
+                "select count(*) from sys_user where id = ? and deleted_at is not null", Long.class, disposableId);
+        assertThat(softDeleted).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("G2-6 删除账号：不能删自己（服务端兜底，前端只拦了 UI）")
+    void deleteSelfDenied() {
+        var resp = call("DELETE", "/api/users/1", null, token);
+        assertThat(resp.code()).isEqualTo(ErrorCode.USER_SELF_OPERATION_DENIED.getCode());
+        assertThat(resp.message()).contains("不能删除当前登录账号");
+    }
+
+    @Test
+    @DisplayName("G2-6 删除账号：不能删最后一个启用中的超级管理员")
+    void deleteLastSuperAdminDenied() {
+        Long adminId = jdbc.queryForObject("select id from sys_user where username = 'admin'", Long.class);
+        Long actorId = jdbc.queryForObject("select id from sys_user where username = 'emp001'", Long.class);
+        try {
+            jdbc.update("update sys_user set status = 'DISABLED' where username in ('lin.gong', 'emp001')");
+            LoginUser actor = LoginUser.builder()
+                    .userId(actorId).username("emp001").realName("emp001").deptId(1L)
+                    .superAdmin(true).dataScope(DataScope.ALL)
+                    .permissions(Set.of(PermissionCode.WILDCARD)).build();
+            LoginUserContext.set(actor);
+            BizException ex = assertThrows(BizException.class, () -> userAdminService.delete(adminId));
+            assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.LAST_SUPER_ADMIN);
+        } finally {
+            jdbc.update("update sys_user set status = 'ACTIVE' where username in ('lin.gong', 'emp001')");
+            LoginUserContext.clear();
+        }
+    }
+
+    @Test
+    @DisplayName("G2-6 列表字段：hasBusinessData 来自 sys_kb.owner_id 真实判定（非恒 false）")
+    void hasBusinessDataReflectedInList() {
+        Long ownerId = jdbc.queryForObject(
+                "select owner_id from sys_kb where code = 'kb_prod_doc'", Long.class);
+        String ownerName = jdbc.queryForObject(
+                "select username from sys_user where id = ?", String.class, ownerId);
+        var resp = get("/api/users?keyword=" + ownerName + "&page=1&size=10", token).assertOk("按创建人查");
+        List<Map<String, Object>> list = resp.data("$.list");
+        Map<String, Object> owner = list.stream()
+                .filter(r -> ownerName.equals(r.get("username"))).findFirst().orElseThrow();
+        assertThat((Boolean) owner.get("hasBusinessData")).isTrue();
+
+        // 反向对照：没有任何知识库的账号应为 false（否则前端会无差别禁用删除按钮）
+        var other = get("/api/users?keyword=probe.profile&page=1&size=10", token).assertOk("对照账号");
+        List<Map<String, Object>> others = other.data("$.list");
+        assertThat(others).isNotEmpty();
+        assertThat((Boolean) others.getFirst().get("hasBusinessData")).isFalse();
+    }
+
     private Map<String, Object> byName(List<Map<String, Object>> nodes, String name) {
         return nodes.stream().filter(n -> name.equals(n.get("name"))).findFirst().orElseThrow();
     }
