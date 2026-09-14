@@ -13,6 +13,9 @@ coverage/
 .codegraph/
 temp/
 
+# 绘图用的 mermaid 本地副本（3.5MB 压缩产物，按需联网补，见 ai_knowledge_app/scripts/gen-diagram.mjs 顶部）
+ai_knowledge_app/scripts/vendor/
+
 # ---------------- 本地测试样本（不入库） ----------------
 # docs/测试文件/ 放的是知识库「文档入库」链路的本地测试件（PDF/DOC/DOCX + 讲义笔记，
 # 约 46MB，个别为外部材料）。仅本地验证解析与分片用，不进版本库。
