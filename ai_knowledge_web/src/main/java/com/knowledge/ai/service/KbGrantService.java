@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.audit.AuditContext;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
@@ -171,6 +172,13 @@ public class KbGrantService {
             throw new BizException(ErrorCode.PARAM_INVALID, "请至少配置一个可见角色或额外授权用户");
         }
 
+        // ============ T-300：先读旧值并登记，再执行全量替换 ============
+        // 该接口是"删光重建"式全量替换，一旦开始 executeUpdate 旧值就没了，
+        // 所以登记必须在两条 delete 之前。
+        String[] before = grantSnapshot(kbId);
+        AuditContext.change("授权级别", before[0], request.level());
+        AuditContext.change("可见角色", before[1], roleNamesOf(request.roleIds()));
+
         entityManager.createNativeQuery(
                         "delete from sys_kb_grant where kb_id = :id and principal_type = 'ROLE'")
                 .setParameter("id", kbId)
@@ -228,6 +236,57 @@ public class KbGrantService {
         if (n == null || n == 0) {
             throw new BizException(ErrorCode.KB_NOT_FOUND);
         }
+    }
+
+    /**
+     * 该库**当前**授权的可读快照（before 侧），用于 T-300 的变更前后对照。
+     *
+     * <p><b>为什么只产出「档位」与「可见角色」两项</b>：这个接口的模型是
+     * **单值 level + 角色集合**（见类注释），保存时把所有角色归一成同一档位、
+     * 并全量替换角色集合 —— 所以"改了什么"在语义上就只有这两件事。
+     * 逐角色展开成 N 行反而会误导（看着像每个角色独立可调，实际不是）。
+     *
+     * <p>返回 {@code [档位文本, 角色名单文本]}，两项都可能是 {@code null}
+     * （表示该库当前无人可见），由 {@link AuditChange} 规范化成 {@code —}。
+     */
+    private String[] grantSnapshot(long kbId) {
+        // ⚠️ 单列原生查询返回的是 List<String>，不是 List<Object[]> ——
+        // 按 Object[] 遍历会 ClassCastException（8 条 KbGrantFlowTest 直接变红）。
+        List<String> levelRows = entityManager.createNativeQuery(
+                        "select distinct level from sys_kb_grant where kb_id = :id and level <> 'NONE'")
+                .setParameter("id", kbId)
+                .getResultList();
+        int maxRank = 0;
+        for (String level : levelRows) {
+            maxRank = Math.max(maxRank, rankOf(level));
+        }
+
+        List<String> roleNames = entityManager.createNativeQuery("""
+                        select r.name from sys_kb_grant g
+                        join sys_role r on r.id = g.principal_id
+                        where g.kb_id = :id and g.principal_type = 'ROLE' and g.level <> 'NONE'
+                        order by r.id
+                        """)
+                .setParameter("id", kbId)
+                .getResultList();
+
+        return new String[]{
+                maxRank == 0 ? null : levelName(maxRank),
+                roleNames.isEmpty() ? null : String.join("、", roleNames)
+        };
+    }
+
+    /** 提交值里的角色名单（after 侧），口径与 {@link #grantSnapshot} 的「可见角色」一致。 */
+    private String roleNamesOf(List<Long> roleIds) {
+        if (roleIds == null || roleIds.isEmpty()) {
+            return null;
+        }
+        List<Long> ids = new ArrayList<>(new LinkedHashSet<>(roleIds));
+        List<String> names = entityManager.createNativeQuery(
+                        "select name from sys_role where id in (:ids) order by id")
+                .setParameter("ids", ids)
+                .getResultList();
+        return names.isEmpty() ? null : String.join("、", names);
     }
 
     private Map<Long, Long> memberCounts() {

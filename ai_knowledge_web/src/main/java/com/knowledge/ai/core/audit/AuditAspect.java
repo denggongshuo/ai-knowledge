@@ -102,6 +102,10 @@ public class AuditAspect {
                 ? null
                 : String.join(",", user.getRoleCodes());
 
+        // T-300：取走业务侧登记的变更明细（"取走"而非"读取" —— drain 后线程即回到干净状态）。
+        // 必须放在 finally 路径上，否则业务抛异常时这份登记会残留到池化线程的下一次请求。
+        AuditContext.Captured captured = AuditContext.drain();
+
         return new AuditEvent(
                 annotation.module(),
                 annotation.action(),
@@ -117,7 +121,8 @@ public class AuditAspect {
                 costMs,
                 result,
                 failReason,
-                null,
+                captured.affectedUsers(),
+                captured.changes(),
                 annotation.recordParams() ? summarizeArgs(joinPoint) : null
         );
     }

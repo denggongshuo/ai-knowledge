@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.audit.AuditContext;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
@@ -267,8 +268,13 @@ public class RoleAdminService {
                 .getResultList()
                 .forEach(k -> itemKeys.add((String) k));
 
-        int applied = 0;
-        LocalDateTime now = LocalDateTime.now();
+        // ============ 先整批校验，再读旧值登记，最后才写 ============
+        // 顺序不能反：若先写新值再登记，before 读到的就是新值，
+        // 前端算出的「其中 M 项发生变更」会恒为 0，看着像"什么都没改"。
+        // 校验也必须在登记之前 —— 否则被拒的请求会留下一条"变更明细"，
+        // 而它的 result 是 FAILED、业务一行没改，明细就成了误导（见 T-300 的 D-1 教训）。
+        // 整批先校验：任一变更非法则整个请求拒绝，且**不留任何变更明细**
+        // （被拒的请求如果留下明细，而它的 result 是 FAILED、业务一行没改，明细就是误导）
         for (AdminDtos.MatrixChange change : changes) {
             SysRole role = roleRepository.findById(change.roleId())
                     .orElseThrow(() -> new BizException(ErrorCode.ROLE_NOT_FOUND));
@@ -279,6 +285,25 @@ public class RoleAdminService {
                 throw new BizException(ErrorCode.PARAM_INVALID, "未知的功能项：" + change.permKey());
             }
             parseLevel(change.level());
+        }
+
+        Map<String, String> oldLevels = matrixLevels();
+        Map<Long, String> roleNames = roleNames();
+        Map<String, String> itemLabels = matrixItemLabels();
+        Set<Long> touchedRoles = new LinkedHashSet<>();
+        for (AdminDtos.MatrixChange change : changes) {
+            String before = oldLevels.get(matrixKey(change.roleId(), change.permKey()));
+            String label = roleNames.getOrDefault(change.roleId(), "角色#" + change.roleId())
+                    + " · " + itemLabels.getOrDefault(change.permKey(), change.permKey());
+            AuditContext.change(label, before, change.level());
+            touchedRoles.add(change.roleId());
+        }
+        // 影响用户数 = 受影响角色的成员数，**去重后按人算**（同一人在两个受影响角色里只算一次）
+        AuditContext.affectedUsers(memberCountDistinct(touchedRoles));
+
+        int applied = 0;
+        LocalDateTime now = LocalDateTime.now();
+        for (AdminDtos.MatrixChange change : changes) {
             // 只允许已知档位（防"读写"这类中文值混进来）
             entityManager.createNativeQuery("""
                             insert into sys_role_matrix (role_id, item_key, level, updated_at)
@@ -293,6 +318,57 @@ public class RoleAdminService {
             applied++;
         }
         return new AdminDtos.MatrixSaveResponse(applied, TIME_FORMAT.format(now), "");
+    }
+
+    /** 矩阵当前档位：{@code "roleId|itemKey" → level}。没有行的项视为 {@code NONE}（与读侧同口径）。 */
+    private Map<String, String> matrixLevels() {
+        Map<String, String> levels = new HashMap<>();
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select role_id, item_key, level from sys_role_matrix")
+                .getResultList();
+        for (Object[] row : rows) {
+            levels.put(matrixKey(((Number) row[0]).longValue(), (String) row[1]), (String) row[2]);
+        }
+        return levels;
+    }
+
+    /** 矩阵项的展示名：{@code item_key → label}。 */
+    private Map<String, String> matrixItemLabels() {
+        Map<String, String> labels = new HashMap<>();
+        entityManager.createNativeQuery("select item_key, label from sys_matrix_item")
+                .getResultList()
+                .forEach(r -> {
+                    Object[] row = (Object[]) r;
+                    labels.put((String) row[0], (String) row[1]);
+                });
+        return labels;
+    }
+
+    private Map<Long, String> roleNames() {
+        Map<Long, String> names = new HashMap<>();
+        for (SysRole role : roleRepository.findAll()) {
+            names.put(role.getId(), role.getName());
+        }
+        return names;
+    }
+
+    /** 去重后的受影响人数（同一人在多个受影响角色里只算一次）。 */
+    private int memberCountDistinct(java.util.Collection<Long> roleIds) {
+        if (roleIds.isEmpty()) {
+            return 0;
+        }
+        Number n = (Number) entityManager.createNativeQuery("""
+                        select count(distinct ur.user_id) from sys_user_role ur
+                        join sys_user u on u.id = ur.user_id and u.deleted_at is null
+                        where ur.role_id in (:ids)
+                        """)
+                .setParameter("ids", roleIds)
+                .getSingleResult();
+        return n == null ? 0 : n.intValue();
+    }
+
+    private static String matrixKey(long roleId, String itemKey) {
+        return roleId + "|" + itemKey;
     }
 
     // ==================== 私有 ====================

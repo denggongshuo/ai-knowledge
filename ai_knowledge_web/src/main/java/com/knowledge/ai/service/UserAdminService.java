@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.audit.AuditContext;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
@@ -66,6 +67,9 @@ public class UserAdminService {
     private final SysDepartmentRepository departmentRepository;
 
     private final DataScopeService dataScopeService;
+
+    /** 复用鉴权侧的部门全路径名口径（「研发中心 / 平台架构组」），避免第二套实现漂移。 */
+    private final UserPrincipalAssembler principalAssembler;
 
     private final PasswordEncoder passwordEncoder;
 
@@ -201,6 +205,21 @@ public class UserAdminService {
     public AdminDtos.UserRow update(Long id, AdminDtos.UserUpdateRequest request) {
         SysUser user = userRepository.findByIdAndDeletedAtIsNull(id)
                 .orElseThrow(() -> new BizException(ErrorCode.USER_NOT_FOUND));
+
+        // ============ T-300：先读旧值并登记，再改 ============
+        // 顺序不能反（见 AuditContext 的 javadoc）。这里读两样：角色与部门 ——
+        // 前者是"权限扩大/收缩"的直接体现，后者决定数据范围（能看哪些部门的库）。
+        List<String> oldRoleCodes = currentRoleCodes(id);
+        String oldDeptName = departmentNameOf(user.getDeptId());
+        String newDeptName = departmentNameOf(requireDept(request.deptId()));
+        AuditContext.change("角色",
+                oldRoleCodes.isEmpty() ? null : String.join("、", oldRoleCodes),
+                (request.roleIds() == null || request.roleIds().isEmpty())
+                        ? null : String.join("、", request.roleIds()));
+        AuditContext.change("部门", oldDeptName, newDeptName);
+        // 影响面是这次被编辑的这一个人
+        AuditContext.affectedUsers(1);
+
         user.setRealName(request.realName().trim());
         user.setPhone(blankToNull(request.phone()));
         user.setEmail(blankToNull(request.email()));
@@ -209,6 +228,22 @@ public class UserAdminService {
         userRepository.save(user);
         setRoles(user, request.roleIds());
         return toRows(List.of(user)).getFirst();
+    }
+
+    /** 用户当前的角色编码（id 升序，供审计 before 侧与对照展示）。 */
+    private List<String> currentRoleCodes(Long userId) {
+        return entityManager.createNativeQuery("""
+                        select r.code from sys_user_role ur
+                        join sys_role r on r.id = ur.role_id
+                        where ur.user_id = :id order by r.id
+                        """)
+                .setParameter("id", userId)
+                .getResultList();
+    }
+
+    /** 部门名（含「未分配」虚拟节点），与列表行的 {@code department} 字段同一口径。 */
+    private String departmentNameOf(Long deptId) {
+        return principalAssembler.departmentName(deptId);
     }
 
     // ==================== 状态机（T-207，含自锁防护 G2-5） ====================
