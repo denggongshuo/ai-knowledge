@@ -9,6 +9,7 @@ import jakarta.validation.Valid;
 import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -107,5 +108,17 @@ public class UserAdminController {
             throw new com.knowledge.ai.core.exception.BizException(
                     com.knowledge.ai.core.exception.ErrorCode.IMPORT_TEMPLATE_INVALID, "文件读取失败");
         }
+    }
+
+    /**
+     * {@code DELETE /users/{id}} —— 🚩 删除账号（**软删**）。
+     *
+     * <p>三道闸（G2-6，服务端是唯一防线 —— 前端 {@code removeUser} 只做了本地拦截）：
+     * 不能删自己 / 不能删最后一个超管 / **有业务数据只能禁用**。
+     */
+    @DeleteMapping("/{id}")
+    @RequiresPerm("user:delete")
+    public ApiResponse<AdminDtos.Deleted> delete(@PathVariable Long id) {
+        return ApiResponse.ok(userAdminService.delete(id));
     }
 }

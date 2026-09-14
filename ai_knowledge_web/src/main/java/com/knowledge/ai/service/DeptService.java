@@ -150,9 +150,12 @@ public class DeptService {
     }
 
     /**
-     * 删除。三个前置校验缺一不可：虚拟节点不可删、有子部门先删子、
-     * 部门下有用户先转移（《05》§1.6）。知识库校验在 S3 建库后补 ——
-     * 现在 {@code sys_kb} 表还不存在，硬写会直接 SQL 报错。
+     * 删除。四个前置校验缺一不可：虚拟节点不可删、有子部门先删子、
+     * 部门下有用户先转移、**部门下有知识库先转移**（《05》§1.6）。
+     *
+     * <p>知识库校验在 S2 时留了 TODO（当时 {@code sys_kb} 还是骨架、写 SQL 会报错），
+     * V7 建表后回补。**校验的是直属知识库**（{@code sys_kb.dept_id}）：子部门的知识库
+     * 由子部门自己的删除流程把关，这里不越级 —— 与「有子部门先删子部门」是同一条逻辑链。
      */
     @Transactional
     public AdminDtos.Deleted delete(Long id) {
@@ -174,7 +177,14 @@ public class DeptService {
             throw new BizException(ErrorCode.DEPT_NOT_EMPTY,
                     "该部门下仍有 " + members + " 名成员，请先转移成员再删除");
         }
-        // TODO(S3)：知识库表建成后，这里加「部门下有知识库」的同类校验（《05》§1.6）
+        Long kbs = (Long) entityManager.createNativeQuery(
+                        "select count(*) from sys_kb where dept_id = :id")
+                .setParameter("id", id)
+                .getSingleResult();
+        if (kbs != null && kbs > 0) {
+            throw new BizException(ErrorCode.DEPT_NOT_EMPTY,
+                    "该部门下仍有 " + kbs + " 个知识库，请先转移知识库再删除");
+        }
         departmentRepository.delete(dept);
         return new AdminDtos.Deleted(true);
     }

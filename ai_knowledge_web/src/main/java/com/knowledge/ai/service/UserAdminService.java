@@ -248,6 +248,56 @@ public class UserAdminService {
         return toRows(List.of(user)).getFirst();
     }
 
+    // ==================== 删除（G2-6，软删） ====================
+
+    /**
+     * 删除账号（**软删**，`deleted_at` 置时间戳）。
+     *
+     * <p><b>三道闸</b>（《05》§1.5 / §1.6）：
+     * <ol>
+     *   <li>不能删自己 —— 与停用同类，自锁防护（{@link ErrorCode#USER_SELF_OPERATION_DENIED}）；</li>
+     *   <li>不能删最后一个启用中的超级管理员 —— 否则系统再无人能管（{@link ErrorCode#LAST_SUPER_ADMIN}）；</li>
+     *   <li><b>有业务数据的账号禁止删除</b>（{@link ErrorCode#USER_HAS_BUSINESS_DATA}）——
+     *       创建过知识库或上传过文档的账号只能禁用：删了会留下**孤立数据**
+     *       （库还在、创建人没了）。判定见 {@link #hasBusinessData}。</li>
+     * </ol>
+     *
+     * <p><b>为什么软删而不是物理删</b>：账号可能仍被历史记录引用（登录日志、审计日志），
+     * 且"删除"在《05》§1.5 的语义是"不可逆但保留历史记录"。物理删会破坏审计链。
+     * 软删后该账号不出现在任何列表（仓储层统一 `deleted_at is null`），
+     * 也不能再登录（{@code findByUsernameAndDeletedAtIsNull} 查不到）。
+     *
+     * <p>🚩 高危：删除账号不可逆，接 {@link AuditLog} 留痕。**先自锁防护、再删**，
+     * 保证被拒的操作不产生副作用。
+     */
+    @Transactional
+    @AuditLog(module = AuditModule.USER, action = "删除用户", risk = RiskLevel.HIGH,
+            target = "'用户#' + #id")
+    public AdminDtos.Deleted delete(Long id) {
+        LoginUser current = LoginUserContext.require();
+        SysUser user = userRepository.findByIdAndDeletedAtIsNull(id)
+                .orElseThrow(() -> new BizException(ErrorCode.USER_NOT_FOUND));
+
+        if (id.equals(current.getUserId())) {
+            throw new BizException(ErrorCode.USER_SELF_OPERATION_DENIED, "不能删除当前登录账号");
+        }
+        if (isLastActiveSuperAdmin(id)) {
+            throw new BizException(ErrorCode.LAST_SUPER_ADMIN, "系统至少保留一个启用的超级管理员");
+        }
+        if (hasBusinessData(id)) {
+            throw new BizException(ErrorCode.USER_HAS_BUSINESS_DATA);
+        }
+
+        // 删除前先收掉登录态：与停用同理，账号已删除不该等下一个请求才失效
+        int revoked = refreshTokenStore.revokeAll(id);
+        user.setDeletedAt(LocalDateTime.now());
+        user.setUpdatedAt(LocalDateTime.now());
+        userRepository.save(user);
+        log.info("删除账号（软删）：userId={} username={} 撤销 refreshToken={} 条",
+                id, user.getUsername(), revoked);
+        return new AdminDtos.Deleted(true);
+    }
+
     // ==================== 重置密码 / 重发邀请（T-208） ====================
 
     /**
@@ -399,9 +449,26 @@ public class UserAdminService {
         return dept.getName();
     }
 
-    /** **有业务数据禁删**的判定点。S2 阶段知识库/文档表还不存在，恒 false；
-     *  S3 建库后在这里补「创建过知识库 / 上传过文档」的存在性查询（G2-6 的校验点）。 */
+    /**
+     * **有业务数据禁删**（G2-6，《05》§1.5）：「创建过知识库 或 上传过文档」的账号只能禁用。
+     *
+     * <p>S2 阶段这里恒 {@code false}（{@code sys_kb} 还是骨架、文档表要到 S4 才建）；
+     * V8 起 {@code sys_kb.owner_id} 已落创建人，本方法改为**真实查询**。
+     * 文档侧的「上传过文档」在 S4 建 {@code sys_document} 后并入本条 SQL。
+     *
+     * <p>用 {@code count(*) > 0} 的 {@code select 1 ... limit 1} 语义而不是全表 count：
+     * 只关心存在性，命中一条即可返回。
+     */
     private boolean hasBusinessData(Long userId) {
+        Number owned = (Number) entityManager.createNativeQuery(
+                        "select count(*) from sys_kb where owner_id = :uid limit 1")
+                .setParameter("uid", userId)
+                .getSingleResult();
+        if (owned != null && owned.longValue() > 0) {
+            return true;
+        }
+        // TODO(S4)：sys_document 建表后，这里并入「上传过文档」的同类存在性查询
+        //           （《05》§1.5 的「或上传过文档」半边）。
         return false;
     }
 
