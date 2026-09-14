@@ -39,7 +39,7 @@ const loading = ref(false)
 const saving = ref(false)
 const rebuilding = ref(false)
 const activeTab = ref('basic')
-const meta = ref({ name: '', code: '', department: '', docCount: 0, chunkCount: 0, status: '', createdAt: '', updatedAt: '' })
+const meta = ref({ name: '', code: '', department: '', docCount: 0, chunkCount: 0, status: '', statusLabel: '', createdAt: '', updatedAt: '' })
 const form = ref<KbConfigForm | null>(null)
 const orig = ref<KbConfigForm | null>(null)
 const presets = ref<SplitPresetDef[]>([])
@@ -66,6 +66,7 @@ onMounted(async () => {
       docCount: cfg.docCount,
       chunkCount: cfg.chunkCount,
       status: cfg.status,
+      statusLabel: cfg.statusLabel,
       createdAt: cfg.createdAt,
       updatedAt: cfg.updatedAt,
     }
@@ -359,7 +360,10 @@ async function deleteKb() {
               <div v-if="dirty('deptId')" class="diff-note">由「{{ beforeVal('deptId') }}」改为「{{ deptName(form.deptId) }}」</div>
             </el-form-item>
             <el-form-item label="状态">
-              <el-tag size="small" type="success">{{ meta.status === 'ACTIVE' ? '正常' : meta.status }}</el-tag>
+              <!-- W1：不按 status 分支 —— 后端的域内真值是 READY/INDEXING，
+                   而 KnowledgeBase['status'] 是 ACTIVE|BUILDING|PAUSED，两者不是一个词表。
+                   按 status 判 ACTIVE 会把真后端的 READY 渲染成裸字符串「READY」。 -->
+              <el-tag size="small" type="success">{{ meta.statusLabel || meta.status }}</el-tag>
             </el-form-item>
             <el-form-item class="span-2" label="描述" :class="{ dirty: dirty('description') }">
               <el-input v-model="form.description" type="textarea" :rows="3" maxlength="200" show-word-limit />
@@ -475,7 +479,7 @@ async function deleteKb() {
                 <span class="mono">
                   <el-icon class="vl-ic"><Picture /></el-icon>
                   VL 视觉模型：{{ vlModel.enabled ? vlModel.name : '未配置' }}
-                  <template v-if="vlModel.enabled"> · 全局唯一 · 自 {{ vlModel.appliedAt }} 起生效</template>
+                  <template v-if="vlModel.enabled"> · 全局唯一<template v-if="vlModel.appliedAt"> · 自 {{ vlModel.appliedAt }} 起生效</template></template>
                 </span>
                 <el-icon><Lock /></el-icon>
               </div>

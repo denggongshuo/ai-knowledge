@@ -132,6 +132,13 @@ export const kbApi = {
       docCount: number
       chunkCount: number
       status: string
+      /**
+       * 派生的展示文案（已就绪 / 索引中）。
+       * ⚠️ 状态标签必须用它，不要按 `status` 分支 —— 后端的域内真值是
+       * `READY` / `INDEXING`，与 `KnowledgeBase['status']` 的
+       * `ACTIVE|BUILDING|PAUSED` 不是一个词表（W1）。
+       */
+      statusLabel: string
       createdAt: string
       updatedAt: string
       visibleRoles: string[]

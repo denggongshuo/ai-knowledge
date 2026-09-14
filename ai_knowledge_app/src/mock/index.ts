@@ -14,6 +14,7 @@ import {
   DEPT_NAME,
   DATA_SCOPE_LABEL,
   USER_STATUS_LABEL,
+  KB_STATUS_LABEL,
   SPLIT_PRESETS,
   SECRET_LEVEL_LABEL,
   RETRIEVAL_MODE_LABEL,
@@ -501,6 +502,9 @@ register('GET', '/api/kb/:id/config', (_req, res, ctx) => {
     docCount: kb.docCount,
     chunkCount: kb.chunkCount,
     status: kb.status,
+    // 与真后端的派生字段对齐：设置页的状态标签改用它渲染（W1）。
+    // mock 侧的词表是 ACTIVE，映射到与后端同一句中文，页面才不会因切 mock/真后端而变样。
+    statusLabel: kb.status === 'ACTIVE' ? '已就绪' : KB_STATUS_LABEL[kb.status],
     createdAt: kb.createdAt,
     updatedAt: kb.updatedAt,
     visibleRoles: ['SUPER_ADMIN', 'KB_ADMIN'],
