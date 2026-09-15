@@ -178,6 +178,12 @@ public class KbGrantService {
         String[] before = grantSnapshot(kbId);
         AuditContext.change("授权级别", before[0], request.level());
         AuditContext.change("可见角色", before[1], roleNamesOf(request.roleIds()));
+        // T-302（W1）：受影响面 = 这次被授权的角色集合（**after 侧**）。
+        // 用 after 而不是 before：抽屉展示的是「这次改动波及了谁」，用户看的是新授权。
+        // 人数同源（同一批 roleIds 的成员数），两者配对。
+        List<Long> affected = request.roleIds() == null ? List.of() : new ArrayList<>(new LinkedHashSet<>(request.roleIds()));
+        AuditContext.affectedUsers(memberCountDistinct(affected));
+        AuditContext.affectedRole(roleNamesOf(affected));
 
         entityManager.createNativeQuery(
                         "delete from sys_kb_grant where kb_id = :id and principal_type = 'ROLE'")
@@ -289,8 +295,27 @@ public class KbGrantService {
         return names.isEmpty() ? null : String.join("、", names);
     }
 
-    private Map<Long, Long> memberCounts() {
-        List<Object[]> rows = entityManager.createNativeQuery("""
+    /**
+     * 去重后的受影响人数（T-302 W1 的配套）：同一人在多个被授权角色里只算一次。
+     *
+     * <p>与 {@code RoleAdminService#memberCountDistinct} 同口径（含 {@code deleted_at is null}）——
+     * 同一页面两个抽屉的人数不该用两种算法。
+     */
+    private int memberCountDistinct(java.util.Collection<Long> roleIds) {
+        if (roleIds == null || roleIds.isEmpty()) {
+            return 0;
+        }
+        Number n = (Number) entityManager.createNativeQuery("""
+                        select count(distinct ur.user_id) from sys_user_role ur
+                        join sys_user u on u.id = ur.user_id and u.deleted_at is null
+                        where ur.role_id in (:ids)
+                        """)
+                .setParameter("ids", roleIds)
+                .getSingleResult();
+        return n == null ? 0 : n.intValue();
+    }
+
+    private Map<Long, Long> memberCounts() {        List<Object[]> rows = entityManager.createNativeQuery("""
                         select ur.role_id, count(*) from sys_user_role ur
                         join sys_user u on u.id = ur.user_id and u.deleted_at is null
                         group by ur.role_id

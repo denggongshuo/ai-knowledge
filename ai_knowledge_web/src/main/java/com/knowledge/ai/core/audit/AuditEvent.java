@@ -19,6 +19,11 @@ import java.util.List;
  *                      切面 {@code drain()} 取走；**未登记时是空列表**（落库为 NULL，不是 {@code []}）
  * @param affectedUsers 受影响人数。未登记时为 {@code null} —— 与 {@code 0} 语义不同：
  *                      {@code null} = 这类动作本就没有影响面，{@code 0} = 影响面确实是 0 人
+ * @param affectedRole  受影响**角色名**（T-302 查询侧的 W1 修复）。与 {@code affectedUsers}
+ *                      配对登记。⚠️ 不要与 {@code roleName} 混：后者是**操作人自己的角色码**，
+ *                      两者语义相反，前端详情抽屉消费的是本字段
+ * @param roleName      操作人自己的角色码（逗号连接）。前端审计页**不消费**它，
+ *                      保留是因为"谁在用超管身份操作"仍是有效的审计事实
  */
 public record AuditEvent(
         String module,
@@ -37,7 +42,8 @@ public record AuditEvent(
         String failReason,
         Integer affectedUsers,
         List<AuditChange> changes,
-        String note
+        String note,
+        String affectedRole
 ) {
 
     /** {@code result} 取值。 */

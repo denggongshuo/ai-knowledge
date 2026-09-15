@@ -114,6 +114,12 @@ public final class AuditRiskPolicy {
         register(AuditModule.KB, "创建知识库", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
                 "§4.3 四类不含建库：新建库不扩大任何既有权限（初始授权只覆盖向导里勾选的角色 + 超管 MANAGE），"
                         + "《01》§10.1 的建库样例也没有 🚩。标高危会让「高危」退化成「所有写操作」");
+
+        // ---------- 第 2 类 · 数据导出（T-304 于 S3-C 落地，2026-09-15 从 PLANNED 移入） ----------
+        register(AuditModule.AUDIT, "导出审计日志", Category.DATA_EXPORT, RiskLevel.HIGH,
+                "§4.3②数据导出；同时是 T-304「审计自审」—— 导出这件事本身也要记一条。"
+                        + "移入 IMPLEMENTED 的时点是 @AuditLog 注解真正落到 AuditController#export 上；"
+                        + "在此之前它必须留在 PLANNED，否则反向断言（策略→注解）会报幽灵条目");
     }
 
     // ==================================================================
@@ -144,8 +150,6 @@ public final class AuditRiskPolicy {
                 "§4.3④模型配置变更，**含启用切换**");
         register(PLANNED, AuditModule.SYSTEM, "切换重排模型", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
                 "§4.3④：切换重排/VL 属系统级行为变更，必须留痕");
-        register(PLANNED, AuditModule.AUDIT, "导出审计日志", Category.DATA_EXPORT, RiskLevel.HIGH,
-                "§4.3②数据导出；同时是 T-304「审计自审」——导出这件事本身也要记一条");
     }
 
     private AuditRiskPolicy() {

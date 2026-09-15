@@ -65,26 +65,65 @@ public class AuditLogService {
         SysAuditLog entity = new SysAuditLog();
         entity.setLogNo(logNoGenerator.next(now.toLocalDate()));
         entity.setTraceId(event.traceId());
-        entity.setApiPath(event.apiPath());
+        entity.setApiPath(mask(event.apiPath()));
         entity.setModule(event.module());
         entity.setAction(event.action());
         entity.setRiskLevel(event.riskLevel().name());
-        entity.setTarget(event.target());
+        entity.setTarget(mask(event.target()));
         entity.setOperator(event.operator());
         entity.setOperatorName(event.operatorName());
         entity.setRoleName(event.roleName());
+        entity.setAffectedRole(mask(event.affectedRole()));
         entity.setIp(event.ip());
         entity.setUserAgent(event.userAgent());
         entity.setResult(event.result());
-        entity.setFailReason(event.failReason());
+        entity.setFailReason(mask(event.failReason()));
         entity.setCostMs((int) Math.min(event.costMs(), Integer.MAX_VALUE));
         entity.setAffectedUsers(event.affectedUsers());
-        entity.setChangesJson(serializeChanges(event.changes()));
-        entity.setNote(event.note());
+        entity.setChangesJson(serializeChanges(maskChanges(event.changes())));
+        entity.setNote(mask(event.note()));
         entity.setCreatedAt(now);
         entity.setCreatedDate(now.toLocalDate());
 
         repository.save(entity);
+    }
+
+    // ==================== T-305 · 落库前脱敏（G3-10） ====================
+
+    /**
+     * 自由文本字段的脱敏 + 留痕。
+     *
+     * <p>只过**自由文本**这几列（{@code apiPath / target / note / failReason /
+     * affectedRole}）。{@code operator} / {@code module} / {@code action} 是受控值
+     * （账号名、枚举、注解字面量），不在名单里 —— 把受控值也过一遍脱敏没有收益，
+     * 反而会在真出问题时让人怀疑"是不是脱敏把日志改花了"。
+     *
+     * <p>命中时打 warn：打码本身是静默的，但「审计里出现了密钥」这件事值得留痕 ——
+     * 它说明某个业务入口正在往自由文本里写密钥，是该修的上游缺陷，
+     * 而审计页上只会看到一个 {@code ***}，看不出成因。
+     */
+    private static String mask(String raw) {
+        if (SensitiveMasker.containsSensitive(raw)) {
+            log.warn("审计字段命中敏感模式，已脱敏后落库（G3-10）——上游业务疑似把密钥写进了自由文本");
+        }
+        return SensitiveMasker.mask(raw);
+    }
+
+    /**
+     * 变更明细的脱敏。
+     *
+     * <p>逐**字段值**打码再序列化（不是对序列化后的 JSON 串打码）：
+     * 后者一旦替换文本里带的引号就会产出非法 JSON，详情接口反序列化直接 500 ——
+     * 脱敏把日志写坏，比不脱敏更糟。对字段值打码则结构由 Jackson 保证，
+     * 覆盖范围完全相同（密钥只可能出现在值里）。
+     */
+    private static List<AuditChange> maskChanges(List<AuditChange> changes) {
+        if (changes == null || changes.isEmpty()) {
+            return changes;
+        }
+        return changes.stream()
+                .map(c -> new AuditChange(mask(c.label()), mask(c.before()), mask(c.after())))
+                .toList();
     }
 
     /**

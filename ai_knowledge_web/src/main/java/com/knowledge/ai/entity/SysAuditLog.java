@@ -80,10 +80,15 @@ public class SysAuditLog {
     @Column(name = "operator_name", length = 64)
     private String operatorName;
 
-    /** 操作人角色（多角色用逗号连接），供详情抽屉展示。 */
+    /**
+     * <b>操作人自己的</b>角色码（多角色用逗号连接）。
+     *
+     * <p>⚠️ 与 {@link #affectedRole} **语义相反**，别合并也别互相顶替：
+     * 本字段答的是「谁在操作」，{@code affectedRole} 答的是「谁被影响了」。
+     * 前端详情抽屉消费的是后者（{@code AuditLogView.vue:337/349}）。
+     */
     @Column(name = "role_name", length = 128)
     private String roleName;
-
     @Column(name = "ip", length = 64)
     private String ip;
 
@@ -105,6 +110,17 @@ public class SysAuditLog {
     /** 受影响人数（权限变更类动作才有）。 */
     @Column(name = "affected_users")
     private Integer affectedUsers;
+
+    /**
+     * 受影响**角色名**（权限变更类动作才有，如「访客」）。{@code V11} 新增列。
+     *
+     * <p>存在的唯一理由：前端详情抽屉把 {@code roleName} 当受影响角色渲染
+     * 「{@code N 人（该角色下全部成员）}」，而 {@link #roleName} 存的是操作人角色码 ——
+     * 语义相反。历史 1262 行全为 {@code null}（当时没记），详情接口按 null 返回，
+     * 前端已有守卫会省略括号，不伪造。
+     */
+    @Column(name = "affected_role", length = 128)
+    private String affectedRole;
 
     /** 变更前后对照，JSON 数组字符串：{@code [{label,before,after}]}。 */
     @Column(name = "changes_json", columnDefinition = "TEXT")

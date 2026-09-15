@@ -300,6 +300,12 @@ public class RoleAdminService {
         }
         // 影响用户数 = 受影响角色的成员数，**去重后按人算**（同一人在两个受影响角色里只算一次）
         AuditContext.affectedUsers(memberCountDistinct(touchedRoles));
+        // T-302（W1）：受影响角色名与上面的人数**配对登记**。
+        // 前端详情抽屉渲染「N 人（该角色下全部成员）」，而 sys_audit_log.role_name 存的
+        // 是操作人自己的角色码 —— 不登记这一笔，抽屉会显示「N 人（SUPER_ADMIN 下全部成员）」。
+        // 多角色时用顿号连接（与 KbGrantService 的「可见角色」同口径），
+        // 一次性提交改多个角色是常态，取第一个会漏报影响面。
+        AuditContext.affectedRole(roleNamesOf(touchedRoles));
 
         int applied = 0;
         LocalDateTime now = LocalDateTime.now();
@@ -350,6 +356,26 @@ public class RoleAdminService {
             names.put(role.getId(), role.getName());
         }
         return names;
+    }
+
+    /**
+     * 受影响角色名的展示串（T-302 W1）：按 id 升序，顿号连接；空集返回 {@code null}。
+     *
+     * <p>升序 + 顿号的口径与 {@code KbGrantService#roleNamesOf}（「可见角色」）逐字一致 ——
+     * 同一页面的两个抽屉不该有两种排序。
+     */
+    private String roleNamesOf(java.util.Collection<Long> roleIds) {
+        if (roleIds == null || roleIds.isEmpty()) {
+            return null;
+        }
+        Map<Long, String> names = roleNames();
+        String joined = roleIds.stream()
+                .distinct()
+                .sorted()
+                .map(id -> names.getOrDefault(id, "角色#" + id))
+                .reduce((a, b) -> a + "、" + b)
+                .orElse(null);
+        return joined;
     }
 
     /** 去重后的受影响人数（同一人在多个受影响角色里只算一次）。 */

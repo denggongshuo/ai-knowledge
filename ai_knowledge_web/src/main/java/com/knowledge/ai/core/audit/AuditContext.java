@@ -43,7 +43,7 @@ import java.util.List;
 public final class AuditContext {
 
     /** 登记内容为空时的占位，避免每次 drain 都新建对象。 */
-    private static final Captured EMPTY = new Captured(List.of(), null);
+    private static final Captured EMPTY = new Captured(List.of(), null, null);
 
     private static final ThreadLocal<Holder> HOLDER = new ThreadLocal<>();
 
@@ -75,6 +75,26 @@ public final class AuditContext {
         holder().affectedUsers = Math.max(count, 0);
     }
 
+    /**
+     * 登记受影响角色名（T-302 查询侧的 W1 修复，2026-09-15）。
+     *
+     * <p><b>为什么需要它</b>：前端详情抽屉用 {@code roleName} 渲染
+     * 「{@code N 人（该角色下全部成员）}」，而 {@code sys_audit_log.role_name} 列存的
+     * 是**操作人自己的角色码**（{@code AuditAspect#build} 从 {@code LoginUser.getRoleCodes()} 写）——
+     * 语义刚好相反。接真后端后抽屉会显示「12 人（SUPER_ADMIN 下全部成员）」：
+     * 数字是真的、格式也是真的，只有那个角色名是假的。
+     *
+     * <p>所以独立登记一笔「受影响角色」，落进新增的 {@code affected_role} 列。
+     * 与 {@link #affectedUsers} 是**配对**的：有影响面才两个都有，没影响面两个都是 null。
+     *
+     * <p>多次调用以最后一次为准（与 {@link #affectedUsers} 同口径）。
+     *
+     * @param roleName 角色名（展示名，如「访客」），不是角色码
+     */
+    public static void affectedRole(String roleName) {
+        holder().affectedRole = (roleName == null || roleName.isBlank()) ? null : roleName;
+    }
+
     // ==================== 切面读取 ====================
 
     /**
@@ -91,7 +111,7 @@ public final class AuditContext {
         if (holder == null) {
             return EMPTY;
         }
-        return new Captured(List.copyOf(holder.changes), holder.affectedUsers);
+        return new Captured(List.copyOf(holder.changes), holder.affectedUsers, holder.affectedRole);
     }
 
     /** 清空但**不返回** —— 供 {@link AuditContextFilter} 在请求结束时兜底。 */
@@ -113,6 +133,7 @@ public final class AuditContext {
     private static final class Holder {
         private final List<AuditChange> changes = new ArrayList<>();
         private Integer affectedUsers;
+        private String affectedRole;
     }
 
     /**
@@ -120,11 +141,13 @@ public final class AuditContext {
      *
      * @param changes       变更明细，**不可变**；无登记时是空列表
      * @param affectedUsers 受影响人数；未登记时为 {@code null}（与 0 语义不同：0 是"确实没人受影响"）
+     * @param affectedRole  受影响角色名；未登记时为 {@code null}。与 {@code affectedUsers} 配对 ——
+     *                      仅在后者的登记点（权限变更类动作）才有意义
      */
-    public record Captured(List<AuditChange> changes, Integer affectedUsers) {
+    public record Captured(List<AuditChange> changes, Integer affectedUsers, String affectedRole) {
 
         public boolean isEmpty() {
-            return changes.isEmpty() && affectedUsers == null;
+            return changes.isEmpty() && affectedUsers == null && affectedRole == null;
         }
     }
 }

@@ -123,7 +123,10 @@ public class AuditAspect {
                 failReason,
                 captured.affectedUsers(),
                 captured.changes(),
-                annotation.recordParams() ? summarizeArgs(joinPoint) : null
+                annotation.recordParams() ? summarizeArgs(joinPoint) : null,
+                // T-302（W1）：受影响角色名与受影响人数**配对**，同一次登记来、同一个快照取走。
+                // 与上面的 roleName（操作人自己的角色码）语义相反，别合并。
+                captured.affectedRole()
         );
     }
 
