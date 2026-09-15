@@ -85,6 +85,12 @@ public final class AuditRiskPolicy {
                 "§4.3①权限扩大：roleIds 全量替换，可能新增角色；同时可能改部门（数据范围）");
         register(AuditModule.GRANT, "调整知识库授权", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
                 "§4.3①权限扩大：库的可见角色集与档位全量替换");
+        register(AuditModule.KB, "保存配置", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
+                "§4.3①权限扩大：同一请求可改 visibleRoles（落到 sys_kb_grant 全量替换），"
+                        + "勾上 KB_ADMIN 会把该库最高档位从 READ 抬到 UPLOAD —— 正是「知识库授权级别提高」。"
+                        + "与「创建知识库」标 NORMAL 不矛盾：新库还没有内容、初始授权不覆盖任何既有权限，"
+                        + "而编辑一个已有内容的库是真扩权。策略表按 (module, action) 做静态键，"
+                        + "做不到「只改了描述就降级」，两害相权宁可粗、不漏标（B2 计划 §3.4 假设 4）");
 
         // ---------- 第 3 类 · 内容删除 ----------
         register(AuditModule.USER, "删除用户", Category.CONTENT_DELETE, RiskLevel.HIGH,

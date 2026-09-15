@@ -1,6 +1,7 @@
 package com.knowledge.ai.dto.kb;
 
 import com.knowledge.ai.core.enums.KbPresets;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
@@ -10,7 +11,7 @@ import jakarta.validation.constraints.Size;
 import java.util.List;
 
 /**
- * M04（知识库）的出入参（T-400 / T-401 / T-402 / T-403）。
+ * M04（知识库）的出入参（T-400 ~ T-405 / T-408 / T-411）。
  *
  * <p><b>字段名的事实源是前端</b>（与 {@code dto/admin/AdminDtos} 同一条约定）：
  * 本包字段逐一对齐 {@code ai_knowledge_app/src/types/index.ts} 的
@@ -159,15 +160,121 @@ public final class KbDtos {
      * @param department 归属部门名（由 {@code deptId} 现拼，不落库 —— 部门改名后不漂移）
      * @param visibleRoles 可见角色 **code**（取自 {@code sys_kb_grant} 的 ROLE 行），
      *                     与创建时提交的 {@code visibleRoles} 同口径
+     * @param reindexRequired 配置已改、索引未重建（T-404 置位，S4 的 T-406 清除）。
+     *                        <b>不并入 {@code status}</b>：那是"索引过程"，这是"配置条件"，
+     *                        两者可同时成立（正在索引时又改了一次配置）。详见 {@code SysKb} 该字段注释
      */
     public record KbConfig(long id, String name, String code, String description,
                            String department, long deptId, long docCount, long chunkCount,
                            String status, String statusLabel,
                            String createdAt, String updatedAt,
+                           boolean reindexRequired,
                            List<String> visibleRoles,
                            KbConfigForm config,
                            EmbeddingInfo embedding,
                            VlModelInfo vlModel,
                            List<KbPresets.Preset> presetOptions) {
+    }
+
+    // ==================== T-404 保存配置 ====================
+
+    /**
+     * 保存 / 预估的请求体：把 {@link KbConfigForm} 包一层 {@code config}。
+     *
+     * <p><b>为什么要有这个壳，而不是直接收表单</b>：前端就是这么发的 ——
+     * {@code api/index.ts} 的 {@code saveConfig} 是 {@code http.put(url, { config })}，
+     * mock 也读 {@code ctx.body.config}。按本仓「字段名与形状的事实源是前端」的约定，
+     * 后端跟随它、而不是让前端改调用点。多这一层的代价是"少一次前端改动"，
+     * 收益是**同一个表单结构在三个接口上完全一致**（创建 / 保存 / 预估）。
+     *
+     * <p>⚠️ {@code @Valid} **必须挂在组件上**：不挂的话外层 {@code @Valid} 不会级联进
+     * {@code config}，于是"名称 1 个字"这类校验会在保存接口上**静默失效** ——
+     * 而创建接口拦得住。同一份表单两个接口口径不同，是最难被发现的那种。
+     */
+    public record KbConfigRequest(@Valid KbConfigForm config) {
+    }
+
+    /**
+     * 保存结果。
+     *
+     * <p><b>{@code needReindex} 是服务端算的，不是把请求里的东西回显</b>：
+     * 服务端拿"库里的旧值"与"提交的新值"逐字段比对，命中重建字段集才置 true
+     * （字段集口径见 {@code KbService} 的说明）。
+     *
+     * <p>⚠️ <b>前端当前的判定是它自己那份本地 diff</b>（{@code KbDetailView}
+     * 的 {@code needReindex} computed，保存后直接丢弃本响应的该字段）。
+     * 两者必须同源，否则会出现"页面说不用重建、库里标着脏"这种谁也看不出来的分叉
+     * —— 所以本批刻意让服务端字段集**逐字对齐**前端，而不是"按我认为对的来"
+     * （B2 计划 §3.1 步 4；其中 4 个检索期参数是否真该触发重建，已登记为遗留）。
+     *
+     * @param needReindex 本次改动是否使索引失效（同时已落 {@code sys_kb.reindex_required}）
+     */
+    public record KbConfigSaved(boolean saved, boolean needReindex, String updatedAt) {
+    }
+
+    // ==================== T-405 影响预估 ====================
+
+    /**
+     * 重建影响预估。
+     *
+     * <p><b>请求体是完整的 {@code KbConfigForm}，不是 diff 列表</b>：
+     * 前端原本按 {@code {changes:[{label,before,after}]}} 发，但那一份只有**展示后的字符串**
+     * （"开启"/"通用文档"/"—"），服务端拿它反推 {@code chunkSize} 得先解析中文，
+     * 属于注定会漂移的做法。改成发完整表单后，服务端用**与保存完全同一段** diff 代码
+     * 算出"哪些字段变了"，估算才和真实保存一致（B2 计划 §3.1 步 5）。
+     *
+     * @param chunkAfter {@code chunkBefore} 按新 chunkSize/overlap 折算的**估计值**，
+     *                   不是精确值 —— G3-4 要求它与重建后的真实分片数同量级（±10%），
+     *                   该判据待 S4 有重建能力后合并验收
+     */
+    public record ReindexImpact(long docCount, long chunkBefore, long chunkAfter,
+                                long estimateMinutes, long estimateTokens) {
+    }
+
+    // ==================== T-408 存储配额 ====================
+
+    /**
+     * 全站配额卡（消费方 {@code DocDownloadView.vue:297}）。
+     *
+     * <p>{@code used} 是**带单位的字符串**（如 {@code "2.4 GB"}）而不是字节数 ——
+     * 前端直接渲染该串，格式化口径归后端，这是既有契约（{@code types/index.ts} 的
+     * {@code StorageQuota.used: string}）。
+     *
+     * @param monthTokens 本月全站 tokens。**当前恒 0**：全项目没有 token 用量表
+     *                    （用量统计是 S6 的 {@code T-905}），来源缺失已登记（B2 计划 §1 W-a）
+     */
+    public record StorageQuota(String used, long kbCount, long docCount, long chunkCount,
+                               long monthTokens) {
+    }
+
+    // ==================== T-411 只读解析配置 ====================
+
+    /**
+     * 解析配置的一行（标签 + 值 + 三个布尔标记）。
+     *
+     * <p>布尔项用 {@code boolean} 而不是 {@code Boolean}：前端三个标记都是真值判断
+     * （{@code v-if="g.locked"} / {@code :class="{ locked: g.locked }"}，
+     * {@code KbUploadView.vue:489-511}），{@code false} 与 {@code undefined} 行为一致；
+     * 而 {@code Boolean} 序列化出来是 {@code null}，多一个没必要的三态。
+     *
+     * @param locked  锁定不可改（如整表原子化、嵌入模型）
+     * @param warning 需提示风险（如"语义切分仅兜底"）
+     * @param enabled 索引增强项是否开启（只有 image / enhance 两栏用）
+     */
+    public record ParseConfigGroup(String label, String value,
+                                   boolean locked, boolean warning, boolean enabled) {
+    }
+
+    /**
+     * 上传页的只读解析配置（四栏）。
+     *
+     * <p><b>它是"知识库配置 + 系统常量"的投影，不是独立的配置实体</b>：
+     * {@code split} / {@code table} 两栏来自该库的 {@code *_policy_json} 与嵌入模型，
+     * {@code image} / {@code enhance} 两栏是全站固定口径（图片处理、标题路径注入、
+     * HyQ 等不按库差异化）。所以它**没有写侧**，也不该有 —— 改配置走
+     * {@code PUT /kb/{id}/config}。
+     */
+    public record ParseConfigView(List<ParseConfigGroup> split, List<ParseConfigGroup> table,
+                                  List<ParseConfigGroup> image, List<ParseConfigGroup> enhance) {
     }
 }

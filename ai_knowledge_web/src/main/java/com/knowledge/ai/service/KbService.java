@@ -1,11 +1,13 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.audit.AuditContext;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
 import com.knowledge.ai.core.enums.KbConfigDefaults;
 import com.knowledge.ai.core.enums.KbPresets;
 import com.knowledge.ai.core.enums.ModelType;
+import com.knowledge.ai.core.enums.RetrievalMode;
 import com.knowledge.ai.core.enums.SecretLevel;
 import com.knowledge.ai.core.ai.ModelClientRegistry;
 import com.knowledge.ai.core.ai.ModelConfigSpec;
@@ -15,11 +17,16 @@ import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.dto.kb.KbDtos;
+import io.minio.ListObjectsArgs;
+import io.minio.MinioClient;
+import io.minio.Result;
+import io.minio.messages.Item;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.core.type.TypeReference;
@@ -32,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -70,12 +78,46 @@ public class KbService {
             "READY", "已就绪",
             "INDEXING", "索引中");
 
+    /**
+     * 配置行的共用 select（列索引表见 {@link #configRowOrDeny} 的注释）。
+     *
+     * <p>⚠️ 末尾以 {@code and } 结尾，拼装条件时**必须补一个空格** —— 这里是普通
+     * 字符串字面量所以行尾空格还在，但拼装侧仍显式写 {@code + " " +}：
+     * B1 曾用 text block 写这段，text block 会剥掉行尾空白，拼出 {@code andEXISTS}
+     * 这种只在真跑时才暴露的语法错（B1 计划 §8.1）。
+     */
+    private static final String CONFIG_SELECT = """
+            select k.id, k.name, k.code, k.description, k.dept_id, k.doc_count, k.chunk_count,
+                   k.status, k.created_at, k.updated_at, k.secret_level, k.business_domain,
+                   k.custom_tags, k.split_policy_json, k.table_policy_json, k.retrieval_config_json,
+                   k.reindex_required
+            from sys_kb k where k.id = :id and """;
+
+    /**
+     * 重建速率（分片 / 分钟），仅用于估算耗时。
+     *
+     * <p>取值来自《09》§1.10 的示例：38,502 个分片 ≈ 约 42 分钟，即约 917 分片/分钟，
+     * 取整到 900 留一点余量。**是估算口径不是性能承诺** —— S4 的真实重建跑出数据后
+     * 应当以实测替换它（已登记为建议）。
+     */
+    private static final long REBUILD_CHUNKS_PER_MINUTE = 900L;
+
     private final DataScopeService dataScopeService;
 
     private final ModelClientRegistry modelClientRegistry;
 
     /** 与 {@code AuditLogService} 同一个（Boot 自动配置的 Jackson 3）。 */
     private final ObjectMapper jsonMapper;
+
+    /** 对象存储客户端（{@code T-408} 的配额卡要算桶用量）。 */
+    private final MinioClient minioClient;
+
+    /**
+     * 业务桶名。用字段注入而不是构造器参数：Lombok 的 {@code @RequiredArgsConstructor}
+     * 不会给 {@code final} 字段注入 {@code @Value} 的配置值（拿到的是 {@code null}）。
+     */
+    @Value("${minio.bucket:rag-documents}")
+    private String minioBucket;
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -247,28 +289,9 @@ public class KbService {
      * 本仓既有口径（{@code KbGrantController} 的 {@code requireKb}）也是先判存在。
      */
     @Transactional(readOnly = true)
-    @SuppressWarnings("unchecked")
     public KbDtos.KbConfig config(long kbId) {
         LoginUser user = LoginUserContext.require();
-        requireKb(kbId);
-
-        DataScopeService.ScopeCondition cond = dataScopeService.kbVisibility(user);
-        // ⚠️ 拼接处保留前导空格：text block **会剥掉每行行尾空白**，
-        // 写成 `... and """ + cond.sql()` 会拼出 `andEXISTS`（语法错，已实测踩到）。
-        Query query = entityManager.createNativeQuery("""
-                        select k.id, k.name, k.code, k.description, k.dept_id, k.doc_count, k.chunk_count,
-                               k.status, k.created_at, k.updated_at, k.secret_level, k.business_domain,
-                               k.custom_tags, k.split_policy_json, k.table_policy_json, k.retrieval_config_json
-                        from sys_kb k where k.id = :id and """ + " " + cond.sql());
-        query.setParameter("id", kbId);
-        cond.params().forEach(query::setParameter);
-
-        List<Object[]> rows = query.getResultList();
-        if (rows.isEmpty()) {
-            // 库存在但求交不放行 —— ② 部门在范围外，或 ③ 没有任何授权（I-7 的两种拦法）
-            throw BizException.of(ErrorCode.KB_ACCESS_DENIED);
-        }
-        Object[] row = rows.getFirst();
+        Object[] row = configRowOrDeny(kbId, user);
 
         String status = (String) row[7];
         KbDtos.KbConfigForm config = new KbDtos.KbConfigForm(
@@ -297,11 +320,520 @@ public class KbService {
                 statusLabel(status),
                 toTimeText(row[8]),
                 toTimeText(row[9]),
+                asBoolean(row[16]),
                 roleCodesOf(kbId),
                 config,
                 embeddingInfo(),
                 vlModelInfo(),
                 KbPresets.all());
+    }
+
+    // ==================== T-404 · 保存配置 ====================
+
+    /**
+     * 保存配置（🚩 审计打点：模块「知识库」，动作「保存配置」）。
+     *
+     * <p><b>为什么标 HIGH</b>：本请求**可以改 {@code visibleRoles}**，而它落到
+     * {@code sys_kb_grant} 上就是"该库可见角色集全量替换" —— 勾上 {@code KB_ADMIN}
+     * 会把库的最高档位从 {@code READ} 抬到 {@code UPLOAD}，正是《05》§4.3①
+     * 「**知识库授权级别提高**」。这与建库标 NORMAL 不矛盾：建库时新库还没有任何
+     * 内容、初始授权也不覆盖任何既有权限；而编辑一个已有内容的库是真扩权。
+     *
+     * <p>口径的代价与备选见 B2 计划 §3.4 假设 4：策略表是按 {@code (module, action)}
+     * 做键的静态表，做不到"只改了描述就降级"，两害相权选了"宁可粗、不漏标"。
+     *
+     * <p><b>不改 {@code code}</b>：{@code uk_kb_code} + 《01》§10.1 把它定义为
+     * 创建后不可改的持久标识。提交了不同的值**显式报错而不是静默忽略** ——
+     * 静默忽略会让用户以为改成功了。
+     *
+     * <p><b>登记顺序与 {@code KbGrantService#save} 同口径</b>：先读旧值 → 登记 → 再写库。
+     * 反过来的话 {@code executeUpdate} 之后旧值就没了，2026-09-14 那次已经把这条写成注释。
+     *
+     * @return {@code needReindex} 由服务端按字段集算出（只有 14 个"分片 + 表格 + 检索"
+     *         字段会触发重建，逐条见 {@link #diffConfig}）
+     */
+    @Transactional
+    @AuditLog(module = AuditModule.KB, action = "保存配置", risk = RiskLevel.HIGH,
+            target = "'知识库#' + #kbId")
+    public KbDtos.KbConfigSaved saveConfig(long kbId, KbDtos.KbConfigForm form) {
+        LoginUser user = LoginUserContext.require();
+        Object[] row = configRowOrDeny(kbId, user);
+
+        // ---------- ① 校验 ----------
+        String storedCode = (String) row[2];
+        if (form.code() == null || !storedCode.equals(form.code().trim())) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "知识库编码 `" + storedCode + "` 创建后不可修改");
+        }
+        requireDept(form.deptId());
+        KbDtos.SplitPolicy split = requireValidSplitPolicy(form.splitPolicy());
+        KbDtos.TablePolicy table = form.tablePolicy() == null ? defaultTablePolicy() : form.tablePolicy();
+        KbDtos.RetrievalConfig retrieval =
+                form.retrievalConfig() == null ? defaultRetrievalConfig() : form.retrievalConfig();
+        SecretLevel secret = resolveSecretLevel(form.secretLevel());
+
+        List<String> oldRoles = roleCodesOf(kbId);
+        List<String> newRoles = normalizeRoles(form.visibleRoles());
+
+        // ---------- ② 算 diff 并登记（必须在写库之前）----------
+        List<ConfigChange> changes = diffConfig(row, form, split, table, retrieval, secret,
+                oldRoles, newRoles);
+        boolean needReindex = changes.stream().anyMatch(ConfigChange::rebuild);
+        for (ConfigChange change : changes) {
+            AuditContext.change(change.label(), change.before(), change.after());
+        }
+
+        // ---------- ③ 写库 ----------
+        LocalDateTime now = LocalDateTime.now();
+        // reindex_required 是**粘性**的：本次改动不需要重建时**不清零** ——
+        // 上一个改动留下的"脏"还没被 T-406（S4）清掉，清了就等于谎报索引是新的。
+        boolean reindexRequired = asBoolean(row[16]) || needReindex;
+        Query update = entityManager.createNativeQuery("""
+                        update sys_kb set name = :name, description = :description, dept_id = :deptId,
+                               secret_level = :secretLevel, business_domain = :businessDomain,
+                               custom_tags = :customTags, split_policy_json = :splitPolicy,
+                               table_policy_json = :tablePolicy, retrieval_config_json = :retrievalConfig,
+                               reindex_required = :reindexRequired, updated_at = :now
+                        where id = :id
+                        """);
+        update.setParameter("id", kbId);
+        update.setParameter("name", form.name().trim());
+        update.setParameter("description", blankToNull(form.description()));
+        update.setParameter("deptId", form.deptId());
+        update.setParameter("secretLevel", secret.name());
+        update.setParameter("businessDomain", form.businessDomain());
+        update.setParameter("customTags", toJson(form.customTags() == null || form.customTags().isEmpty()
+                ? null : form.customTags()));
+        update.setParameter("splitPolicy", toJson(split));
+        update.setParameter("tablePolicy", toJson(table));
+        update.setParameter("retrievalConfig", toJson(retrieval));
+        update.setParameter("reindexRequired", reindexRequired ? 1 : 0);
+        update.setParameter("now", now);
+        update.executeUpdate();
+
+        // ---------- ④ 可见角色变了才动授权行 ----------
+        // 只在真的变了时替换：全量替换会重写 created_at，白白破坏审计线索。
+        if (!new LinkedHashSet<>(oldRoles).equals(new LinkedHashSet<>(newRoles))) {
+            replaceGrants(kbId, newRoles, now);
+        }
+
+        return new KbDtos.KbConfigSaved(true, needReindex, TIME_FORMAT.format(now));
+    }
+
+    // ==================== T-405 · 影响预估 ====================
+
+    /**
+     * 变更影响预估。请求体与保存**同一个表单**，diff 也复用同一段代码
+     * （理由见 {@link KbDtos.ReindexImpact} 的注释）。
+     *
+     * <p><b>估算模型</b>：分片数与"有效步长"成反比 —— 同一份正文，
+     * 窗口越细切得越多。有效步长 = {@code chunkSize - overlap}（这正是两级分片
+     * 流水线里第二级的推进量）。所以
+     * {@code chunkAfter ≈ chunkBefore × 旧步长 ÷ 新步长}。
+     *
+     * <p>这是**估算**不是承诺：G3-4 只要求与重建后的真实值同量级（±10%），
+     * 且该判据要等 S4 有重建能力才能验（本批挂起）。
+     */
+    @Transactional(readOnly = true)
+    public KbDtos.ReindexImpact impact(long kbId, KbDtos.KbConfigForm form) {
+        LoginUser user = LoginUserContext.require();
+        Object[] row = configRowOrDeny(kbId, user);
+
+        KbDtos.SplitPolicy newSplit = requireValidSplitPolicy(form.splitPolicy());
+        KbDtos.SplitPolicy oldSplit = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+
+        long docCount = ((Number) row[5]).longValue();
+        long chunkBefore = ((Number) row[6]).longValue();
+        long stepOld = Math.max(1, oldSplit.chunkSize() - oldSplit.overlap());
+        long stepNew = Math.max(1, newSplit.chunkSize() - newSplit.overlap());
+        // 空库（chunkBefore = 0）就该返 0 —— 硬凑成 1 会让"这个库还没有文档"
+        // 显示成"预计 1 个分片"，是那种界面上看不出来的假数据。
+        long chunkAfter = chunkBefore == 0
+                ? 0
+                : Math.max(1, Math.round(chunkBefore * (double) stepOld / stepNew));
+
+        long minutes = chunkAfter == 0 ? 0 : Math.max(1, (chunkAfter + REBUILD_CHUNKS_PER_MINUTE - 1)
+                / REBUILD_CHUNKS_PER_MINUTE);
+        // tokens 按"每个分片嵌入 chunkSize 个 token"折算：与正在编辑的那个参数同源，
+        // 所以把 chunkSize 调大时它会同向变，而不是像写死系数那样对不上。
+        long tokens = chunkAfter * newSplit.chunkSize();
+        return new KbDtos.ReindexImpact(docCount, chunkBefore, chunkAfter, minutes, tokens);
+    }
+
+    // ==================== T-408 · 存储配额 ====================
+
+    /**
+     * 全站配额（消费方是 S4 的 {@code DocDownloadView} 配额卡）。
+     *
+     * <p>三个计数取自 {@code sys_kb} 的**冗余计数列**而不是实时统计文档表：
+     * 它们是建库/上传时维护的投影（B1 建库写 0），与列表页显示的同一口径，
+     * 不会出现"列表说 1246、配额说 0"这种同页矛盾。
+     *
+     * <p>{@code monthTokens} 恒 0 —— 无来源表（B2 计划 §1 W-a）。
+     */
+    @Transactional(readOnly = true)
+    public KbDtos.StorageQuota storageQuota() {
+        Object[] agg = (Object[]) entityManager.createNativeQuery("""
+                        select count(*), coalesce(sum(doc_count), 0), coalesce(sum(chunk_count), 0)
+                        from sys_kb
+                        """).getSingleResult();
+        return new KbDtos.StorageQuota(
+                humanSize(minioUsedBytes()),
+                ((Number) agg[0]).longValue(),
+                ((Number) agg[1]).longValue(),
+                ((Number) agg[2]).longValue(),
+                0L);
+    }
+
+    // ==================== T-411 · 只读解析配置 ====================
+
+    /**
+     * 上传页四栏只读展示。**是"库配置 + 系统常量"的投影，没有写侧**
+     * （改配置走 {@code PUT /kb/{id}/config}，理由见 {@link KbDtos.ParseConfigView}）。
+     *
+     * <p>文案逐条对齐 {@code mock/data.ts} 的 {@code PARSE_CONFIG_VIEW}：那张表是
+     * 前端·mock·需求三方对账过的既有口径，此处只把**随库变化的部分**
+     * （预设 / chunkSize / overlap / 六项表格策略 / 嵌入与 VL 模型）换成真值。
+     */
+    @Transactional(readOnly = true)
+    public KbDtos.ParseConfigView parseConfig(long kbId) {
+        LoginUser user = LoginUserContext.require();
+        Object[] row = configRowOrDeny(kbId, user);
+
+        KbDtos.SplitPolicy split = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+        KbDtos.TablePolicy table = parseOr(row[14], KbDtos.TablePolicy.class, defaultTablePolicy());
+        KbDtos.EmbeddingInfo embedding = embeddingInfo();
+        KbDtos.VlModelInfo vl = vlModelInfo();
+
+        List<KbDtos.ParseConfigGroup> splitGroups = List.of(
+                group("策略预设", presetText(split.preset()), false, false, false),
+                group("第一级 · 结构边界", "标题层级 / 表格整表 / 代码块 / 完整列表", true, false, false),
+                group("第二级 · 递归分隔符", split.recursiveSplit()
+                        ? "开 · 段落 → 句号 → 分号 → 空格" : "关", false, false, false),
+                // 语义切分按《06》§1.4.3 只作"无标题且超长"的兜底，故恒带风险提示
+                group("第二级 · 语义切分", split.semanticSplit()
+                        ? "开 · 仅无标题且超长时兜底" : "关 · 仅无标题且超长时兜底", false, true, false),
+                group("chunkSize / overlap", split.chunkSize() + " / " + split.overlap() + " tokens",
+                        false, false, false),
+                group("嵌入模型", embedding.model() + " · " + embedding.dimension() + " 维 · "
+                        + embedding.norm(), true, false, false));
+
+        List<KbDtos.ParseConfigGroup> tableGroups = List.of(
+                group("整表原子化", (table.atomicTable() ? "开" : "关") + " · 锁定不切分", true, false, false),
+                group("双表示", table.dualRepresentation()
+                        ? "Markdown 给大模型 / 行式文本给向量" : "关", false, false, false),
+                group("表头重复", table.repeatHeader() ? "开" : "关", false, false, false),
+                group("跨页表格合并", table.mergeCrossPage() ? "开 · 列数一致时并回一张表" : "关",
+                        false, false, false),
+                group("扫描件表格识别", table.ocrTable() ? "开 · 失败标红" : "关", false, false, false),
+                group("回表行数上限", table.rowLimit() + " 行 · ±" + table.rowWindow(), false, false, false),
+                group("表格召回通道", "未单开（Rerank 加权 " + KbConfigDefaults.TABLE_WEIGHT + " 代替）",
+                        false, false, false));
+
+        List<KbDtos.ParseConfigGroup> imageGroups = List.of(
+                group("图片处理", "开 · 图片整体原子化（不切分）", true, false, false),
+                group("题注优先", "有题注则并入图片描述", false, false, false),
+                group("VL 描述生成", vl.enabled() ? "开 · 产出描述 + 检索摘要" : "关 · 未启用 VL 模型",
+                        false, false, vl.enabled()),
+                group("当前 VL 模型", vl.enabled() ? vl.name() : "未配置", true, false, false),
+                group("图片去重", "按 md5 去重，同图只理解一次", false, false, false),
+                group("识别失败标记", "开 · 标红以便补录", false, true, false));
+
+        List<KbDtos.ParseConfigGroup> enhanceGroups = List.of(
+                group("标题路径注入", "把「3. 接口设计 > 3.1 鉴权流程」拼进分片", false, false, true),
+                group("HyQ 假设性问题", "为每个分片生成可能被问到的问句一并索引", false, false, true),
+                group("文档级摘要", "仅文档级，不做 chunk 级摘要", false, false, true),
+                group("内容标签抽取", "复用摘要同一次 LLM 调用，边际成本为零", false, false, true));
+
+        return new KbDtos.ParseConfigView(splitGroups, tableGroups, imageGroups, enhanceGroups);
+    }
+
+    // ==================== 内部：配置读（三处接口共用）====================
+
+    /**
+     * 按「库存在 + 求交放行」读一行配置原始列。
+     *
+     * <p>顺序刻意与 {@link #config} 一致：先判存在（10043），再判可见（10022）。
+     * 反过来的话正常用户输错 id 只会拿到"无权限"，没有可执行的提示。
+     *
+     * <p><b>列索引表</b>（三处接口共用一份 select，改名/加列时一起看）：
+     * <pre>
+     *   0 id  1 name  2 code  3 description  4 dept_id  5 doc_count  6 chunk_count  7 status
+     *   8 created_at  9 updated_at  10 secret_level  11 business_domain  12 custom_tags
+     *   13 split_policy_json  14 table_policy_json  15 retrieval_config_json  16 reindex_required
+     * </pre>
+     *
+     * @throws BizException 10043 库不存在 / 10022 求交不放行（② 部门在范围外，或 ③ 无任何授权）
+     */
+    @SuppressWarnings("unchecked")
+    private Object[] configRowOrDeny(long kbId, LoginUser user) {
+        requireKb(kbId);
+        DataScopeService.ScopeCondition cond = dataScopeService.kbVisibility(user);
+        // ⚠️ 拼接处保留前导空格：text block **会剥掉每行行尾空白**，
+        // 写成 `... and """ + cond.sql()` 会拼出 `andEXISTS`（语法错，已实测踩到）。
+        Query query = entityManager.createNativeQuery(CONFIG_SELECT + " " + cond.sql());
+        query.setParameter("id", kbId);
+        cond.params().forEach(query::setParameter);
+
+        List<Object[]> rows = query.getResultList();
+        if (rows.isEmpty()) {
+            throw BizException.of(ErrorCode.KB_ACCESS_DENIED);
+        }
+        return rows.getFirst();
+    }
+
+    // ==================== 内部：diff ====================
+
+    /**
+     * 一条字段变更：展示用标签 + 前后值（已是展示文本）+ 是否使索引失效。
+     */
+    private record ConfigChange(String label, String before, String after, boolean rebuild) {
+    }
+
+    /**
+     * 逐字段比对并产出变更清单。顺序 = 前端 {@code TAB_FIELDS} 的拼接顺序
+     * （basic → split → table → tags），标签逐条对齐前端 {@code FIELD_LABEL}。
+     *
+     * <p><b>值与"是否变了"都按展示文本比较</b>，与前端 {@code dirty()}（用 {@code fmt()} 比）
+     * 同口径。代价：纯空白差异（描述尾部多个空格）不算变更 —— 换来的是"审计里的变更条数"
+     * 与"页面上高亮的字段个数"永远一致，不会一边说 3 项、一边只高亮 2 个。
+     */
+    private List<ConfigChange> diffConfig(Object[] row, KbDtos.KbConfigForm form,
+                                          KbDtos.SplitPolicy split, KbDtos.TablePolicy table,
+                                          KbDtos.RetrievalConfig retrieval, SecretLevel secret,
+                                          List<String> oldRoles, List<String> newRoles) {
+        KbDtos.SplitPolicy oldSplit = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+        KbDtos.TablePolicy oldTable = parseOr(row[14], KbDtos.TablePolicy.class, defaultTablePolicy());
+        KbDtos.RetrievalConfig oldRetrieval =
+                parseOr(row[15], KbDtos.RetrievalConfig.class, defaultRetrievalConfig());
+
+        List<ConfigChange> out = new ArrayList<>();
+        // ---------- 基础信息（不影响索引）----------
+        add(out, "知识库名称", (String) row[1], form.name().trim(), false);
+        add(out, "描述", (String) row[3], blankToNull(form.description()), false);
+        add(out, "归属部门", departmentName(((Number) row[4]).longValue()),
+                departmentName(form.deptId()), false);
+
+        // ---------- 分片 + 检索（前端 TAB_FIELDS.split，**14 个重建字段里的前 8 个**）----------
+        add(out, "分片策略预设", presetText(oldSplit.preset()), presetText(split.preset()), true);
+        add(out, "chunkSize", oldSplit.chunkSize(), split.chunkSize(), true);
+        add(out, "overlap", oldSplit.overlap(), split.overlap(), true);
+        add(out, "语义切分", oldSplit.semanticSplit(), split.semanticSplit(), true);
+        add(out, "检索方式", modeText(oldRetrieval.mode()), modeText(retrieval.mode()), true);
+        add(out, "召回阈值", oldRetrieval.recallThreshold(), retrieval.recallThreshold(), true);
+        add(out, "Rerank 保留数", oldRetrieval.rerankTopK(), retrieval.rerankTopK(), true);
+        add(out, "Rerank 开关", oldRetrieval.rerankEnabled(), retrieval.rerankEnabled(), true);
+
+        // ---------- 表格处理（前端 TAB_FIELDS.table，**后 6 个重建字段**）----------
+        add(out, "双表示", oldTable.dualRepresentation(), table.dualRepresentation(), true);
+        add(out, "表头重复", oldTable.repeatHeader(), table.repeatHeader(), true);
+        add(out, "跨页表格合并", oldTable.mergeCrossPage(), table.mergeCrossPage(), true);
+        add(out, "扫描件表格识别", oldTable.ocrTable(), table.ocrTable(), true);
+        add(out, "回表行数上限", oldTable.rowLimit(), table.rowLimit(), true);
+        add(out, "命中行窗口", oldTable.rowWindow(), table.rowWindow(), true);
+
+        // ---------- 治理标签（不影响索引）----------
+        add(out, "密级", secretText((String) row[10]), secretText(secret.name()), false);
+        add(out, "业务域", (String) row[11], form.businessDomain(), false);
+        add(out, "自定义标签", parseTags((String) row[12]), form.customTags(), false);
+        // 可见角色排最后：它是本接口唯一会改授权的字段，也是本动作标高危的原因
+        add(out, "可见角色", roleCodesOrdered(oldRoles), roleCodesOrdered(newRoles), false);
+        return out;
+    }
+
+    /** 展示文本相同即视为未变；{@code null} 交给 {@code AuditChange} 规范化成 {@code —}。 */
+    private static void add(List<ConfigChange> out, String label, Object before, Object after,
+                            boolean rebuild) {
+        String b = text(before);
+        String a = text(after);
+        if (Objects.equals(b, a)) {
+            return;
+        }
+        out.add(new ConfigChange(label, b, a, rebuild));
+    }
+
+    /** 值 → 展示文本。布尔/列表/数字都在这里统一，避免各处各写一套格式。 */
+    private static String text(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Boolean flag) {
+            return flag ? "开启" : "关闭";
+        }
+        if (value instanceof List<?> list) {
+            return list.isEmpty()
+                    ? null
+                    : String.join("、", list.stream().map(String::valueOf).toList());
+        }
+        return String.valueOf(value);
+    }
+
+    /**
+     * 预设 id → 展示名。
+     *
+     * <p>用 {@code KbPresets} 而不是 {@code SplitPreset} 枚举：页面下拉渲染的是前者
+     * （{@code KbPresets} 的标签逐条对齐 {@code mock/data.ts} 的 SPLIT_PRESETS，
+     * 与枚举那份确实不同字 —— "通用文档" vs "通用"）。
+     *
+     * <p><b>{@code CUSTOM} 必须特判成「自定义」</b>：它不是内置预设，
+     * {@link KbPresets#find} 对它返 {@code null}，直接兜底会把审计明细写成英文 {@code CUSTOM}，
+     * 而页面在同一位置显示的是中文「自定义」—— 同一条变更两处文案不一致。
+     * 口径与前端 {@code KbDetailView#presetLabel} 逐字一致。
+     *
+     * <p>真正未知的 id 原样返回：宁可让人看见一个陌生的英文 id，
+     * 也不要显示成"自定义"（那会掩盖脏数据）。
+     */
+    private static String presetText(String id) {
+        if (id == null || id.isBlank()) {
+            return null;
+        }
+        if ("CUSTOM".equals(id)) {
+            return "自定义";
+        }
+        KbPresets.Preset preset = KbPresets.find(id);
+        return preset == null ? id : preset.label();
+    }
+
+    /** 密级 → 中文（{@code SecretLevel.label}，与前端 {@code SECRET_LABEL} 逐字一致）。 */
+    private static String secretText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return SecretLevel.valueOf(raw).getLabel();
+        } catch (IllegalArgumentException ex) {
+            return raw;
+        }
+    }
+
+    /** 检索方式 → 中文（{@code RetrievalMode.label}，与前端 {@code RETRIEVAL_LABEL} 逐字一致）。 */
+    private static String modeText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return RetrievalMode.valueOf(raw).getLabel();
+        } catch (IllegalArgumentException ex) {
+            return raw;
+        }
+    }
+
+    /** 角色 code 集合 → 按**角色 id** 排序的名字串。两侧同一排序，比较才不会因顺序误报变更。 */
+    @SuppressWarnings("unchecked")
+    private String roleCodesOrdered(List<String> codes) {
+        if (codes == null || codes.isEmpty()) {
+            return null;
+        }
+        List<String> names = entityManager.createNativeQuery(
+                        "select name from sys_role where code in (:codes) order by id")
+                .setParameter("codes", new ArrayList<>(codes))
+                .getResultList();
+        return names.isEmpty() ? null : String.join("、", names);
+    }
+
+    // ==================== 内部：校验（写侧）====================
+
+    /**
+     * 分片几何校验：{@code 0 <= overlap < chunkSize}。
+     *
+     * <p>不成立时"有效步长"（{@code chunkSize - overlap}）为零或负，分片会退化 ——
+     * 估算侧会除零、重建侧会无限切片。前端表单也限制了这个区间，这里是**服务端兜底**。
+     *
+     * <p>⚠️ {@code create} 尚未接这道校验（B1 已上线，本批不动它的行为），
+     * 已登记为遗留 —— 不等价之处在于：创建能存进一个"改的时候会被拒"的配置。
+     */
+    private KbDtos.SplitPolicy requireValidSplitPolicy(KbDtos.SplitPolicy policy) {
+        KbDtos.SplitPolicy value = policy == null ? defaultSplitPolicy() : policy;
+        if (value.chunkSize() <= 0) {
+            throw new BizException(ErrorCode.PARAM_INVALID, "chunkSize 必须大于 0");
+        }
+        if (value.overlap() < 0 || value.overlap() >= value.chunkSize()) {
+            throw new BizException(ErrorCode.PARAM_INVALID,
+                    "overlap 必须大于等于 0 且小于 chunkSize（当前 " + value.overlap() + " / " + value.chunkSize() + "）");
+        }
+        return value;
+    }
+
+    /** 可见角色归一化：**超管恒在**（与创建同口径，否则保存一次就把超管挤出去了）。 */
+    private static List<String> normalizeRoles(List<String> roles) {
+        Set<String> codes = new LinkedHashSet<>();
+        codes.add("SUPER_ADMIN");
+        if (roles != null) {
+            roles.stream().filter(code -> code != null && !code.isBlank()).forEach(codes::add);
+        }
+        return new ArrayList<>(codes);
+    }
+
+    /** 空串归 {@code null}：V9 的 {@code description} 可空，存空串会与 NULL 两个语义并存。 */
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    // ==================== 内部：MinIO 用量 ====================
+
+    /**
+     * MinIO 桶内对象总字节数；失败返 {@code -1}（展示成 {@code —}）。
+     *
+     * <p>失败**不抛错**：配额是辅助信息，MinIO 抖动不该把下载页整块打不开 ——
+     * 与 {@code StorageStartupReporter} 的"失败不阻断"同口径。
+     *
+     * <p>逐对象累加是 O(n)。当前只在页面挂载时调一次，且桶里还没有文档（返 0）；
+     * 等 S4 文档量上来若成瓶颈，改为在 {@code sys_kb} 上累加字节数（B2 计划 §5）。
+     */
+    private long minioUsedBytes() {
+        long total = 0;
+        try {
+            Iterable<Result<Item>> objects = minioClient.listObjects(
+                    ListObjectsArgs.builder().bucket(minioBucket).recursive(true).build());
+            for (Result<Item> result : objects) {
+                total += result.get().size();
+            }
+            return total;
+        } catch (Exception ex) {
+            log.warn("MinIO 桶用量统计失败，配额卡 used 显示为 —：{}", ex.toString());
+            return -1L;
+        }
+    }
+
+    /** 字节数 → 展示串（前端契约是带单位的字符串，如 {@code "2.4 GB"}）。 */
+    private static String humanSize(long bytes) {
+        if (bytes < 0) {
+            return "—";
+        }
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        String[] units = {"KB", "MB", "GB", "TB"};
+        double value = bytes;
+        int unit = -1;
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024;
+            unit++;
+        }
+        return String.format("%.1f %s", value, units[unit]);
+    }
+
+    private static KbDtos.ParseConfigGroup group(String label, String value,
+                                                 boolean locked, boolean warning, boolean enabled) {
+        return new KbDtos.ParseConfigGroup(label, value, locked, warning, enabled);
+    }
+
+    /**
+     * TINYINT(1) → 布尔。
+     *
+     * <p><b>不能直接 {@code ((Number) raw).intValue() != 0}</b>：MySQL 的
+     * {@code TINYINT(1)} 在 JDBC 里映射成 {@link Boolean}（不是 Integer），
+     * 强转 {@code Number} 会 {@code ClassCastException} → 9999。
+     * 与 {@code DataScopeService#kbLevel} 那条"count(*) 返回 BIGINT 不是 BOOLEAN"
+     * 是同一类坑、方向相反：那边是 Number 不是 Boolean，这边是 Boolean 不是 Number。
+     */
+    private static boolean asBoolean(Object raw) {
+        if (raw instanceof Boolean flag) {
+            return flag;
+        }
+        if (raw instanceof Number number) {
+            return number.intValue() != 0;
+        }
+        return false;
     }
 
     // ==================== 内部：校验 ====================
@@ -328,6 +860,25 @@ public class KbService {
     }
 
     // ==================== 内部：授权写入 ====================
+
+    /**
+     * 全量替换该库的**角色**授权行（额外授权用户不在此列 —— 那是
+     * {@code KbGrantService#save} 的 extraUserIds，设置页不管）。
+     *
+     * <p>为什么是"删光重建"而不是逐行 diff：可见角色是**整体读写单元**，
+     * 与 {@code KbGrantService} 的全量替换同型；逐行 diff 在"档位由角色 code 推导"
+     * 的模型下反而更容易漂移（同一个角色换个档位要 update 还是 delete+insert 没有定论）。
+     *
+     * <p>⚠️ 会重写 {@code created_at}，所以调用方**必须先确认角色集真的变了**
+     * （{@code saveConfig} 里用 Set 比较过），否则每次保存都刷掉授权行的创建时间。
+     */
+    private void replaceGrants(long kbId, List<String> roleCodes, LocalDateTime now) {
+        entityManager.createNativeQuery(
+                        "delete from sys_kb_grant where kb_id = :id and principal_type = 'ROLE'")
+                .setParameter("id", kbId)
+                .executeUpdate();
+        writeGrants(kbId, roleCodes, now);
+    }
 
     /**
      * 按可见角色写入 {@code sys_kb_grant}（档位映射 = B1 计划 §3.4 假设 1）。
