@@ -8,7 +8,6 @@ import type {
   ChatSessionItem,
   ChunkInfo,
   ChunkStat,
-  ConfigDiffItem,
   DeptUsage,
   DocMeta,
   DocVersion,
@@ -139,6 +138,12 @@ export const kbApi = {
        * `ACTIVE|BUILDING|PAUSED` 不是一个词表（W1）。
        */
       statusLabel: string
+      /**
+       * 配置已改、索引未重建（T-404 置位，S4 的重建索引清除）。
+       * ⚠️ 它**不是** `status` 的一个取值：`status` 描述"索引过程"（READY/INDEXING），
+       * 本字段描述"配置条件"（脏了/干净），两者可以同时成立。
+       */
+      reindexRequired: boolean
       createdAt: string
       updatedAt: string
       visibleRoles: string[]
@@ -149,9 +154,13 @@ export const kbApi = {
     }>(`/kb/${id}/config`),
   saveConfig: (id: number | string, config: KbConfigForm) =>
     http.put<{ saved: boolean; needReindex: boolean; updatedAt: string }>(`/kb/${id}/config`, { config }),
-  /** 变更影响预估（docCount / chunkBefore / chunkAfter / estimateMinutes / estimateTokens） */
-  impact: (id: number | string, changes: ConfigDiffItem[]) =>
-    http.post<ReindexImpact>(`/kb/${id}/config/impact`, { changes }),
+  /**
+   * 变更影响预估。
+   * ⚠️ 提交的是**完整表单**而不是 diff 列表：服务端要用与保存完全同一段 diff 代码
+   * 算出变了哪些字段，估算才和真实保存一致（只发展示后的中文串，服务端得先解析中文）。
+   */
+  impact: (id: number | string, config: KbConfigForm) =>
+    http.post<ReindexImpact>(`/kb/${id}/config/impact`, { config }),
   reindex: (id: number | string, mode: 'IMMEDIATE' | 'SCHEDULED') =>
     http.post<{ taskId: string; mode: string; status: string; scheduledAt: string | null }>(`/kb/${id}/reindex`, { mode }),
   clearIndex: (id: number | string) => http.delete<{ cleared: boolean }>(`/kb/${id}/index`),

@@ -236,7 +236,9 @@ async function openSaveConfirm() {
   impactLoading.value = true
   impact.value = null
   try {
-    impact.value = await kbApi.impact(kbId.value, diffList.value)
+    // 发**完整表单**（不是 diff 列表）：服务端用与保存同一段代码算变了哪些字段，
+    // 估算才和真实保存一致（发中文展示串的话服务端得反推 chunkSize）
+    impact.value = await kbApi.impact(kbId.value, form.value)
   } finally {
     impactLoading.value = false
   }
