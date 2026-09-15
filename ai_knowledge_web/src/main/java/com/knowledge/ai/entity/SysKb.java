@@ -17,8 +17,8 @@ import java.time.LocalDateTime;
  * 知识库（表 {@code sys_kb}）。
  *
  * <p>字段口径对齐 {@code V7__s2_kb_skeleton_and_grants.sql}（骨架 + 授权种子）、
- * {@code V8__s3_kb_owner.sql}（创建人）与 {@code V9__s3_kb_governance_and_policies.sql}
- * （治理标签 + 三类策略）。
+ * {@code V8__s3_kb_owner.sql}（创建人）、{@code V9__s3_kb_governance_and_policies.sql}
+ * （治理标签 + 三类策略）与 {@code V10__s3_kb_reindex_required.sql}（待重建标记）。
  *
  * <p><b>本实体存在的首要作用是让 {@code ddl-auto: validate} 生效</b>：在这之前
  * {@code sys_kb} 没有对应的实体，Hibernate 启动时**根本不看这张表** ——
@@ -80,6 +80,23 @@ public class SysKb {
      */
     @Column(name = "status", length = 16, nullable = false)
     private String status;
+
+    /**
+     * 配置已改、索引未重建（{@code V10} 新增）。
+     *
+     * <p>由 {@code T-404}（保存配置）置 <b>1</b>，由 S4 的 {@code T-406}（重建索引）
+     * 完成后置回 <b>0</b> —— 本批只负责写，清除在下一批。
+     *
+     * <p><b>刻意独立于 {@link #status}，不扩它的词表</b>：{@code status} 描述的是
+     * "索引**过程**"（{@code READY} / {@code INDEXING}），本列描述的是"配置**条件**"
+     * （脏了 / 干净）。两者可以同时成立 —— 正在索引的库又被改了一次配置，就是
+     * {@code INDEXING} + {@code reindexRequired=true}。并进一列会让这个组合无法表达。
+     *
+     * <p>用 {@code boolean} 而不是 {@link Boolean}：列是 {@code NOT NULL DEFAULT 0}，
+     * 不存在"未设置"态；用包装类会逼每个消费点去决定 {@code null} 算哪边。
+     */
+    @Column(name = "reindex_required", nullable = false)
+    private boolean reindexRequired;
 
     /** 创建人。演示数据可能为 {@code NULL}（无对应账号），**无外键**（见类注释）。 */
     @Column(name = "owner_id")
