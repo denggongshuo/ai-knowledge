@@ -54,6 +54,8 @@ const PROBE = { account: 'admin', password: 'Admin@123' }
 /** 探针库的固定编码（自清锚点，必须匹配 ^kb_[a-z0-9_]{2,}$）。 */
 const PROBE_CODE = 'kb_e2e_probe'
 const PROBE_NAME = 'B1 页面级探针库'
+/** B2 保存配置用的描述值（判据：只改描述 → needReindex 必须为 false）。 */
+const SAVE_DESC = 'B2 保存探针：只改描述不应触发重建'
 
 const steps = []
 function check(ok, label, detail = '') {
@@ -226,6 +228,23 @@ window.__t = {
     return true
   },
   box: () => [...document.querySelectorAll('.el-message-box')].find((b) => b.offsetParent !== null) || null,
+  /**
+   * 当前**可见**的 el-dialog。
+   * ⚠️ 必须按可见性（offsetParent）判定，不能取列表末项：Element Plus 的 dialog
+   * 关闭后有淡出期，末项可能还是上一个已经关掉的框（B1 在 ElMessageBox 上踩过同型）。
+   */
+  dialog: () => [...document.querySelectorAll('.el-dialog')].find((d) => d.offsetParent !== null) || null,
+  /** 在当前可见 dialog 的 footer 里点按钮（按文本），避开页面上同名按钮 */
+  clickInDialog: (text) => {
+    const d = window.__t.dialog()
+    if (!d) throw new Error('当前没有可见的 dialog')
+    const all = [...d.querySelectorAll('button, .el-button')]
+    const b = all.find((x) => window.__t.norm(x.textContent) === window.__t.norm(text))
+      || all.find((x) => window.__t.norm(x.textContent).includes(window.__t.norm(text)))
+    if (!b) throw new Error('dialog 里找不到按钮：' + text + '（现有：' + all.map((x) => window.__t.norm(x.textContent)).join('/') + '）')
+    b.click()
+    return true
+  },
 }
 'ok'
 `
@@ -422,7 +441,11 @@ async function main() {
     check(cfg.config?.splitPolicy?.preset === 'CONTRACT', '回显的预设与向导提交值一致', `preset=${cfg.config?.splitPolicy?.preset}`)
     check(cfg.embedding?.locked === true, 'G3-2：设置页嵌入模型只读', `locked=${cfg.embedding?.locked}`)
 
-    await waitFor(`window.__t.norm(document.querySelector('.page-desc')?.textContent).length > 0`, { label: '设置页页头渲染' })
+    // ⚠️ 必须等**被断言的那个元素本身**出现，不能等 `.page-desc` ——
+    //    页头在 `v-if="form"` 之外，页面一挂载就有；而表单要等 config + depts/tree + roles
+    //    三个接口都回来才渲染。等页头等于"接口还没回来就去读表单里的 tag"，读到空字符串。
+    //    （B1 那版就是等页头的，本批跑两次都复现 —— 是断言竞态，不是页面缺陷。）
+    await waitFor(`!!document.querySelector('.detail-page .el-form-item .el-tag')`, { label: '设置页表单渲染（含状态标签）' })
     const statusTag = await evaluate(`window.__t.text('.detail-page .el-form-item .el-tag')`)
     check(
       statusTag === '已就绪',
@@ -437,15 +460,134 @@ async function main() {
     const shot3 = await send('Page.captureScreenshot', { format: 'png' })
     writeFileSync(`${OUT_DIR}/kb-detail.png`, Buffer.from(shot3.data, 'base64'))
 
+    // ==================== 3.5 保存配置：只改描述（T-404 · needReindex=false） ====================
+    await evaluate(`window.__t.clickText('基本设置')`)
+    await evaluate(`window.__t.fillByLabel('描述', ${JSON.stringify(SAVE_DESC)})`)
+    await waitFor(`window.__t.text('.sb-actions .el-button:last-child') === '保存修改'`, { label: '保存栏切到「保存修改」' })
+    const saveBtnSoft = await evaluate(`window.__t.text('.sb-actions .el-button:last-child')`)
+    check(
+      saveBtnSoft === '保存修改',
+      'T-404：只改描述时保存按钮是「保存修改」（needReindex=false，不禁用为重建入口）',
+      `按钮=${saveBtnSoft}`,
+    )
+
+    await evaluate(`window.__t.clickText('保存修改')`)
+    await waitFor(`!!window.__t.dialog()`, { label: '确认配置变更弹窗' })
+    const impactSoft = await waitForApi((e) => e.url.includes(`/api/kb/${createdId}/config/impact`), { label: 'POST /config/impact' })
+    check(true, 'T-405：保存前调用 POST /api/kb/:id/config/impact', assertBizOk(impactSoft, 'impact'))
+    const impactSoftBody = JSON.parse(impactSoft.postData ?? '{}')
+    check(
+      impactSoftBody.config?.splitPolicy?.chunkSize !== undefined,
+      'T-405：预估请求体带**完整表单**（服务端要用与保存同一段 diff，不能只发中文展示串）',
+      `config.splitPolicy.chunkSize=${impactSoftBody.config?.splitPolicy?.chunkSize}`,
+    )
+    check(impactSoftBody.changes === undefined, 'T-405：预估请求体**不再**发 changes 列表（旧契约已废弃）', '无 changes 字段')
+    const softDialogText = await evaluate(`window.__t.dialog().textContent`)
+    check(
+      !softDialogText.includes('重建影响'),
+      'T-404：不改分片/表格时弹窗**不显示**「重建影响」区块（判成需要重建会让用户白等）',
+      `含「重建影响」=${softDialogText.includes('重建影响')}`,
+    )
+
+    await evaluate(`window.__t.clickInDialog('确认保存')`)
+    const saveSoftEntry = await waitForApi((e) => e.url.includes(`/api/kb/${createdId}/config`) && e.method === 'PUT', { label: 'PUT /config' })
+    check(true, 'T-404：确认保存走通真写接口 PUT /api/kb/:id/config', assertBizOk(saveSoftEntry, 'PUT config'))
+    const savedSoft = JSON.parse(saveSoftEntry.body ?? '{}').data ?? {}
+    check(savedSoft.saved === true && savedSoft.needReindex === false, 'T-404：只改描述时服务端判 needReindex=false', `needReindex=${savedSoft.needReindex}`)
+    check(
+      !/\/reindex/.test(ledger.map((e) => e.url).join(' ')),
+      'T-404：needReindex=false 时**不**调 /reindex（少一次无谓的重建请求）',
+      '台账中无 reindex',
+    )
+
+    // ==================== 3.6 保存配置：改 chunkSize（影响预估来自真后端） ====================
+    await evaluate(`window.__t.clickText('分片与索引')`)
+    await evaluate(`window.__t.fillByLabel('chunkSize', '256')`)
+    await waitFor(`window.__t.text('.sb-actions .el-button:last-child') === '保存并重建索引'`, { label: '按钮切到重建态' })
+    const saveBtnHard = await evaluate(`window.__t.text('.sb-actions .el-button:last-child')`)
+    check(saveBtnHard === '保存并重建索引', 'T-404：改 chunkSize 后按钮变成「保存并重建索引」（本地 needReindex=true）', `按钮=${saveBtnHard}`)
+
+    await evaluate(`window.__t.clickText('保存并重建索引')`)
+    await waitFor(`!!window.__t.dialog()`, { label: '第二次确认弹窗' })
+    const impactHard = await waitForApi((e) => e.url.includes(`/api/kb/${createdId}/config/impact`) && e !== impactSoft, { label: '第二次 impact' })
+    const impactHardData = JSON.parse(impactHard.body ?? '{}').data ?? {}
+    check(
+      Number(impactHardData.chunkBefore) === 0 && Number(impactHardData.chunkAfter) === 0,
+      'T-405：新库无文档 → chunkBefore/chunkAfter 均为 0（不得硬凑成 1，那是假数据）',
+      `before=${impactHardData.chunkBefore} after=${impactHardData.chunkAfter}`,
+    )
+    check(
+      Number(impactHardData.estimateMinutes) === 0 && Number(impactHardData.estimateTokens) === 0,
+      'T-405：空库的耗时 / tokens 估算同为 0（估算是派生的，不能脱离分片数独立取值）',
+      `分钟=${impactHardData.estimateMinutes} tokens=${impactHardData.estimateTokens}`,
+    )
+    await waitFor(`window.__t.norm(window.__t.dialog()?.textContent).includes('重建影响')`, { label: '弹窗渲染重建影响区块' })
+    const hardDialogText = await evaluate(`window.__t.norm(window.__t.dialog().textContent)`)
+    check(
+      hardDialogText.includes('需重新切分与向量化的文档') && hardDialogText.includes('预计分片数变化'),
+      'T-405：弹窗的「重建影响」四行由真后端数据渲染（不是硬编码示例值）',
+      hardDialogText.slice(0, 90),
+    )
+    const shotImpact = await send('Page.captureScreenshot', { format: 'png' })
+    writeFileSync(`${OUT_DIR}/kb-save-impact.png`, Buffer.from(shotImpact.data, 'base64'))
+
+    await evaluate(`window.__t.clickInDialog('确认保存')`)
+    const saveHardEntry = await waitForApi((e) => e.url.includes(`/api/kb/${createdId}/config`) && e.method === 'PUT' && e !== saveSoftEntry, { label: '第二次 PUT' })
+    check(true, 'T-404：改 chunkSize 的保存同样走通真后端', assertBizOk(saveHardEntry, 'PUT config (rebuild)'))
+    const savedHard = JSON.parse(saveHardEntry.body ?? '{}').data ?? {}
+    check(savedHard.needReindex === true, 'T-404：改 chunkSize → 服务端判 needReindex=true', `needReindex=${savedHard.needReindex}`)
+
+    // 服务端已置位 reindex_required，且**改描述那次不会把它清零**（粘性）
+    const dirtyRow = mysqlScalar(`select reindex_required from sys_kb where id = ${createdId}`)
+    check(String(dirtyRow) === '1', 'T-404：reindex_required 已落库（S4 的 T-406 据此找待重建的库）', `reindex_required=${dirtyRow}`)
+
+    // ⚠️ 已知偏差（W-c，登记为观察项不计成败）：page 随后会调 /reindex，而它在 S4 才实现。
+    //    T-3C2 的兜底会把它降级成提示（不静默），但 confirmSave 的 catch 会顺手弹
+    //    「保存失败」—— **配置其实已经保存成功**。这是 B2 的已知断面，S4 落地 T-406 后自然消失。
+    observe(
+      'W-c：保存并重建的最后一步 /reindex 尚未实现（S4 的 T-406）',
+      `台账含 reindex=${/\/reindex/.test(ledger.map((e) => e.url).join(' '))}`,
+    )
+
+    // ==================== 3.7 上传页四栏（T-411） ====================
+    await navigate(`/kb/${createdId}/upload`)
+    await waitFor(`!!document.querySelector('.four-col')`, { label: '上传页四栏渲染', timeout: 20000 })
+    await evaluate(PAGE_TOOLS)
+    const parseEntry = await waitForApi((e) => e.url.includes(`/api/kb/${createdId}/parse-config`), { label: 'GET /parse-config' })
+    check(true, 'T-411：上传页调用 GET /api/kb/:id/parse-config', assertBizOk(parseEntry, 'parse-config'))
+    const parseData = JSON.parse(parseEntry.body ?? '{}').data ?? {}
+    check(
+      ['split', 'table', 'image', 'enhance'].every((k) => Array.isArray(parseData[k]) && parseData[k].length > 0),
+      'T-411：四栏（分片 / 表格 / 图片 / 增强）全部非空',
+      `行数=${['split', 'table', 'image', 'enhance'].map((k) => parseData[k]?.length).join('/')}`,
+    )
+    const presetRow = (parseData.split ?? []).find((g) => g.label === '策略预设')?.value
+    check(
+      presetRow === '自定义',
+      'T-411：预设行跟随该库配置（向导选了 CONTRACT 又手改了 chunkSize → CUSTOM → 「自定义」）',
+      `策略预设=${presetRow}`,
+    )
+    const sizeRow = (parseData.split ?? []).find((g) => g.label === 'chunkSize / overlap')?.value
+    check(sizeRow === '256 / 48 tokens', 'T-411：chunkSize/overlap 行取自刚落库的值（256 / 48）', `chunkSize行=${sizeRow}`)
+    const fourColText = await evaluate(`window.__t.norm(document.querySelector('.four-col').textContent)`)
+    check(
+      fourColText.includes('256 / 48 tokens') && fourColText.includes('策略预设'),
+      'T-411：四栏真的渲染到页面上（接口有数据 ≠ 页面渲染出来）',
+      fourColText.slice(0, 80),
+    )
+    const shotParse = await send('Page.captureScreenshot', { format: 'png' })
+    writeFileSync(`${OUT_DIR}/kb-upload-parse.png`, Buffer.from(shotParse.data, 'base64'))
+
     // ==================== 4. console 与溯源 ====================
     const bad = consoleMsgs.filter((m) => /Failed to resolve component|Unhandled error|TypeError|is not a function/.test(m.text))
     check(bad.length === 0, 'KB 三页 console 无未捕获异常', bad.map((b) => b.text).join(' | ') || '—')
-    const keyEntries = [listEntry, presetsEntry, createEntry, configEntry]
+    const keyEntries = [listEntry, presetsEntry, createEntry, configEntry,
+      impactSoft, saveSoftEntry, impactHard, saveHardEntry, parseEntry]
     const missingTrace = keyEntries.filter((e) => !headerOf(e.headers, 'x-trace-id'))
     check(missingTrace.length === 0, '关键 /api 响应均带 x-trace-id（证明确为真后端）', `${keyEntries.length - missingTrace.length}/${keyEntries.length}`)
 
     console.log(`\n接口台账：\n${ledger.map((e) => `  ${e.method.padEnd(6)} ${e.url.replace(BASE, '')} → ${e.status}`).join('\n')}`)
-    console.log(`截图：${OUT_DIR}/{kb-list,kb-create-done,kb-detail}.png`)
+    console.log(`截图：${OUT_DIR}/{kb-list,kb-create-done,kb-detail,kb-save-impact,kb-upload-parse}.png`)
   } finally {
     await sleep(200)
     try {
