@@ -245,11 +245,22 @@ export interface AuditLogDetail extends AuditLog {
   apiPath: string
   costMs: number
   userAgent: string
-  affectedUsers: number
-  /** 变更前后对照（权限/配置类日志） */
-  changes?: { label: string; before: string; after: string }[]
+  /**
+   * 受影响人数。未登记时为 `null` —— 与 `0` 语义不同（`0` = 确实没人受影响，
+   * `null` = 这类动作本就没有影响面）。页面按真值判断是否渲染该行。
+   */
+  affectedUsers: number | null
+  /** 变更前后对照（权限/配置类日志）。无变更时为 `null`，**不是空数组**。 */
+  changes?: { label: string; before: string; after: string }[] | null
   note?: string
-  roleName?: string
+  /**
+   * 受影响**角色名**（如「访客」），不是操作人的角色码。
+   *
+   * ⚠️ 与后端 `sys_audit_log.role_name`（操作人角色码）**语义相反**：
+   * 本字段来自 `affected_role` 列。为 `null` 时页面会自动省略
+   * 「（该角色下全部成员）」与「查看该角色当前权限」按钮。
+   */
+  roleName?: string | null
 }
 
 // ==================== 模型配置（V2：四类模型 · 多配置 · 可切换） ====================

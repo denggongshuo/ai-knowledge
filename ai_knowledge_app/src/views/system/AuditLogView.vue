@@ -3,36 +3,22 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Download, Search, Calendar, Warning, UserFilled, Close, Document, CopyDocument, Right } from '@element-plus/icons-vue'
 import { sysApi } from '@/api'
+import type { AuditLog, AuditLogDetail } from '@/types'
 
 // ---------------- 类型 ----------------
-interface AuditRow {
-  id: number
-  time: string
-  operator: string
-  operatorName: string
-  module: string
-  action: string
-  riskLevel: 'HIGH' | 'NORMAL'
-  target: string
-  ip: string
-  result: 'SUCCESS' | 'FAILED'
-  failReason?: string
-}
-
-interface AuditDetail extends AuditRow {
-  logNo: string
-  traceId: string
-  apiPath: string
-  costMs: number
-  userAgent: string
-  affectedUsers: number
-  changes?: { label: string; before: string; after: string }[]
-  roleName?: string
-  note?: string
-}
+// 用 `types/index.ts` 的共享定义，**不在页面里另写一份** —— 页面私有 interface 与
+// `api/index.ts` 的泛型是两份会各自演化的声明，字段对不上时不报错、只是静默空白
+// （本仓 `AdminDtos` 的注释记过同型坑）。C 批把三个审计接口的泛型从
+// `Record<string, unknown>` 收成实名类型，这里顺势合并。
+type AuditRow = AuditLog
+type AuditDetail = AuditLogDetail
 
 // ---------------- 统计卡 ----------------
-const stats = reactive({ today: 247, highRisk: 12, activeUsers: 34, failed: 3 })
+/**
+ * 初值一律 0，**不是 mock 常数**（此前写死 247/12/34/3，接真后端前会闪一下假数）。
+ * 0 与"没查到"在视觉上等价，而假数会让运维以为系统里有那些操作。
+ */
+const stats = reactive({ today: 0, highRisk: 0, activeUsers: 0, failed: 0 })
 
 // ---------------- 筛选 ----------------
 const list = ref<AuditRow[]>([])
@@ -46,14 +32,49 @@ const resultFilter = ref('all')
 // 快捷筛选
 const quick = ref<'all' | 'high' | 'failed' | 'grant' | 'export' | 'model'>('all')
 
-const dateRange = ref<[string, string] | null>(['2026-09-10', '2026-09-11'])
+/**
+ * 日期范围：**默认今天**（需求 §4.4「时间范围必选且默认「今日」，避免一次扫全表」）。
+ *
+ * ⚠️ 曾经写死 `['2026-09-10','2026-09-11']` 且 `loadLogs()` 根本没发这两个参数 ——
+ * 页面显示的日期与列表内容毫无关系。两个 bug 是一体的：只改显示不改请求，
+ * 或只改请求不给默认值（范围为空 → 后端不筛 → 扫全表），都还是错的。
+ */
+const toDateStr = (d: Date) => {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+const dateRange = ref<[string, string] | null>([toDateStr(new Date()), toDateStr(new Date())])
 const shortcuts = [
   { text: '今日', value: () => { const d = new Date(); return [d, d] } },
   { text: '近 7 天', value: () => { const end = new Date(); const start = new Date(end.getTime() - 6 * 86400000); return [start, end] } },
   { text: '本月', value: () => { const d = new Date(); const start = new Date(d.getFullYear(), d.getMonth(), 1); return [start, d] } },
 ]
 
-const MODULES = ['认证', '用户', '授权', '知识库', '文档', '问答', '系统']
+/**
+ * 模块下拉。`审计` 必须在内 —— `T-304` 的「导出审计日志」写的是 `module='审计'`
+ * （`AuditModule.AUDIT`），不在下拉里就等于**写得进、筛不出**。
+ * 与后端 `AuditModule` 的取值集合逐字对应。
+ */
+const MODULES = ['认证', '用户', '授权', '知识库', '文档', '问答', '系统', '审计']
+
+/** 当前筛选条件（列表与导出**共用同一份**：页面筛了什么，导出的就是什么）。 */
+function currentFilters() {
+  const f: Record<string, string | undefined> = {
+    keyword: keyword.value || undefined,
+    module: moduleFilter.value === 'all' ? undefined : moduleFilter.value,
+    result: resultFilter.value === 'all' ? undefined : resultFilter.value,
+  }
+  if (quick.value === 'high') f.riskLevel = 'HIGH'
+  if (quick.value === 'failed') f.result = 'FAILED'
+  if (quick.value === 'grant') f.module = '授权'
+  if (quick.value === 'export') f.module = '问答'
+  if (quick.value === 'model') f.module = '系统'
+  if (dateRange.value?.[0]) f.startTime = dateRange.value[0]
+  if (dateRange.value?.[1]) f.endTime = dateRange.value[1]
+  return f
+}
 
 async function loadLogs() {
   loading.value = true
@@ -61,22 +82,21 @@ async function loadLogs() {
     const params: Record<string, string | number | undefined> = {
       page: page.value,
       size: pageSize.value,
-      keyword: keyword.value || undefined,
-      module: moduleFilter.value === 'all' ? undefined : moduleFilter.value,
-      result: resultFilter.value === 'all' ? undefined : resultFilter.value,
+      ...currentFilters(),
     }
-    if (quick.value === 'high') params.riskLevel = 'HIGH'
-    if (quick.value === 'failed') params.result = 'FAILED'
-    if (quick.value === 'grant') params.module = '授权'
-    if (quick.value === 'export') params.module = '问答'
-    if (quick.value === 'model') params.module = '系统'
-
     const res = await sysApi.auditLogs(params)
-    list.value = (res.list as unknown as AuditRow[]) ?? []
+    list.value = res.list ?? []
     total.value = res.total ?? 0
   } finally {
     loading.value = false
   }
+}
+
+/** 统计卡：与列表同一天（页面默认今日，两者口径必须一致，否则卡片与列表对不上）。 */
+async function loadStats() {
+  const day = dateRange.value?.[0]
+  const res = await sysApi.auditStats(day ? { date: day } : {})
+  Object.assign(stats, res ?? {})
 }
 
 function applyQuick(q: 'all' | 'high' | 'failed' | 'grant' | 'export' | 'model') {
@@ -90,6 +110,13 @@ function search() {
   loadLogs()
 }
 
+/** 日期变了：列表与统计卡一起刷新（卡片口径 = 所选区间的起始日）。 */
+function onDateChange() {
+  page.value = 1
+  loadStats()
+  loadLogs()
+}
+
 // ---------------- 详情抽屉 ----------------
 const drawerVisible = ref(false)
 const detail = ref<AuditDetail | null>(null)
@@ -100,7 +127,7 @@ async function openDetail(row: AuditRow) {
   detailLoading.value = true
   detail.value = null
   try {
-    detail.value = (await sysApi.auditLogDetail(row.id)) as unknown as AuditDetail
+    detail.value = await sysApi.auditLogDetail(row.id)
   } finally {
     detailLoading.value = false
   }
@@ -114,8 +141,22 @@ function copyTrace() {
   )
 }
 
-function exportLogs() {
-  ElMessage.success('已提交导出任务，完成后将通过通知中心提醒（本次导出本身也已计入审计日志）')
+/**
+ * 导出：真调用异步接口，**筛选条件原样带走**（页面筛了什么就导出什么）。
+ *
+ * 此前是个纯 toast（假成功）。交付通道那半截仍然是断的：任务轮询接口
+ * `GET /doc/tasks/{taskId}` 属 S4、通知中心属 S6 —— 所以提示语只说
+ * "已提交"，不承诺"完成后会通知你"。见 C 批计划 §3.3 / §9-3。
+ */
+const exporting = ref(false)
+async function exportLogs() {
+  exporting.value = true
+  try {
+    const res = await sysApi.auditExport(currentFilters())
+    ElMessage.success(res?.note || `导出任务已提交（taskId: ${res?.taskId ?? '-'}）`)
+  } finally {
+    exporting.value = false
+  }
 }
 
 // 变更统计
@@ -136,8 +177,7 @@ const MODULE_TAG: Record<string, string> = {
 }
 
 onMounted(async () => {
-  const res = await sysApi.auditStats()
-  Object.assign(stats, res ?? {})
+  await loadStats()
   loadLogs()
 })
 </script>
@@ -150,7 +190,7 @@ onMounted(async () => {
         <p class="page-desc">记录所有关键操作，不可编辑、不可删除，用于事后追溯与合规核查</p>
       </div>
       <div class="head-actions">
-        <el-button :icon="Download" @click="exportLogs">导出日志</el-button>
+        <el-button :icon="Download" :loading="exporting" @click="exportLogs">导出日志</el-button>
       </div>
     </div>
 

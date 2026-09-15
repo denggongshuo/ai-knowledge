@@ -359,11 +359,31 @@ export const sysApi = {
   /** 重建含图片 / 扫描件的文档 🚩 */
   rebuildImageDocs: () =>
     http.post<{ taskId: string; imageDocCount: number; imageCount: number; status: string }>('/system/model/rebuild-image-docs'),
+  /**
+   * 审计日志列表。
+   *
+   * ⚠️ `startTime` / `endTime` 由页面**必传**（需求 §4.4：时间范围必选、默认今日，
+   * 避免一次扫全表）。此前 `loadLogs()` 压根没发这两个参数，页面显示的日期范围
+   * 与列表内容毫无关系 —— C 批已修，改回时先看 `AuditLogView.vue#loadLogs`。
+   */
   auditLogs: (query: Record<string, string | number | undefined>) =>
-    http.get<PageResult<Record<string, unknown>>>('/audit/logs', query),
-  auditStats: () => http.get<{ today: number; highRisk: number; activeUsers: number; failed: number }>('/audit/stats'),
-  auditLogDetail: (id: number | string) => http.get<Record<string, unknown>>(`/audit/logs/${id}`),
-  auditExport: () => http.post<{ taskId: string; status: string }>('/audit/export'),
+    http.get<PageResult<AuditLog>>('/audit/logs', query),
+  auditStats: (query?: { date?: string }) =>
+    http.get<{ today: number; highRisk: number; activeUsers: number; failed: number }>('/audit/stats', query),
+  auditLogDetail: (id: number | string) => http.get<AuditLogDetail>(`/audit/logs/${id}`),
+  /**
+   * 导出审计日志（异步）。筛选条件原样带走 —— 页面筛了什么就导出什么，
+   * 传空对象表示全量导出（后端有 5 万行上限，超出会明确报错而不是静默截断）。
+   */
+  auditExport: (query?: {
+    startTime?: string
+    endTime?: string
+    module?: string
+    riskLevel?: string
+    result?: string
+    operator?: string
+    keyword?: string
+  }) => http.post<{ taskId: string; status: string; note: string }>('/audit/export', query ?? {}),
 }
 
 export { chatStream }
