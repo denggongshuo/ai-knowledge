@@ -95,6 +95,15 @@ public class DataScopeService {
      * <p>② 按 {@link #userScope} 同一套规则展开；但 {@code SELF} 在库维度上
      * **不加部门条件** —— 知识库不是用户创建的，「仅本人」对库的含义由 ③ 表达
      * （《01》§2.5：普通用户 = 仅已授权知识库 + 只读）。
+     *
+     * <p><b>④ 账号状态也是条件的一部分</b>（B2 的 W7，2026-09-15 加）：
+     * 需求《03》§4.1 /《04》§1.4 /《05》§1.5 三处逐字写着「『已禁用』不是禁止登录：
+     * 允许登录，但**无法访问任何知识库**」。把它做成**条件片段**而不是在业务方法里
+     * 另写一个 if，是因为后者会在新增查询点时被漏掉 —— 知识库的列表 / 单库读取 /
+     * 保存 / 解析配置全走本方法，一处生效即处处生效。
+     *
+     * <p>用子查询而不是 join：调用方把本片段**裸拼进 where**（{@link #userScope} 的
+     * 拼接约定），加 join 会改变调用方 from 子句的形态，那样的改动会波及每个调用点。
      */
     public ScopeCondition kbVisibility(LoginUser user) {
         DataScope scope = user.getDataScope() == null ? DataScope.SELF : user.getDataScope();
@@ -106,25 +115,35 @@ public class DataScopeService {
                         AND ((g.principal_type = 'ROLE' AND g.principal_id IN
                               (SELECT ur.role_id FROM sys_user_role ur WHERE ur.user_id = :ds_uid))
                              OR (g.principal_type = 'USER' AND g.principal_id = :ds_uid)))""";
+        // 停用账号恒不可见（W7）：与授权、部门两维**硬交**，不设豁免
+        String active = """
+                EXISTS (SELECT 1 FROM sys_user u WHERE u.id = :ds_uid AND u.status <> 'DISABLED')""";
+        String visible = granted + " AND " + active;
         return switch (scope) {
-            case ALL -> new ScopeCondition(granted, params);
+            case ALL -> new ScopeCondition(visible, params);
             case DEPT_AND_CHILD -> {
                 params.put("ds_dept", user.getDeptId());
-                yield new ScopeCondition(granted + """
+                yield new ScopeCondition(visible + """
                         AND (k.dept_id = :ds_dept OR k.dept_id IN
                              (SELECT id FROM sys_department WHERE parent_id = :ds_dept))""", params);
             }
             case DEPT -> {
                 params.put("ds_dept", user.getDeptId());
-                yield new ScopeCondition(granted + " AND k.dept_id = :ds_dept", params);
+                yield new ScopeCondition(visible + " AND k.dept_id = :ds_dept", params);
             }
-            case SELF, CUSTOM -> new ScopeCondition(granted, params);
+            case SELF, CUSTOM -> new ScopeCondition(visible, params);
         };
     }
 
     /**
      * 用户对某个知识库的**实际级别**（多角色取最高 + 额外授权参与折算）。
      * 返回 {@code NONE} = 无授权（对 ② 范围外的库即使有授权行也返回 NONE —— 求交不做豁免）。
+     *
+     * <p>⚠️ <b>本方法不含"账号已停用"那一维</b>（W7 只落进了 {@link #kbVisibility}）。
+     * 当前主代码里它**没有调用方**（{@code KbGrantService#currentLevel} 也无人调），
+     * 所以没有造成不一致；但**一旦有人拿它做授权判定，必须补上状态检查** ——
+     * 否则停用账号会在代码路径上"有级别"。补法与 {@code kbVisibility} 同型：
+     * {@code select count(*) from sys_user where id = :uid and status <> 'DISABLED'}。
      */
     public com.knowledge.ai.core.enums.KbGrantLevel kbLevel(LoginUser user, long kbId) {
         DataScope scope = user.getDataScope() == null ? DataScope.SELF : user.getDataScope();

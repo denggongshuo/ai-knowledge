@@ -95,10 +95,16 @@ public class UserService {
      * <p>出参直接复用 {@code AuthDtos.UserView}（登录响应里那个用户对象）——
      * 个人信息页要的字段是它的子集。头像额外换成**预签名 URL**：
      * 库里存的是对象名，直接返出去前端 {@code <img src>} 加载不了。
+     *
+     * <p>⚠️ <b>用 {@link #loadReadable} 而不是 {@link #load}</b>（B2 的 W7）：
+     * 本接口是**布局壳启动即调**的（{@code BasicLayout.vue:118}），而
+     * {@code ACCOUNT_DISABLED} 的 HTTP 状态是 **401** —— 前端 {@code request.ts:96}
+     * 见 401 就清 token 跳登录页。所以停用账号一旦被拦在这里，就是
+     * 「登录成功 → 立刻被踢回登录页 → 再登录」的死循环，"允许登录"根本兑现不了。
      */
     @Transactional(readOnly = true)
     public AuthDtos.UserView profile(Long userId) {
-        UserPrincipalAssembler.Principal principal = assembler.assemble(load(userId));
+        UserPrincipalAssembler.Principal principal = assembler.assemble(loadReadable(userId));
         AuthDtos.UserView view = assembler.toUserView(principal);
         return view.withAvatar(avatarStorage.presignedUrl(view.avatar()));
     }
@@ -338,7 +344,8 @@ public class UserService {
      */
     @Transactional(readOnly = true)
     public UserDtos.SecurityView security(Long userId) {
-        SysUser user = load(userId);
+        // 只读视图，同 profile() 的理由走 loadReadable（W7）
+        SysUser user = loadReadable(userId);
 
         List<SysLoginLog> recent = loginLogService.recentSuccess(userId, RECENT_DEVICE_LIMIT);
         List<UserDtos.RecentDeviceView> devices = new ArrayList<>(recent.size());
@@ -370,11 +377,29 @@ public class UserService {
 
     /** 取当前有效用户；不存在（被删）时按未登录处理，避免拿一个已删账号继续操作。 */
     private SysUser load(Long userId) {
-        SysUser user = userRepository.findByIdAndDeletedAtIsNull(userId)
-                .orElseThrow(() -> BizException.of(ErrorCode.USER_NOT_FOUND));
+        SysUser user = loadReadable(userId);
         if (user.getStatus() == UserStatus.DISABLED) {
             throw BizException.of(ErrorCode.ACCOUNT_DISABLED);
         }
         return user;
+    }
+
+    /**
+     * 取用户的**只读**视角：不因账号被停用而拒绝。
+     *
+     * <p><b>「停用」在本仓的语义 = 只读 + 知识库不可见</b>（B2 的 W7）。需求
+     * 《03》§4.1 /《04》§1.4 /《05》§1.5 只规定了三件事：允许登录、所有知识库不可见、
+     * 界面给出明确说明。第三条决定了账号必须**能留在应用里**看到那句说明 ——
+     * 而布局壳启动即调 {@code GET /user/profile}，把它拦掉就会因为
+     * {@code ACCOUNT_DISABLED} 是 401 而被前端清 token 踢回登录页，形成
+     * 「登录成功 → 立刻被踢 → 再登录」的死循环（见 {@link #profile} 的注释）。
+     *
+     * <p>所以自助服务按**读写分界**：{@code profile} / {@code security} 这类只读视图
+     * 走本方法；改资料 / 换头像 / 改密码 / 换绑手机邮箱这类**写**操作仍走
+     * {@link #load} 拦截。需求没有规定写侧，取"停用即不可改"是收紧的方向。
+     */
+    private SysUser loadReadable(Long userId) {
+        return userRepository.findByIdAndDeletedAtIsNull(userId)
+                .orElseThrow(() -> BizException.of(ErrorCode.USER_NOT_FOUND));
     }
 }

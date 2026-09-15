@@ -140,13 +140,22 @@ public class AuthService {
         }
 
         // ⑤ 状态校验：密码对了才检查状态 —— 否则"账号已停用"会变成账号存在性的探针
-        if (user.getStatus() == UserStatus.DISABLED) {
-            failLogin(user.getId(), account, ip, userAgent, "账号已停用");
-            throw BizException.of(ErrorCode.ACCOUNT_DISABLED);
-        }
+        //
+        // ⚠️ DISABLED **不再拦登录**（B2 的 W7）。需求三处逐字一致：
+        //    《03》§4.1 / 《04》§1.4 / 《05》§1.5 ——「『已禁用』不是禁止登录：
+        //    允许登录，但**无法访问任何知识库**，界面给出明确说明（不是『密码错误』）」。
+        //    可见性那一半落在 DataScopeService#kbVisibility（求交条件里加了一句账号状态），
+        //    所以这里放行不会漏 —— 停用账号登录后 /kb 恒为空。
+        //
+        //    刻意**不调 failLogin**：那会给账号累计失败次数并可能触发锁定（G1-5），
+        //    而"账号被停用"不是一次登录失败 —— 让停用账号把自己的账号锁掉是荒谬的。
         if (user.getStatus() == UserStatus.PENDING) {
             failLogin(user.getId(), account, ip, userAgent, "账号待激活");
             throw BizException.of(ErrorCode.ACCOUNT_PENDING);
+        }
+        if (user.getStatus() == UserStatus.DISABLED) {
+            log.info("停用账号登录成功（仅可浏览，知识库不可见）：userId={} username={}",
+                    user.getId(), user.getUsername());
         }
 
         // ⑥ 成功：清计数、更新登录时间、记日志、发令牌
@@ -169,8 +178,11 @@ public class AuthService {
         RefreshTokenStore.Rotation rotation = refreshTokenStore.rotate(refreshToken, userId -> {
             SysUser user = userRepository.findByIdAndDeletedAtIsNull(userId)
                     .orElseThrow(() -> BizException.of(ErrorCode.REFRESH_TOKEN_INVALID));
-            if (user.getStatus() != UserStatus.ACTIVE) {
-                throw BizException.of(ErrorCode.ACCOUNT_DISABLED);
+            // ⚠️ DISABLED 必须放行（B2 的 W7）：不放行的话"允许登录"只成立 30 分钟 ——
+            //    访问令牌一过期就刷不出新的，等于换个地方把人拒了。
+            //    仍未放开的是 PENDING：待激活账号本就没走完激活流程。
+            if (user.getStatus() == UserStatus.PENDING) {
+                throw BizException.of(ErrorCode.ACCOUNT_PENDING);
             }
             return new RefreshTokenStore.TokenPair(
                     refreshTokenStore.issue(userId, JwtService.newTokenId()),
