@@ -12,6 +12,9 @@ import com.knowledge.ai.pipeline.PdfDocumentParser;
 import com.knowledge.ai.pipeline.PlainTextParser;
 import com.knowledge.ai.pipeline.TikaDocumentParser;
 import com.knowledge.ai.pipeline.TextLayerGuard;
+import com.knowledge.ai.pipeline.cleaning.CleanedDocument;
+import com.knowledge.ai.pipeline.cleaning.CleaningOptions;
+import com.knowledge.ai.pipeline.cleaning.DocumentCleaner;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -74,6 +77,9 @@ public class DocParseService {
 
     private final ChunkingService chunkingService;
 
+    /** 清洗层（`优化/O3`）—— 解析与分片之间的纯函数变换，见 {@link DocumentCleaner}。 */
+    private final DocumentCleaner documentCleaner;
+
     private final jakarta.persistence.EntityManager entityManager;
 
     /**
@@ -89,12 +95,24 @@ public class DocParseService {
         recordWriter.markParsing(docId);
 
         ParsedDocument parsed = null;
+        // 与 parsed 同一种写法：在 try 外声明，成功路径上必然非空（失败路径已 return）。
+        // 放在里面的话成功路径读不到它，而"清洗结果"正是成功路径要报的东西
+        CleanedDocument cleaned = null;
         String parsePath = null;
         int chunkCount = 0;
         try {
             byte[] source = docStorage.open(row.storagePath());
             parsed = dispatch(row.type(), source, row.fileName());
+            // ⚠️ 体检在清洗**之前**：TextLayerGuard 的判据吃 chars，而清洗只减不增。
+            // 反过来排的话，一篇正常文档会因为"剥掉了页眉"而掉到扫描件的阈值以下 —— 误报。
             TextLayerGuard.check(parsed);
+
+            // `优化/O3` 逐文档清洗：页眉页脚剥离。位置有两条约束，缺一不可 ——
+            //   ① 在 **storeArtifact 之后**（产物存的是**原始解析结果**）：清洗是"判定噪音"，
+            //      不是"抽取"，产物要保持解析器抽到什么样就是什么样。改清洗阈值只需重分片，不必重解析；
+            //   ② 在 **chunk 之前**：这是 O3 的硬窗 —— 向量一旦生成，事后清洗等于全库重建
+            //      （T-508 属 S4-C3，紧随本批）。
+            cleaned = documentCleaner.clean(parsed, cleaningOptions(row.kbId()));
 
             byte[] artifact = MAPPER.writerWithDefaultPrettyPrinter()
                     .writeValueAsBytes(parsed);
@@ -104,9 +122,12 @@ public class DocParseService {
             // 放在 markParsed **之前**：分片失败时文档应当停在 FAILED 并给出分片侧的原因，
             // 而不是先标成「解析完成」再让用户发现一个块都没有。
             chunkCount = recordWriter.replaceChunks(docId, row.kbId(),
-                    chunkingService.chunk(parsed, chunkingOptions(row.kbId())));
+                    chunkingService.chunk(cleaned.document(), chunkingOptions(row.kbId())));
 
-            recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed());
+            // 质量四列里的三个：表格两列由解析侧给，图片列由 `O3` 步 4 销掉 S4-B §9 第 3 条
+            // 的"采了不用"（imageCount 早已在采，只是没写）。image_parsed 仍等 T-512 的 VL。
+            recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed(),
+                    cleaned.document().imageCount());
         } catch (ParseException ex) {
             recordWriter.markFailed(docId, ex.getMessage());
             recordWriter.replaceIssues(docId, row.kbId(), parsed != null ? parsed.issues() : java.util.List.of());
@@ -122,14 +143,16 @@ public class DocParseService {
         }
 
         recordWriter.replaceIssues(docId, row.kbId(), parsed.issues());
-        log.info("文档解析完成：docId={} type={} pages={} chars={} tables={}/{} chunks={}",
-                docId, row.type(), parsed.pages(), parsed.chars(),
-                parsed.tableParsed(), parsed.tableTotal(), chunkCount);
+        log.info("文档解析完成：docId={} type={} pages={} chars={}(原始 {}) tables={}/{} images={} chunks={}",
+                docId, row.type(), parsed.pages(), cleaned.document().chars(), parsed.chars(),
+                parsed.tableParsed(), parsed.tableTotal(), parsed.imageCount(), chunkCount);
         Map<String, Object> result = new HashMap<>();
         result.put("docId", docId);
         result.put("status", "INDEXING");
         result.put("pages", parsed.pages());
-        result.put("chars", parsed.chars());
+        // chars 报**清洗后**的值：前端"本页多少字"问的是"进了索引多少字"，
+        // 而原始值仍留在 parse.json 里可查（两个数都打进了上面的日志）
+        result.put("chars", cleaned.document().chars());
         result.put("tableTotal", parsed.tableTotal());
         result.put("tableParsed", parsed.tableParsed());
         result.put("chunkCount", chunkCount);
@@ -172,6 +195,41 @@ public class DocParseService {
             log.warn("知识库分片策略 JSON 解析失败，本次按默认参数分片：kbId={} json={} err={}",
                     kbId, json, ex.getMessage());
             return ChunkingOptions.defaults();
+        }
+    }
+
+    /**
+     * 读该知识库的清洗参数（`优化/O3`：阈值必须是配置，不是常量）。
+     *
+     * <h3>为什么复用 {@code split_policy_json} 而不是新开一列</h3>
+     * <p>本批不加迁移（计划 §4）。清洗阈值与分片参数同属"这个库怎么处理文档"，
+     * 塞进同一份 JSON 不必改表结构；将来 `T-406` 的"重建索引"若要让用户单独调清洗，
+     * 再拆成独立字段也不迟 —— 那时是一次真正的表结构变更，值得单独一个迁移。
+     *
+     * <p>读不到 / 解析不了 / 键缺失 → 一律回落到 {@link CleaningOptions#defaults()}，
+     * 并**留一条 warn**（与 {@link #chunkingOptions(long)} 同一条纪律：配置坏了不能静默变成
+     * "什么都没清洗"，也不能因此让整篇文档解析失败）。
+     */
+    private CleaningOptions cleaningOptions(long kbId) {
+        List<String> rows = entityManager.createNativeQuery(
+                        "select split_policy_json from sys_kb where id = :kbId")
+                .setParameter("kbId", kbId)
+                .getResultList();
+        if (rows.isEmpty() || rows.getFirst() == null || rows.getFirst().isBlank()) {
+            return CleaningOptions.defaults();
+        }
+        String json = rows.getFirst();
+        try {
+            var node = MAPPER.readTree(json);
+            CleaningOptions defaults = CleaningOptions.defaults();
+            return new CleaningOptions(
+                    node.path("cleanRatio").asDouble(defaults.ratio()),
+                    node.path("cleanEdgeLines").asInt(defaults.edgeLines()),
+                    node.path("cleanMinPages").asInt(defaults.minPages()));
+        } catch (Exception ex) {
+            log.warn("知识库清洗参数 JSON 解析失败，本次按默认参数清洗：kbId={} json={} err={}",
+                    kbId, json, ex.getMessage());
+            return CleaningOptions.defaults();
         }
     }
 

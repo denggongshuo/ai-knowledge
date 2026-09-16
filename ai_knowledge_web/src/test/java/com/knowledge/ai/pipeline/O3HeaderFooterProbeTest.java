@@ -11,10 +11,14 @@ import org.opendataloader.pdf.api.OpenDataLoaderPDF;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -110,7 +114,257 @@ class O3HeaderFooterProbeTest {
                 .isZero();
     }
 
+    @Test
+    @DisplayName("O3 步 3 前置：image 元素到底带不带几何信息（决定装饰图判定做不做得了）")
+    void imageGeometryInventory() throws Exception {
+        Path[] samples = {
+                SAMPLE,
+                Path.of("..", "docs", "测试文件", "1-DeepSeek使用.pdf").toAbsolutePath().normalize(),
+                Path.of("..", "docs", "测试文件", "百福云PaaS平台应用部署快速入门 v1.0.pdf")
+                        .toAbsolutePath().normalize(),
+        };
+
+        StringBuilder sb = new StringBuilder();
+        for (Path sample : samples) {
+            if (!Files.isRegularFile(sample)) {
+                sb.append("（缺样本，跳过）").append(sample).append('\n');
+                continue;
+            }
+            JsonNode root = runAndReadJson(sample);
+
+            // ① 每种 type 的字段全集 —— 一眼看出 image 有没有 bounding box
+            Map<String, Set<String>> keysByType = new TreeMap<>();
+            collectKeys(root.get("kids"), keysByType);
+
+            // ② 图片清单：页码 + 包围盒
+            List<String> images = new ArrayList<>();
+            collectImages(root.get("kids"), 0, images);
+
+            sb.append("======== O3 步 3 前置：").append(sample.getFileName()).append(" ========\n");
+            sb.append("页数=").append(root.path("number of pages").asInt())
+                    .append(" · image 元素=").append(images.size()).append('\n');
+            keysByType.forEach((type, keys) -> sb.append("  ").append(type)
+                    .append(" 字段 = ").append(keys).append('\n'));
+            images.stream().limit(12).forEach(s -> sb.append("  img ").append(s).append('\n'));
+            if (images.size() > 12) {
+                sb.append("  … 另 ").append(images.size() - 12).append(" 张\n");
+            }
+        }
+        dump("image-geometry", sb.toString());
+    }
+
+    @Test
+    @DisplayName("O3 步 0 干跑：真样本上「跨页重复」两条启发式分别能判出什么")
+    void dryRunOfBothHeuristics() throws Exception {
+        Path[] samples = {
+                SAMPLE,
+                Path.of("..", "docs", "测试文件", "1-DeepSeek使用.pdf").toAbsolutePath().normalize(),
+                Path.of("..", "docs", "测试文件", "百福云PaaS平台应用部署快速入门 v1.0.pdf")
+                        .toAbsolutePath().normalize(),
+        };
+
+        StringBuilder sb = new StringBuilder();
+        for (Path sample : samples) {
+            if (!Files.isRegularFile(sample)) {
+                sb.append("（缺样本，跳过）").append(sample).append('\n');
+                continue;
+            }
+            JsonNode root = runAndReadJson(sample);
+            int pages = root.path("number of pages").asInt();
+
+            // ---- ① 文本侧：每页首/尾 3 行的归一化文本 → 出现在几页上 ----
+            Map<Integer, List<String>> linesByPage = new TreeMap<>();
+            collectTextLines(root.get("kids"), 0, linesByPage);
+            Map<String, Set<Integer>> textSeen = new TreeMap<>();
+            linesByPage.forEach((page, lines) -> {
+                Set<String> edge = new LinkedHashSet<>();
+                lines.stream().limit(3).forEach(t -> edge.add(normalize(t)));
+                if (lines.size() > 3) {
+                    lines.subList(Math.max(3, lines.size() - 3), lines.size()).forEach(t -> edge.add(normalize(t)));
+                }
+                edge.forEach(t -> textSeen.computeIfAbsent(t, k -> new TreeSet<>()).add(page));
+            });
+
+            // ---- ② 图片侧：包围盒取整后 → 出现在几页上 ----
+            List<String> imageBoxes = new ArrayList<>();
+            collectImageBoxes(root.get("kids"), 0, imageBoxes);
+
+            sb.append("======== O3 干跑：").append(sample.getFileName())
+                    .append("（").append(pages).append(" 页）========\n");
+            sb.append("-- 文本侧：归一化后出现在 ≥").append(threshold(pages)).append(" 页的首/尾行 --\n");
+            int[] textHits = {0};
+            textSeen.forEach((text, pagesSeen) -> {
+                if (pagesSeen.size() >= threshold(pages)) {
+                    textHits[0]++;
+                    sb.append(String.format("   [%2d/%d 页] %s%n", pagesSeen.size(), pages, clip(text)));
+                }
+            });
+            if (textHits[0] == 0) {
+                sb.append("   （无 —— 该样本没有可被 >60% 页规则判出的页眉页脚）\n");
+            }
+            sb.append("-- 图片侧：同一包围盒出现在 ≥2 页的 --\n");
+            Map<String, Set<Integer>> boxSeen = new TreeMap<>();
+            imageBoxes.forEach(s -> {
+                int eq = s.indexOf(' ');
+                String box = s.substring(eq + 1);
+                int page = Integer.parseInt(s.substring(5, eq));
+                boxSeen.computeIfAbsent(box, k -> new TreeSet<>()).add(page);
+            });
+            int[] boxHits = {0};
+            boxSeen.forEach((box, pagesSeen) -> {
+                if (pagesSeen.size() >= 2) {
+                    boxHits[0]++;
+                    sb.append(String.format("   [%d 页] %s（需 ≥%d 页才算）%n",
+                            pagesSeen.size(), box, threshold(pages)));
+                }
+            });
+            if (boxHits[0] == 0) {
+                sb.append("   （无 —— 该样本没有跨页同位置的图）\n");
+            }
+        }
+        dump("dry-run", sb.toString());
+    }
+
+    @Test
+    @DisplayName("O3 步 0 干跑·原始行：逐页首/尾 3 行原样打印（判「样本到底有没有页眉页脚」）")
+    void rawEdgeLinesPerPage() throws Exception {
+        Assumptions.assumeTrue(Files.isRegularFile(SAMPLE), "缺样本 " + SAMPLE);
+
+        JsonNode root = runAndReadJson(SAMPLE);
+        Map<Integer, List<String>> linesByPage = new TreeMap<>();
+        collectTextLines(root.get("kids"), 0, linesByPage);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("O3 干跑·原始行：").append(SAMPLE.getFileName()).append('\n');
+        linesByPage.forEach((page, lines) -> {
+            sb.append("-- 第 ").append(page).append(" 页（共 ").append(lines.size()).append(" 行）--\n");
+            for (int i = 0; i < Math.min(3, lines.size()); i++) {
+                sb.append("   首").append(i + 1).append(": ").append(clip(lines.get(i))).append('\n');
+            }
+            if (lines.size() > 3) {
+                for (int i = Math.max(3, lines.size() - 3); i < lines.size(); i++) {
+                    sb.append("   尾").append(lines.size() - i).append(": ")
+                            .append(clip(lines.get(i))).append('\n');
+                }
+            }
+        });
+        dump("raw-edge-lines", sb.toString());
+    }
+
     // ==================================================================
+
+    /**
+     * 把取证写到 **UTF-8 文件**再读。
+     *
+     * <p>⚠️ 不写 {@code System.out}：本机控制台是 GBK，中文在 Maven → 终端这一跳
+     * 会变成 `���`，探针就白跑了（第一次干跑就是这么废掉的）。文件是唯一可靠的落点。
+     */
+    private static void dump(String fileName, String content) throws Exception {
+        Path p = Path.of("target", "o3-probe-" + fileName + ".txt").toAbsolutePath();
+        Files.createDirectories(p.getParent());
+        Files.writeString(p, content, StandardCharsets.UTF_8);
+        System.out.println("（取证已写 " + p + "）");
+    }
+
+    /** `>60% 页出现` 的页数门槛（向上取整 + 至少 2 页，否则单页文档也"跨页"了）。 */
+    private static int threshold(int pages) {
+        return Math.max(2, (int) Math.ceil(pages * 0.6));
+    }
+
+    private static String clip(String s) {
+        return s.length() <= 60 ? s : s.substring(0, 60) + "…";
+    }
+
+    /**
+     * 页眉页脚的**归一化**：去掉页眉里唯一会变的那部分 —— 页码与日期。
+     *
+     * <p>这一步就是 `O3` §4 步 2 说的"归一化去数字"：`第 3 页` 与 `第 17 页`
+     * 必须归并成同一个模式，否则逐页文本各不相同，连"完全重复"都算不上。
+     */
+    static String normalize(String text) {
+        return text.replaceAll("\\s+", "")
+                .replaceAll("[0-9第页Pp＃#]+", "#")
+                .replaceAll("[-—–·•]+", "");
+    }
+
+    /** 递归收集「页码 → 该页**正文类**元素的文本，按文档顺序」。 */
+    private static void collectTextLines(JsonNode kids, int inheritedPageNo,
+                                         Map<Integer, List<String>> out) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            int pageNo = el.path("page number").asInt(inheritedPageNo);
+            String type = el.path("type").asText();
+            if (type.equals("heading") || type.equals("paragraph")) {
+                String content = el.path("content").asText("").strip();
+                if (!content.isEmpty()) {
+                    out.computeIfAbsent(pageNo, k -> new ArrayList<>()).add(content);
+                }
+            }
+            collectTextLines(el.get("kids"), pageNo, out);
+        }
+    }
+
+    /** 递归收集图片包围盒，形如 {@code page=3 [90.0,380.8,504.2,611.6]}（坐标取整以容忍浮点抖动）。 */
+    private static void collectImageBoxes(JsonNode kids, int inheritedPageNo, List<String> out) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            int pageNo = el.path("page number").asInt(inheritedPageNo);
+            if ("image".equals(el.path("type").asText())) {
+                JsonNode box = el.get("bounding box");
+                if (box != null && box.isArray() && box.size() == 4) {
+                    out.add("page=" + pageNo + " [" + box.get(0).asInt() + "," + box.get(1).asInt()
+                            + "," + box.get(2).asInt() + "," + box.get(3).asInt() + "]");
+                } else {
+                    out.add("page=" + pageNo + " <无包围盒>");
+                }
+            }
+            collectImageBoxes(el.get("kids"), pageNo, out);
+        }
+    }
+
+    /** 递归收集 type → 该 type 出现过的全部字段名。 */
+    private static void collectKeys(JsonNode kids, Map<String, Set<String>> byType) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            String type = el.path("type").asText("<none>");
+            Set<String> keys = byType.computeIfAbsent(type, k -> new TreeSet<>());
+            el.fieldNames().forEachRemaining(keys::add);
+            collectKeys(el.get("kids"), byType);
+        }
+    }
+
+    /** 递归收集 image 元素的「页码 + bounding box」。 */
+    private static void collectImages(JsonNode kids, int inheritedPageNo, List<String> out) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            int pageNo = el.path("page number").asInt(inheritedPageNo);
+            if ("image".equals(el.path("type").asText())) {
+                JsonNode box = el.get("bounding box");
+                out.add("page=" + pageNo + " box=" + (box == null || box.isNull() ? "<无>" : box.toString())
+                        + " 其余字段=" + fieldsExcept(el, "type", "page number", "bounding box", "kids"));
+            }
+            collectImages(el.get("kids"), pageNo, out);
+        }
+    }
+
+    private static String fieldsExcept(JsonNode el, String... exclude) {
+        Set<String> skip = new LinkedHashSet<>(List.of(exclude));
+        List<String> rest = new ArrayList<>();
+        el.fieldNames().forEachRemaining(f -> {
+            if (!skip.contains(f)) {
+                rest.add(f + "=" + el.get(f));
+            }
+        });
+        return rest.toString();
+    }
 
     /** 递归收集 type → 出现次数（**递归**是关键：容器里的元素也要计入）。 */
     private static void collectTypes(JsonNode kids, TreeMap<String, Integer> counts) {

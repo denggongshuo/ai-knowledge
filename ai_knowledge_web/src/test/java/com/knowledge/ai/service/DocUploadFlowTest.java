@@ -58,24 +58,51 @@ class DocUploadFlowTest extends ApiTestSupport {
     // ==================================================================
 
     /**
-     * 清掉本用例造的库及其全部文档。
+     * 清掉本用例造的库，及其文档 / 分片 / 问题行 / 授权，**以及对象存储里的文件**。
      *
-     * <p>顺序：文档 → 授权 → 库。无外键约束，顺序其实无所谓，但与既有批次
-     * （{@code KbWriteFlowTest#deleteKbByCode}）保持同一口径，残留排查时好解释。
+     * <h3>⚠️ 2026-09-16 补了两处遗漏（都是实测踩出来的）</h3>
+     * <ol>
+     *   <li><b>{@code sys_chunk} 没清</b> —— 本方法写在 `T-503` 落地**之前**，那时还没有分片表。
+     *       `S4-M05-C1` 建了表、上传后即自动解析，于是每跑一轮就在库里留下一批
+     *       **孤儿分片**（实测 100 行，而 {@code sys_document} 是空的）。
+     *       这与 `汇总.md` §3 #66 是同一个教训的第二次：
+     *       **新表落地时要回头查所有清理函数**，不能只改自己正在写的那一个。</li>
+     *   <li><b>MinIO 对象没清</b> —— 同样只删库行不删文件。实测一个下午跑下来桶里攒到
+     *       **1030 个对象**，而 {@code GET /kb/storage-quota} 会**全桶递归列举**
+     *       （{@code KbService#minioUsedBytes}），慢到客户端读超时 ——
+     *       结果是与本批毫不相干的 {@code KbWriteFlowTest#storageQuotaMatchesDictionary} 转红。
+     *       这是最费时间的假红形态：错误的信号指向错误的地方。</li>
+     * </ol>
+     * <p>对象名必须在**删行之前**取出来 —— 删了行就查不到 {@code storage_path}/{@code parse_path} 了。
+     *
+     * <p>顺序：对象 → 分片 → 问题行 → 文档 → 授权 → 库。
+     * 无外键约束，顺序其实无所谓，但与既有批次（{@code KbWriteFlowTest#deleteKbByCode}）
+     * 保持同一口径，残留排查时好解释。
      */
     @AfterEach
     void cleanProbeData() {
         for (Long kbId : probeKbIds) {
-            // 顺序：问题行 → 文档 → 授权 → 库（问题行引用 doc_id，先删防止悬挂）
-            jdbcTemplate.update("""
-                    delete i from sys_parse_issue i
-                    join sys_document d on d.id = i.doc_id where d.kb_id = ?
-                    """, kbId);
+            for (Map<String, Object> row : jdbcTemplate.queryForList(
+                    "select storage_path, parse_path from sys_document where kb_id = ?", kbId)) {
+                removeObject(row.get("storage_path"));
+                removeObject(row.get("parse_path"));
+            }
+            // 按 kb_id 直删，而不是 join sys_document：分片引用的文档行可能已经不在了，
+            // 那种情况下 join 一条也匹配不到，孤儿就这么留下来了
+            jdbcTemplate.update("delete from sys_chunk where kb_id = ?", kbId);
+            jdbcTemplate.update("delete from sys_parse_issue where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_document where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb_grant where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb where id = ?", kbId);
         }
         probeKbIds.clear();
+    }
+
+    /** 对象名可能为空（未转存完成 / 未解析成功）；删不掉也不该让用例失败。 */
+    private void removeObject(Object objectKey) {
+        if (objectKey != null && !objectKey.toString().isBlank()) {
+            docStorage.remove(objectKey.toString());
+        }
     }
 
     // ==================================================================

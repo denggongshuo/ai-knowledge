@@ -254,8 +254,76 @@ public record ParsedDocument(String format,
      *
      * @param pageNo 页码，1-based（**无"全文级"哨兵值**：整体性失败走 {@code error_msg}，不进本列表）
      * @param reason 可执行的原因（同 {@link ParseException} 的文案纪律）
+     * @param kind   问题**种类**（`S4-M05-C2` 步 0.6 新增，见 {@link IssueKind}）
      */
-    public record DocumentIssue(int pageNo, String reason) {
+    public record DocumentIssue(int pageNo, String reason, IssueKind kind) {
+
+        /**
+         * 缺省种类 —— 兼容**旧产物**用的。
+         *
+         * <p>{@code kind} 是 2026-09-16 新增的字段。在它之前落库的 {@code parse.json}
+         * 里没有这一项，Jackson 会传 {@code null} 进来（记录类的紧凑构造器就是干这个的）。
+         * 不做这个兜底，读旧产物会直接炸在反序列化上 —— 而那正是"换个批次就跑不起来"的形态。
+         */
+        public DocumentIssue {
+            kind = kind == null ? IssueKind.OTHER : kind;
+        }
+    }
+
+    /**
+     * 逐页问题的**种类**（`S4-M05-C2` 步 0.6）。
+     *
+     * <h3>为什么现在才加</h3>
+     * <p>在这之前 {@code DocumentIssue} 只有一句自由文本，于是所有断言只能写成
+     * 「{@code reason} 里包含某个中文字串」—— 那种断言在**改一次文案**时就转红，
+     * 而它对"这是哪一类问题"其实一无所知。种类是机器可读的那一半，
+     * 文案是给人看的那一半，两者不该挤在同一个字段里。
+     *
+     * <h3>⚠️ 它落库时会退化成文字前缀</h3>
+     * <p>{@code sys_parse_issue} **没有**种类列（本批不加迁移，见计划 §4），所以写入时
+     * 由 {@link #tag()} 拼在 {@code reason} 前面。也就是说：**种类在库里是文字，
+     * 不是可查询的列**。要按种类过滤就得加列 —— 那件事留给真正需要它的批次。
+     *
+     * <h3>为什么不用它替掉 reason</h3>
+     * <p>本项目对失败态的要求是「给出具体原因，不许只说'失败'两字」（`G4-3`）。
+     * 种类只回答"哪一类"，`reason` 才回答"我能做什么"。两者都留着。
+     */
+    public enum IssueKind {
+
+        /** 整页抽不到可复制文本（疑似扫描图）。 */
+        NO_TEXT_LAYER("无文本层"),
+
+        /** 表格结构检出了、格子却没内容（静默故障的正面）。 */
+        TABLE_NOT_PARSED("表格未识别"),
+
+        /** 重复样板（页眉/页脚）已从正文中剥离（`优化/O3`）。 */
+        HEADER_FOOTER_STRIPPED("页眉页脚已剥离"),
+
+        /** 其余 —— 也是**旧产物**缺 {@code kind} 时的兜底。 */
+        OTHER("其他"),
+        ;
+
+        private final String label;
+
+        IssueKind(String label) {
+            this.label = label;
+        }
+
+        /** 人读的中文名（前端与日志用）。 */
+        public String label() {
+            return label;
+        }
+
+        /**
+         * 落 {@code sys_parse_issue.reason} 时拼在前面的**文字前缀**。
+         *
+         * <p>之所以是前缀而不是独立列：本批不加迁移（见计划 §4），
+         * 而"种类"这件事必须在库里**看得见**，否则按 `reason` 关键词过滤是唯一手段、
+         * 而那正是加 {@code kind} 想摆脱的东西。
+         */
+        public String tag() {
+            return "【" + label + "】";
+        }
     }
 
     /**

@@ -142,7 +142,8 @@ public class PdfDocumentParser {
         if (chars <= 0) {
             for (int p = 1; p <= Math.max(pages, 1); p++) {
                 issues.add(new ParsedDocument.DocumentIssue(p,
-                        "该页未提取到任何可复制文本（疑似整页扫描图），内容无法参与检索"));
+                        "该页未提取到任何可复制文本（疑似整页扫描图），内容无法参与检索",
+                        ParsedDocument.IssueKind.NO_TEXT_LAYER));
             }
         }
         // ---- 检出结构但抽不到内容的表格（G4-4 的"静默故障"正面）----
@@ -153,7 +154,8 @@ public class PdfDocumentParser {
                 issues.add(new ParsedDocument.DocumentIssue(t.pageNo(),
                         "第 " + t.pageNo() + " 页的表格检出了结构（" + t.rowCount() + " 行 × "
                                 + t.colCount() + " 列）但未提取到内容，该表无法参与检索；"
-                                + "疑似扫描件中的表格，请补录文本或启用 OCR 后重建索引"));
+                                + "疑似扫描件中的表格，请补录文本或启用 OCR 后重建索引",
+                        ParsedDocument.IssueKind.TABLE_NOT_PARSED));
             }
         }
 

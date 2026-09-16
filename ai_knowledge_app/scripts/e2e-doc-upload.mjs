@@ -98,8 +98,43 @@ docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -
   return (r.stdout ?? '').trim()
 }
 
-/** 幂等清理探针库及其文档（顺序：问题行 → 分片 → 文档 → 授权 → 主表）。 */
+/**
+ * 删 MinIO 里的对象（**只删库行是不够的**）。
+ *
+ * <p>不删的后果是实测过的（`S4-M05-C2`，2026-09-16）：两个 E2E 各跑一轮就在桶里留下
+ * 9 个对象，而 `GET /kb/storage-quota` 会**全桶递归列举**（`KbService#minioUsedBytes`）——
+ * 攒到上千个之后慢到读超时，把毫不相干的 `KbWriteFlowTest` 拖红。
+ * 那是最费时间的假红形态：错误的信号指向错误的地方。
+ *
+ * <p>对象名必须在**删行之前**取出来。`mysql -N` 的空值打印成字面量 `NULL`，要滤掉。
+ *
+ * <h3>⚠️ 必须把路径塞进 `sh -c` 里，不能当裸参数传给 `docker exec`</h3>
+ * <p>Git Bash 会把形似 Unix 绝对路径的**裸参数**改写成 Windows 路径
+ * （`/data/…` → `C:/Program Files/Git/data/…`，MSYS 的自动转换）。
+ * 于是 `rm -rf` 删的是一个不存在的路径，而 `-f` 让它**静默返回 0** ——
+ * 本轮实测就是这个形态：命令报成功，对象一个没少。
+ * 塞进 `sh -c '...'` 的整串里就绕开了转换（容器内的 sh 才是解析者）。
+ */
+function minioRemove(rawObjectKeys) {
+  const keys = (rawObjectKeys ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s && s !== 'NULL')
+  if (keys.length === 0) return
+  const paths = keys.map((k) => `'/data/rag-documents/${k}'`).join(' ')
+  spawnSync('bash', ['-c', `MSYS_NO_PATHCONV=1 docker exec kb-minio sh -c "rm -rf ${paths}"`],
+    { cwd: REPO_ROOT, encoding: 'utf8' })
+}
+
+/**
+ * 幂等清理探针库及其文档（顺序：对象 → 问题行 → 分片 → 文档 → 授权 → 主表）。
+ *
+ * <p>对象排在最前：删了文档行，`storage_path`/`parse_path` 就查不出来了。
+ */
 function purgeProbe() {
+  const probeDocs = `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}'`
+  minioRemove(mysqlScalar(`select d.storage_path ${probeDocs};`))
+  minioRemove(mysqlScalar(`select d.parse_path ${probeDocs};`))
   mysqlScalar(
     `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
       delete c from sys_chunk c join sys_document d on d.id=c.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';

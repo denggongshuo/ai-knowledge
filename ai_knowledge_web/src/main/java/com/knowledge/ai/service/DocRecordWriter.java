@@ -124,21 +124,30 @@ public class DocRecordWriter {
      *
      * <p><b>终态是 INDEXING 而不是 READY</b>：READY 的语义是"唯一可被检索的状态"（《03》§4.2），
      * 而向量还没写进 Milvus（`T-508` 属 S4-C）—— 这时标 READY 正是本项目最怕的"报告说成功"。
-     * {@code chunk_count} **不同步更新**：分片是 `T-503` 的事，本批诚实地留 0
-     * —— 宁可显示"0 个分片但解析完成"，也不写一个"看起来完整"的假数。
+     * {@code chunk_count} **不同步更新**：分片在 {@code replaceChunks} 里回填
+     * （`T-505` 已接上），这里不重复写。
+     *
+     * <p>⚠️ {@code image_total} 是 {@code S4-M05-C2} 新接的（`O3` §4 步 4）：解析阶段
+     * **早就知道**图片数（{@code ParsedDocument#imageCount}），只是一直没写进质量列
+     * —— "采了不用"。{@code image_parsed} 仍留 0，表示"未理解"（`T-512` 的 VL 才填）。
+     * 于是含图文档的 {@code image_parsed < image_total} 恒成立，它会被
+     * {@code DocService} 的"质量待改进"过滤命中 —— 这是**刻意的**：
+     * 图片确实还没被理解，页面上的"有 N 张图（未理解）"就是这个意思。
      */
     @Transactional
-    public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed) {
+    public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal) {
         entityManager.createNativeQuery("""
                         update sys_document
                            set status = 'INDEXING', parse_path = :path,
                                table_total = :tableTotal, table_parsed = :tableParsed,
+                               image_total = :imageTotal,
                                error_msg = null, updated_at = :now
                          where id = :id
                         """)
                 .setParameter("path", parsePath)
                 .setParameter("tableTotal", tableTotal)
                 .setParameter("tableParsed", tableParsed)
+                .setParameter("imageTotal", imageTotal)
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", docId)
                 .executeUpdate();
@@ -172,7 +181,7 @@ public class DocRecordWriter {
                     .setParameter("docId", docId)
                     .setParameter("kbId", kbId)
                     .setParameter("pageNo", issue.pageNo())
-                    .setParameter("reason", truncate(issue.reason()))
+                    .setParameter("reason", truncate(kindTagOf(issue) + issue.reason()))
                     .setParameter("now", now)
                     .executeUpdate();
         }
@@ -324,6 +333,20 @@ public class DocRecordWriter {
             // 连"记下失败"都失败了 —— 只能留日志，不能让异常再往上冒把任务体的原始失败原因盖掉
             log.error("回写文档失败状态时出错：docId={} 原始原因={} err={}", docId, msg, ex.getMessage());
         }
+    }
+
+    /**
+     * 把问题**种类**拼成 {@code reason} 的文字前缀。
+     *
+     * <p>{@code sys_parse_issue} 没有种类列（本批不加迁移，见计划 §4），所以种类在库里
+     * 是**文字**而不是可查询的列。{@link ParsedDocument.IssueKind#tag()} 就是那个前缀，
+     * 这里只负责接上 —— 前缀的形状由枚举定，不在这里另写一份字面量。
+     *
+     * <p>为什么不干脆扔掉种类、只留 reason：那等于把"哪一类问题"的信息
+     * 塞回自由文本里靠人眼识别，也就没法写出"断言种类是 X"的测试。
+     */
+    private static String kindTagOf(ParsedDocument.DocumentIssue issue) {
+        return issue.kind() == null ? "" : issue.kind().tag();
     }
 
     /** reason 截断到 {@code sys_parse_issue.reason} 的列宽 512。 */

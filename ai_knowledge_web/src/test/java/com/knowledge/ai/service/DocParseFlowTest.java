@@ -38,6 +38,9 @@ class DocParseFlowTest extends ApiTestSupport {
     /** 真实样本目录（不入库）。 */
     private static final Path SAMPLE_DIR = Path.of("..", "docs", "测试文件").toAbsolutePath().normalize();
 
+    /** 含图样本 —— `O3` 判据 4 需要"有图且图数可数"的文档，这份实测 23 张。 */
+    private static final String IMAGE_SAMPLE = "百福云PaaS平台应用部署快速入门 v1.0.pdf";
+
     private final List<Long> probeKbIds = new ArrayList<>();
 
     @Autowired
@@ -52,22 +55,38 @@ class DocParseFlowTest extends ApiTestSupport {
     @AfterEach
     void cleanProbeData() {
         for (Long kbId : probeKbIds) {
-            jdbcTemplate.update("""
-                    delete i from sys_parse_issue i
-                    join sys_document d on d.id = i.doc_id where d.kb_id = ?
-                    """, kbId);
+            // 对象名必须在删行**之前**取出来
+            for (Map<String, Object> row : jdbcTemplate.queryForList(
+                    "select storage_path, parse_path from sys_document where kb_id = ?", kbId)) {
+                removeObject(row.get("storage_path"));
+                removeObject(row.get("parse_path"));
+            }
             // sys_chunk 必须一起清：它按 doc_id 关联，文档行删掉后这些块就成了孤儿 ——
             // 留在库里会污染"全库 SQL 断言"（如 G4-6 的父子完整性），
             // 让下一条用例在一个不知道谁造的脏数据上做判断。
-            jdbcTemplate.update("""
-                    delete c from sys_chunk c
-                    join sys_document d on d.id = c.doc_id where d.kb_id = ?
-                    """, kbId);
+            // 按 kb_id 直删而不是 join sys_document：文档行可能已经不在了，
+            // join 一条也匹配不到、孤儿照样留下（`S4-M05-C2` 在隔壁
+            // `DocUploadFlowTest` 实测到 100 行这种孤儿）。
+            jdbcTemplate.update("delete from sys_chunk where kb_id = ?", kbId);
+            jdbcTemplate.update("delete from sys_parse_issue where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_document where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb_grant where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb where id = ?", kbId);
         }
         probeKbIds.clear();
+    }
+
+    /**
+     * 删对象存储里的文件。
+     *
+     * <p>不删的后果是实测过的：桶里累积到 1030 个对象后，
+     * {@code GET /kb/storage-quota} 的全桶列举慢到读超时，把**毫不相干**的
+     * {@code KbWriteFlowTest#storageQuotaMatchesDictionary} 拖红。
+     */
+    private void removeObject(Object objectKey) {
+        if (objectKey != null && !objectKey.toString().isBlank()) {
+            docStorage.remove(objectKey.toString());
+        }
     }
 
     // ==================================================================
@@ -116,6 +135,32 @@ class DocParseFlowTest extends ApiTestSupport {
                 .as("该 PDF 实测含 9 张表（含 2 张版式误判被过滤后 ≥5 张有效表）")
                 .isGreaterThanOrEqualTo(5);
         assertThat(tableParsed).as("有文本层的 PDF 表格应全部识别（T-0S1 §一-1）").isEqualTo(tableTotal);
+    }
+
+    @Test
+    @DisplayName("判据3（O3）：含图 PDF 的 image_total 不再是恒 0 —— 销「采了不用」")
+    void imageTotalIsFilled() {
+        assumeSample(IMAGE_SAMPLE);
+        String token = loginAsAdmin().data("$.accessToken");
+        long kbId = createProbeKb(token);
+        byte[] pdf = readSample(IMAGE_SAMPLE);
+
+        long docId = ((Number) upload(kbId, pdf, "百福云探针.pdf", token)
+                .assertOk("上传含图 PDF").data("$.docId")).longValue();
+
+        Map<String, Object> row = rowOf(docId);
+        assertThat(row.get("status")).isEqualTo("INDEXING");
+        assertThat(((Number) row.get("image_total")).longValue())
+                .as("探针实测该样本有 23 个 image 元素（结构事实，取等值不取区间）。"
+                        + "这一列在此前**恒 0** —— 而 0 表示「未评估」不表示「没有图片」，"
+                        + "前端因此对含图文档显示「无图片」（S4-B §9 第 3 条）")
+                .isEqualTo(23);
+        assertThat(((Number) row.get("image_parsed")).longValue())
+                .as("image_parsed 仍为 0 = 「未理解」（VL 描述属 T-512 / S6）。"
+                        + "于是含图文档的 image_parsed < image_total 恒成立，"
+                        + "它会被 DocService 的「质量待改进」过滤命中 —— 这是**刻意**的："
+                        + "图片确实还没被理解")
+                .isZero();
     }
 
     // ==================================================================
@@ -316,7 +361,8 @@ class DocParseFlowTest extends ApiTestSupport {
         ParsedDocument emptyTableDoc = new ParsedDocument("PDF", 1, 10, "占位",
                 List.of(), List.of(new ParsedDocument.ParsedTable("", 3,
                         List.of(List.of("", ""), List.of("", "")))),
-                1, 0, List.of(new ParsedDocument.DocumentIssue(3, "表格检出结构（2 行 × 2 列）但未提取到内容")),
+                1, 0, List.of(new ParsedDocument.DocumentIssue(3, "表格检出结构（2 行 × 2 列）但未提取到内容",
+                        ParsedDocument.IssueKind.TABLE_NOT_PARSED)),
                 List.of());
 
         long docId = ((Number) upload(kbId, "占位".getBytes(StandardCharsets.UTF_8), "占位.md", token)
@@ -332,6 +378,11 @@ class DocParseFlowTest extends ApiTestSupport {
                 "select page_no, reason from sys_parse_issue where doc_id = ?", docId);
         assertThat(((Number) issue.get("page_no")).intValue()).isEqualTo(3);
         assertThat((String) issue.get("reason")).contains("未提取到内容");
+        assertThat((String) issue.get("reason"))
+                .as("问题**种类**在库里是可读的文字前缀（S4-M05-C2 步 0.6）。"
+                        + "sys_parse_issue 没有种类列、本批不加迁移，所以种类只能这样落 —— "
+                        + "但「这是哪一类问题」必须看得见，否则按关键词瞎猜是唯一手段")
+                .startsWith(ParsedDocument.IssueKind.TABLE_NOT_PARSED.tag());
         assertThat(row.get("status")).isIn("INDEXING", "FAILED");
     }
 
@@ -708,8 +759,10 @@ class DocParseFlowTest extends ApiTestSupport {
     }
 
     private Map<String, Object> rowOf(long docId) {
+        // 质量四列都要选出来：`S4-M05-C2` 起 image_total 有真值了（不再是恒 0），
+        // 少了它，本文件里那些"质量列填真值"的判据就只剩两列可查
         return jdbcTemplate.queryForMap(
-                "select status, error_msg, parse_path, table_total, table_parsed "
+                "select status, error_msg, parse_path, table_total, table_parsed, image_total, image_parsed "
                         + "from sys_document where id = ?", docId);
     }
 
