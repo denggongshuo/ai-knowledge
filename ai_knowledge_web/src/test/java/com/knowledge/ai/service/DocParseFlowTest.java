@@ -56,6 +56,13 @@ class DocParseFlowTest extends ApiTestSupport {
                     delete i from sys_parse_issue i
                     join sys_document d on d.id = i.doc_id where d.kb_id = ?
                     """, kbId);
+            // sys_chunk 必须一起清：它按 doc_id 关联，文档行删掉后这些块就成了孤儿 ——
+            // 留在库里会污染"全库 SQL 断言"（如 G4-6 的父子完整性），
+            // 让下一条用例在一个不知道谁造的脏数据上做判断。
+            jdbcTemplate.update("""
+                    delete c from sys_chunk c
+                    join sys_document d on d.id = c.doc_id where d.kb_id = ?
+                    """, kbId);
             jdbcTemplate.update("delete from sys_document where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb_grant where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb where id = ?", kbId);
@@ -309,7 +316,8 @@ class DocParseFlowTest extends ApiTestSupport {
         ParsedDocument emptyTableDoc = new ParsedDocument("PDF", 1, 10, "占位",
                 List.of(), List.of(new ParsedDocument.ParsedTable("", 3,
                         List.of(List.of("", ""), List.of("", "")))),
-                1, 0, List.of(new ParsedDocument.DocumentIssue(3, "表格检出结构（2 行 × 2 列）但未提取到内容")));
+                1, 0, List.of(new ParsedDocument.DocumentIssue(3, "表格检出结构（2 行 × 2 列）但未提取到内容")),
+                List.of());
 
         long docId = ((Number) upload(kbId, "占位".getBytes(StandardCharsets.UTF_8), "占位.md", token)
                 .assertOk("上传占位文档").data("$.docId")).longValue();
@@ -514,6 +522,113 @@ class DocParseFlowTest extends ApiTestSupport {
         assertThat(seen).as("状态序列只含合法前缀（UPLOADED→PARSING→INDEXING 的子序列，不回退）")
                 .isSubsetOf("UPLOADED", "PARSING", "INDEXING", "FAILED");
         assertThat(seen.getLast()).isEqualTo("INDEXING");
+    }
+
+    // ==================================================================
+    // S4-C1 · 判据 12 / 13 与 G4-6：分片落库
+    // ==================================================================
+
+    @Test
+    @DisplayName("判据12：真 PDF → 块落 sys_chunk，chunk_count 不再是 0（销 汇总.md §3 #54）")
+    void realPdfProducesChunks() {
+        assumeSample("1-DeepSeek使用.pdf");
+        String token = loginAsAdmin().data("$.accessToken");
+        long kbId = createProbeKb(token);
+
+        long docId = ((Number) upload(kbId, readSample("1-DeepSeek使用.pdf"), "分片探针.pdf", token)
+                .assertOk("上传").data("$.docId")).longValue();
+
+        assertThat(rowOf(docId).get("status"))
+                .as("有文本层的 PDF 解析 + 分片都成功，终态仍是 INDEXING（READY 等 T-508 的向量）")
+                .isEqualTo("INDEXING");
+
+        int chunks = count("select count(*) from sys_chunk where doc_id = ?", docId);
+        assertThat(chunks).as("真 PDF 一定切得出块").isGreaterThan(0);
+
+        int topLevel = count("select count(*) from sys_chunk where doc_id = ? and parent_id is null", docId);
+        int chunkCount = count("select chunk_count from sys_document where id = ?", docId);
+        assertThat(chunkCount)
+                .as("chunk_count 的口径 = 顶层块数（D-5 §1.5：表格子块不计入）。"
+                        + "汇总.md §3 #54 记的「chunk_count 恒 0」在本批销账")
+                .isEqualTo(topLevel)
+                .isGreaterThan(0);
+    }
+
+    @Test
+    @DisplayName("G4-6 / I-3：SQL 断言 100% 成立 —— 子块必指向 TABLE 父块，且从不用 0 当哨兵")
+    void childChunksAlwaysPointToTableParent() {
+        assumeSample("1-DeepSeek使用.pdf");
+        String token = loginAsAdmin().data("$.accessToken");
+        long kbId = createProbeKb(token);
+
+        long docId = ((Number) upload(kbId, readSample("1-DeepSeek使用.pdf"), "父子断言探针.pdf", token)
+                .assertOk("上传").data("$.docId")).longValue();
+
+        int childCount = count("select count(*) from sys_chunk where doc_id = ? and parent_id is not null", docId);
+        assertThat(childCount)
+                .as("该样本实测 7 张有效表 —— 子块数为 0 说明表格双表示没产出，"
+                        + "下面的断言就成了空断言（空集上恒成立）")
+                .isGreaterThan(0);
+
+        assertThat(count("""
+                select count(*) from sys_chunk c
+                 where c.doc_id = ?
+                   and c.parent_id is not null
+                   and not exists (select 1 from sys_chunk p
+                                    where p.id = c.parent_id and p.chunk_type = 'TABLE')
+                """, docId))
+                .as("G4-6 的判据原文：「每个子块 parentId 指向 blockType=TABLE 的父块」")
+                .isZero();
+
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and parent_id = 0", docId))
+                .as("D-5 §1.2 硬口径：禁止用 0 表示「无父块」—— 0 不是哨兵值，"
+                        + "它会与真实的 id = 0 混淆")
+                .isZero();
+
+        assertThat(count("""
+                select count(*) from sys_chunk c
+                 where c.doc_id = ? and c.parent_id is not null
+                   and c.parent_id <= 0
+                """, docId))
+                .as("任何非正的 parent_id 都是坏的（0 之外的负数同样不该出现）")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("判据13：重跑解析幂等 —— sys_chunk 行不翻倍，order_no 不重复")
+    void reparseIsIdempotent() {
+        assumeSample("1-DeepSeek使用.pdf");
+        String token = loginAsAdmin().data("$.accessToken");
+        long kbId = createProbeKb(token);
+
+        long docId = ((Number) upload(kbId, readSample("1-DeepSeek使用.pdf"), "重跑探针.pdf", token)
+                .assertOk("上传").data("$.docId")).longValue();
+
+        int first = count("select count(*) from sys_chunk where doc_id = ?", docId);
+        assertThat(first).isGreaterThan(0);
+
+        // 直接重跑解析（T-406 重建索引将来复用同一入口）
+        docParseService.parseDocument(docId);
+
+        assertThat(count("select count(*) from sys_chunk where doc_id = ?", docId))
+                .as("先删后插让重跑幂等 —— 不翻倍是这条的判据。"
+                        + "残留的旧块检索得到、却不再属于这篇文档，是最难排查的一类脏数据")
+                .isEqualTo(first);
+
+        assertThat(count("""
+                select count(*) from (
+                    select order_no from sys_chunk where doc_id = ? group by order_no having count(*) > 1
+                ) t
+                """, docId))
+                .as("order_no 在文档内必须唯一 —— 落库时靠 (doc_id, order_no) 回查自增 id，"
+                        + "重复会让父块 id 取错")
+                .isZero();
+    }
+
+    /** 计数查询的短别名（本节的判据全是"某个 SQL 返回几"）。 */
+    private int count(String sql, long arg) {
+        Integer n = jdbcTemplate.queryForObject(sql, Integer.class, arg);
+        return n == null ? 0 : n;
     }
 
     // ==================================================================

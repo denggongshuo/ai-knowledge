@@ -1,8 +1,11 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.enums.KbConfigDefaults;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.storage.DocStorage;
+import com.knowledge.ai.pipeline.ChunkingOptions;
+import com.knowledge.ai.pipeline.ChunkingService;
 import com.knowledge.ai.pipeline.ParseException;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import com.knowledge.ai.pipeline.PdfDocumentParser;
@@ -19,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -68,6 +72,8 @@ public class DocParseService {
 
     private final DocRecordWriter recordWriter;
 
+    private final ChunkingService chunkingService;
+
     private final jakarta.persistence.EntityManager entityManager;
 
     /**
@@ -84,6 +90,7 @@ public class DocParseService {
 
         ParsedDocument parsed = null;
         String parsePath = null;
+        int chunkCount = 0;
         try {
             byte[] source = docStorage.open(row.storagePath());
             parsed = dispatch(row.type(), source, row.fileName());
@@ -92,6 +99,12 @@ public class DocParseService {
             byte[] artifact = MAPPER.writerWithDefaultPrettyPrinter()
                     .writeValueAsBytes(parsed);
             parsePath = docStorage.storeArtifact(row.kbId(), docId, ARTIFACT_NAME, artifact);
+
+            // T-503 / T-504 / T-505：解析产物 → 两级分片 → 块落 sys_chunk（含 chunk_count 回填）。
+            // 放在 markParsed **之前**：分片失败时文档应当停在 FAILED 并给出分片侧的原因，
+            // 而不是先标成「解析完成」再让用户发现一个块都没有。
+            chunkCount = recordWriter.replaceChunks(docId, row.kbId(),
+                    chunkingService.chunk(parsed, chunkingOptions(row.kbId())));
 
             recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed());
         } catch (ParseException ex) {
@@ -109,9 +122,9 @@ public class DocParseService {
         }
 
         recordWriter.replaceIssues(docId, row.kbId(), parsed.issues());
-        log.info("文档解析完成：docId={} type={} pages={} chars={} tables={}/{}",
+        log.info("文档解析完成：docId={} type={} pages={} chars={} tables={}/{} chunks={}",
                 docId, row.type(), parsed.pages(), parsed.chars(),
-                parsed.tableParsed(), parsed.tableTotal());
+                parsed.tableParsed(), parsed.tableTotal(), chunkCount);
         Map<String, Object> result = new HashMap<>();
         result.put("docId", docId);
         result.put("status", "INDEXING");
@@ -119,8 +132,47 @@ public class DocParseService {
         result.put("chars", parsed.chars());
         result.put("tableTotal", parsed.tableTotal());
         result.put("tableParsed", parsed.tableParsed());
+        result.put("chunkCount", chunkCount);
         result.put("parsePath", parsePath);
         return result;
+    }
+
+    /**
+     * 读该知识库的分片策略（{@code sys_kb.split_policy_json}）→ {@link ChunkingOptions}。
+     *
+     * <h3>为什么按库读，而不是用常量默认值</h3>
+     * <p>分片策略是**库级配置**（前端「分片设置」Tab 可改，5 个预设的 chunkSize 各不相同：
+     * GENERAL 512 / STRUCTURED 640 / CONTRACT 384 / QA_PAIR 320）。硬编码默认值会让
+     * 「用户改了配置、系统照旧」—— 配置文件里看得见的值没生效，是最难排查的一类问题。
+     *
+     * <h3>为什么读失败不抛异常</h3>
+     * <p>JSON 列读不出来是 **S3 配置写侧**该保证的不变量（`KbService` 只在几何校验通过后落库）。
+     * 因为历史脏数据让整篇文档解析失败，代价远大于按默认参数分片 —— 而且那是**另一个模块**的问题，
+     * 不该由解析任务来报。所以降级 + {@code WARN} 日志，日志里有 kbId 与原文，可追。
+     *
+     * <p>默认值取自 {@link KbConfigDefaults}（与 `KbService#defaultSplitPolicy` 同源），
+     * 不在这里另抄一份字面量。
+     */
+    private ChunkingOptions chunkingOptions(long kbId) {
+        List<String> rows = entityManager.createNativeQuery(
+                        "select split_policy_json from sys_kb where id = :kbId")
+                .setParameter("kbId", kbId)
+                .getResultList();
+        if (rows.isEmpty() || rows.getFirst() == null || rows.getFirst().isBlank()) {
+            return ChunkingOptions.defaults();
+        }
+        String json = rows.getFirst();
+        try {
+            var node = MAPPER.readTree(json);
+            return new ChunkingOptions(
+                    node.path("chunkSize").asInt(KbConfigDefaults.CHUNK_SIZE),
+                    node.path("overlap").asInt(KbConfigDefaults.OVERLAP),
+                    node.path("semanticSplit").asBoolean(KbConfigDefaults.SEMANTIC_SPLIT));
+        } catch (Exception ex) {
+            log.warn("知识库分片策略 JSON 解析失败，本次按默认参数分片：kbId={} json={} err={}",
+                    kbId, json, ex.getMessage());
+            return ChunkingOptions.defaults();
+        }
     }
 
     /**

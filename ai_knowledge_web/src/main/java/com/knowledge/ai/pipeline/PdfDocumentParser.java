@@ -114,6 +114,7 @@ public class PdfDocumentParser {
         List<ParsedDocument.Heading> headings = new ArrayList<>();
         List<ParsedDocument.ParsedTable> tables = new ArrayList<>();
         List<String> paragraphs = new ArrayList<>();
+        List<ParsedDocument.DocElement> elements = new ArrayList<>();
         List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
         int imageCount = 0;
         int pages = intOr(root.get("number of pages"), 0);
@@ -137,14 +138,24 @@ public class PdfDocumentParser {
                                 default -> 1;
                             };
                             headings.add(new ParsedDocument.Heading(level, text, pageNo));
+                            elements.add(ParsedDocument.DocElement.heading(level, text, pageNo));
                         }
                     }
-                    case "table" -> tables.add(toTable(textOr(el.get("title"), title), pageNo, el));
-                    case "image" -> imageCount++;
+                    case "table" -> {
+                        tables.add(toTable(textOr(el.get("title"), title), pageNo, el));
+                        // 下标就是刚插进去的那张 —— 用 size()-1 而不是另设计数器，
+                        // 两者一旦分头维护就会错位（这是"单一事实源"的本地落法）
+                        elements.add(ParsedDocument.DocElement.table(tables.size() - 1, pageNo));
+                    }
+                    case "image" -> {
+                        imageCount++;
+                        elements.add(ParsedDocument.DocElement.image(pageNo));
+                    }
                     case "paragraph" -> {
                         String text = textOr(el.get("content"), "").trim();
                         if (!text.isEmpty()) {
                             paragraphs.add(text);
+                            elements.add(ParsedDocument.DocElement.paragraph(text, pageNo));
                         }
                     }
                     case "list" -> {
@@ -152,6 +163,7 @@ public class PdfDocumentParser {
                         String joined = joinListItems(el);
                         if (!joined.isBlank()) {
                             paragraphs.add(joined);
+                            elements.add(ParsedDocument.DocElement.paragraph(joined, pageNo));
                         }
                     }
                     default -> {
@@ -187,9 +199,9 @@ public class PdfDocumentParser {
             }
         }
 
-        String markdown = buildMarkdown(title, headings, paragraphs, tables);
+        String markdown = buildMarkdown(title, elements, tables);
         return new ParsedDocument("PDF", Math.max(pages, 1), chars, markdown,
-                headings, tables, paragraphs.size(), imageCount, issues);
+                headings, tables, paragraphs.size(), imageCount, issues, elements);
     }
 
     /** {@code table} 元素 → cell 矩阵。格子在 {@code cells[].kids[].content} 里逐段拼。 */
@@ -252,24 +264,37 @@ public class PdfDocumentParser {
         return sb.toString();
     }
 
-    /** 统一形态的 markdown：标题 + 段落 + 表格（按元素出现顺序的近似）。 */
-    private static String buildMarkdown(String title, List<ParsedDocument.Heading> headings,
-                                        List<String> paragraphs, List<ParsedDocument.ParsedTable> tables) {
+    /**
+     * 统一形态的 markdown：**按 {@code elements} 的文档顺序**逐条拼。
+     *
+     * <p>⚠️ 本方法此前是"先把标题全拼完、再拼全部段落、再拼全部表格"—— 注释写的是
+     * 「按元素出现顺序的近似」，但那个"近似"其实**不成立**：段落与标题的相对位置整个丢了。
+     * 后果是 {@code markdown} 无法用于切分（`T-503` 的第一级要靠它），
+     * 且与 {@code TikaDocumentParser}（流式按序）的产物结构**不一致**。
+     * `S4-M05-C1` 步 0.6 改为按序拼，两条路径就此同形。
+     */
+    private static String buildMarkdown(String title,
+                                        List<ParsedDocument.DocElement> elements,
+                                        List<ParsedDocument.ParsedTable> tables) {
         StringBuilder sb = new StringBuilder();
         if (!title.isBlank()) {
             sb.append("# ").append(title.trim()).append("\n\n");
         }
-        for (ParsedDocument.Heading h : headings) {
-            sb.append("#".repeat(Math.max(1, Math.min(6, h.level()))))
-                    .append(' ').append(h.text()).append("\n\n");
-        }
-        for (String p : paragraphs) {
-            sb.append(p).append("\n\n");
-        }
-        for (ParsedDocument.ParsedTable t : tables) {
-            String md = t.toMarkdown();
-            if (!md.isBlank()) {
-                sb.append(md).append('\n');
+        for (ParsedDocument.DocElement el : elements) {
+            switch (el.kind()) {
+                case HEADING -> sb.append("#".repeat(Math.max(1, Math.min(6, el.level()))))
+                        .append(' ').append(el.text()).append("\n\n");
+                case PARAGRAPH -> sb.append(el.text()).append("\n\n");
+                case TABLE -> {
+                    String md = tables.get(el.tableIndex()).toMarkdown();
+                    if (!md.isBlank()) {
+                        sb.append(md).append('\n');
+                    }
+                }
+                // 图片不进正文：题注已在 table 侧承接；在 T-512 产出 VL 描述之前，
+                // 这里没有任何可放的文本（占位成"（图片）"会变成一条假正文）。
+                case IMAGE -> {
+                }
             }
         }
         return sb.toString();

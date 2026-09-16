@@ -47,6 +47,7 @@ public final class PlainTextParser {
         boolean isMd = fileName != null && fileName.toLowerCase(java.util.Locale.ROOT).endsWith(".md");
         java.util.List<ParsedDocument.Heading> headings = new java.util.ArrayList<>();
         java.util.List<String> paragraphs = new java.util.ArrayList<>();
+        java.util.List<ParsedDocument.DocElement> elements = new java.util.ArrayList<>();
         StringBuilder md = new StringBuilder();
 
         if (isMd) {
@@ -58,6 +59,7 @@ public final class PlainTextParser {
                     int level = matcher.group(1).length();
                     String t = matcher.group(2);
                     headings.add(new ParsedDocument.Heading(level, t, 1));
+                    elements.add(ParsedDocument.DocElement.heading(level, t, 1));
                     md.append("#".repeat(level)).append(' ').append(t).append("\n\n");
                 } else if (line.isBlank()) {
                     if (!md.isEmpty() && !md.substring(md.length() - 2).equals("\n\n")) {
@@ -66,6 +68,7 @@ public final class PlainTextParser {
                 } else {
                     md.append(line).append('\n');
                     paragraphs.add(line);
+                    elements.add(ParsedDocument.DocElement.paragraph(line, 1));
                 }
             }
         } else {
@@ -73,7 +76,7 @@ public final class PlainTextParser {
             StringBuilder para = new StringBuilder();
             for (String line : text.split("\\R", -1)) {
                 if (line.isBlank()) {
-                    flushPara(para, paragraphs, md);
+                    flushPara(para, paragraphs, elements, md);
                 } else {
                     if (!para.isEmpty()) {
                         para.append('\n');
@@ -81,18 +84,21 @@ public final class PlainTextParser {
                     para.append(line.trim());
                 }
             }
-            flushPara(para, paragraphs, md);
+            flushPara(para, paragraphs, elements, md);
         }
 
         int chars = text.strip().length();
+        // 纯文本没有页的概念 —— pages = 1，元素 pageNo 恒 1（与 Tika 路径同理，是格式事实不是缺陷）
         return new ParsedDocument(isMd ? "MD" : "TXT", 1, chars, md.toString().trim(),
-                headings, java.util.List.of(), paragraphs.size(), 0, java.util.List.of());
+                headings, java.util.List.of(), paragraphs.size(), 0, java.util.List.of(), elements);
     }
 
-    private static void flushPara(StringBuilder para, java.util.List<String> paragraphs, StringBuilder md) {
+    private static void flushPara(StringBuilder para, java.util.List<String> paragraphs,
+                                  java.util.List<ParsedDocument.DocElement> elements, StringBuilder md) {
         if (!para.isEmpty()) {
             String t = para.toString();
             paragraphs.add(t);
+            elements.add(ParsedDocument.DocElement.paragraph(t, 1));
             md.append(t).append("\n\n");
             para.setLength(0);
         }

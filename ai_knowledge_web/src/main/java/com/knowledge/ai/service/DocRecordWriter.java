@@ -2,6 +2,7 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.pipeline.Block;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
@@ -11,7 +12,9 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * {@code sys_document} 的**短事务写点**（`T-500` 的落库侧）。
@@ -173,6 +176,127 @@ public class DocRecordWriter {
                     .setParameter("now", now)
                     .executeUpdate();
         }
+    }
+
+    /**
+     * 整批重建分片块（`T-505`，先删后插），并回填 {@code sys_document.chunk_count}。
+     *
+     * <h3>为什么是"整批重写"而不是增量</h3>
+     * <p>与 {@link #replaceIssues} 同一条理由：重跑解析时块集可能整个变样
+     * （换了 chunkSize、标题层级变了），增量对账的成本高于重写，而且会留下
+     * "上一次的残留块"——那些块检索得到、却不再属于这篇文档，
+     * 是最难排查的一类脏数据。先删后插让重跑天然幂等。
+     *
+     * <h3>为什么分两遍插（父块先、子块后）</h3>
+     * <p>子块的 {@code parent_id} 要指向父块的**自增 id**，而那个 id 只有插进去才知道。
+     * 分片阶段子块只持有"父块的 orderNo"（{@link Block#parentOrderNo()}）——
+     * 那是刻意的：分片是纯函数，不该依赖数据库。
+     *
+     * <p>两遍插入**不依赖"父块一定排在子块前面"**这个假设。虽然 {@code ChunkingService}
+     * 目前确实先产出父块，但把正确性建立在产出的顺序上，会在将来某次改动后
+     * 变成一个静默的父子错位。
+     *
+     * @return 写入的**顶层块**数（= 回填的 {@code chunk_count}），
+     *         口径见 D-5 §1.5 与 {@code BlockType#countsInChunkTotal()}
+     */
+    @Transactional
+    public int replaceChunks(long docId, long kbId, List<Block> blocks) {
+        entityManager.createNativeQuery("delete from sys_chunk where doc_id = :docId")
+                .setParameter("docId", docId)
+                .executeUpdate();
+
+        int topLevel = 0;
+        if (blocks != null && !blocks.isEmpty()) {
+            LocalDateTime now = LocalDateTime.now();
+            // orderNo → 刚落库的父块 id
+            Map<Integer, Long> parentIds = new HashMap<>();
+
+            for (Block block : blocks) {
+                if (!block.isTopLevel()) {
+                    continue;
+                }
+                parentIds.put(block.orderNo(), insertChunk(docId, kbId, block, null, now));
+            }
+            for (Block block : blocks) {
+                if (block.isTopLevel()) {
+                    continue;
+                }
+                Long parentId = parentIds.get(block.parentOrderNo());
+                if (parentId == null) {
+                    // 分片产出了指向不存在父块的子块 —— 契约违例（D-5 §1.2）。
+                    // 落一条 parent_id = null 子块会更糟：它既不会被回表取到，
+                    // 又会让 G4-6 的"子块必有 TABLE 父块"断言在事后才发现是假的。
+                    throw new BizException(ErrorCode.SYSTEM_ERROR,
+                            "分片结果自相矛盾：第 " + block.orderNo() + " 块指向不存在的父块 #"
+                                    + block.parentOrderNo() + "，本次解析未写入任何分片");
+                }
+                insertChunk(docId, kbId, block, parentId, now);
+            }
+
+            topLevel = (int) blocks.stream()
+                    .filter(Block::isTopLevel)
+                    .filter(b -> b.blockType().countsInChunkTotal())
+                    .count();
+
+            entityManager.createNativeQuery(
+                            "update sys_document set chunk_count = :n, updated_at = :now where id = :id")
+                    .setParameter("n", topLevel)
+                    .setParameter("now", now)
+                    .setParameter("id", docId)
+                    .executeUpdate();
+        } else {
+            // 空块集也要回填 0：上次解析若写过 chunk_count，不归零会留下
+            // "文档没有块、却报告有 42 个分片"的假数
+            entityManager.createNativeQuery(
+                            "update sys_document set chunk_count = 0, updated_at = :now where id = :id")
+                    .setParameter("now", LocalDateTime.now())
+                    .setParameter("id", docId)
+                    .executeUpdate();
+        }
+        return topLevel;
+    }
+
+    /**
+     * 插一个块并返回它的自增 id。
+     *
+     * <p>取 id 用「按 (doc_id, order_no) 回查」而不是 {@code getGeneratedKeys} ——
+     * 与 {@link #insert} 同一个理由：Hibernate 的 {@code createNativeQuery(...).executeUpdate()}
+     * 不返回自增键。{@code (doc_id, order_no)} 在本次写入内唯一（orderNo 是 1..N），
+     * 且刚做过全删，所以这条回查是确定的。
+     */
+    private Long insertChunk(long docId, long kbId, Block block, Long parentId, LocalDateTime now) {
+        entityManager.createNativeQuery("""
+                        insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, title_path,
+                                               raw_content, order_no, page_no, created_at)
+                        values (:docId, :kbId, :chunkType, :parentId, :titlePath,
+                                :rawContent, :orderNo, :pageNo, :now)
+                        """)
+                .setParameter("docId", docId)
+                .setParameter("kbId", kbId)
+                .setParameter("chunkType", block.blockType().name())
+                .setParameter("parentId", parentId)
+                .setParameter("titlePath", blankToNull(block.titlePath()))
+                .setParameter("rawContent", block.rawContent())
+                .setParameter("orderNo", block.orderNo())
+                .setParameter("pageNo", block.pageNo())
+                .setParameter("now", now)
+                .executeUpdate();
+
+        @SuppressWarnings("unchecked")
+        List<Number> ids = entityManager.createNativeQuery(
+                        "select id from sys_chunk where doc_id = :docId and order_no = :orderNo")
+                .setParameter("docId", docId)
+                .setParameter("orderNo", block.orderNo())
+                .getResultList();
+        if (ids.isEmpty()) {
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "分片写入失败，请重试");
+        }
+        return ids.getFirst().longValue();
+    }
+
+    /** 空串与 {@code null} 在库里是两种值 —— 标题路径没有就是没有，不写空串进去。 */
+    private static String blankToNull(String v) {
+        return v == null || v.isBlank() ? null : v;
     }
 
     /**

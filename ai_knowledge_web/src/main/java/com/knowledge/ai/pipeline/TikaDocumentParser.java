@@ -109,6 +109,7 @@ public class TikaDocumentParser {
         private final List<ParsedDocument.Heading> headings = new ArrayList<>();
         private final List<ParsedDocument.ParsedTable> tables = new ArrayList<>();
         private final List<String> paragraphs = new ArrayList<>();
+        private final List<ParsedDocument.DocElement> elements = new ArrayList<>();
         private final List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
         /**
          * 当前表的**可变**行缓冲。
@@ -159,7 +160,7 @@ public class TikaDocumentParser {
             flushParagraph();
             String markdown = md.toString().trim();
             return new ParsedDocument(format, pageNo, chars, markdown,
-                    headings, tables, paragraphs.size(), imageCount, issues);
+                    headings, tables, paragraphs.size(), imageCount, issues, elements);
         }
 
         private void reset() {
@@ -168,6 +169,7 @@ public class TikaDocumentParser {
             headings.clear();
             tables.clear();
             paragraphs.clear();
+            elements.clear();
             issues.clear();
             inline.setLength(0);
             openTableRows.clear();
@@ -264,6 +266,7 @@ public class TikaDocumentParser {
                     List<List<String>> rows = currentTableRows();
                     if (!rows.isEmpty()) {
                         tables.add(new ParsedDocument.ParsedTable("", tablePage, rows));
+                        elements.add(ParsedDocument.DocElement.table(tables.size() - 1, tablePage));
                     }
                     openTableRows.remove("current");
                 }
@@ -296,6 +299,7 @@ public class TikaDocumentParser {
                         if (!text.isEmpty()) {
                             int level = HEADINGS.get(name);
                             headings.add(new ParsedDocument.Heading(level, text, pageNo));
+                            elements.add(ParsedDocument.DocElement.heading(level, text, pageNo));
                             headingNo++;
                             md.append("#".repeat(level)).append(' ').append(text).append("\n\n");
                             // 字符数不在这里累计 —— text() 已经数过（flushParagraph 的注释）
@@ -340,6 +344,7 @@ public class TikaDocumentParser {
                 md.append(text).append("\n\n");
             }
             paragraphs.add(text);
+            elements.add(ParsedDocument.DocElement.paragraph(text, pageNo));
             // 字符数不在这里累计：text() 已经数过一次（heading 的文本也走 inline，
             // 若这里再数，标题文本会被算两遍 —— XLSX 探针实测 6 字符变 12）
         }

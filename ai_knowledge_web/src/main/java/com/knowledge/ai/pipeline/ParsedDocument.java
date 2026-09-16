@@ -20,18 +20,25 @@ import java.util.List;
  * 下游读它而不重新解析。所以**改这里的字段名 = 改已落库产物的格式** ——
  * 老产物会读不出来。加字段可以（Jackson 对缺失字段有默认值），改名要先想清楚。
  *
+ * <p>⚠️ {@link #elements()} 是 **2026-09-16（`S4-M05-C1` 步 0.6）新增**的字段。
+ * 在这之前落库的 {@code parse.json} 没有它（Jackson 给空列表）→ 那些文档分片时会得到**空块集**。
+ * 所以 {@code DocParseService} 有一条防御：elements 为空而 {@code chars > 0} 时**显式失败**
+ * 并要求重解析，而不是静默产出 0 个块（"跑了但什么都没产出"是本项目最不能接受的形态）。
+ *
  * @param format      源格式（{@code PDF}/{@code DOCX}/… ，取自 {@code sys_document.type}）
  * @param pages       页数。非分页格式（TXT/MD/SHEET）按 {@code 1} 计 —— **不能填 0**，
  *                    否则 {@link #charsPerPage()} 除零，且"0 页"在下游会被读成"没解析出东西"
  * @param chars       抽出的正文字符数（含 markdown 里的表格串 —— 它就是"内容有多少"）
  * @param markdown    统一形态的正文。**这是"内容"本身**，也是将来 `T-504` 表格双表示的原料
- * @param headings    标题结构，按文档顺序。**分片第一级（结构边界）吃它**
- *                    （《06》§1.4.2：「标题层级 H1→H3，叶子节点即一个候选块」）
+ * @param headings    标题结构，按文档顺序
  * @param tables      表格（含 cell 矩阵）。`T-504` 的 Markdown 表示与行式文本都由它产出
  * @param paragraphs  正文段落数（不含标题、不含表格内文本）—— 供质量展示与分片估算
  * @param imageCount  图片元素个数。⚠️ 只用于**统计**，本批不产出 `IMAGE` 分片
  *                    （图片处理是 `T-512`，P1）
  * @param issues      逐页问题（null 与空列表等价，见 {@link DocumentIssue}）
+ * @param elements    **按文档顺序**的元素序列 —— **分片第一级（结构边界）吃它**
+ *                    （《06》§1.4.2：「标题层级 H1→H3，叶子节点即一个候选块」）。
+ *                    见 {@link DocElement} 与下方"为什么需要它"
  */
 public record ParsedDocument(String format,
                              int pages,
@@ -41,7 +48,8 @@ public record ParsedDocument(String format,
                              List<ParsedTable> tables,
                              int paragraphs,
                              int imageCount,
-                             List<DocumentIssue> issues) {
+                             List<DocumentIssue> issues,
+                             List<DocElement> elements) {
 
     /** 紧凑构造器：把"没解析出东西"的两种表达统一成空列表，下游不必两处判空。 */
     public ParsedDocument {
@@ -49,6 +57,7 @@ public record ParsedDocument(String format,
         headings = headings == null ? List.of() : List.copyOf(headings);
         tables = tables == null ? List.of() : List.copyOf(tables);
         issues = issues == null ? List.of() : List.copyOf(issues);
+        elements = elements == null ? List.of() : List.copyOf(elements);
     }
 
     /**
@@ -99,6 +108,58 @@ public record ParsedDocument(String format,
             path.add(h.text());
         }
         return List.copyOf(path);
+    }
+
+    /**
+     * 文档顺序上的一个元素（`S4-M05-C1` 步 0.6 新增）。
+     *
+     * <h3>为什么需要它 —— 而不是直接用 {@link #headings()} + {@link #tables()}</h3>
+     * <p>这三份列表各自有序，但**彼此的相对位置丢了**：知道"有哪些标题"和"有哪些段落"，
+     * 却不知道"这段正文属于哪个标题"。而 {@code T-503} 的第一级分片正是
+     * 「按标题层级锁结构边界」—— 没有归属关系就没有边界。
+     *
+     * <p>本字段落地前的实测症状：`PdfDocumentParser` 按序遍历元素树，却把它们**分桶**进
+     * 三个列表；`buildMarkdown` 随后"先把标题全拼完、再拼段落、再拼表格"，
+     * 于是连 {@code markdown} 都不是文档顺序的忠实还原。而 `TikaDocumentParser` 是
+     * 流式按序拼的 —— **两条路径产出的结构还不一致**。本字段把两条路收敛到同一形状。
+     *
+     * <h3>派生关系（单一事实源）</h3>
+     * <p>{@code headings} / {@code paragraphs} / {@code markdown} 都**由本序列派生**，
+     * 不再各自独立累积 —— 否则它们会漂移，而漂移了没人看得出来。
+     *
+     * @param kind       元素种类
+     * @param text       文本。`HEADING`/`PARAGRAPH` 是原文；`TABLE`/`IMAGE` 为 {@code null}
+     *                   （表格内容在 {@link #tables()} 里，用 {@link #tableIndex()} 取）
+     * @param pageNo     所在页码，1-based
+     * @param level      仅 `HEADING` 有意义：1~6；**非标题为 {@code 0}**（标题层级不可能为 0，无歧义）
+     * @param tableIndex 仅 `TABLE` 有意义：{@link #tables()} 的**下标（0-based，0 是合法值）**；
+     *                   **非表格为 {@code -1}** —— 这里必须用负数哨兵，
+     *                   因为 0 是一个真实的表格下标（与 `parentId` 禁用 0 的理由同源：0 有真身）
+     */
+    public record DocElement(Kind kind, String text, int pageNo, int level, int tableIndex) {
+
+        /** 元素种类。与 {@link com.knowledge.ai.core.enums.BlockType} 不是一回事 ——
+         * 那是**分片后**的块类型（8 种，含摘要与 HyQ），这是**解析产物**的元素形状。 */
+        public enum Kind {
+            HEADING, PARAGRAPH, TABLE, IMAGE
+        }
+
+        /** 排序恒为文档顺序 —— 分片靠的就是它，不该有第二种顺序。 */
+        public static DocElement heading(int level, String text, int pageNo) {
+            return new DocElement(Kind.HEADING, text, pageNo, level, -1);
+        }
+
+        public static DocElement paragraph(String text, int pageNo) {
+            return new DocElement(Kind.PARAGRAPH, text, pageNo, 0, -1);
+        }
+
+        public static DocElement table(int tableIndex, int pageNo) {
+            return new DocElement(Kind.TABLE, null, pageNo, 0, tableIndex);
+        }
+
+        public static DocElement image(int pageNo) {
+            return new DocElement(Kind.IMAGE, null, pageNo, 0, -1);
+        }
     }
 
     /**
