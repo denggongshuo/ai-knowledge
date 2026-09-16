@@ -26,7 +26,10 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Milvus 集合初始化（T-010 / 验收门 G0-7）。
@@ -49,6 +52,12 @@ import java.util.List;
  * <p><b>幂等</b>：启动时按"集合存在？→ 索引存在？"逐级判断，全部存在则只做
  * 只读校验。因此可以随应用反复重启，不会重复建索引、不会丢数据。
  *
+ * <p>⚠️ <b>判"索引存在"必须按索引名、不能按字段名</b>：Milvus 的
+ * {@code describeIndex(fieldName=…)} 忽略 fieldName，恒返回整个集合的索引列表。
+ * 2026-09-17 前的实现正是按字段名判的，于是那个守卫恒为真、四个标量索引
+ * <b>从建表起就没建出来过</b>，而日志看上去一切正常（S0 潜伏到 S4-C3 才被探针逮到）。
+ * 现在统一走 {@link #collectionIndexNames(String)}，见其 javadoc。
+ *
  * <p><b>维度漂移不自动修复</b>：发现集合维度与配置不一致时**只报错不重建**。
  * 集合一旦按旧维度建好就无法原地修改，擅自 drop 会静默毁掉全部分片向量
  * （量级见 《01-示例数据字典》：38,502 条）。修复必须是人显式决定的动作。
@@ -68,6 +77,12 @@ public class MilvusCollectionInitializer implements ApplicationRunner {
             MilvusConstants.FIELD_DOC_ID,
             MilvusConstants.FIELD_CHUNK_TYPE,
             MilvusConstants.FIELD_SECRET_LEVEL);
+
+    /** 向量索引名（唯一一个；建索引时与判存在时都用它）。 */
+    private static final String VECTOR_INDEX_NAME = "idx_embedding";
+
+    /** 标量索引名前缀：{@code idx_<字段名>}。 */
+    private static final String SCALAR_INDEX_PREFIX = "idx_";
 
     private final MilvusServiceClient client;
 
@@ -205,15 +220,15 @@ public class MilvusCollectionInitializer implements ApplicationRunner {
 
     /** 向量字段索引：IVF_FLAT + L2 + nlist。已存在则跳过。 */
     private void ensureVectorIndex(String collection) throws Exception {
-        List<IndexDescription> indexes = describeIndexes(collection, MilvusConstants.FIELD_VECTOR);
-        if (!indexes.isEmpty()) {
-            log.info("[Milvus] 向量索引已存在：{}", indexNames(indexes));
+        Set<String> names = collectionIndexNames(collection);
+        if (names.contains(VECTOR_INDEX_NAME)) {
+            log.info("[Milvus] 向量索引已存在：{}", names);
             return;
         }
         CreateIndexParam param = CreateIndexParam.newBuilder()
                 .withCollectionName(collection)
                 .withFieldName(MilvusConstants.FIELD_VECTOR)
-                .withIndexName("idx_embedding")
+                .withIndexName(VECTOR_INDEX_NAME)
                 .withIndexType(IndexType.valueOf(properties.getIndexType()))
                 .withMetricType(MetricType.valueOf(properties.getMetricType()))
                 .withExtraParam("{\"nlist\":" + properties.getIndexNlist() + "}")
@@ -229,26 +244,36 @@ public class MilvusCollectionInitializer implements ApplicationRunner {
      *
      * <p>失败**只 WARN 不中断**：标量索引是性能优化，不是可用性前提。
      * 缺了它检索仍然正确，只是大集合下过滤变慢。
+     *
+     * <p>⚠️ <b>不能用「该字段有没有索引」来判存在</b>（2026-09-17 修的坑）：
+     * {@code describeIndex(fieldName=…)} 的 fieldName **被 Milvus 忽略**，恒返回整个集合的
+     * 索引列表。若照此判存在，守卫恒为真 → 四个字段全部被静默跳过，
+     * <b>索引从建表起就没建出来过、而日志看上去一切正常</b>（S0 起潜伏至 S4-C3）。
+     * 现在一律按**集合的索引名集合**判存在，且三条路径（已存在 / 创建成功 / 被拒绝）都留日志。
      */
     private void ensureScalarIndexes(String collection) {
         if (!properties.isScalarIndexEnabled()) {
             log.info("[Milvus] app.milvus.scalar-index-enabled=false，跳过标量索引");
             return;
         }
+        Set<String> names = collectionIndexNames(collection);
         for (String field : SCALAR_FILTER_FIELDS) {
+            String indexName = SCALAR_INDEX_PREFIX + field;
             try {
-                if (!describeIndexes(collection, field).isEmpty()) {
+                if (names.contains(indexName)) {
+                    log.info("[Milvus] 标量索引已存在：{}", indexName);
                     continue;
                 }
                 CreateIndexParam param = CreateIndexParam.newBuilder()
                         .withCollectionName(collection)
                         .withFieldName(field)
-                        .withIndexName("idx_" + field)
+                        .withIndexName(indexName)
                         .withIndexType(IndexType.INVERTED)
                         .withSyncMode(Boolean.TRUE)
                         .build();
                 R<?> result = client.createIndex(param);
                 if (result.getStatus() != null && result.getStatus() == R.Status.Success.getCode()) {
+                    names.add(indexName);
                     log.info("[Milvus] 标量索引创建完成：{}.{} INVERTED", collection, field);
                 } else {
                     log.warn("[Milvus] 标量索引创建被拒绝（不影响功能，仅影响过滤性能）：{}.{} → {}",
@@ -277,23 +302,31 @@ public class MilvusCollectionInitializer implements ApplicationRunner {
         return result.getData();
     }
 
-    private List<IndexDescription> describeIndexes(String collection, String field) {
+    /**
+     * 取集合的**全部索引名**。
+     *
+     * <p>⚠️ <b>刻意不传 {@code fieldName}</b>：Milvus 忽略它（实测 REST 与 gRPC 同现象 ——
+     * 带不带 fieldName 返回的都是整个集合的索引）。传了会得到一个"看起来像按字段查、
+     * 其实不是"的结果，`ensureScalarIndexes` 正是因此从 S0 起就没建出过标量索引。
+     *
+     * <p>「集合还没有任何索引」时 Milvus 返回失败态 —— 这不是错误，是"还没建"，故降级 debug。
+     */
+    private Set<String> collectionIndexNames(String collection) {
         R<io.milvus.grpc.DescribeIndexResponse> result = client.describeIndex(
                 DescribeIndexParam.newBuilder()
                         .withCollectionName(collection)
-                        .withFieldName(field)
                         .build());
         Integer status = result.getStatus();
         if (status == null || status != R.Status.Success.getCode()) {
-            // 该字段还没有任何索引时，Milvus 会返回"index not found"——这不是错误，是"还没建"
-            log.debug("[Milvus] describeIndex({}.{}) 返回：{}", collection, field, result.getMessage());
-            return List.of();
+            log.debug("[Milvus] describeIndex({}) 返回：{}", collection, result.getMessage());
+            return Set.of();
         }
-        return result.getData() == null ? List.of() : result.getData().getIndexDescriptionsList();
-    }
-
-    private String indexNames(List<IndexDescription> indexes) {
-        return indexes.stream().map(IndexDescription::getIndexName).toList().toString();
+        if (result.getData() == null) {
+            return Set.of();
+        }
+        return result.getData().getIndexDescriptionsList().stream()
+                .map(IndexDescription::getIndexName)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     private Integer dimensionOf(DescribeCollectionResponse response) {

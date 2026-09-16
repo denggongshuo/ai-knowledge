@@ -11,6 +11,7 @@ import io.milvus.grpc.DescribeCollectionResponse;
 import io.milvus.grpc.FieldSchema;
 import io.milvus.grpc.KeyValuePair;
 import io.milvus.param.collection.DescribeCollectionParam;
+import io.milvus.param.index.DescribeIndexParam;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,6 +22,7 @@ import org.springframework.web.client.RestClient;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -124,6 +126,32 @@ class S0VerificationTest {
                 milvusProperties.getCollection(), response.getSchema().getFieldsCount(),
                 dim, milvusProperties.getMetricType(), milvusProperties.getIndexType(),
                 milvusProperties.getIndexNlist());
+    }
+
+    @Test
+    @DisplayName("G0-7：四个标量过滤字段的 INVERTED 索引真的建出来了")
+    void scalarFilterIndexesExist() {
+        // ⚠️ 这条断言是 2026-09-17（S4-M05-C3 step 0）补的，它本该在 S0 就存在：
+        //    上面那条只验了「标量**字段**齐备」，没验「标量**索引**存在」——
+        //    而 `MilvusCollectionInitializer.ensureScalarIndexes` 的旧守卫
+        //    （按 fieldName 调 describeIndex，被 Milvus 忽略）恒为真，
+        //    于是四个 INVERTED 索引从建表起就没建出来过，且静默无日志。
+        //    字段在、索引不在，恰好落在两条断言的缝隙里。
+        Set<String> names = milvusClient.describeIndex(
+                        DescribeIndexParam.newBuilder()
+                                .withCollectionName(milvusProperties.getCollection())
+                                .build())
+                .getData()
+                .getIndexDescriptionsList().stream()
+                .map(io.milvus.grpc.IndexDescription::getIndexName)
+                .collect(Collectors.toSet());
+
+        assertTrue(names.contains("idx_embedding"), "缺少向量索引：" + names);
+        for (String scalar : List.of(MilvusConstants.FIELD_KB_ID, MilvusConstants.FIELD_DOC_ID,
+                MilvusConstants.FIELD_CHUNK_TYPE, MilvusConstants.FIELD_SECRET_LEVEL)) {
+            assertTrue(names.contains("idx_" + scalar),
+                    "缺少标量过滤索引 idx_" + scalar + "（大集合下过滤会退化为逐行扫描）—— 实际索引：" + names);
+        }
     }
 
     @Test
