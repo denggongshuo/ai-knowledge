@@ -108,6 +108,19 @@ class IndexEnhanceFlowTest {
 
         assertThat(count("select count(*) from sys_chunk where doc_id = ? and chunk_type = 'SUMMARY'", docId))
                 .as("`G4-9` 的判据原文：「存在 SUMMARY 类型分片」").isEqualTo(1);
+
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and title_path = ?",
+                docId, "3. 接口设计"))
+                .as("`G4-9` 的另一半：「分片内容含标题路径」。⚠️ 本批之前**没人证过这一列** —— "
+                        + "`ChunkingServiceTest` 只断言了 Block 上的 titlePath 算得对，"
+                        + "而「算对了但没写进库」是两条独立的失败路径（写入侧是 blankToNull）。"
+                        + "期望 2 = 标题块自身 + 它下面的正文块")
+                .isEqualTo(2);
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and chunk_type = 'SUMMARY' "
+                + "and title_path is null", docId))
+                .as("摘要块是**文档级**的，不属于任何一节 —— 空标题路径落库为 NULL 而不是空串"
+                        + "（空串与 NULL 在库里是两种值，见 DocRecordWriter#blankToNull）")
+                .isEqualTo(1);
         assertThat(written)
                 .as("顶层块 = 标题 + 正文 + 摘要 = 3")
                 .isEqualTo(3);
