@@ -103,76 +103,34 @@ public class PdfDocumentParser {
     /**
      * 从 opendataloader 的 JSON 元素树构造产物。
      *
-     * <p>元素树的形状（探针实测）：顶层 {@code kids[]} 是文档级元素序列，
-     * {@code type} 取 {@code heading/paragraph/list/table/image/caption}；
-     * 表格的 {@code rows[].cells[].kids[].content} 才是格子文本
-     * （cell 自身没有 content 字段）。
+     * <h3>元素树的形状（2026-09-16 探针重测，`S4-M05-C2` 步 0.1）</h3>
+     * <p>{@code type} 的**全集是 6 种**：{@code heading}·{@code paragraph}·{@code list}·
+     * {@code table}·{@code image}·**{@code text block}**。
+     * 表格的 {@code rows[].cells[].kids[].content} 才是格子文本（cell 自身没有 content 字段）。
+     *
+     * <p>⚠️ <b>这份清单此前漏了 {@code text block}，代价是静默丢了 8.1% 的内容。</b>
+     * 它是**容器**：自己没有 {@code content}，真正的段落与列表在它的 {@code kids[]} 里。
+     * 当时的实现只遍历顶层 {@code kids[]}、把不认识的一律丢掉，于是整棵子树消失
+     * —— 而 {@code table} 恰好都在顶层，所以既有判据（`table_total = 7`）照旧通过，
+     * 没有任何测试发现。**改本方法前先读 {@link #walk} 的 javadoc。**
+     *
+     * <p>另：{@code header}/{@code footer} **不存在**（同一次探针确认）——
+     * 所以页眉页脚得靠 `优化/O3` 的跨页重复检测自己判，不能指望解析器分类。
      */
     static ParsedDocument fromJson(JsonNode root) {
         String title = textOr(root.get("title"), "");
 
-        List<ParsedDocument.Heading> headings = new ArrayList<>();
-        List<ParsedDocument.ParsedTable> tables = new ArrayList<>();
-        List<String> paragraphs = new ArrayList<>();
-        List<ParsedDocument.DocElement> elements = new ArrayList<>();
-        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
-        int imageCount = 0;
+        Scan scan = new Scan();
         int pages = intOr(root.get("number of pages"), 0);
 
-        JsonNode kids = root.get("kids");
-        if (kids != null && kids.isArray()) {
-            for (JsonNode el : kids) {
-                String type = textOr(el.get("type"), "");
-                int pageNo = intOr(el.get("page number"), 0);
-                switch (type) {
-                    case "heading" -> {
-                        String text = textOr(el.get("content"), "").trim();
-                        if (!text.isEmpty()) {
-                            // "Doctitle" 之类的非数字层级归 1；数字层级夹到 1~6
-                            int level = switch (textOr(el.get("heading level"), "1")) {
-                                case "2" -> 2;
-                                case "3" -> 3;
-                                case "4" -> 4;
-                                case "5" -> 5;
-                                case "6" -> 6;
-                                default -> 1;
-                            };
-                            headings.add(new ParsedDocument.Heading(level, text, pageNo));
-                            elements.add(ParsedDocument.DocElement.heading(level, text, pageNo));
-                        }
-                    }
-                    case "table" -> {
-                        tables.add(toTable(textOr(el.get("title"), title), pageNo, el));
-                        // 下标就是刚插进去的那张 —— 用 size()-1 而不是另设计数器，
-                        // 两者一旦分头维护就会错位（这是"单一事实源"的本地落法）
-                        elements.add(ParsedDocument.DocElement.table(tables.size() - 1, pageNo));
-                    }
-                    case "image" -> {
-                        imageCount++;
-                        elements.add(ParsedDocument.DocElement.image(pageNo));
-                    }
-                    case "paragraph" -> {
-                        String text = textOr(el.get("content"), "").trim();
-                        if (!text.isEmpty()) {
-                            paragraphs.add(text);
-                            elements.add(ParsedDocument.DocElement.paragraph(text, pageNo));
-                        }
-                    }
-                    case "list" -> {
-                        // 列表的 items 各自是一条 content，整表按一个段落计
-                        String joined = joinListItems(el);
-                        if (!joined.isBlank()) {
-                            paragraphs.add(joined);
-                            elements.add(ParsedDocument.DocElement.paragraph(joined, pageNo));
-                        }
-                    }
-                    default -> {
-                        // caption / 其它：题注若挂着表格，会在 table 侧用 "title" 承接；
-                        // 独立题注不进正文（它是"关于某图的说明"，不是可检索的正文段落）
-                    }
-                }
-            }
-        }
+        walk(root.get("kids"), 0, title, scan);
+
+        List<ParsedDocument.Heading> headings = scan.headings;
+        List<ParsedDocument.ParsedTable> tables = scan.tables;
+        List<String> paragraphs = scan.paragraphs;
+        List<ParsedDocument.DocElement> elements = scan.elements;
+        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
+        int imageCount = scan.imageCount;
 
         // ---- 「无文本层」的逐页问题（P0，T-0S1 §六-1）----
         // 一行一页：15 页的扫描件就是 15 行 —— 「第几页」是 G4-11 点名的字段，
@@ -202,6 +160,98 @@ public class PdfDocumentParser {
         String markdown = buildMarkdown(title, elements, tables);
         return new ParsedDocument("PDF", Math.max(pages, 1), chars, markdown,
                 headings, tables, paragraphs.size(), imageCount, issues, elements);
+    }
+
+    /** 遍历过程中的累积点 —— 递归需要一个**跨层共享的可变容器**（方法局部变量做不到）。 */
+    private static final class Scan {
+        private final List<ParsedDocument.Heading> headings = new ArrayList<>();
+        private final List<ParsedDocument.ParsedTable> tables = new ArrayList<>();
+        private final List<String> paragraphs = new ArrayList<>();
+        private final List<ParsedDocument.DocElement> elements = new ArrayList<>();
+        private int imageCount;
+    }
+
+    /**
+     * 递归遍历元素树，把可检索的元素收进 {@code scan}。
+     *
+     * <h3>为什么必须递归（`S4-M05-C2` 步 0.5 修的缺陷）</h3>
+     * <p>本方法此前**只遍历顶层 `kids[]`**，不认识的一律落进 {@code default} 丢掉。
+     * 而 opendataloader 的元素树里有一类**容器**：{@code type = "text block"} ——
+     * 它自己没有 {@code content}，真正的段落与列表在它的 {@code kids[]} 里。
+     * 于是整棵子树被**静默**丢弃：20 页样本实测丢 **8.1%** 的可提取文本
+     * （32 个后代元素 / 200 字符，而顶层只保留了 2278 字符）。
+     *
+     * <p>它是"少了一点东西而没人发现"的形态 —— 既有测试全部通过，因为
+     * {@code table} 都在顶层（`table_total = 7` 照旧成立），`chars` 又不计被丢的部分。
+     *
+     * <h3>为什么是"递归"而不是"给 text block 加一个 case"</h3>
+     * <p>加 case 而不递归 = 只处理一层，遇到嵌套更深的容器会**再丢一次**。
+     * 这里的分界是：**容器往下走、叶子就地处理**。
+     *
+     * <p>⚠️ **`list` 不递归**：它的条目（`list item`）由 {@link #joinListItems} 整表读走，
+     * 再递归会重复计入。这条"谁是容器"的分界线是改本方法时最容易写错的地方。
+     *
+     * @param inheritedPageNo 父容器的页号；**子元素自己带页号时以子为准**
+     */
+    private static void walk(JsonNode kids, int inheritedPageNo, String title, Scan scan) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            String type = textOr(el.get("type"), "");
+            int pageNo = intOr(el.get("page number"), inheritedPageNo);
+            switch (type) {
+                case "heading" -> {
+                    String text = textOr(el.get("content"), "").trim();
+                    if (!text.isEmpty()) {
+                        // "Doctitle" 之类的非数字层级归 1；数字层级夹到 1~6
+                        int level = switch (textOr(el.get("heading level"), "1")) {
+                            case "2" -> 2;
+                            case "3" -> 3;
+                            case "4" -> 4;
+                            case "5" -> 5;
+                            case "6" -> 6;
+                            default -> 1;
+                        };
+                        scan.headings.add(new ParsedDocument.Heading(level, text, pageNo));
+                        scan.elements.add(ParsedDocument.DocElement.heading(level, text, pageNo));
+                    }
+                }
+                case "table" -> {
+                    scan.tables.add(toTable(textOr(el.get("title"), title), pageNo, el));
+                    // 下标就是刚插进去的那张 —— 用 size()-1 而不是另设计数器，
+                    // 两者一旦分头维护就会错位（这是"单一事实源"的本地落法）
+                    scan.elements.add(ParsedDocument.DocElement.table(scan.tables.size() - 1, pageNo));
+                }
+                case "image" -> {
+                    scan.imageCount++;
+                    scan.elements.add(ParsedDocument.DocElement.image(pageNo));
+                }
+                case "paragraph" -> {
+                    String text = textOr(el.get("content"), "").trim();
+                    if (!text.isEmpty()) {
+                        scan.paragraphs.add(text);
+                        scan.elements.add(ParsedDocument.DocElement.paragraph(text, pageNo));
+                    }
+                }
+                case "list" -> {
+                    // 列表的 items 各自是一条 content，整表按一个段落计。
+                    // **不递归** —— 见 javadoc 末尾那条分界线
+                    String joined = joinListItems(el);
+                    if (!joined.isBlank()) {
+                        scan.paragraphs.add(joined);
+                        scan.elements.add(ParsedDocument.DocElement.paragraph(joined, pageNo));
+                    }
+                }
+                default -> {
+                    // 容器（`text block`）与题注（`caption`）：**自身不产出元素，但子树必须照常走**。
+                    // 这是步 0.5 修的那个缺陷 —— 此前这里什么都不做，于是 `text block`
+                    // 的后代（段落、列表）整片消失。题注没有 kids，递归到它是空操作；
+                    // "题注挂着表格"那一路仍由 table 侧的 "title" 承接，不进正文。
+                    walk(el.get("kids"), pageNo, title, scan);
+                }
+            }
+        }
     }
 
     /** {@code table} 元素 → cell 矩阵。格子在 {@code cells[].kids[].content} 里逐段拼。 */
