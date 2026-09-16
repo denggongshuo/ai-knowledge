@@ -245,6 +245,23 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!--
+                Tika 3.2.2 的 ZIP 容器探测（DefaultZipContainerDetector）调用
+                ZipFile.builder()，该方法在 commons-compress 1.26 才出现；
+                而 minio:8.5.7 传递引入 commons-compress 1.24.0，Maven"最近声明取胜"
+                会选 1.24.0 —— 结果是**任何 DOCX/XLSX 解析都抛 NoSuchMethodError**
+                （S4-M05-B 开工探针实测）。tika-parent:3.2.2 自己声明的版本是 1.28.0，
+                在这里锁同版，压过 minio 的传递版本。
+                修法取"依赖管理收敛"而不是给 minio 加 exclusion：
+                exclusion 之后 Tika 拿不到 1.26+ 时 minio 若真用到该类会
+                NoClassDefFoundError（静默埋雷）；收敛版本是标准做法，且两者实际共存良好。
+                同类先例：上方 opendataloader 1.11.0 → 2.5.0（同样的 NoSuchMethodError 病因）。
+            -->
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-compress</artifactId>
+                <version>1.28.0</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 

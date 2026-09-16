@@ -106,4 +106,17 @@ public class DocController {
     public ApiResponse<DocDtos.TaskView> task(@PathVariable String taskId) {
         return ApiResponse.ok(docService.taskView(taskId));
     }
+
+    /**
+     * {@code GET /api/kb/{kbId}/parse-issues} —— 逐页解析问题清单（`T-511`，`G4-11`）。
+     *
+     * <p>权限 {@code kb:list}：与文档列表同码 —— 清单是列表页告警条的数据源，
+     * "能看列表却看不到告警"只会造成"列表里有红标、顶部却安静"的割裂。
+     * 行粒度 = (文档, 页码)；前端"篇数"按 {@code docId} 去重。
+     */
+    @GetMapping("/api/kb/{kbId}/parse-issues")
+    @RequiresPerm("kb:list")
+    public ApiResponse<DocDtos.ParseIssuePage> parseIssues(@PathVariable long kbId) {
+        return ApiResponse.ok(docService.parseIssues(kbId));
+    }
 }

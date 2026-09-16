@@ -105,4 +105,30 @@ public final class DocDtos {
     public record TaskView(String taskId, String stage, int percent, int chunkDone,
                            int chunkTotal, String errorMsg) {
     }
+
+    // ==================== T-511 · 未识别表格 / 解析问题清单 ====================
+
+    /**
+     * 逐页解析问题行（字段与前端 {@code ParseIssue} 逐字对齐，
+     * {@code ai_knowledge_app/src/types/index.ts:555}：{@code docId/docTitle/pageNo/reason}）。
+     *
+     * <p><b>行粒度 = (文档, 页码)</b> —— 契约 {@code {docId, docTitle, pageNo, reason}}
+     * 天然允许一篇文档多行（同一份扫描件 15 页就是 15 行）。
+     * 这与 mock 的形状不同（mock 恰好 3 行 3 文档，历史上看不出来），
+     * 所以前端告警条的"篇数"必须按 {@code docId} 去重 —— 那半边改动在本批前端步骤里。
+     *
+     * <p>{@code docTitle} 冗余进每一行而不是让前端 join：告警条一次渲染就要标题，
+     * 而文档标题在展示期间不会变（改名走的是另一条接口），冗余是安全的。
+     */
+    public record ParseIssueRow(long docId, String docTitle, int pageNo, String reason) {
+    }
+
+    /**
+     * 问题清单分页体（对齐《10》§14：{@code { list: [...], total }}）。
+     *
+     * <p>{@code total} 与 {@code list.size()} 恒相等 —— 本接口**有意不分页**
+     * （后端截断 100 条保护数据库与前端，超出部分属异常情形，靠质量列与逐文档排查兜底）。
+     */
+    public record ParseIssuePage(List<ParseIssueRow> list, long total) {
+    }
 }

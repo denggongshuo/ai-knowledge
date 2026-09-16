@@ -66,6 +66,11 @@ class DocUploadFlowTest extends ApiTestSupport {
     @AfterEach
     void cleanProbeData() {
         for (Long kbId : probeKbIds) {
+            // 顺序：问题行 → 文档 → 授权 → 库（问题行引用 doc_id，先删防止悬挂）
+            jdbcTemplate.update("""
+                    delete i from sys_parse_issue i
+                    join sys_document d on d.id = i.doc_id where d.kb_id = ?
+                    """, kbId);
             jdbcTemplate.update("delete from sys_document where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb_grant where kb_id = ?", kbId);
             jdbcTemplate.update("delete from sys_kb where id = ?", kbId);
@@ -82,9 +87,11 @@ class DocUploadFlowTest extends ApiTestSupport {
     void uploadPersistsAllFieldsAndReadsBack() {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
-        byte[] content = "判据2：上传落库与回读".getBytes(StandardCharsets.UTF_8);
+        // S4-B 起上传即解析，夹具必须是**真的可解析内容**（S4-A 用的是文本字节充 PDF，
+        // 那样文档会走到 FAILED）。真 MD 文本：断言值不变，但流水线真的跑得通。
+        byte[] content = "# 判据2：上传落库与回读\n\n正文段落，用于解析。".getBytes(StandardCharsets.UTF_8);
 
-        RawResponse uploaded = upload(kbId, content, "回读探针.pdf", token).assertOk("上传");
+        RawResponse uploaded = upload(kbId, content, "回读探针.md", token).assertOk("上传");
         long docId = ((Number) uploaded.data("$.docId")).longValue();
 
         Map<String, Object> row = jdbcTemplate.queryForMap(
@@ -98,13 +105,15 @@ class DocUploadFlowTest extends ApiTestSupport {
         assertThat(row.get("title")).as("title 不含扩展名（与前端 KbDocRow.title 一致）")
                 .isEqualTo("回读探针");
         assertThat(row.get("file_name")).as("file_name 保留扩展名（下载要用）")
-                .isEqualTo("回读探针.pdf");
-        assertThat(row.get("type")).isEqualTo("PDF");
+                .isEqualTo("回读探针.md");
+        assertThat(row.get("type")).isEqualTo("MD");
         assertThat(((Number) row.get("size_bytes")).longValue()).isEqualTo(content.length);
         assertThat(row.get("md5")).as("md5 由服务端按字节重算，不是客户端传的")
                 .isEqualTo(md5Hex(content));
-        assertThat(row.get("status")).as("本批无解析管线，终态就是 UPLOADED")
-                .isEqualTo("UPLOADED");
+        assertThat(row.get("status"))
+                .as("S4-B 起上传即解析：终态是 INDEXING（解析完成、等待建立索引），"
+                        + "READY 要等向量入 Milvus（S4-C）—— 那才是「报告说成功」")
+                .isEqualTo("INDEXING");
         assertThat(row.get("storage_path")).as("对象名由任务体回写").isNotNull();
 
         // 文件真的进了 MinIO —— 只断言接口返回过不了判据 8 那类"报告说成功了"的情形
@@ -117,7 +126,7 @@ class DocUploadFlowTest extends ApiTestSupport {
     void secondUploadHitsMd5Dedup() {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
-        byte[] content = "判据3：秒传去重".getBytes(StandardCharsets.UTF_8);
+        byte[] content = "# 判据3：秒传去重\n\n正文。".getBytes(StandardCharsets.UTF_8);
 
         RawResponse first = upload(kbId, content, "去重探针.md", token).assertOk("首次上传");
         long firstDocId = ((Number) first.data("$.docId")).longValue();
@@ -136,7 +145,7 @@ class DocUploadFlowTest extends ApiTestSupport {
     void dedupKeyIsOwnerScoped() {
         String adminToken = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(adminToken);
-        byte[] content = "判据4：owner 维度的去重".getBytes(StandardCharsets.UTF_8);
+        byte[] content = "判据4：owner 维度的去重\n".getBytes(StandardCharsets.UTF_8);
 
         upload(kbId, content, "跨用户去重探针.txt", adminToken).assertOk("管理员上传");
 
@@ -159,7 +168,7 @@ class DocUploadFlowTest extends ApiTestSupport {
     void dedupHintDoesNotBlockUpload() {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
-        byte[] content = "判据5：命中不阻断".getBytes(StandardCharsets.UTF_8);
+        byte[] content = "# 判据5：命中不阻断\n\n正文。".getBytes(StandardCharsets.UTF_8);
 
         long firstId = ((Number) upload(kbId, content, "覆盖探针.md", token)
                 .assertOk("首次上传").data("$.docId")).longValue();
@@ -186,7 +195,9 @@ class DocUploadFlowTest extends ApiTestSupport {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
 
-        // 100MB 全 0x11：内容无所谓，判的是"真的走过来了 104857600 字节"
+        // 100MB 全 0x11：内容无所谓，判的是"真的走过来了 104857600 字节"。
+        // ⚠️ 但 S4-B 起上传即解析 —— 假字节必然解析失败，而本判据**只关心 MinIO 的字节数**，
+        // 所以这里显式接受终态为 FAILED（解析失败不影响"文件真的落进桶里"这个断言对象）。
         byte[] big = new byte[100 * 1024 * 1024];
         java.util.Arrays.fill(big, (byte) 0x11);
 
@@ -198,6 +209,11 @@ class DocUploadFlowTest extends ApiTestSupport {
         String objectKey = jdbcTemplate.queryForObject(
                 "select storage_path from sys_document where id = ?", String.class, docId);
         assertThat(objectKey).as("对象名应已由任务体回写").isNotNull();
+
+        String status = jdbcTemplate.queryForObject(
+                "select status from sys_document where id = ?", String.class, docId);
+        assertThat(status).as("假字节解析必失败 —— 这是诚实的行为（观察项），本判据不断言它")
+                .isEqualTo("FAILED");
 
         long objectSize = docStorage.sizeOf(objectKey);
         assertThat(objectSize)
@@ -234,7 +250,8 @@ class DocUploadFlowTest extends ApiTestSupport {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
 
-        RawResponse uploaded = upload(kbId, "判据9：进度".getBytes(StandardCharsets.UTF_8), "进度探针.pdf", token)
+        RawResponse uploaded = upload(kbId, "# 判据9：进度\n\n正文。".getBytes(StandardCharsets.UTF_8),
+                "进度探针.md", token)
                 .assertOk("上传");
         String taskId = uploaded.data("$.taskId");
 
@@ -290,7 +307,7 @@ class DocUploadFlowTest extends ApiTestSupport {
         assertThat(before).as("新库应为 0 篇").isZero();
 
         for (int i = 1; i <= 3; i++) {
-            upload(kbId, ("判据13-" + i).getBytes(StandardCharsets.UTF_8), "列表探针" + i + ".md", token)
+            upload(kbId, ("# 判据13-" + i + "\n\n正文。").getBytes(StandardCharsets.UTF_8), "列表探针" + i + ".md", token)
                     .assertOk("上传第 " + i + " 篇");
         }
 
@@ -304,12 +321,12 @@ class DocUploadFlowTest extends ApiTestSupport {
         assertThat(list).hasSize(3);
         assertThat(displayed).isEqualTo(3);
 
-        // 每行都带质量四列（本批恒 0，但字段必须在 —— 前端按它渲染常驻列）
+        // 每行都带质量四列与状态（S4-B 起解析真跑，MD 文本会到 INDEXING 且质量列仍为 0 —— 无表格）
         Map<String, Object> row = list.getFirst();
         assertThat(row).containsKeys("tableTotal", "tableParsed", "imageTotal", "imageParsed",
                 "chunkCount", "status", "owner", "uploadedAt");
-        assertThat(((Number) row.get("tableTotal")).longValue()).as("本批无解析，质量列为 0").isZero();
-        assertThat(row.get("status")).isEqualTo("UPLOADED");
+        assertThat(((Number) row.get("tableTotal")).longValue()).as("MD 文本无表格，tableTotal 为 0").isZero();
+        assertThat(row.get("status")).isEqualTo("INDEXING");
     }
 
     @Test
@@ -317,14 +334,15 @@ class DocUploadFlowTest extends ApiTestSupport {
     void statusColumnIsIndependentFromQualityColumn() {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
-        upload(kbId, "判据12".getBytes(StandardCharsets.UTF_8), "质量列探针.pdf", token).assertOk("上传");
+        upload(kbId, "# 判据12\n\n正文。".getBytes(StandardCharsets.UTF_8), "质量列探针.md", token).assertOk("上传");
 
         Map<String, Object> row = get("/api/kb/" + kbId + "/docs", token)
                 .assertOk("列表").data("$.list[0]");
 
         // 《06》§3.6 的设计目的：两行的 status 可以一模一样，差别只在质量列。
-        // 本批质量恒 0（无解析），但**两个字段是分开的** —— 这是 S4-B 填值的前提。
-        assertThat(row.get("status")).isEqualTo("UPLOADED");
+        // S4-B 起解析真跑：状态推进到 INDEXING，MD 文本没有表格所以质量列仍全 0
+        // —— 两个字段各走各的，正是"独立"的可执行证据。
+        assertThat(row.get("status")).isEqualTo("INDEXING");
         assertThat(((Number) row.get("tableParsed")).longValue())
                 .as("质量列不随 status 派生 —— 它是解析产物，不是状态的函数")
                 .isZero();
@@ -336,7 +354,7 @@ class DocUploadFlowTest extends ApiTestSupport {
     void qualityFilterReturnsEmptyWhenNoIssue() {
         String token = loginAsAdmin().data("$.accessToken");
         long kbId = createProbeKb(token);
-        upload(kbId, "筛选探针".getBytes(StandardCharsets.UTF_8), "筛选探针.pdf", token).assertOk("上传");
+        upload(kbId, "# 筛选探针\n\n正文。".getBytes(StandardCharsets.UTF_8), "筛选探针.md", token).assertOk("上传");
 
         RawResponse filtered = get("/api/kb/" + kbId + "/docs?quality=issue", token).assertOk("质量筛选");
         List<Map<String, Object>> list = filtered.data("$.list");
@@ -433,7 +451,7 @@ class DocUploadFlowTest extends ApiTestSupport {
 
         Long maxBefore = jdbcTemplate.queryForObject(
                 "select coalesce(max(id), 0) from sys_audit_log", Long.class);
-        upload(kbId, "判据16：审计".getBytes(StandardCharsets.UTF_8), "审计探针.pdf", token).assertOk("上传");
+        upload(kbId, "# 判据16：审计\n\n正文。".getBytes(StandardCharsets.UTF_8), "审计探针.md", token).assertOk("上传");
 
         Map<String, Object> log = jdbcTemplate.queryForMap("""
                 select module, action, risk_level, operator, result, api_path
@@ -462,7 +480,7 @@ class DocUploadFlowTest extends ApiTestSupport {
         // 用探针账号上传（它需要能看见该库：USER 角色在 V7 里拿到全库 READ）——
         // 但 upload 需要 doc:upload 权限，而 USER 角色是只读。
         // 所以走管理员建行、把 owner_id 指到探针账号（模拟"该账号上传过文档"）。
-        long docId = ((Number) upload(kbId, "判据18".getBytes(StandardCharsets.UTF_8), "业务数据探针.pdf",
+        long docId = ((Number) upload(kbId, "# 判据18\n\n正文。".getBytes(StandardCharsets.UTF_8), "业务数据探针.md",
                 adminToken).assertOk("上传").data("$.docId")).longValue();
         Long ownerId = jdbcTemplate.queryForObject(
                 "select id from sys_user where username = ?", Long.class, probe.username());

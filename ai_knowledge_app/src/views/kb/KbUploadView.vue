@@ -30,6 +30,13 @@ const queue = ref<UploadItem[]>([])
 const docs = ref<KbDocRow[]>([])
 const total = ref(0)
 const issues = ref<ParseIssue[]>([])
+/**
+ * 告警条的「篇数」：按 {@code docId} 去重，**不能直接用 issues.length**。
+ *
+ * 后端的行粒度是 (文档, 页码) —— 一份 15 页的扫描件会返回 15 行
+ * （「第几页」是 `G4-11` 点名的字段），直接数行会把"1 篇"说成"15 篇"。
+ */
+const issueDocCount = computed(() => new Set(issues.value.map((i) => i.docId)).size)
 const parseConfig = ref<ParseConfigView | null>(null)
 const loading = ref(false)
 const selected = ref<KbDocRow[]>([])
@@ -620,12 +627,12 @@ function gotoIssue() {
         </div>
       </template>
 
-      <!-- 未识别表格告警条 -->
+      <!-- 解析问题告警条 -->
       <div v-if="issues.length" class="issue-bar">
         <el-icon class="issue-icon"><WarningFilled /></el-icon>
         <span class="issue-text">
-          <b>{{ issues.length }} 篇文档存在未识别的表格</b>：{{ issues[0]?.docTitle }} 第 {{ issues[0]?.pageNo }} 页。该表格内的内容无法被检索命中，
-          建议改用可复制文本的 PDF，或开启 OCR 后重建索引。
+          <b>{{ issueDocCount }} 篇文档存在解析问题</b>：{{ issues[0]?.docTitle }} 第 {{ issues[0]?.pageNo }} 页 —— {{ issues[0]?.reason }}。
+          有问题的页面内容无法被检索命中，建议改用可复制文本的源文件后重建索引。
         </span>
         <el-button size="small" @click="gotoIssue">查看详情</el-button>
       </div>

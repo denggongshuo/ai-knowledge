@@ -128,6 +128,58 @@ public class DocStorage {
         }
     }
 
+    /**
+     * 读回对象字节（`T-502` 解析的入口：源文件在 MinIO，解析要从它开始）。
+     *
+     * <p>与 {@link #store} 的方向相反、纪律相同：**对象名是唯一事实源**
+     * （{@code sys_document.storage_path}），不存 URL、不接受外部路径 ——
+     * 入参只能来自我们自己写库的值，杜绝"拼一个 key 去读别人对象"的口子。
+     *
+     * @return 对象字节；对象不存在时抛 {@code 10044}（文档的存储对象丢了属于资源缺失，
+     *         不是参数错误 —— 比如有人手动清过桶）
+     */
+    public byte[] open(String objectKey) {
+        try (InputStream in = minioClient.getObject(io.minio.GetObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectKey)
+                .build())) {
+            return in.readAllBytes();
+        } catch (Exception ex) {
+            log.error("读回文档对象失败：object={} err={}", objectKey, ex.getMessage());
+            throw new BizException(ErrorCode.DOC_NOT_FOUND, "文档文件已不存在，请重新上传");
+        }
+    }
+
+    /**
+     * 写解析产物（`T-502` 的产物侧）。
+     *
+     * <p>对象名 {@code parsed/{kbId}/{docId}/{name}} —— 与源文件的 {@code documents/} 前缀
+     * 平行：一个前缀是"用户给的"，一个前缀是"系统产的"，生命周期策略可以分开定
+     * （将来"删源留解析产物"或"一起删"都是一条前缀规则的事）。
+     *
+     * <p>产物与源文件一样**全量覆盖写**：重跑解析会覆盖旧产物 —— 这正是幂等的一部分
+     * （同一个 docId 的产物永远只有一份、且是最新解析的结果）。
+     *
+     * @return 可直接写入 {@code sys_document.parse_path} 的对象名
+     */
+    public String storeArtifact(long kbId, long docId, String name, byte[] bytes) {
+        String objectKey = "parsed/" + kbId + "/" + docId + "/" + safeName(name);
+        try (InputStream in = new java.io.ByteArrayInputStream(bytes)) {
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    // 产物是 JSON，远小于 5MB 的 multipart 下限，单次 PUT 足够
+                    .stream(in, bytes.length, -1)
+                    .contentType("application/json")
+                    .build());
+        } catch (Exception ex) {
+            log.error("解析产物写入 MinIO 失败：kbId={} docId={} object={} err={}",
+                    kbId, docId, objectKey, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "解析产物存储失败，请稍后重试");
+        }
+        return objectKey;
+    }
+
     /** 删除对象（文档被彻底删除时用）。**当前无调用方** —— `T-616` 起接入。 */
     public void remove(String objectKey) {
         try {

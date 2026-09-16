@@ -2,6 +2,7 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.pipeline.ParsedDocument;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -99,6 +100,82 @@ public class DocRecordWriter {
     }
 
     /**
+     * 进入解析态（`T-502` 的第 1 步）。
+     *
+     * <p>独立方法而不是并进 {@link #markParsed}：状态机里 {@code PARSING} 是**可观测的中间态**
+     * （`G4-3` 的判据是"状态可观测"），用户轮询时要能看到"解析中"，
+     * 而不是从「已上传」直接跳到终态 —— 那会让 100MB 文档在轮询里表现为"卡住"。
+     */
+    @Transactional
+    public void markParsing(long docId) {
+        entityManager.createNativeQuery(
+                        "update sys_document set status = 'PARSING', error_msg = null, updated_at = :now "
+                                + "where id = :id")
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /**
+     * 解析成功：写产物路径、填质量列、推进到 {@code INDEXING}。
+     *
+     * <p><b>终态是 INDEXING 而不是 READY</b>：READY 的语义是"唯一可被检索的状态"（《03》§4.2），
+     * 而向量还没写进 Milvus（`T-508` 属 S4-C）—— 这时标 READY 正是本项目最怕的"报告说成功"。
+     * {@code chunk_count} **不同步更新**：分片是 `T-503` 的事，本批诚实地留 0
+     * —— 宁可显示"0 个分片但解析完成"，也不写一个"看起来完整"的假数。
+     */
+    @Transactional
+    public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed) {
+        entityManager.createNativeQuery("""
+                        update sys_document
+                           set status = 'INDEXING', parse_path = :path,
+                               table_total = :tableTotal, table_parsed = :tableParsed,
+                               error_msg = null, updated_at = :now
+                         where id = :id
+                        """)
+                .setParameter("path", parsePath)
+                .setParameter("tableTotal", tableTotal)
+                .setParameter("tableParsed", tableParsed)
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /**
+     * 整批重建逐页问题（先删后插）。
+     *
+     * <p>调用时机：解析成功与失败**两条路都调** —— 失败的文档也要看得见
+     * （《07》§2.6「让上传的人**当场**就知道」）。先删后插让重跑天然幂等：
+     * 同一文档的问题行永远对齐"最近一次解析"。
+     *
+     * <p><b>不在 {@code markParsed} 里顺带写</b>：issue 行数是任意多的，
+     * 与"更新文档一行"不是一个事务形状；而且失败路径没有 parse_path 可写，
+     * 拆开让两条路各调各的，不硬凑同一个方法签名。
+     */
+    @Transactional
+    public void replaceIssues(long docId, long kbId, List<ParsedDocument.DocumentIssue> issues) {
+        entityManager.createNativeQuery("delete from sys_parse_issue where doc_id = :docId")
+                .setParameter("docId", docId)
+                .executeUpdate();
+        if (issues == null || issues.isEmpty()) {
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        for (ParsedDocument.DocumentIssue issue : issues) {
+            entityManager.createNativeQuery("""
+                            insert into sys_parse_issue (doc_id, kb_id, page_no, reason, created_at)
+                            values (:docId, :kbId, :pageNo, :reason, :now)
+                            """)
+                    .setParameter("docId", docId)
+                    .setParameter("kbId", kbId)
+                    .setParameter("pageNo", issue.pageNo())
+                    .setParameter("reason", truncate(issue.reason()))
+                    .setParameter("now", now)
+                    .executeUpdate();
+        }
+    }
+
+    /**
      * 标记失败并留下**具体原因**。
      *
      * <p>{@code G4-3} 的判据是「失败态给出**具体原因**（非"失败"两字）」，
@@ -123,5 +200,14 @@ public class DocRecordWriter {
             // 连"记下失败"都失败了 —— 只能留日志，不能让异常再往上冒把任务体的原始失败原因盖掉
             log.error("回写文档失败状态时出错：docId={} 原始原因={} err={}", docId, msg, ex.getMessage());
         }
+    }
+
+    /** reason 截断到 {@code sys_parse_issue.reason} 的列宽 512。 */
+    private static String truncate(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return "解析发现问题（未提供细节）";
+        }
+        String v = reason.trim();
+        return v.length() > 500 ? v.substring(0, 500) : v;
     }
 }

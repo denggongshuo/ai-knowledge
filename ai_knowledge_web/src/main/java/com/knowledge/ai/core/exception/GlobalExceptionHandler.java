@@ -15,6 +15,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -139,6 +140,25 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleNoResource(NoResourceFoundException ex) {
         log.warn("资源不存在 uri={} traceId={}", ex.getResourcePath(), TraceContext.get());
         return build(HttpStatus.NOT_FOUND.value(), ApiResponse.fail(ErrorCode.NOT_FOUND));
+    }
+
+    /**
+     * 请求体超过 multipart 上限（{@code application.yml} 的
+     * {@code spring.servlet.multipart.max-request-size}）。
+     *
+     * <p><b>为什么值得单列一个处理器</b>：这个异常在 **DispatcherServlet 解析 multipart 时**
+     * 抛出，会一路穿透到本类 —— 但若没有这一条，它落进兜底 {@code Exception} 处理器，
+     * 前端拿到的是 HTTP 500 的 {@code {code:9999,"系统异常"}}；
+     * 更糟的是**容器层面**（Tomcat 的 {@code maxSwallowSize}）拒绝读取时连接被直接断开，
+     * 前端收到的是 HTML 错误页 —— 现象就是 S4-A §9 第 6 条登记的
+     * 「选个 101MB 文件，上传按钮转一下就没反应」。
+     * 显式映射到 {@code 10035 FILE_TOO_LARGE}，让 {@code request.ts} 能按业务码弹提示。
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMaxUploadSize(MaxUploadSizeExceededException ex) {
+        log.warn("请求体超过 multipart 上限 traceId={} message={}", TraceContext.get(), ex.getMessage());
+        return build(HttpStatus.OK.value(),
+                ApiResponse.fail(ErrorCode.FILE_TOO_LARGE, "文件超过 100 MB 上限，请压缩或拆分后上传"));
     }
 
     // ==================== 9999 兜底 ====================

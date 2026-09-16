@@ -23,7 +23,7 @@
  * </ol>
  * 这条断言的价值：`md5.ts` 是**自研**的（零依赖决策，见计划 §5），
  * 而自研 MD5 最典型的错法是"跨 64 字节分组的边界处理"—— 小文件对、大文件错。
- * 所以对照用的样本特意取 **400KB**（远超 64 字节，且跨 MD5 的填充边界）。
+ * 所以对照用的样本特意取 **2MB**（远超 64 字节，且跨 MD5 的填充边界）。
  *
  * <h3>自清纪律</h3>
  * 本脚本会用固定 code {@code kb_e2e_doc_probe} 真建一个库、真传文件，跑完必须
@@ -101,7 +101,8 @@ docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -
 /** 幂等清理探针库及其文档（顺序：文档 → 授权 → 主表）。 */
 function purgeProbe() {
   mysqlScalar(
-    `delete d from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';` +
+    `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
+      delete d from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';` +
       `delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';` +
       `delete from sys_kb where code='${PROBE_CODE}';`,
   )
@@ -266,10 +267,14 @@ async function main() {
     '# E2E 回归探针\n\n型号 A-100，产品名称 智能网关，单价 ￥1,200，交期 7 天。\n', 'utf8')
   writeFileSync(`${OUT_DIR}/${smallName}`, smallBytes)
 
-  const bigName = 'E2E限速探针.pdf'
-  const bigBytes = Buffer.alloc(THROTTLE_BYTES)
-  // 伪随机填充：真正"内容不同"，而不是一坨 0（全 0 的内容让 MD5 的错法更难暴露）
-  for (let i = 0; i < bigBytes.length; i++) bigBytes[i] = (i * 131 + 7) & 0xff
+  // 大文件也必须是**真能解析的文本**：S4-B 起上传即解析，伪随机字节会被判「无文本层」
+  // 而走 FAILED —— 那会让下面的「队列项 ↔ 已完成」等待超时，且把一个真实的解析失败
+  // 混进限速判据里（两件事互相干扰）。2MB 的中文文本足够撑起限速窗口，也能解析成功。
+  const bigName = 'E2E限速探针.md'
+  const bigBytes = Buffer.from(
+    ('# E2E 限速探针\n\n' + '型号 A-100，产品名称 智能网关，单价 ￥1,200，交期 7 天。'.repeat(4) + '\n\n')
+      .repeat(Math.ceil(THROTTLE_BYTES / 120)),
+    'utf8').subarray(0, THROTTLE_BYTES)
   writeFileSync(`${OUT_DIR}/${bigName}`, bigBytes)
 
   const smallMd5 = createHash('md5').update(smallBytes).digest('hex')
@@ -481,13 +486,15 @@ async function main() {
     await waitFor(`window.__t.docRows().length === 1`, { label: '文档列表出现该行', timeout: 20000 })
     const row = await evaluate(`window.__t.docRowOf(${JSON.stringify('E2E回归探针')})`)
     check(Array.isArray(row) && row.length > 0, 'G4-1：上传完成后文档列表出现该行（真刷新的列表）', row ? `列数=${row.length}` : '—')
-    check(row && row.includes('已上传'), 'G4-3：状态列渲染「已上传」（域内真值 UPLOADED → 展示文案）', row ? row[5] : '—')
+    check(row && row.includes('索引中'), 'G4-3：状态列渲染「索引中」（域内真值 INDEXING → 展示文案；S4-B 起上传即解析）', row ? row[5] : '—')
 
     // ---- G4-4：状态列与解析质量列**独立** ----
     // 列索引：0 勾选 · 1 文件名 · 2 类型 · 3 大小 · 4 分片数 · 5 状态 · 6 解析质量 · 7 上传人 · 8 上传时间 · 9 操作
+    // S4-B 起：MD 文本解析成功 → INDEXING；无表格 → 质量列「无表格 / 图片」。
+    // 两列各自反映一件独立的事实（状态来自 status，质量来自 table_*/image_*），这正是 §3.6 的设计目的。
     check(
-      row && row[5] === '已上传' && row[6] === '无表格 / 图片',
-      'G4-4：《06》§3.6 的两列独立 —— 状态列「已上传」而质量列是「无表格 / 图片」（本批未解析，质量恒 0）',
+      row && row[5] === '索引中' && row[6] === '无表格 / 图片',
+      'G4-4：《06》§3.6 的两列独立 —— 状态列「索引中」而质量列「无表格 / 图片」（MD 无表格，质量列如实为 0）',
       `状态=${row?.[5]} 质量=${row?.[6]}`,
     )
     check(

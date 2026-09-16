@@ -89,6 +89,15 @@ public class SysDocument {
     private String storagePath;
 
     /**
+     * 解析产物对象名（{@code parsed/{kbId}/{docId}/parse.json}，`V13` 新增）。
+     *
+     * <p>可空：只有解析**成功**才写；{@code UPLOADED/PARSING/FAILED} 三态均为 {@code null}。
+     * 与 {@link #storagePath} 同一条纪律 —— 存对象名不存 URL。
+     */
+    @Column(name = "parse_path", length = 512)
+    private String parsePath;
+
+    /**
      * 状态机（《03》§4.2）。
      *
      * <p>用 {@link DocStatus} 枚举 + {@code @Enumerated(STRING)}，与前端

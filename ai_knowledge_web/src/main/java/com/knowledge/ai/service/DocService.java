@@ -79,6 +79,8 @@ public class DocService {
 
     private final AsyncTaskService asyncTaskService;
 
+    private final DocParseService docParseService;
+
     // ==================== T-501 · MD5 去重（秒传判断）====================
 
     /**
@@ -175,13 +177,27 @@ public class DocService {
                 context.percent(90);
                 recordWriter.markStored(docId, objectKey);
 
+                // ---- S4-B：转存完成即解析（同一任务体的后续阶段，不另立任务）----
+                // 阶段文案与百分比对齐"上传只是受理、解析才是内容"的语义；
+                // parseDocument 内部已把失败落成 FAILED + error_msg，这里只透传结果形状。
+                context.stage("解析中");
+                Map<String, Object> parseResult = docParseService.parseDocument(docId);
+                boolean parseOk = "INDEXING".equals(parseResult.get("status"));
+                context.stage(parseOk ? "解析完成，等待建立索引" : "解析失败，详见文档列表");
+                context.percent(100);
+
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("docId", docId);
                 payload.put("objectKey", objectKey);
                 payload.put("bytes", size);
+                payload.put("parse", parseResult);
+                // 解析失败时任务本身仍算"完成"（受理与转存都成功了）；
+                // 失败的事实由文档状态（FAILED + error_msg）与任务 payload 共同承载，
+                // 前端轮询读 errorMsg 的通道不变（G4-3）。
                 context.complete(payload);
-                log.info("文档上传完成：kbId={} docId={} taskId={} name={} bytes={}",
-                        kbId, docId, context.taskId(), realName, size);
+                log.info("文档上传完成：kbId={} docId={} taskId={} name={} bytes={} parse={}",
+                        kbId, docId, context.taskId(), realName, size,
+                        parseResult.get("status"));
             } catch (BizException ex) {
                 // 业务异常的消息本来就是给用户看的（如"文件超过 100 MB 上限"），直接用
                 recordWriter.markFailed(docId, ex.getMessage());
@@ -287,6 +303,48 @@ public class DocService {
                     formatTime(r[11])));
         }
         return new DocDtos.DocPage(list, total, list.size());
+    }
+
+    // ==================== T-511 · 未识别表格 / 解析问题清单 ====================
+
+    /**
+     * 库内逐页解析问题（驱动上传页顶部告警条，`G4-11`）。
+     *
+     * <p><b>行粒度 = (文档, 页码)</b>：同一篇扫描件 15 页就有 15 行 ——
+     * 「第几页」是门禁原文点名的字段，聚合成"每文档一行"会把它丢掉；
+     * 前端的"篇数"按 {@code docId} 去重（本批前端步骤）。
+     *
+     * <p><b>截断 100 条</b>：清单的用途是"告诉人去哪修"，不是数据导出；
+     * 真有超过 100 处问题时，靠列表的质量列逐篇排查比一个滚不到头的告警条更有用。
+     *
+     * <p>只统计**未删除**文档的问题 —— 回收站里的文档不该再告警（与 {@link #checkMd5}
+     * 的 {@code deleted_at is null} 同一条口径）。
+     */
+    @Transactional(readOnly = true)
+    public DocDtos.ParseIssuePage parseIssues(long kbId) {
+        requireKbVisible(kbId);
+
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select i.doc_id, d.title, i.page_no, i.reason
+                        from sys_parse_issue i
+                        join sys_document d on d.id = i.doc_id and d.deleted_at is null
+                        where i.kb_id = :kbId
+                        order by i.doc_id, i.page_no, i.id
+                        limit 100
+                        """)
+                .setParameter("kbId", kbId)
+                .getResultList();
+
+        List<DocDtos.ParseIssueRow> list = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            list.add(new DocDtos.ParseIssueRow(
+                    ((Number) r[0]).longValue(),
+                    (String) r[1],
+                    ((Number) r[2]).intValue(),
+                    (String) r[3]));
+        }
+        return new DocDtos.ParseIssuePage(list, list.size());
     }
 
     // ==================== 内部 ====================
