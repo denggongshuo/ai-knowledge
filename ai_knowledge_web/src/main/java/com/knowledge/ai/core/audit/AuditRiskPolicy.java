@@ -92,6 +92,24 @@ public final class AuditRiskPolicy {
                         + "而编辑一个已有内容的库是真扩权。策略表按 (module, action) 做静态键，"
                         + "做不到「只改了描述就降级」，两害相权宁可粗、不漏标（B2 计划 §3.4 假设 4）");
 
+        // ---------- T-3C3 补打点（2026-09-15 · S3-C2）----------
+        // 本节的动作名与档次由用户 2026-09-15 逐条裁定，出处见 S3-M03-C2 计划头部。
+        register(AuditModule.USER, "新建用户", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
+                "§4.3①权限扩大：`roleIds` 是**必填**（@NotEmpty），所以「建号」与「赋角色」是同一个原子动作"
+                        + "——等价于「用户新增角色」。不因为「新建的对象此前不存在」而降到 NORMAL："
+                        + "凭空造一个带 SUPER_ADMIN 的账号正是最典型的越权路径，事后追溯首先要看它");
+        register(AuditModule.USER, "批量导入用户", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
+                "§4.3①权限扩大：批量形态的「新建 + 赋角色」，一次请求可能造出几十个带角色的账号 —— "
+                        + "权限扩大面比单个新建更大。《10》§3 该行本就带 🚩。与「新建用户」同档");
+        register(AuditModule.GRANT, "编辑角色", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
+                "§4.3①权限扩大：`permissions` 是全量替换（先 delete 再 insert），一次「编辑」"
+                        + "可以把这个角色的权限点整个换掉，而该角色下所有成员的权限**立即随之改变**。"
+                        + "与「保存功能矩阵」是同一类动作的两条路径（按权限点改 / 按角色改），档次必须一致");
+        register(AuditModule.GRANT, "启用/停用角色", Category.PERMISSION_EXPANSION, RiskLevel.HIGH,
+                "§4.3①权限扩大：停用会让该角色**全部成员**的权限按《05》§242 降级为默认角色 —— "
+                        + "一次点击改变 N 个人的权限，且是「看不出被改了什么」的那种"
+                        + "（成员自己的角色列表没变，是档位被抽掉了）；启用则把这些权限一次性恢复");
+
         // ---------- 第 3 类 · 内容删除 ----------
         register(AuditModule.USER, "删除用户", Category.CONTENT_DELETE, RiskLevel.HIGH,
                 "§4.3③内容删除：软删账号，不可逆（保留历史记录但不可再用）");
@@ -101,6 +119,14 @@ public final class AuditRiskPolicy {
                 "第5类扩展：改密后旧令牌全部失效，属账号接管类动作");
         register(AuditModule.AUTH, "重置密码（忘记密码自助）", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
                 "第5类扩展：凭重置凭证改密，可视为账号接管路径");
+        register(AuditModule.USER, "重置密码（管理员）", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
+                "第5类扩展（T-3C3 补）：与「重置密码（忘记密码自助）」是**同一件事的两条路径**"
+                        + "——一条用户自助、一条管理员代劳。档次必须一致，否则会出现"
+                        + "「自己重置算高危、管理员重置不算」这种反直觉的口径");
+        register(AuditModule.USER, "启用/停用账号", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
+                "第5类扩展（T-3C3 补）：停用会立即撤销全部刷新令牌、该账号所有知识库不可见（W7）；"
+                        + "启用则把这些权限一次性恢复。两个方向都是「账号可用性」的开关，"
+                        + "属账号接管类动作的面 —— 与「修改密码」保留 HIGH 同一条理由");
         register(AuditModule.USER, "换绑手机号", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
                 "第5类扩展：手机号是登录凭证 + 找回密码通道，换绑等于换身份凭据");
         register(AuditModule.USER, "换绑邮箱", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
@@ -114,6 +140,26 @@ public final class AuditRiskPolicy {
         register(AuditModule.KB, "创建知识库", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
                 "§4.3 四类不含建库：新建库不扩大任何既有权限（初始授权只覆盖向导里勾选的角色 + 超管 MANAGE），"
                         + "《01》§10.1 的建库样例也没有 🚩。标高危会让「高危」退化成「所有写操作」");
+        register(AuditModule.GRANT, "新建角色", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3 四类不含建角色（T-3C3）：新角色**零成员**（sys_user_role 里还没有引用），"
+                        + "建它不改变任何人的现有权限 —— 与「创建知识库」同一条理由（建一个没人被挂上去的容器）。"
+                        + "**但「给它配权限」是另一件事**：走 `编辑角色` 或经 `编辑用户` 挂人时，"
+                        + "那两次操作各自已标高危。策略表按 (module, action) 做静态键，"
+                        + "做不到「看 permissions 是否为空再降级」，两害相权宁可粗、不漏标");
+        register(AuditModule.GRANT, "删除角色", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3③不含删空角色（T-3C3）：走到删除那一行时该角色**必定 0 成员**（成员 >0 会被"
+                        + " ROLE_IN_USE 拦下），所以删它不改变任何人的权限。§4.3③指的是**内容**"
+                        + "（文档/知识库）与可用权限载体，删一个空角色更接近「清理无用配置」。"
+                        + "⚠️ 若将来放宽「有成员也能删」，此处必须同步改 HIGH 并加 affectedUsers");
+        register(AuditModule.SYSTEM, "新建部门", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3 四类不含组织结构维护（T-3C3）：不扩大权限、不是数据导出、删的不是内容、与模型配置无关。"
+                        + "**但必须留痕**：改部门 = 改所有人的数据范围（数据范围按部门收敛）。"
+                        + "模块归 SYSTEM 的依据见 AuditModule#SYSTEM 的 javadoc");
+        register(AuditModule.SYSTEM, "编辑部门", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3 四类不含组织结构维护（T-3C3）。同「新建部门」：非高危但必须留痕");
+        register(AuditModule.SYSTEM, "删除部门", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3③不含删空部门（T-3C3）：三道闸（无子部门 / 无成员 / 无知识库）挡着，"
+                        + "删的是空组织节点。⚠️ 若将来放宽「有内容也能删」，此处必须同步改 HIGH");
 
         // ---------- 第 2 类 · 数据导出（T-304 于 S3-C 落地，2026-09-15 从 PLANNED 移入） ----------
         register(AuditModule.AUDIT, "导出审计日志", Category.DATA_EXPORT, RiskLevel.HIGH,

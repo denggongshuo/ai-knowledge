@@ -149,8 +149,16 @@ public class UserAdminService {
      *       前端 toast 固定说"创建后为待激活"，但响应里带了 {@code initialPassword}，
      *       联调时若文案与实际状态冲突，改前端 toast 一句话即可（响应是纯新增字段）。</li>
      * </ul>
+     *
+     * <p>🚩 <b>高危（权限扩大，T-3C3 补打点 2026-09-15）</b>：{@code roleIds} 是
+     * <b>必填</b>（{@code @NotEmpty}），所以「建号」与「赋角色」是同一个原子动作 ——
+     * 等价于 §4.3①「用户新增角色」。档次与既有「编辑用户（含角色调整）」对齐，
+     * 不因为"新建的对象此前不存在"而降档：新增一个带 SUPER_ADMIN 的账号正是
+     * 最典型的越权路径，事后追溯首先要看的就是它。
      */
     @Transactional
+    @AuditLog(module = AuditModule.USER, action = "新建用户", risk = RiskLevel.HIGH,
+            target = "#request.name()")
     public AdminDtos.UserCreateResponse create(AdminDtos.UserCreateRequest request) {
         String username = request.username().trim().toLowerCase();
         if (userRepository.findByUsernameAndDeletedAtIsNull(username).isPresent()) {
@@ -163,7 +171,8 @@ public class UserAdminService {
         user.setRealName(request.name().trim());
         user.setPhone(blankToNull(request.phone()));
         user.setEmail(blankToNull(request.email()));
-        user.setDeptId(requireDept(request.deptId()));
+        Long deptId = requireDept(request.deptId());
+        user.setDeptId(deptId);
         user.setStatus(UserStatus.PENDING);
         user.setMustChangePassword(false);
         user.setCreatedAt(LocalDateTime.now());
@@ -190,6 +199,18 @@ public class UserAdminService {
         } else {
             throw new BizException(ErrorCode.PARAM_INVALID, "inviteMode 仅支持 INVITE / PASSWORD");
         }
+
+        // ============ T-3C3：登记变更明细（新建的 before 侧全是「—」）============
+        // 放在状态最终确定之后（inviteMode 会改写 status）—— 早登记会把 PENDING 记成终态。
+        // 不登记密码：request 里没有密码，initialPassword 是**本方法生成**的，
+        // 只记"已设置初始密码"这件事（I-15：只记已变更，不记值）。
+        AuditContext.change("账号", null, username);
+        AuditContext.change("部门", null, principalAssembler.departmentName(deptId));
+        AuditContext.change("角色", null,
+                request.roleIds().isEmpty() ? null : String.join("、", request.roleIds()));
+        AuditContext.change("初始密码", null, initialPassword == null ? "未设置（待邀请激活）" : "已设置，首登强制修改");
+        // 影响面是这次新建的这一个人（与「编辑用户」同口径）
+        AuditContext.affectedUsers(1);
         return new AdminDtos.UserCreateResponse(user.getId(), user.getStatus().name(), initialPassword);
     }
 
@@ -252,10 +273,17 @@ public class UserAdminService {
      * 状态切换。只接受 ACTIVE/DISABLED（前端只在这两档间切换；PENDING 只能通过
      * 邀请接受流转，不走这个接口）。
      *
-     * <p>自锁防护（G2-5）服务端必须兜底：前端全部是本地拦截（不发请求），
+     * <p><b>自锁防护（G2-5）服务端必须兜底</b>：前端全部是本地拦截（不发请求），
      * 意味着**绕过 UI 直调 API 时这里是唯一防线**。
+     *
+     * <p>🚩 <b>高危（第 5 类扩展 · 账号安全变更，T-3C3 补打点 2026-09-15）</b>：
+     * 停用会立即撤销全部刷新令牌、且该账号所有知识库不可见（W7）；启用则把这些
+     * 权限一次性恢复。两个方向都是"账号可用性"的开关，属账号接管类动作的面
+     * —— 与「修改密码」保留 HIGH 是同一条理由（《05》§4.3 第 5 类扩展）。
      */
     @Transactional
+    @AuditLog(module = AuditModule.USER, action = "启用/停用账号", risk = RiskLevel.HIGH,
+            target = "'用户#' + #id")
     public AdminDtos.UserRow patchStatus(Long id, String status) {
         LoginUser current = LoginUserContext.require();
         UserStatus target = parseStatus(status);
@@ -264,6 +292,14 @@ public class UserAdminService {
         }
         SysUser user = userRepository.findByIdAndDeletedAtIsNull(id)
                 .orElseThrow(() -> new BizException(ErrorCode.USER_NOT_FOUND));
+
+        // ============ T-3C3：先读旧值并登记，再改 ============
+        // 必须在任何校验/写入之前读 —— 与 create 相反（那边要等终态确定）。
+        // 这里 status 在方法开头就已定档，后续分支只影响令牌撤销，不改 target。
+        // 用 getLabel()（中文展示名"正常/已停用"）而不是 name()：审计页「操作」列
+        // 旁边就是「变更前 → 变更后」，给技术代号（ACTIVE/DISABLED）要读者自己翻译。
+        AuditContext.change("状态", user.getStatus().getLabel(), target.getLabel());
+        AuditContext.affectedUsers(1);
 
         if (target == UserStatus.DISABLED) {
             if (id.equals(current.getUserId())) {
@@ -338,8 +374,18 @@ public class UserAdminService {
     /**
      * 管理员重置密码：生成新随机密码 + 强制首登修改 + **撤销该用户全部登录态**（《05》§1.5）。
      * 新密码放进响应返回给管理员 —— v1 没有通知通道，不给明文这个账号就没人能登录了。
+     *
+     * <p>🚩 <b>高危（第 5 类扩展 · 账号安全变更，T-3C3 补打点 2026-09-15）</b>：
+     * 与已实现的「重置密码（忘记密码自助）」(`AuthService#resetPassword`) 是**同一件事的
+     * 两条路径** —— 一条用户自助、一条管理员代劳。档次必须一致，否则会出现
+     * 「自己重置算高危、管理员重置不算」这种反直觉的口径。
+     *
+     * <p><b>I-15</b>：新密码**本身绝不进审计** —— 只登记「已重置」与「登录态已撤销」两件事。
+     * 明文只出现在 {@code initialPassword} 响应字段里（那是发给管理员的，不是留存的）。
      */
     @Transactional
+    @AuditLog(module = AuditModule.USER, action = "重置密码（管理员）", risk = RiskLevel.HIGH,
+            target = "'用户#' + #id")
     public AdminDtos.ResetPasswordResponse resetPassword(Long id) {
         SysUser user = userRepository.findByIdAndDeletedAtIsNull(id)
                 .orElseThrow(() -> new BizException(ErrorCode.USER_NOT_FOUND));
@@ -351,6 +397,12 @@ public class UserAdminService {
         userRepository.save(user);
         int revoked = refreshTokenStore.revokeAll(id);
         log.info("管理员重置密码：userId={} 撤销 refreshToken={} 条", id, revoked);
+
+        // T-3C3：只记"发生了什么"，不记值（I-15）。撤销条数是本次操作的影响面证据。
+        AuditContext.change("登录密码", "已设置", "已重置，首登强制修改");
+        AuditContext.change("登录态", "全部有效", "已全部撤销（" + revoked + " 条令牌）");
+        AuditContext.affectedUsers(1);
+
         return new AdminDtos.ResetPasswordResponse(true, true,
                 "已重置为初始密码，用户下次登录需修改", newPassword);
     }
@@ -377,8 +429,15 @@ public class UserAdminService {
      * 模板列：{@code username,realName,phone,email,department,roles}（roles 是角色编码，
      * 分号分隔，缺省 USER）。逐行校验「用户名重复」「部门不存在」两类错误（《05》§1.7），
      * 报告精确到行号 + 原因；**行与行之间互不影响**，错的跳过、对的照常入库。
+     *
+     * <p>🚩 <b>高危（权限扩大，T-3C3 补打点 2026-09-15）</b>：批量形态的「新建 + 赋角色」，
+     * 与「新建用户」同档 —— 一次请求可能凭空造出几十个带角色（甚至超管）的账号，
+     * 权限扩大面比单个新建更大。变更明细只汇总两条：「导入结果」（成功/失败行数）与
+     * 「新增账号」（本次真正入库的用户名顿号相连），**不逐行一条 change** —— 上游是上传
+     * 文件、结果只回行号与原因，逐行登记会让 `changes_json` 撑到几 KB 且没人看得下去。
      */
     @Transactional
+    @AuditLog(module = AuditModule.USER, action = "批量导入用户", risk = RiskLevel.HIGH)
     public AdminDtos.ImportResponse importUsers(byte[] content) {
         if (content == null || content.length == 0) {
             throw new BizException(ErrorCode.IMPORT_TEMPLATE_INVALID, "文件为空");
@@ -404,6 +463,8 @@ public class UserAdminService {
         List<AdminDtos.ImportRowError> errors = new ArrayList<>();
         int success = 0;
         Set<String> seenInFile = new LinkedHashSet<>();
+        /** 本次真正入库的用户名，供审计登记影响面（T-3C3）。 */
+        List<String> created = new ArrayList<>();
         LocalDateTime now = LocalDateTime.now();
 
         for (int i = 1; i < lines.length; i++) {
@@ -455,8 +516,17 @@ public class UserAdminService {
             setRoles(user, codes);
             existingUsernames.add(username);
             seenInFile.add(username);
+            created.add(username);
             success++;
         }
+
+        // T-3C3：登记"成功/失败各几行"，不逐行登记用户名（见方法 javadoc）。
+        AuditContext.change("导入结果",
+                null, "成功 " + success + " 行 / 失败 " + errors.size() + " 行");
+        if (!created.isEmpty()) {
+            AuditContext.change("新增账号", null, String.join("、", created));
+        }
+        AuditContext.affectedUsers(success);
         return new AdminDtos.ImportResponse(success, errors.size(), errors);
     }
 

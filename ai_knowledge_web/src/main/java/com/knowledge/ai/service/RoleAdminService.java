@@ -88,7 +88,20 @@ public class RoleAdminService {
 
     // ==================== 增改删 / 启停 ====================
 
+    /**
+     * 新建角色。
+     *
+     * <p>🚩 <b>NORMAL（T-3C3 补打点 2026-09-15 —— 刻意不标高危）</b>：
+     * 新角色<b>零成员</b>（`sys_user_role` 里还没有任何引用），建它不改变任何人的
+     * 现有权限 —— 与「创建知识库」标 NORMAL 是同一条理由（§4.3 四类不含"新建一个
+     * 还没人被挂上去的容器"）。**但"给它配权限"是另一件事**：一旦通过 {@link #update}
+     * 给它配上权限点、或经「编辑用户」把人挂上去，那次操作才是权限扩大 ——
+     * 那两处已各自标高危。策略表按 {@code (module, action)} 做静态键，
+     * 做不到"看 permissions 是否为空再降级"，两害相权宁可粗、不漏标。
+     */
     @Transactional
+    @AuditLog(module = AuditModule.GRANT, action = "新建角色", risk = RiskLevel.NORMAL,
+            target = "#request.name()")
     public AdminDtos.RoleRow create(AdminDtos.RoleSaveRequest request) {
         if (!CODE_PATTERN.matcher(request.code()).matches()) {
             throw new BizException(ErrorCode.PARAM_INVALID, "角色编码需为大写字母开头，仅含大写字母/数字/下划线");
@@ -105,10 +118,27 @@ public class RoleAdminService {
         role.setUpdatedAt(now);
         roleRepository.save(role);
         savePermissions(role, request.permissions());
+
+        // T-3C3：新建的 before 侧全是「—」；权限点记的是**个数**不是清单
+        // （40 个码拼起来会撑爆 changes_json，而"从 0 到 40"这个跃迁才是要看的事实）。
+        AuditContext.change("角色编码", null, role.getCode());
+        AuditContext.change("数据范围", null, role.getDataScope());
+        AuditContext.change("权限点", null, request.permissions().size() + " 项");
         return toRow(role, memberCounts(), permissionCounts());
     }
 
+    /**
+     * 编辑角色。
+     *
+     * <p>🚩 <b>HIGH（权限扩大，T-3C3 补打点 2026-09-15）</b>：{@code permissions} 是
+     * <b>全量替换</b>（{@link #savePermissions} 先 delete 再 insert），所以一次"编辑"
+     * 可以把这个角色的权限点整个换掉 —— 而该角色下所有成员的权限**立即随之改变**。
+     * 与「保存功能矩阵」是同一类动作的两条路径（一条按权限点维度改、一条按角色维度改），
+     * 档次必须一致。
+     */
     @Transactional
+    @AuditLog(module = AuditModule.GRANT, action = "编辑角色", risk = RiskLevel.HIGH,
+            target = "'角色#' + #id")
     public AdminDtos.RoleRow update(Long id, AdminDtos.RoleSaveRequest request) {
         SysRole role = roleRepository.findById(id)
                 .orElseThrow(() -> new BizException(ErrorCode.ROLE_NOT_FOUND));
@@ -116,6 +146,19 @@ public class RoleAdminService {
         if (!role.getCode().equals(request.code())) {
             throw new BizException(ErrorCode.ROLE_BUILTIN_IMMUTABLE, "角色编码不可修改");
         }
+
+        // ============ T-3C3：先读旧值并登记，再改 ============
+        int permsBefore = codesOf(role).size();
+        int members = memberCountDistinct(List.of(id));
+        AuditContext.change("角色名称", role.getName(), request.name());
+        AuditContext.change("数据范围", role.getDataScope(), request.dataScope());
+        AuditContext.change("权限点", permsBefore + " 项", request.permissions().size() + " 项");
+        AuditContext.change("状态",
+                Boolean.TRUE.equals(role.getEnabled()) ? "启用" : "停用",
+                request.enabled() == null || request.enabled() ? "启用" : "停用");
+        AuditContext.affectedUsers(members);
+        AuditContext.affectedRole(role.getName());
+
         applyRequest(role, request);
         role.setUpdatedAt(LocalDateTime.now());
         roleRepository.save(role);
@@ -126,8 +169,16 @@ public class RoleAdminService {
     /**
      * 删除。三道闸（《05》§0.6 + G2-4）：内置角色不可删；
      * 仍有成员先转移（《01》§2.1 五角色成员合计必须等于 128，删了带成员的角色会破坏这个恒等式）。
+     *
+     * <p>🚩 <b>NORMAL（T-3C3 补打点 2026-09-15 —— 刻意不标高危）</b>：
+     * 走到这一行时该角色<b>必定 0 成员</b>（上面那道闸挡着），所以删它
+     * <b>不改变任何人的权限</b> —— §4.3③「内容删除」指的是内容（文档/知识库）与
+     * 可用的权限载体，而删一个空角色更接近"清理无用配置"。
+     * 若将来放宽"有成员也能删"，这里必须同步改 HIGH。
      */
     @Transactional
+    @AuditLog(module = AuditModule.GRANT, action = "删除角色", risk = RiskLevel.NORMAL,
+            target = "'角色#' + #id")
     public AdminDtos.Deleted delete(Long id) {
         SysRole role = roleRepository.findById(id)
                 .orElseThrow(() -> new BizException(ErrorCode.ROLE_NOT_FOUND));
@@ -139,6 +190,9 @@ public class RoleAdminService {
             throw new BizException(ErrorCode.ROLE_IN_USE,
                     "角色「" + role.getName() + "」下存在 " + members + " 名成员，请先转移成员");
         }
+        // T-3C3：登记被删角色是什么（删完查不到了，这条日志是唯一的追溯线索）
+        AuditContext.change("角色", role.getName() + "（" + role.getCode() + "）", null);
+        AuditContext.change("权限点", codesOf(role).size() + " 项", null);
         entityManager.createNativeQuery("delete from sys_role_permission where role_id = :id")
                 .setParameter("id", id)
                 .executeUpdate();
@@ -152,14 +206,29 @@ public class RoleAdminService {
     /**
      * 启停。停用超管角色直接拒（G2-4）：它是"系统自锁"的最后一道防线 ——
      * 超管角色一停，全部管理员瞬间降级，而普通用户没有任何入口能把它启用回来。
+     *
+     * <p>🚩 <b>HIGH（权限扩大，T-3C3 补打点 2026-09-15）</b>：停用会让该角色
+     * <b>全部成员</b>的权限按《05》§242 降级为默认角色 —— 一次点击改变 N 个人的权限，
+     * 且是"看不出被改了什么"的那种（成员自己的角色列表没变，是档位被抽掉了）。
+     * 启用则把这些权限一次性恢复。这正是 §4.3①「权限扩大」的两端。
+     * 影响面（成员数 + 角色名）必须随日志记下 —— 与 `saveMatrix` 同口径。
      */
     @Transactional
+    @AuditLog(module = AuditModule.GRANT, action = "启用/停用角色", risk = RiskLevel.HIGH,
+            target = "'角色#' + #id")
     public AdminDtos.RoleRow patchStatus(Long id, boolean enabled) {
         SysRole role = roleRepository.findById(id)
                 .orElseThrow(() -> new BizException(ErrorCode.ROLE_NOT_FOUND));
         if (!enabled && "SUPER_ADMIN".equals(role.getCode())) {
             throw new BizException(ErrorCode.ROLE_BUILTIN_IMMUTABLE, "超级管理员角色不可停用");
         }
+        // T-3C3：读旧值 → 登记 → 再写
+        AuditContext.change("状态",
+                Boolean.TRUE.equals(role.getEnabled()) ? "启用" : "停用",
+                enabled ? "启用" : "停用");
+        AuditContext.affectedUsers(memberCountDistinct(List.of(id)));
+        AuditContext.affectedRole(role.getName());
+
         role.setEnabled(enabled);
         role.setUpdatedAt(LocalDateTime.now());
         roleRepository.save(role);
