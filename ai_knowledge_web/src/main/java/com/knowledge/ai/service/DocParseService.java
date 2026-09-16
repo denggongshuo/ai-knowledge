@@ -15,6 +15,7 @@ import com.knowledge.ai.pipeline.TextLayerGuard;
 import com.knowledge.ai.pipeline.cleaning.CleanedDocument;
 import com.knowledge.ai.pipeline.cleaning.CleaningOptions;
 import com.knowledge.ai.pipeline.cleaning.DocumentCleaner;
+import com.knowledge.ai.pipeline.enhance.IndexEnhancer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -80,6 +81,9 @@ public class DocParseService {
     /** 清洗层（`优化/O3`）—— 解析与分片之间的纯函数变换，见 {@link DocumentCleaner}。 */
     private final DocumentCleaner documentCleaner;
 
+    /** 索引增强（`T-507`）—— 分片之后的文档级摘要调用，见 {@link IndexEnhancer}。 */
+    private final IndexEnhancer indexEnhancer;
+
     private final jakarta.persistence.EntityManager entityManager;
 
     /**
@@ -121,8 +125,17 @@ public class DocParseService {
             // T-503 / T-504 / T-505：解析产物 → 两级分片 → 块落 sys_chunk（含 chunk_count 回填）。
             // 放在 markParsed **之前**：分片失败时文档应当停在 FAILED 并给出分片侧的原因，
             // 而不是先标成「解析完成」再让用户发现一个块都没有。
-            chunkCount = recordWriter.replaceChunks(docId, row.kbId(),
-                    chunkingService.chunk(cleaned.document(), chunkingOptions(row.kbId())));
+            List<com.knowledge.ai.pipeline.Block> blocks =
+                    chunkingService.chunk(cleaned.document(), chunkingOptions(row.kbId()));
+
+            // T-507 索引增强：文档级 1 次调用 → SUMMARY 块（parentId = null）。
+            // 放在分片**之后**：摘要要基于"实际进了索引的那些块"所覆盖的正文。
+            // ⚠️ 增强失败**不牵连文档** —— 正文已经切好能检索了，因为摘要没生成就把整篇判失败，
+            // 等于用一件增强功能的故障否掉一篇可用文档。失败原因照实记日志。
+            IndexEnhancer.Result enhanced = indexEnhancer.enhance(cleaned.document(), blocks);
+            logEnhancement(docId, enhanced);
+
+            chunkCount = recordWriter.replaceChunks(docId, row.kbId(), enhanced.blocks());
 
             // 质量四列里的三个：表格两列由解析侧给，图片列由 `O3` 步 4 销掉 S4-B §9 第 3 条
             // 的"采了不用"（imageCount 早已在采，只是没写）。image_parsed 仍等 T-512 的 VL。
@@ -195,6 +208,31 @@ public class DocParseService {
             log.warn("知识库分片策略 JSON 解析失败，本次按默认参数分片：kbId={} json={} err={}",
                     kbId, json, ex.getMessage());
             return ChunkingOptions.defaults();
+        }
+    }
+
+    /**
+     * 把增强结果落到日志。
+     *
+     * <h3>为什么"没失败"也要记</h3>
+     * <p>增强有四种非 OK 的结果（关掉 / 空正文 / 模型炸 / 输出不成 JSON），它们的后果**一样**：
+     * 这篇文档没有摘要块。如果只在异常时记日志，那"关掉了"与"模型一直炸"在日志里长得一样
+     * —— 而这两种情况的处置完全不同（前者正常，后者要查密钥/网络）。
+     *
+     * <p>分档：{@code DISABLED} 与 {@code EMPTY_INPUT} 是**预期内**的（info），
+     * 另两种是**真出了问题**（warn）。`G4-3` 的口径是失败态要给出具体原因，
+     * 所以 detail 里带的是可读原因而不是枚举名。
+     *
+     * <p>⚠️ 目前这些只进日志，**用户看不到** —— 已登记为遗留（计划 §9）。
+     */
+    private static void logEnhancement(long docId, IndexEnhancer.Result enhanced) {
+        switch (enhanced.status()) {
+            case OK -> log.info("文档级增强完成：docId={} {}", docId, enhanced.detail());
+            case DISABLED, EMPTY_INPUT ->
+                    log.info("文档级增强未产出摘要：docId={} 原因={}", docId, enhanced.detail());
+            case MODEL_FAILED, BAD_OUTPUT ->
+                    log.warn("文档级增强未产出摘要（文档已正常入库，不影响检索）：docId={} 原因={}",
+                            docId, enhanced.detail());
         }
     }
 
