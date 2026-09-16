@@ -19,7 +19,7 @@
 | **O5** | [解析质量基线与可追溯](./O5-parse-quality-baseline.md) | 夹具进 CI + 产物版本指纹 + 质量看板 | **P1** | O1 | 3 人天 | ⬜ 待认领 | `New: ParseBaselineTest` |
 | **O6** | [审计与合规留痕](./O6-audit-trail-for-pipeline.md) | 解析提交人留痕 + 预签名 TTL | **P1** | O1 | 1.5 人天 | ⬜ 待认领 | `AsyncTaskService` · `AuditLog` |
 | **O7** | [存储寻址与生命周期](./O7-content-addressed-storage.md) | 内容寻址（sha256）+ 三前缀留存规则 | **P1** | — | 2 人天 | ⬜ 待认领 | `DocStorage` |
-| **O8** | [分片契约：块视图分离](./O8-chunk-view-separation.md) | 块内容与嵌入视图分离 + 多视图泛化 | **P0** | — | 3 人天 | 🟡 进行中（`S4-M05-C1` 步 0） | `10-M05-分片产出契约（D-5）` |
+| **O8** | [分片契约：块视图分离](./O8-chunk-view-separation.md) | 块内容与嵌入视图分离 + 多视图泛化 | **P0** | — | 3 人天 | ✅ 已完成（`S4-M05-C1` 步 0 · 2026-09-16） | `10-M05-分片产出契约（D-5）` |
 | **O9** | [去重与成本治理](./O9-dedup-and-cost-control.md) | 内容指纹 + 样板抑制 + HyQ 门控 | **P2** | O8 | 3 人天 | ⬜ 待认领 | `T-504`~`T-507` 下游 |
 
 > **2026-09-16 排期裁定**（用户授权「按最优计划开始」后落地，改写了 §2 的原始建议顺序）：
