@@ -87,11 +87,15 @@ docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -
 function purgeProbe() {
   mysqlScalar(
     `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
+      delete c from sys_chunk c join sys_document d on d.id=c.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
       delete d from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';` +
       `delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';` +
       `delete from sys_kb where code='${PROBE_CODE}';`,
   )
 }
+/** 探针库的分片行数 —— `S4-M05-C1` 起 `sys_chunk` 也要跟着清，否则留下**孤儿块**。 */
+const chunkRowsOfProbe = () =>
+  Number(mysqlScalar(`select count(*) from sys_chunk c join sys_kb k on k.id=c.kb_id where k.code='${PROBE_CODE}';`))
 const kbCount = () => Number(mysqlScalar('select count(*) from sys_kb;'))
 const docRowsOfProbe = () =>
   Number(mysqlScalar(`select count(*) from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';`))
@@ -102,6 +106,22 @@ const issueRowsOfProbe = () =>
 function docRowOf(title) {
   const raw = mysqlScalar(
     `select concat_ws('|', d.title, d.status, coalesce(d.error_msg,''), d.table_total, d.table_parsed, coalesce(d.parse_path,'')) ` +
+      `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}' and d.title='${title}' order by d.id desc limit 1;`,
+  )
+  return raw ? raw.split('|') : null
+}
+
+/**
+ * 探针库里某文档的分片统计（`chunk_count|顶层块数|全部块数`）。
+ *
+ * 用于 `S4-M05-C1` 的判据 15：`chunk_count` 从「恒 0」变成真值，
+ * 且口径必须是**顶层块数**（D-5 §1.5 —— 表格子块不计入）。
+ */
+function chunkStatOf(title) {
+  const raw = mysqlScalar(
+    `select concat_ws('|', d.chunk_count, ` +
+      `(select count(*) from sys_chunk c where c.doc_id=d.id and c.parent_id is null), ` +
+      `(select count(*) from sys_chunk c where c.doc_id=d.id)) ` +
       `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}' and d.title='${title}' order by d.id desc limit 1;`,
   )
   return raw ? raw.split('|') : null
@@ -416,6 +436,18 @@ async function main() {
       `质量=${mdRow?.[6]}`,
     )
 
+    const mdChunks = chunkStatOf('E2E解析探针')
+    check(
+      mdRow && /^\d+$/.test(mdRow[4]) && Number(mdRow[4]) > 0,
+      'T-503：分片数列显示**真值**而非占位「—」（此前 chunk_count 恒 0，本页只能显示「—」）',
+      `分片数=${mdRow?.[4]}`,
+    )
+    check(
+      mdChunks && Number(mdChunks[0]) > 0 && mdChunks[0] === mdChunks[1],
+      'T-503：chunk_count 口径 = 顶层块数（D-5 §1.5：表格子块不计入）—— 销 汇总.md §3 #54',
+      mdChunks ? `chunk_count=${mdChunks[0]} 顶层=${mdChunks[1]} 全部=${mdChunks[2]}` : '—',
+    )
+
     const mdDb = docRowOf('E2E解析探针')
     check(
       mdDb && mdDb[1] === 'INDEXING' && mdDb[5].startsWith('parsed/'),
@@ -527,10 +559,11 @@ async function main() {
       const after = kbCount()
       const docsLeft = docRowsOfProbe()
       const issuesLeft = issueRowsOfProbe()
+      const chunksLeft = chunkRowsOfProbe()
       check(
-        after === 8 && docsLeft === 0 && issuesLeft === 0,
-        '收尾：探针库 / 文档 / 问题行已自清（sys_kb 回到 8 行）',
-        `库=${after} 文档残留=${docsLeft} 问题行残留=${issuesLeft}`,
+        after === 8 && docsLeft === 0 && issuesLeft === 0 && chunksLeft === 0,
+        '收尾：探针库 / 文档 / 问题行 / **分片行**已自清（sys_kb 回到 8 行）',
+        `库=${after} 文档残留=${docsLeft} 问题行残留=${issuesLeft} 分片残留=${chunksLeft}`,
       )
     } catch (e) {
       check(false, '收尾：探针库自清失败，需人工检查', String(e.message))

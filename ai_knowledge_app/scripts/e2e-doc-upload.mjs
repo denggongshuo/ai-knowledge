@@ -98,16 +98,20 @@ docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -
   return (r.stdout ?? '').trim()
 }
 
-/** 幂等清理探针库及其文档（顺序：文档 → 授权 → 主表）。 */
+/** 幂等清理探针库及其文档（顺序：问题行 → 分片 → 文档 → 授权 → 主表）。 */
 function purgeProbe() {
   mysqlScalar(
     `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
+      delete c from sys_chunk c join sys_document d on d.id=c.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
       delete d from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';` +
       `delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';` +
       `delete from sys_kb where code='${PROBE_CODE}';`,
   )
 }
 const kbCount = () => Number(mysqlScalar('select count(*) from sys_kb;'))
+/** 探针库的分片行数 —— `S4-M05-C1` 起 `sys_chunk` 也要跟着清，否则留下**孤儿块**。 */
+const chunkRowsOfProbe = () =>
+  Number(mysqlScalar(`select count(*) from sys_chunk c join sys_kb k on k.id=c.kb_id where k.code='${PROBE_CODE}';`))
 const docRowsOfProbe = () =>
   Number(mysqlScalar(`select count(*) from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';`))
 
@@ -497,9 +501,14 @@ async function main() {
       'G4-4：《06》§3.6 的两列独立 —— 状态列「索引中」而质量列「无表格 / 图片」（MD 无表格，质量列如实为 0）',
       `状态=${row?.[5]} 质量=${row?.[6]}`,
     )
+    // ⚠️ 本条在 `S4-M05-C1` 被**改写**（原断言：`row[4] === '—'`）。
+    // 原断言立得没错 —— 那时分片还没实现（`T-503` 属 S4-C），`chunk_count` 恒 0，
+    // 本列只能显示占位「—」，而"0 会被读成『切了 0 片』这个具体事实"。
+    // 现在分片真的落地了，列语义**没变**（0 仍显示「—」），变的是
+    // "这篇文档确实有分片了" —— 断言跟着改成断真值，否则它会守住一个已经不存在的行为。
     check(
-      row && row[4] === '—',
-      'G4-4：分片数列显示占位「—」而不是 0（0 会被读成"切了 0 片"这个具体事实）',
+      row && /^\d+$/.test(row[4]) && Number(row[4]) > 0,
+      'G4-4 + T-503：分片数列显示**真值**（分片落地前本列恒为占位「—」，本批销账）',
       `分片数=${row?.[4]}`,
     )
     const shot1 = await send('Page.captureScreenshot', { format: 'png' })
@@ -648,7 +657,12 @@ async function main() {
       purgeProbe()
       const after = kbCount()
       const docsLeft = docRowsOfProbe()
-      check(after === 8 && docsLeft === 0, '收尾：探针库与文档已自清，sys_kb 回到 8 行', `库=${after} 文档残留=${docsLeft}`)
+      const chunksLeft = chunkRowsOfProbe()
+      check(
+        after === 8 && docsLeft === 0 && chunksLeft === 0,
+        '收尾：探针库 / 文档 / **分片行**已自清，sys_kb 回到 8 行',
+        `库=${after} 文档残留=${docsLeft} 分片残留=${chunksLeft}`,
+      )
     } catch (e) {
       check(false, '收尾：探针库自清失败，需人工检查', String(e.message))
     }
