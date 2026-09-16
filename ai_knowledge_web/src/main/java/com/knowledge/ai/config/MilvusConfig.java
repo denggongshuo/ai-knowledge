@@ -14,10 +14,19 @@ import java.util.concurrent.TimeUnit;
  * Milvus 客户端装配（T-008）。
  *
  * <p><b>为什么用 v1 的 {@link MilvusServiceClient} 而不是 v2 fluent client</b>：
- * Spring AI 2.0.1 的 {@code MilvusVectorStore.builder(...)} 签名为
- * {@code builder(io.milvus.client.MilvusServiceClient, EmbeddingModel)} ——
- * 它只认 v1 客户端。M07 索引入库、M08 检索都要经 Spring AI 的 VectorStore，
- * 所以全项目统一 v1，**避免以后出现两个连同一台 Milvus 的客户端**。
+ * 全项目只保留**一个**连 Milvus 的客户端 —— 两套连接并存时，「连的是不是同一台、
+ * 看到的是不是同一份 schema」会变成每次排查都要重新确认的事。
+ *
+ * <p>⚠️ <b>订正（2026-09-17 · S4-M05-C3 步 0.5 探针）</b>：这里原先写
+ * 「M07 索引入库、M08 检索都要经 Spring AI 的 VectorStore」。实测 Spring AI 2.0.1 的
+ * {@code MilvusVectorStore.Builder} 方法面只有
+ * {@code iDFieldName / contentFieldName / metadataFieldName / embeddingFieldName / autoId / initializeSchema} ——
+ * **metadata 只能落成"一列"**，无法把 {@code kb_id}/{@code doc_id}/{@code chunk_type}/{@code secret_level}
+ * 表达成**四个各自带 INVERTED 索引的标量列**（那是 D-4/R-8 的过滤设计，也是 I-9「先算 doc_id 集合
+ * 再作标量过滤」的前提）；而本集合 {@code enableDynamicField=false}，写未声明字段会被 Milvus 直接拒绝。
+ * 因此**写入侧走裸 {@code MilvusServiceClient.insert}**（`T-508`）；
+ * 检索侧能否改用 VectorStore 属 M07/M08 的口径，**留到 S5 开工时定**
+ * （已登记在 {@code ai_knowledge_web/plan/2026-09-17-S4-M05-C3.md} §9）。
  *
  * <p>连接参数全部来自 {@link MilvusProperties}（{@code app.milvus.*}），
  * 而 {@code app.milvus.*} 的值来自 {@code .env} 的 {@code MILVUS_*} —— 
