@@ -125,6 +125,75 @@ export const http = {
   delete<T>(path: string, body?: unknown) {
     return request<T>(path, { method: 'DELETE', body: serializeBody(body) })
   },
+  /**
+   * 带**真实上传进度**的 multipart 请求（T-500）。
+   *
+   * <h3>为什么不能用 `request()` / `fetch`</h3>
+   * `fetch` 至今**没有上传进度事件** —— `Response` 的 `body` 可读流是**下载**方向，
+   * 上传方向要等 streaming request body（`duplex: 'half'`）在全部浏览器落地且
+   * 服务端也支持才有。所以这里用 `XMLHttpRequest` 的
+   * `upload.onprogress` —— 它是唯一跨浏览器可用的上传进度来源。
+   *
+   * <p>⚠️ 这正是本批要修的那个缺陷：上一版的上传进度条是 `setInterval` 编出来的
+   * （见 `KbUploadView.vue` 的 W1），真实网络下它会"匀速跑到 100%"再卡住，
+   * 用户完全看不出卡在哪一段。
+   *
+   * <h3>不能设 Content-Type</h3>
+   * multipart 的 `Content-Type` 要带 `boundary`，那是浏览器按 FormData 实例算的，
+   * 手写不出来 —— 显式设了会让后端把 body 当成一个整体字段解析，报"缺少 file 参数"。
+   * （同 {@link serializeBody} 的说明，那是 A-1 修的同一个坑。）
+   */
+  upload<T>(path: string, form: FormData, onProgress?: (percent: number) => void): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `${BASE}${path}`)
+      const token = getToken()
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+      if (onProgress && xhr.upload) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable && e.total > 0) {
+            // 不取整到 100：进度到 99 之前都还没"传完"，最后那 1% 留给服务端确认，
+            // 否则会出现"进度条满了但还在转"的观感（与 W1 的假进度条同一种不体面）
+            onProgress(Math.min(99, Math.round((e.loaded / e.total) * 100)))
+          }
+        }
+      }
+
+      xhr.onload = () => {
+        // 与 request() 同一套解包口径：404 = 后端未注册路由（降级而非崩溃）
+        if (xhr.status === 404) {
+          warnUnimplemented(path, 'POST')
+          reject(new ApiError(404, '接口尚未实现（后端未注册该路由）', true))
+          return
+        }
+        let parsed: ApiResponse<T>
+        try {
+          parsed = JSON.parse(xhr.responseText) as ApiResponse<T>
+        } catch {
+          reject(new ApiError(xhr.status, xhr.responseText || `请求失败（${xhr.status}）`))
+          return
+        }
+        if (parsed.code !== 0) {
+          if (parsed.code === 401 || xhr.status === 401) {
+            localStorage.removeItem('ak_token')
+            if (!location.hash.includes('/login')) location.hash = '#/login'
+          }
+          reject(new ApiError(parsed.code, parsed.message))
+          return
+        }
+        // 成功时补一次 100：真实进度停在上面的 99，这里是"服务端已确认收下"
+        onProgress?.(100)
+        resolve(parsed.data)
+      }
+      xhr.onerror = () => reject(new ApiError(-1, '网络异常，请检查网络连接'))
+      xhr.ontimeout = () => reject(new ApiError(-1, '上传超时，请重试'))
+      // 大文件在慢网下会超过浏览器默认的 0（= 不限），显式给一个宽松上限：
+      // 100MB 在 1Mbps 上要 13 分钟，取 30 分钟避免"传到一半被前端掐断"
+      xhr.timeout = 30 * 60 * 1000
+      xhr.send(form)
+    })
+  },
 }
 
 /** SSE 事件回调集合 */

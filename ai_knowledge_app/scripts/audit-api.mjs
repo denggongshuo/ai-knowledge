@@ -51,9 +51,15 @@ const apiCalls = new Set()
 // 泛型里可能含括号（如 (KbDocRow & {...})[]）或很长（config 的响应泛型跨 15 行），
 // 因此不能用 [^(]* 截断，也不能把窗口设得太小；用惰性匹配 + 「( 紧跟引号」定位，
 // 并只接受以 / 开头的路径（防止误吞泛型里的字符串字面量）。
-for (const m of apiSrc.matchAll(/http\.(get|post|put|patch|delete)\b[\s\S]{0,2000}?\(\s*[`'"]([^`'"]+)/g)) {
+//
+// ⚠️ `upload` 也在名单里（S4-M05-A 新增的 `http.upload`，走 XHR 真进度）。
+// 它**同样是一个 POST**（`request.ts` 里 `xhr.open('POST', ...)`），漏掉它会让
+// `POST /kb/{p}/doc/upload` 从"前端调用"里消失，进而在 ⑥ 段被报成
+// 「需求有、mock/前端没有」的差异项 —— 那是个由本脚本自身的白名单造成的假差异。
+const VERB_TO_METHOD = { upload: 'POST' }
+for (const m of apiSrc.matchAll(/http\.(get|post|put|patch|delete|upload)\b[\s\S]{0,2000}?\(\s*[`'"]([^`'"]+)/g)) {
   if (!m[2].startsWith('/')) continue
-  apiCalls.add(`${m[1].toUpperCase()} ${norm(m[2])}`)
+  apiCalls.add(`${(VERB_TO_METHOD[m[1]] ?? m[1]).toUpperCase()} ${norm(m[2])}`)
 }
 // chatStream 等直接用 fetch(`${BASE}/path`)，method 需从上下文推断（默认 POST）
 for (const m of reqSrc.matchAll(/\$\{BASE\}(\/[^`'"]*)/g)) {

@@ -33,11 +33,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 24 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 25 个动作逐条写死，少一个、多一个、等级错一档都红。
  *
  * <p>⚠️ 与计划书的算术偏差（实测为准）：计划头写「总数由 12 → 23」，实测 HEAD 为 <b>13</b>、
- * 当前为 <b>24</b>（新增 11 条不变）。差异来自撰写时把 {@code AuditContext} 的 javadoc 示例
+ * C2 结束时为 <b>24</b>（新增 11 条不变）。差异来自撰写时把 {@code AuditContext} 的 javadoc 示例
  * 算成了真实注解。本类断言实测值 24，已回填计划 §8。
+ *
+ * <p><b>S4-M05-A（2026-09-16）加 1 条 → 25</b>：`T-500` `DocService#upload` 的
+ * 「文档 / 上传文档 / NORMAL」。同步三处（本仓冻结口径）：① 注解 ②
+ * {@code AuditRiskPolicy.IMPLEMENTED} 登记带理由 ③ 本清单 —— 漏任一处本用例即红。
  */
 class AuditCoverageFlowTest extends ApiTestSupport {
 
@@ -76,7 +80,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     /**
-     * 裁定过的 24 个动作 → 风险等级。
+     * 裁定过的 25 个动作 → 风险等级。
      *
      * <p>写死而**不从 {@code AuditRiskPolicy} 读**：策略表自己就是被测对象，
      * 两边都"自证"等于没测 —— 策略表漏登记、注解也漏挂时，双向比对照样通过。
@@ -104,6 +108,8 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // ---- 知识库（2）----
         expected.put(AuditModule.KB + " 保存配置", RiskLevel.HIGH);
         expected.put(AuditModule.KB + " 创建知识库", RiskLevel.NORMAL);
+        // ---- 文档（1）---- （S4-M05-A 新增：上传入库）
+        expected.put(AuditModule.DOC + " 上传文档", RiskLevel.NORMAL);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -247,13 +253,13 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 24 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 25 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
         assertThat(actual)
                 .as("总数变化必须是有意为之：新增审计点请同步改本用例与 AuditRiskPolicy")
-                .hasSize(24);
+                .hasSize(25);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

@@ -232,6 +232,11 @@ function discard() {
 // ---------------- 保存 ----------------
 async function openSaveConfirm() {
   if (!totalDirty.value) return ElMessage.info('没有需要保存的修改')
+  // ⚠️ 这行守卫**不是**防御性代码，是 `form` 的联合类型（`KbConfigForm | null`）必须收敛。
+  // `totalDirty` 内部已经判过 `!form.value`（见其计算属性），所以运行期永远不为 null；
+  // 但 TS 的窄化不跨函数边界 —— 少了这行 `vue-tsc --build` 会红在下一行的实参上
+  // （S4-M05-A 施工时发现：`check.mjs` 的 type-check 在 HEAD 上就是红的）。
+  if (!form.value) return
   confirmVisible.value = true
   impactLoading.value = true
   impact.value = null

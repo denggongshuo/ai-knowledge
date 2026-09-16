@@ -18,6 +18,7 @@ import {
   Picture,
 } from '@element-plus/icons-vue'
 import { kbApi, docApi } from '@/api'
+import { md5OfFile } from '@/utils/md5'
 import type { UploadItem, KbDocRow, ParseIssue, ParseConfigView } from '@/types'
 
 const route = useRoute()
@@ -127,6 +128,7 @@ function enqueue(files: File[]) {
   for (const f of accepted) {
     const item: UploadItem = {
       uid: `u_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      file: f,
       name: f.name,
       size: f.size,
       type: extOf(f.name).toUpperCase(),
@@ -134,79 +136,146 @@ function enqueue(files: File[]) {
       percent: 0,
       chunkDone: 0,
       chunkTotal: 0,
-      speedKbps: 2200 + Math.floor(Math.random() * 1800),
     }
     queue.value.unshift(item)
-    void runItem(item)
+    // ⚠️ **必须把队列里的那个（响应式代理）交给 runItem，不能直接传 `item`**。
+    //
+    // `queue` 是 `ref<UploadItem[]>`：`unshift(item)` 存的是**原始对象**，而模板里
+    // `v-for="item in queue"` 读到的是它的**响应式代理**。之后在 `runItem` 里写
+    // `item.percent = p` 如果落在原始对象上，就绕过了代理的 set 陷阱 ——
+    // **数据变了但不会触发任何重新渲染**，页面上那一条永远停在
+    // 「上传中 · 0%」，而网络面板里请求早已 200。
+    //
+    // 这个坑在改成真上传之前一直没暴露：那时的进度条也写原始对象，同样不刷新，
+    // 但因为进度是"匀速跑完就完事"，看起来只是在动、看不出是假刷新。
+    // 换成真进度后它立刻现形（E2E 等「已完成」等不到，DOM 却停在 0%）。
+    // 改法的代价只有一次 `find`，换的是"数据与界面一致"这条底线。
+    const live = queue.value.find((q) => q.uid === item.uid) ?? item
+    void runItem(live)
   }
   uploadRef.value?.clearFiles?.()
 }
 
-/** 模拟：上传中 → 解析中 → 已完成 / 失败 */
-async function runItem(item: UploadItem) {
-  // 1) 上传中
-  await new Promise<void>((resolve) => {
-    const t = setInterval(() => {
-      item.percent = Math.min(100, item.percent + 7 + Math.floor(Math.random() * 9))
-      if (item.percent >= 100) {
-        clearInterval(t)
-        timers.delete(t)
-        resolve()
-      }
-    }, 110)
-    timers.add(t)
-  })
-  if (!queue.value.includes(item)) return
-
-  // 2) 解析中（含 MD5 去重演示）
-  try {
-    const dup = await kbApi.checkMd5(kbId.value, { name: item.name, md5: simpleHash(item.name, item.size) })
-    item.duplicated = dup.duplicated
-  } catch {
-    /* 忽略 */
-  }
-
-  const up = await kbApi.uploadDoc(kbId.value, { name: item.name, size: item.size, md5: simpleHash(item.name, item.size) })
-  item.docId = up.docId
-  item.chunkTotal = up.chunkTotal
-  item.status = 'PARSING'
-  item.percent = 0
-
-  // 特定文件模拟「编码失败」，其余成功
-  const willFail = !failedOnce && /\.txt$/i.test(item.name)
-  if (willFail) failedOnce = true
-
-  await new Promise<void>((resolve) => {
-    const t = setInterval(() => {
-      const step = Math.max(1, Math.round(item.chunkTotal / 14))
-      item.chunkDone = Math.min(item.chunkTotal, item.chunkDone + step)
-      item.percent = Math.round((item.chunkDone / item.chunkTotal) * 100)
-      if (item.chunkDone >= item.chunkTotal) {
-        clearInterval(t)
-        timers.delete(t)
-        resolve()
-      }
-    }, 150)
-    timers.add(t)
-  })
-  if (!queue.value.includes(item)) return
-
-  if (willFail) {
-    item.status = 'FAILED'
-    item.errorMsg = '文件编码为 GBK，无法按 UTF-8 解码。建议转码后重新上传。'
-  } else {
-    item.status = 'DONE'
-    item.percent = 100
-  }
-  maybeNotify()
+/** 上传队列项对应的原始 File。 */
+function fileOf(item: UploadItem): File | undefined {
+  return item.file
 }
 
-/** 简易 hash（演示 MD5 去重） */
-function simpleHash(name: string, size: number) {
-  const s = `${name}::${size}`
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
-  return h.toString(16).padStart(8, '0')
+/**
+ * 真上传：算 MD5 → 去重预判 → 真字节上传（XHR 真进度）→ 轮询任务进度。
+ *
+ * <h3>本函数是 W1/W2/W5 三条偏差的收口点</h3>
+ * 上一版这里全是演的：进度条是 `setInterval` 编的、失败按扩展名挑一个文件演、
+ * 「解析中」的 chunkDone 也是编的。现在每一步都对着真接口：
+ * <ul>
+ *   <li>MD5 = `md5OfFile(file)`，**真读文件字节**（上一版是 `simpleHash(name, size)`，
+ *       同名同大小必然同 hash，去重判定等于随机）；</li>
+ *   <li>上传 = `kbApi.uploadDoc(kbId, form, onProgress)`，进度来自
+ *       `XMLHttpRequest.upload.onprogress`；</li>
+ *   <li>进度 = `docApi.task(taskId)` 轮询（上一版 `docApi.task` 已定义但零调用方）。</li>
+ * </ul>
+ *
+ * <h3>为什么「上传完成」不等于「已完成」</h3>
+ * 上传只把文件送到后端并落进 MinIO；解析、分片、向量化在 **S4-B/S4-C** 才做。
+ * 所以本批任务跑到 `DONE` 之后文档状态是 `UPLOADED`（不是 `READY`），
+ * 队列项标「已完成」指的是**上传这一跳完成了**。等解析管线到位，
+ * 这里改成继续轮询文档状态即可 —— 那时 `PARSING`/`INDEXING` 才真正可达。
+ */
+async function runItem(item: UploadItem) {
+  const file = fileOf(item)
+
+  // ---------- 1) 算 MD5 + 去重预判 ----------
+  let md5 = ''
+  try {
+    if (!file) throw new Error('no file')
+    md5 = await md5OfFile(file)
+    item.md5 = md5
+    const dup = await kbApi.checkMd5(kbId.value, { name: item.name, md5 })
+    item.duplicated = dup.duplicated
+    if (dup.duplicated) {
+      // 提示而非阻断：《06》§3.2 的口径是「命中 → 提示『文件已存在，是否覆盖』」，
+      // 是否继续由用户决定（后端不加唯一约束，见 V12 的 idx_doc_md5 注释）
+      ElMessage.info(`「${item.name}」已存在，将归档为新版本（不覆盖历史问答引用）`)
+    }
+  } catch (e) {
+    // 去重预判失败不该拦住上传（它只是"省一次传输"的优化）
+    console.warn('[kb-upload] MD5/去重预判失败，继续上传', e)
+  }
+  if (!queue.value.includes(item)) return
+
+  // ---------- 2) 真上传（真进度）----------
+  try {
+    if (!file) throw new Error('no file')
+    const form = new FormData()
+    form.append('file', file)
+    const up = await kbApi.uploadDoc(kbId.value, form, (p) => {
+      item.percent = p
+    })
+    item.docId = up.docId
+    item.taskId = up.taskId
+    item.chunkTotal = up.chunkTotal
+  } catch (e) {
+    item.status = 'FAILED'
+    item.errorMsg = e instanceof Error ? e.message : '上传失败，请重试'
+    maybeNotify()
+    return
+  }
+  if (!queue.value.includes(item)) return
+
+  // ---------- 3) 轮询任务进度（真后端）----------
+  item.status = 'PARSING'
+  item.percent = 100
+  pollTask(item)
+}
+
+/**
+ * 轮询 `GET /doc/tasks/{taskId}` 直到终态。
+ *
+ * <p>间隔 600ms（《06》§3.7 的"轮询或 SSE"，本批取轮询；SSE 是 S5 的事）。
+ * **页面切走时由 `onBeforeUnmount` 统一清掉**（`timers` 集合）——
+ * 这是本条既有设计，不因改成真轮询而改变。
+ *
+ * <p>`status` 为 `DONE` 时标「已完成」并刷新列表；`FAILED` 时把**后端给的具体原因**
+ * 直接显示（`G4-3`：失败必须给可执行的动作，不许只说"失败"两字）。
+ */
+function pollTask(item: UploadItem) {
+  const taskId = item.taskId
+  if (!taskId) {
+    finishItem(item, true)
+    return
+  }
+  const timer = setInterval(async () => {
+    try {
+      const t = await docApi.task(taskId)
+      item.percent = t.percent
+      item.chunkTotal = t.chunkTotal
+      item.chunkDone = t.chunkDone
+      if (t.percent >= 100 || t.errorMsg) {
+        clearInterval(timer)
+        timers.delete(timer)
+        if (t.errorMsg) {
+          item.status = 'FAILED'
+          item.errorMsg = t.errorMsg
+        } else {
+          finishItem(item, true)
+        }
+      }
+    } catch {
+      // 任务查不到（10045）等情形：停轮询并标记失败，**不静默**留一个空转的定时器
+      clearInterval(timer)
+      timers.delete(timer)
+      item.status = 'FAILED'
+      item.errorMsg = '任务状态查询失败，请刷新页面查看结果'
+    }
+  }, 600)
+  timers.add(timer)
+}
+
+/** 收尾：标完成、刷新列表与告警。 */
+function finishItem(item: UploadItem, ok: boolean) {
+  item.status = ok ? 'DONE' : 'FAILED'
+  item.percent = 100
+  maybeNotify()
 }
 
 /** 整批完成通知（与告警区分） */
@@ -223,7 +292,7 @@ function maybeNotify() {
   })
   if (failed) {
     ElNotification({
-      title: '存在解析失败的文件',
+      title: '存在上传失败的文件',
       message: '失败原因已在队列中标出，可修正后重试；失败不会产生脏向量数据。',
       type: 'error',
     })
@@ -248,7 +317,7 @@ function clearDone() {
 function pauseAll() {
   timers.forEach((t) => clearInterval(t))
   timers.clear()
-  ElMessage.info('已暂停全部进行中的任务（演示）')
+  ElMessage.info('已暂停进度轮询（上传已提交的仍会在后端完成）')
 }
 
 function onExceed() {

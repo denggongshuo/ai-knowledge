@@ -177,8 +177,21 @@ export const kbApi = {
   /** MD5 去重判断 */
   checkMd5: (id: number | string, body: { name: string; md5: string }) =>
     http.post<{ duplicated: boolean; docId?: number; docTitle?: string; hint: string }>(`/kb/${id}/doc/check-md5`, body),
-  uploadDoc: (id: number | string, body: { name: string; size: number; md5: string }) =>
-    http.post<{ docId: number; taskId: string; name: string; kbId: number; chunkTotal: number }>(`/kb/${id}/doc/upload`, body),
+  /**
+   * 上传文档（`multipart/form-data`，真文件字节）。
+   *
+   * <p>⚠️ 上一版发的是 **JSON**（`{name, size, md5}`）—— 一个字节的文件内容都没发，
+   * 进度条是前端编的，后端收到的只有"我叫这个名"。这就是本批要修掉的"假上传"。
+   * 现在：前端读 File → 算 MD5 → FormData 真字节 → `http.upload`（XHR 真进度）。
+   *
+   * <p>进度回调：{@code 0..99} 真实网络进度，{@code 100} 表示服务端已确认收下。
+   */
+  uploadDoc: (
+    id: number | string,
+    form: FormData,
+    onProgress?: (percent: number) => void,
+  ): Promise<{ docId: number; taskId: string; name: string; kbId: number; chunkTotal: number }> =>
+    http.upload(`/kb/${id}/doc/upload`, form, onProgress),
   /** 存储用量与配额 */
   storageQuota: () => http.get<StorageQuota>('/kb/storage-quota'),
 }

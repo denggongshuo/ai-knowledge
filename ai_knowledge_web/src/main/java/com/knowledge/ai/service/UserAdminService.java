@@ -555,26 +555,33 @@ public class UserAdminService {
     }
 
     /**
-     * **有业务数据禁删**（G2-6，《05》§1.5）：「创建过知识库 或 上传过文档」的账号只能禁用。
+     * **有业务数据禁删**（G2-6，《05》§1.5）：「创建过知识库 **或** 上传过文档」的账号只能禁用。
      *
      * <p>S2 阶段这里恒 {@code false}（{@code sys_kb} 还是骨架、文档表要到 S4 才建）；
-     * V8 起 {@code sys_kb.owner_id} 已落创建人，本方法改为**真实查询**。
-     * 文档侧的「上传过文档」在 S4 建 {@code sys_document} 后并入本条 SQL。
+     * V8 起 {@code sys_kb.owner_id} 已落创建人。**S4-M05-A 起两半齐了**
+     * —— {@code V12} 建了 {@code sys_document}，「上传过文档」半边已并入（销《08》§七 遗留 2）。
      *
      * <p>用 {@code count(*) > 0} 的 {@code select 1 ... limit 1} 语义而不是全表 count：
      * 只关心存在性，命中一条即可返回。
+     *
+     * <p>⚠️ 文档侧**必须带 {@code deleted_at is null}**：「业务数据」指的是"现在还有"，
+     * 而不是"历史上曾经有过"。用户把文档从回收站彻底删干净之后，账号就该可删 ——
+     * 否则这条闸会退化成"只要传过一次文件，账号永久不可删"，与 G2-6 的立意（保护真实业务数据）
+     * 背道而驰。
      */
     private boolean hasBusinessData(Long userId) {
-        Number owned = (Number) entityManager.createNativeQuery(
+        Number ownedKb = (Number) entityManager.createNativeQuery(
                         "select count(*) from sys_kb where owner_id = :uid limit 1")
                 .setParameter("uid", userId)
                 .getSingleResult();
-        if (owned != null && owned.longValue() > 0) {
+        if (ownedKb != null && ownedKb.longValue() > 0) {
             return true;
         }
-        // TODO(S4)：sys_document 建表后，这里并入「上传过文档」的同类存在性查询
-        //           （《05》§1.5 的「或上传过文档」半边）。
-        return false;
+        Number ownedDoc = (Number) entityManager.createNativeQuery(
+                        "select count(*) from sys_document where owner_id = :uid and deleted_at is null limit 1")
+                .setParameter("uid", userId)
+                .getSingleResult();
+        return ownedDoc != null && ownedDoc.longValue() > 0;
     }
 
     private boolean isLastActiveSuperAdmin(Long userId) {

@@ -509,9 +509,26 @@ export interface UploadItem {
   docId?: number
   /** 失败的具体原因（可执行动作） */
   errorMsg?: string
-  /** 命中 (owner_id, md5) 去重 */
+  /** 命中 (kb_id, owner_id, md5) 去重 */
   duplicated?: boolean
   speedKbps?: number
+  /**
+   * 本轮上传产生的异步任务 id（`GET /doc/tasks/{taskId}` 用它轮询）。
+   *
+   * <p>⚠️ 上一版把它设了却从不轮询（`docApi.task` 零调用方），
+   * 进度是前端编的 —— S4-M05-A 起真接上。
+   */
+  taskId?: string
+  /** 文件的真实 MD5（32 位小写十六进制，前端算、后端复核）。 */
+  md5?: string
+  /**
+   * 原始 `File` 对象（真上传用）。
+   *
+   * <p>类型里放一个 `File` 会让「上传队列」与「文件系统」耦合，但队列项的生命周期
+   * 本来就和这个文件绑定（重试要重传同一份字节），所以直接挂上最省事 ——
+   * 比在视图里另开一个 `Map<uid, File>` 少一处对账。
+   */
+  file?: File
 }
 
 /** 知识库内文档行（含解析质量列：表格 N/M · 图片 N/M） */
