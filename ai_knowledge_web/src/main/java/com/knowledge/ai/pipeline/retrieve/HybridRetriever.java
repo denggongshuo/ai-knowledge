@@ -125,7 +125,10 @@ public class HybridRetriever {
                 vectorResult.millis(), bm25Result.hits().size(), bm25Result.millis(), wallMillis);
 
         return new Recall(vectorResult.hits(), bm25Result.hits(),
-                vectorResult.millis(), bm25Result.millis(), wallMillis);
+                vectorResult.millis(), bm25Result.millis(), wallMillis,
+                // 向量路未启用（KEYWORD 模式）时 `Channel.skipped` 给的是 0 —— 那也是**真值**：
+                // 这一路整段没跑，确实一点耗时都没有
+                vectorResult.embedMillis(), vectorResult.vectorSearchMillis());
     }
 
     // ==================== 两路通道 ====================
@@ -145,10 +148,21 @@ public class HybridRetriever {
             throw BizException.of(ErrorCode.SYSTEM_ERROR, "提问向量化没有返回结果 —— 请重试");
         }
 
+        // ⚠️ `T-707` 起这两段**分开计时**。此前一个计时器包住"嵌入 + 检索"整段，
+        // 而 `10` §9 的 SSE 线格式把「Embedding」与「向量召回」当**两个**阶段分别显示
+        // —— 不拆就只能给那两个数填 0，而填 0 是把"没测"说成"耗时 0ms"。
+        long embedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        long searchStart = System.nanoTime();
         List<RetrievalHit> hits = search(RetrievalHit.Channel.VECTOR, MilvusConstants.FIELD_VECTOR,
                 List.of(new FloatVec(vectors.getFirst())), scope, params,
                 Map.of("nprobe", properties.getIndexNprobe()));
-        return new Channel(RetrievalHit.Channel.VECTOR, hits, (System.nanoTime() - start) / 1_000_000);
+        long vectorSearchMillis = (System.nanoTime() - searchStart) / 1_000_000;
+
+        // `millis` 仍是**这一路的总耗时** —— `G5-1` 用它证并行时要的是整路口径。
+        // 由 start 一次算出而不是两段相加：相加会叠加两次取整误差
+        return new Channel(RetrievalHit.Channel.VECTOR, hits, (System.nanoTime() - start) / 1_000_000,
+                embedMillis, vectorSearchMillis);
     }
 
     private Channel bm25Channel(String query, RetrievalScope.Scope scope, RetrievalParams params) {
@@ -159,11 +173,15 @@ public class HybridRetriever {
         if (bm25Query.isEmpty()) {
             // 提问里一个有效 token 都没有（纯标点 / 纯空白）—— 这一路必然空，
             // 不必白跑一次 Milvus。**这是短路，不是降级**：结果确实是空
-            return new Channel(RetrievalHit.Channel.BM25, List.of(), (System.nanoTime() - start) / 1_000_000);
+            return new Channel(RetrievalHit.Channel.BM25, List.of(), (System.nanoTime() - start) / 1_000_000,
+                    0L, 0L);
         }
         List<RetrievalHit> hits = search(RetrievalHit.Channel.BM25, MilvusConstants.FIELD_SPARSE,
                 List.of(new EmbeddedText(bm25Query)), scope, params, Map.of());
-        return new Channel(RetrievalHit.Channel.BM25, hits, (System.nanoTime() - start) / 1_000_000);
+        // 这里的 `embedMillis = 0` 是**真值**，不是"没测"：BM25 这一路本来就没有嵌入步骤
+        // （查询侧走 `Bm25Text.of` 做词元化，不调模型）。与向量路那两段必须分开记，是两回事
+        return new Channel(RetrievalHit.Channel.BM25, hits, (System.nanoTime() - start) / 1_000_000,
+                0L, 0L);
     }
 
     /**
@@ -286,31 +304,40 @@ public class HybridRetriever {
     /**
      * 一路通道的召回结果。
      *
-     * @param channel 哪一路
-     * @param hits    排序并编号后的命中（rank 从 1 起）
-     * @param millis  本路耗时
+     * @param channel            哪一路
+     * @param hits               排序并编号后的命中（rank 从 1 起）
+     * @param millis             本路**总**耗时
+     * @param embedMillis        其中"提问向量化"那一段（`T-707` 起单记）。BM25 路恒 0 ——
+     *                           那一路没有嵌入步骤，0 是**真值**不是"没测"
+     * @param vectorSearchMillis 其中"向量检索"那一段。BM25 路恒 0（同上）
      */
-    private record Channel(RetrievalHit.Channel channel, List<RetrievalHit> hits, long millis) {
+    private record Channel(RetrievalHit.Channel channel, List<RetrievalHit> hits, long millis,
+                           long embedMillis, long vectorSearchMillis) {
 
         static Channel skipped(RetrievalHit.Channel channel) {
-            return new Channel(channel, List.of(), 0L);
+            return new Channel(channel, List.of(), 0L, 0L, 0L);
         }
     }
 
     /**
      * 两路并行的召回结果。
      *
-     * @param vectorHits   向量通道（未启用时为空列表）
-     * @param bm25Hits     BM25 通道（未启用时为空列表）
-     * @param vectorMillis 向量路耗时
-     * @param bm25Millis   BM25 路耗时
-     * @param wallMillis   **并行**的墙钟耗时。`G5-1` 的判据：它应**小于**两路之和
+     * @param vectorHits         向量通道（未启用时为空列表）
+     * @param bm25Hits           BM25 通道（未启用时为空列表）
+     * @param vectorMillis       向量路耗时
+     * @param bm25Millis         BM25 路耗时
+     * @param wallMillis         **并行**的墙钟耗时。`G5-1` 的判据：它应**小于**两路之和
+     * @param embedMillis        向量路里"提问向量化"那一段（`T-707`）——
+     *                           `10` §9 把「Embedding」单列为一个阶段，故必须能单独取到
+     * @param vectorSearchMillis 向量路里"向量检索"那一段（`T-707`）。⚠️ 两路都未启用（KEYWORD 模式）时为 0
      */
     public record Recall(List<RetrievalHit> vectorHits,
                          List<RetrievalHit> bm25Hits,
                          long vectorMillis,
                          long bm25Millis,
-                         long wallMillis) {
+                         long wallMillis,
+                         long embedMillis,
+                         long vectorSearchMillis) {
 
         /** 两路合计耗时（**串行假设下的耗时**，用来与 {@link #wallMillis} 对比证明并行）。 */
         public long sumMillis() {

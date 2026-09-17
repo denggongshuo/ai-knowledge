@@ -142,7 +142,8 @@ public class RetrievalService {
         RetrievalTrace trace = new RetrievalTrace(trimmed, params.mode(), scope.kbIds(), kbCount,
                 scope.docScopeCount(), scope.docFallback(),
                 recall.vectorHits().size(), recall.bm25Hits().size(), fused.size(),
-                scopeMillis, recallMillis, fuseMillis, rerank.millis(), tableMillis, totalMillis,
+                scopeMillis, recallMillis, recall.embedMillis(), recall.vectorSearchMillis(),
+                recall.bm25Millis(), fuseMillis, rerank.millis(), tableMillis, totalMillis,
                 params.recallTopK(), params.recallThreshold(), params.rerankTopK(),
                 params.rerankEnabled(), params.tableWeight(), params.missThreshold(),
                 params.lowScoreWarn(), rerank.applied(), rerank.note(),
@@ -351,9 +352,11 @@ public class RetrievalService {
     /** 空结果：**仍然带完整 trace** —— "为什么什么都没搜到"必须能回答。 */
     private static RetrievalResult emptyResult(String query, RetrievalScope.Scope scope,
                                                long scopeMillis, long start, String note) {
+        // 各段耗时全 0 是**真值**：这条路连 Milvus 都没去（没有可见的库 / 没有已索引的分区），
+        // 所以"召回 0 条、耗时 0ms"如实。⚠️ 只有 scopeMillis 非 0 —— 那次 MySQL 确实跑了
         RetrievalTrace trace = new RetrievalTrace(query, null, scope.kbIds(), scope.kbIds().size(),
                 scope.docScopeCount(), scope.docFallback(),
-                0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, elapsed(start),
+                0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, 0L, 0L, 0L, elapsed(start),
                 0, 0d, 0, false, 0d, 0d, 0d, false, note, "",
                 false, List.of());
         return new RetrievalResult(List.of(), trace, scope.kbIds().size());

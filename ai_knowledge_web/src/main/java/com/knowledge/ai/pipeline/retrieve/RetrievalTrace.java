@@ -30,6 +30,13 @@ import java.util.List;
  * @param fusedCount        融合去重后的条数（`G5-2` 期望 ≈26）
  * @param scopeMillis       MySQL 算可见集合的耗时
  * @param recallMillis      两路召回**并行**的墙钟耗时（`G5-1`：应小于两路耗时之和）
+ * @param embedMillis       提问**向量化**的耗时（`T-707`）。`10` §9 的 SSE 线格式把
+ *                          「Embedding」单列为 6 阶段之一，所以它必须能单独取到 ——
+ *                          此前它与"向量检索"共用一个计时器，那样只能给线格式填 0
+ * @param vectorSearchMillis 向量**检索**的耗时（`T-707`）。见 {@link #embedMillis}
+ * @param bm25Millis        BM25 通道的耗时（`T-707`）。⚠️ **不能用
+ *                          {@code recallMillis} 减掉另两段推** —— {@code recallMillis}
+ *                          是两路**并行**的墙钟，各段之和不等于它（那正是并行的证据）
  * @param fuseMillis        融合耗时
  * @param rerankMillis      重排耗时；未重排为 0
  * @param tableMillis       表格回表耗时（`T-705`；`G5-6`）。没有表格命中时接近 0
@@ -63,6 +70,9 @@ public record RetrievalTrace(String query,
                              int fusedCount,
                              long scopeMillis,
                              long recallMillis,
+                             long embedMillis,
+                             long vectorSearchMillis,
+                             long bm25Millis,
                              long fuseMillis,
                              long rerankMillis,
                              long tableMillis,
@@ -106,7 +116,8 @@ public record RetrievalTrace(String query,
             return this;
         }
         return new RetrievalTrace(query, mode, kbIds, kbCount, docScopeCount, docScopeFallback,
-                vectorHits, bm25Hits, fusedCount, scopeMillis, recallMillis, fuseMillis,
+                vectorHits, bm25Hits, fusedCount, scopeMillis, recallMillis, embedMillis,
+                vectorSearchMillis, bm25Millis, fuseMillis,
                 rerankMillis, tableMillis, totalMillis, recallTopK, recallThreshold, rerankTopK,
                 rerankEnabled, tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote,
                 degradeNote, miss, newChunks);

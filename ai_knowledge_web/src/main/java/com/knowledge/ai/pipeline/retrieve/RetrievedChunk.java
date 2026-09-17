@@ -1,5 +1,7 @@
 package com.knowledge.ai.pipeline.retrieve;
 
+import com.knowledge.ai.core.enums.RetrievalSource;
+
 import java.util.Map;
 
 /**
@@ -108,6 +110,37 @@ public record RetrievedChunk(String chunkId,
     /** 是否能拿 {@link #score()} 与全局阈值比较。 */
     public boolean scoreComparable() {
         return scoreKind == ScoreKind.RERANK;
+    }
+
+    /**
+     * 这条分片**最终算来自哪一路** —— SSE {@code retrieval} 事件里每个 chunk 的
+     * {@code source} 字段（`10` §9：取值 {@code vector} / {@code bm25} / {@code graph}）。
+     *
+     * <h3>为什么要有"算"这一步：融合之后一条可能两路都命中</h3>
+     * <p>{@link #channelRanks()} 是 {@code Map<通道, 名次>}，两路都召回时它有**两个**条目；
+     * 而 §9 的 {@code source} 是**单值**（前端拿它渲染引用角标上的"来源"）。所以必须定一条
+     * 确定性的取法，否则同一条分片在不同请求里可能显示不同的来源。
+     *
+     * <p>取法是**名次更好的那一路**（并列取向量）：名次更靠前的那一路才是"先找到它"的那一路，
+     * 按它归属对用户最有解释力。取"向量优先"是固定的兜底，不随名次摇摆。
+     *
+     * <p>⚠️ **这是一次有损投影** —— "两路都命中了"这件事实在本方法里被丢掉。
+     * 需要它时（例如按"双路命中"给分加权）是**新口径**，届时改 {@link RrfFusion} 的计分，
+     * 而不是在这里补第二个返回值。
+     *
+     * <p>{@code channelRanks} 为空（构造上不该发生 —— 它由 {@code RrfFusion} 逐条填）
+     * 时返回 {@link RetrievalSource#VECTOR}：向量是主通道，退到它是所有可能里最不误导的。
+     */
+    public RetrievalSource source() {
+        Integer vector = channelRanks.get(RetrievalHit.Channel.VECTOR);
+        Integer bm25 = channelRanks.get(RetrievalHit.Channel.BM25);
+        if (vector == null) {
+            return bm25 == null ? RetrievalSource.VECTOR : RetrievalSource.BM25;
+        }
+        if (bm25 == null) {
+            return RetrievalSource.VECTOR;
+        }
+        return vector <= bm25 ? RetrievalSource.VECTOR : RetrievalSource.BM25;
     }
 
     /**
