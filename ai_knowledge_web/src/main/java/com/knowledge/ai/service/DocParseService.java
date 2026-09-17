@@ -405,7 +405,16 @@ public class DocParseService {
      * 分派依据是 {@code sys_document.type}（上传时按扩展名登记的域内真值），
      * 不重新嗅探：类型错了在校验层就已经拦了，这里再嗅探一次只会让"登记值"与"实际值"分叉。
      */
-    private ParsedDocument dispatch(String type, byte[] source, String fileName) {
+    /**
+     * 按 {@code sys_document.type} 分派到具体的解析器。
+     *
+     * <p>⚠️ 可见性从 {@code private} 放宽到**包内可见的 static**（`S5-M07-B` 的 `T-O05`）：
+     * 解析基线（{@code ParseBaselineTest}）要用**同一条分派**去跑样本 ——
+     * 它在测试里抄一份「PDF 走 opendataloader、MD/TXT 走 PlainTextParser、其余走 Tika」
+     * 的话，就有两处会在"新增支持一种格式"时各自演化，
+     * 而基线的价值恰恰是"改了解析链路能被发现"：分派抄错一条，基线就永远看不见那条路径的退化。
+     */
+    static ParsedDocument dispatch(String type, byte[] source, String fileName) {
         if (PLAIN_TEXT.contains(type)) {
             return PlainTextParser.parse(source, fileName);
         }
@@ -419,7 +428,7 @@ public class DocParseService {
     }
 
     /** PDF 必须落临时文件（opendataloader 只吃路径），用完即删。 */
-    private ParsedDocument parsePdf(byte[] source) {
+    static ParsedDocument parsePdf(byte[] source) {
         Path tmp = null;
         try {
             tmp = Files.createTempFile("kb-parse-", ".pdf");
