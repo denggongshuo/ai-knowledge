@@ -45,6 +45,14 @@ import { dirname, resolve } from 'node:path'
 // 探针自清 —— **登记表 + 覆盖率闸 + 残留自检**。S4-D2 起清理逻辑只此一份。
 import { assertArtifactCoverage, describeKbResidue, kbResidueClean, mysqlScalar, teardownKbProbe } from './lib/probe-teardown.mjs'
 
+/**
+ * 本脚本触发的那次审计导出任务的 taskId（`S5` 测试可靠性批加）。
+ *
+ * <p>⚠️ 它必须由脚本**自己**点名删：导出任务行 `kb_id` 为 NULL，
+ * 而库族的自清是按 `kb_id` 走的 ⇒ **看不见它**。实测不删的代价是每跑一轮留一行。
+ */
+let exportTaskId = null
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_ROOT = resolve(ROOT, '..')
 const arg = (name, fallback) =>
@@ -577,6 +585,9 @@ async function main() {
     )
     const exportData = JSON.parse(exportEntry.body ?? '{}').data ?? {}
     check(!!exportData.taskId, '导出返回 taskId', `taskId=${exportData.taskId}`)
+    // 记下来收尾删 —— 这个任务行**没有知识库维度**（kb_id 为 NULL），库族自清看不见它，
+    // 只能由**造它的脚本**点名删（`S5` 测试可靠性批实测：不删的话每跑一轮留一行）
+    exportTaskId = exportData.taskId
     check(ledger.length > beforeExport, '导出确实发出了一条网络请求（台账有新增）', `${beforeExport} → ${ledger.length}`)
 
     // ==================== 8. console 与溯源 ====================
@@ -609,6 +620,10 @@ async function main() {
         body: { changes: [{ roleId: MATRIX_ROLE_ID, permKey: MATRIX_ITEM, level: matrixBefore }] },
       })
       check(restore.json?.code === 0, '收尾：功能矩阵已还原', `level=${matrixLevel()}`)
+      // 导出任务行点名删（它没有 kb 维度，库族自清扫不到）—— 见文件头 `exportTaskId` 的注释
+      if (exportTaskId) {
+        mysqlScalar(`delete from sys_async_task where task_id = '${exportTaskId}';`)
+      }
       const r = await teardownKbProbe(PROBE_CODE)
       check(
         kbCount() === 8 && kbResidueClean(r.residue),

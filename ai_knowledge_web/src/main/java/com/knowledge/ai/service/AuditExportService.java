@@ -88,7 +88,14 @@ public class AuditExportService {
         String idempotencyKey = "audit-export:" + user.getUserId() + ":"
                 + LocalDateTime.now().format(STAMP);
 
-        String taskId = asyncTaskService.submit(TASK_TYPE, idempotencyKey, 0, context -> {
+        // ⚠️ 必须带**业务坐标**（`S5` 测试可靠性批查出，与 `T-709` 那次是同一族缺陷）：
+        // 不带的话 `AsyncTaskService` 走的是 `TaskSubject.none()`，
+        // `sys_async_task.owner_id` 被写成 NULL —— 于是**这条导出任务永远查不出是谁触发的**，
+        // 而 `O6` 的「谁在何时触发了 X」正是读这一列。
+        // 导出没有知识库维度（`kbId`/`docId` 留 null 是对的），但**提交人是有的**。
+        // 提交发生在请求线程上，`LoginUserContext` 此刻还有值（工作线程里就没有了）。
+        String taskId = asyncTaskService.submit(TASK_TYPE,
+                AsyncTaskService.TaskSubject.of(null, null, user.getUserId()), idempotencyKey, 0, context -> {
             context.stage("查询日志");
             context.percent(20);
             String csv = auditQueryService.exportCsv(startTime, endTime, module, riskLevel,
