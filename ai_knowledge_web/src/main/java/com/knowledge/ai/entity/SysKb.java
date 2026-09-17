@@ -18,7 +18,8 @@ import java.time.LocalDateTime;
  *
  * <p>字段口径对齐 {@code V7__s2_kb_skeleton_and_grants.sql}（骨架 + 授权种子）、
  * {@code V8__s3_kb_owner.sql}（创建人）、{@code V9__s3_kb_governance_and_policies.sql}
- * （治理标签 + 三类策略）与 {@code V10__s3_kb_reindex_required.sql}（待重建标记）。
+ * （治理标签 + 三类策略）、{@code V10__s3_kb_reindex_required.sql}（待重建标记）
+ * 与 {@code V15__s4_kb_lifecycle.sql}（切代落点 + 软删）。
  *
  * <p><b>本实体存在的首要作用是让 {@code ddl-auto: validate} 生效</b>：在这之前
  * {@code sys_kb} 没有对应的实体，Hibernate 启动时**根本不看这张表** ——
@@ -133,6 +134,31 @@ public class SysKb {
     /** 检索配置，JSON 对象字符串；语义同 {@link #splitPolicyJson}。 */
     @Column(name = "retrieval_config_json", columnDefinition = "TEXT")
     private String retrievalConfigJson;
+
+    /**
+     * 当前向量所在的分区**代**（{@code V15} 新增 · {@code T-406}）。
+     *
+     * <p>Milvus 侧对应分区名 {@code kb{kbId}_g{indexGeneration}}。重建索引的流程是
+     * 「写新代分区 → 完成后**一次 UPDATE 本列**完成切换 → 滚动删旧代」，所以
+     * **本列就是 D-7 那个"原子切换点"**（见 `V15` 的注释里对 BLOCKER 的说明）。
+     *
+     * <p>检索侧只查本列指向的分区。⚠️ <b>这一列必须与 Milvus 分区同生共死</b>——
+     * 步 0 探针实测：查一个**不存在**的分区，Milvus 会**报错**（65535）而不是
+     * 返回空集，所以指向的分区一旦缺失，整个检索请求会炸掉而不是少几条结果。
+     */
+    @Column(name = "index_generation", nullable = false)
+    private Integer indexGeneration;
+
+    /**
+     * 软删时间（{@code V15} 新增 · {@code T-407}）。{@code NULL} = 未删。
+     *
+     * <p>删除知识库是软删进回收站（《03》§领域模型：保留 30 天，可恢复，恢复后需重建索引）。
+     * 与 {@link #status} **正交**：一个库可以"正在索引时被删除"，并进 status 会让这个组合无法表达。
+     *
+     * <p>口径与 {@code SysUser}/{@code SysDocument} 的软删一致（全站统一用 {@code NULL} = 未删）。
+     */
+    @Column(name = "deleted_at")
+    private LocalDateTime deletedAt;
 
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
