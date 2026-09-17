@@ -70,13 +70,20 @@ public class ChunkVectorizer {
         }
 
         String partition = MilvusConstants.partitionName(kbId, generation);
-        List<VectorChunk> candidates = VectorChunk.onlyVectorized(chunks);
+        // 两种"跳过"分别计数：投影维度（表格父块）是 `D-5` 的既有口径，
+        // 样板维度（`O9` 步 4）是本批新增。合成一个数会让日志里只剩"跳过 N 条"，
+        // 而 N 里混着两种完全不同的原因 —— 那正是排查时最想知道的那件事
+        int projected = VectorChunk.onlyVectorized(chunks).size();
+        int skippedProjection = chunks.size() - projected;
+        List<VectorChunk> candidates = VectorChunk.onlyRecallable(chunks);
+        int skippedBoilerplate = projected - candidates.size();
         int skipped = chunks.size() - candidates.size();
         if (candidates.isEmpty()) {
             // 空块集也要走一次删除：上一次解析若写过向量，不清掉就会留下"文档没有块、
             // 却检索得到"的幽灵 —— 与 DocRecordWriter 空块集也要回填 chunk_count = 0 同一条理由
             writer.replaceDocument(partition, docId, List.of());
-            log.info("没有需要向量化的块（全部被跳过）：docId={} 跳过={}", docId, skipped);
+            log.info("没有需要向量化的块（全部被跳过）：docId={} 跳过={}（表格父块 {} + 样板 {}）",
+                    docId, skipped, skippedProjection, skippedBoilerplate);
             return new Result(0, skipped, Status.EMPTY, "没有需要向量化的块",
                     EmbeddingClient.EmbeddingModelRef.NONE);
         }
@@ -106,8 +113,9 @@ public class ChunkVectorizer {
                     modelRef.model(), modelRef.version()));
         }
         int written = writer.replaceDocument(partition, docId, records);
-        log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={} 模型={}（跳过 = 表格父块 / 未实现的图片块）",
-                docId, partition, written, skipped, modelRef.model().isBlank() ? "<未报出>" : modelRef.model());
+        log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={}（表格父块/未实现的图片块 {} + 样板 {}）模型={}",
+                docId, partition, written, skipped, skippedProjection, skippedBoilerplate,
+                modelRef.model().isBlank() ? "<未报出>" : modelRef.model());
         return new Result(written, skipped, Status.OK, "已写入 " + written + " 个向量", modelRef);
     }
 

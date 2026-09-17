@@ -2,6 +2,8 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.text.BoilerplateRule;
+import com.knowledge.ai.core.text.ContentFingerprint;
 import com.knowledge.ai.pipeline.Block;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import jakarta.persistence.EntityManager;
@@ -12,7 +14,9 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -301,6 +305,11 @@ public class DocRecordWriter {
                     .setParameter("now", now)
                     .setParameter("id", docId)
                     .executeUpdate();
+
+            // `O9` 步 3/4：块都落库了，现在做跨文档样板识别。
+            // ⚠️ 位置是硬约束：必须在**全部 insert 之后**（计数要看得见本文档自己的块），
+            // 且必须在**向量化之前**（样板块不进召回池，判据在 ChunkVectorizer 那一跳）
+            markBoilerplate(docId, kbId, blocks);
         } else {
             // 空块集也要回填 0：上次解析若写过 chunk_count，不归零会留下
             // "文档没有块、却报告有 42 个分片"的假数
@@ -324,9 +333,9 @@ public class DocRecordWriter {
     private Long insertChunk(long docId, long kbId, Block block, Long parentId, LocalDateTime now) {
         entityManager.createNativeQuery("""
                         insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, title_path,
-                                               raw_content, order_no, page_no, created_at)
+                                               raw_content, content_sha256, order_no, page_no, created_at)
                         values (:docId, :kbId, :chunkType, :parentId, :titlePath,
-                                :rawContent, :orderNo, :pageNo, :now)
+                                :rawContent, :contentSha256, :orderNo, :pageNo, :now)
                         """)
                 .setParameter("docId", docId)
                 .setParameter("kbId", kbId)
@@ -334,6 +343,9 @@ public class DocRecordWriter {
                 .setParameter("parentId", parentId)
                 .setParameter("titlePath", blankToNull(block.titlePath()))
                 .setParameter("rawContent", block.rawContent())
+                // `O9` 步 1：**块的原始内容**的指纹，不是投影文本（含标题路径）的 ——
+                // 样板判定要的是"这段文本跨文档是否一样"，而标题路径恰恰因文档而异
+                .setParameter("contentSha256", ContentFingerprint.of(block.rawContent()))
                 .setParameter("orderNo", block.orderNo())
                 .setParameter("pageNo", block.pageNo())
                 .setParameter("now", now)
@@ -354,6 +366,138 @@ public class DocRecordWriter {
     /** 空串与 {@code null} 在库里是两种值 —— 标题路径没有就是没有，不写空串进去。 */
     private static String blankToNull(String v) {
         return v == null || v.isBlank() ? null : v;
+    }
+
+    // ==================== O9 步 3/4 · 跨文档样板识别 ====================
+
+    /**
+     * 标记**跨文档样板**分片（`O9` 步 3/4）。
+     *
+     * <h3>计数口径：含本文档在内、**不同文档**数</h3>
+     * <p>为什么按"文档数"而不是"块数"：同一段免责声明在一篇 200 页手册里可能出现 8 次，
+     * 但那**只说明这一篇重复**，不说明它是跨文档样板。按块数计，一篇文档就能把阈值顶到 ——
+     * 那会把"这篇文档自己重复"误判成"全公司都这么写"。
+     *
+     * <h3>为什么标记动作覆盖**全库同指纹的行**（含先前文档）</h3>
+     * <p>这是本方法唯一一处"看起来多做了"的地方，理由必须写清楚：
+     * 样板是**语料级的既有事实**，不是"第 20 篇文档到来时才发现的新情况"。
+     * 若只标当前文档，{@code is_boilerplate} 的含义就依赖**入库顺序** ——
+     * 前 19 篇是 0、后 6 篇是 1，而它们的内容**一模一样**。
+     * 那种字段没法用来回答"这段为什么搜不到"，而那是它存在的唯一目的。
+     *
+     * <p>UPDATE 走 {@code idx_chunk_csha}（V19 建的），范围 = 同库 + 同指纹，代价可控。
+     * ⚠️ **但它只改 MySQL 的标记**：先前那 19 篇的向量**已经在 Milvus 里**，本次不会去删。
+     * 那个缺口（旧向量仍可被召回）需要一次离线回扫 + Milvus 删除，`O9` §6 与计划 §3.3
+     * 明确把它放在了独立小批 —— 这里登记，见结项文档的遗留节。
+     *
+     * @return 本次被置为 1 的行数（含先前文档的），仅用于日志与取证
+     */
+    @Transactional
+    public int markBoilerplate(long docId, long kbId, List<Block> blocks) {
+        // 本文档各块指纹 → 其规范化文本（长度判据要用）。用 LinkedHashMap 去重并保序，
+        // 让"哪几个指纹参与了判定"可复现
+        Map<String, String> candidates = new LinkedHashMap<>();
+        for (Block block : blocks) {
+            String hash = ContentFingerprint.of(block.rawContent());
+            if (hash != null) {
+                candidates.putIfAbsent(hash, ContentFingerprint.normalize(block.rawContent()));
+            }
+        }
+        if (candidates.isEmpty()) {
+            return 0;
+        }
+
+        // 一次查回这批指纹在**其它文档**里的文档数（不是每块一次 COUNT）
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select content_sha256, count(distinct doc_id) from sys_chunk
+                         where kb_id = :kbId and doc_id <> :docId and content_sha256 in (:hashes)
+                         group by content_sha256
+                        """)
+                .setParameter("kbId", kbId)
+                .setParameter("docId", docId)
+                .setParameter("hashes", candidates.keySet())
+                .getResultList();
+
+        Map<String, Long> othersByHash = new HashMap<>(rows.size());
+        for (Object[] row : rows) {
+            othersByHash.put(String.valueOf(row[0]), ((Number) row[1]).longValue());
+        }
+
+        List<String> hit = new ArrayList<>();
+        for (Map.Entry<String, String> entry : candidates.entrySet()) {
+            // +1 = 本文档自己。`BoilerplateRule.MIN_DOCS` 的口径是「含当前文档在内」
+            long documentCount = othersByHash.getOrDefault(entry.getKey(), 0L) + 1;
+            if (BoilerplateRule.shouldMark(documentCount, entry.getValue())) {
+                hit.add(entry.getKey());
+            }
+        }
+        if (hit.isEmpty()) {
+            return 0;
+        }
+
+        int marked = entityManager.createNativeQuery("""
+                        update sys_chunk set is_boilerplate = 1
+                         where kb_id = :kbId and content_sha256 in (:hashes) and is_boilerplate = 0
+                        """)
+                .setParameter("kbId", kbId)
+                .setParameter("hashes", hit)
+                .executeUpdate();
+        log.info("识别出跨文档样板分片（`O9` 步 4）：docId={} kbId={} 命中指纹数={} 标记行数={}"
+                        + "（含先前文档，阈值 = 出现在 ≥{} 个文档且长度 {}~{} 字符，**不进向量召回池**）",
+                docId, kbId, hit.size(), marked,
+                BoilerplateRule.MIN_DOCS, BoilerplateRule.MIN_LENGTH, BoilerplateRule.MAX_LENGTH);
+        return marked;
+    }
+
+    /**
+     * 回填文档级内容指纹（`O9` 步 1）—— 规范化后的**整篇文本**的 sha256。
+     *
+     * <p>独立的 UPDATE 而不是并进 {@link #markParsed}：指纹的来源是**清洗后**的文本
+     * （{@code CleanedDocument#document()#markdown()}），而 {@code markParsed} 的参数
+     * 已经够多了（7 个）。多一个参数就是让每个调用点都要多传一个自己并不关心的值。
+     */
+    @Transactional
+    public void markContentFingerprint(long docId, String contentSha256) {
+        if (contentSha256 == null || contentSha256.isBlank()) {
+            // 空文档没有指纹 —— 不写空串（空串是一个"有值的值"，会让 SQL 里的
+            // `content_sha256 = ''` 把一批空文档判成互相重复）
+            return;
+        }
+        entityManager.createNativeQuery(
+                        "update sys_document set content_sha256 = :csha where id = :id")
+                .setParameter("csha", contentSha256)
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /**
+     * 回填向量模型归因（`O9` 步 7）—— 整篇文档的所有分片一起写。
+     *
+     * <p><b>为什么在向量化之后、且按 {@code doc_id} 整篇写</b>：一次 {@code vectorize}
+     * 调用用的**是同一个模型**（它的 {@code Result#modelRef()} 就是那一次的证据）。
+     * 逐块写要 N 次 UPDATE，而它们写的必然是同一个值。
+     *
+     * <p>⚠️ 只在向量化**确实写了东西**之后调（{@code allowsReady()}）。开关关掉时
+     * 一条向量都没写，这时候盖章等于声称"这些是某模型产的"，而其实什么都没有。
+     */
+    @Transactional
+    public void markVectorAttribution(long docId, String modelId, String modelVersion) {
+        if (modelId == null || modelId.isBlank()) {
+            // 归因不可得（EmbeddingModelRef.NONE）—— 留 NULL，界面按「未记录」渲染。
+            // **不要**写空串：空串会被读成"记了，只是模型名是空的"
+            log.info("向量模型归因不可得，本次不回填（界面按「未记录」展示）：docId={}", docId);
+            return;
+        }
+        entityManager.createNativeQuery("""
+                        update sys_chunk
+                           set embed_model_id = :modelId, embed_model_version = :modelVersion
+                         where doc_id = :docId
+                        """)
+                .setParameter("modelId", modelId)
+                .setParameter("modelVersion", modelVersion)
+                .setParameter("docId", docId)
+                .executeUpdate();
     }
 
     /**

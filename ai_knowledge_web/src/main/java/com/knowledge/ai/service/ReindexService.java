@@ -138,6 +138,11 @@ public class ReindexService {
                 ChunkVectorizer.Result r = chunkVectorizer.vectorize(
                         doc.id(), kbId, to, chunkReader.readByDocId(doc.id()));
                 if (r.allowsReady()) {
+                    // `O9` 步 7：换模型重建时，归因**必须跟着刷新** ——
+                    // 否则这两列记的是"上一次是谁产的"，而它恰恰是这个字段要回答的问题。
+                    // 与 DocParseService 同一条口径：只在确实写过之后盖章
+                    recordWriter.markVectorAttribution(doc.id(),
+                            r.modelRef().model(), r.modelRef().version());
                     // 成功之后**才**记断点 —— 顺序不能反，否则半截写入会被当成已完成
                     recordWriter.markReady(doc.id(), to);
                     processed++;

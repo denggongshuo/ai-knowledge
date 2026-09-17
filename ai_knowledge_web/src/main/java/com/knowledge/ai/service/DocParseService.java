@@ -4,6 +4,7 @@ import com.knowledge.ai.core.enums.KbConfigDefaults;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.storage.DocStorage;
+import com.knowledge.ai.core.text.ContentFingerprint;
 import com.knowledge.ai.pipeline.ChunkingOptions;
 import com.knowledge.ai.pipeline.ChunkingService;
 import com.knowledge.ai.pipeline.ParseException;
@@ -92,6 +93,9 @@ public class DocParseService {
     /** 读已落库的块给向量化用（主键必须是落库后的 chunk.id）。 */
     private final ChunkReader chunkReader;
 
+    /** 内容级近重复识别（`优化/O9` 步 1/2）—— **只提示，不阻断**。 */
+    private final ContentDuplicateDetector contentDuplicateDetector;
+
     /**
      * 页内容路由位（`优化/O2` 步 4）。
      *
@@ -121,6 +125,9 @@ public class DocParseService {
         CleanedDocument cleaned = null;
         String parsePath = null;
         int chunkCount = 0;
+        // 同一种写法：`O9` 步 1/2 的近重复提示要在成功路径上报出去（进 task 结果），
+        // 而它的取值点在 try 里面
+        ContentDuplicateDetector.Hint duplicateHint = ContentDuplicateDetector.Hint.NONE;
         try {
             byte[] source;
             try {
@@ -171,6 +178,15 @@ public class DocParseService {
 
             chunkCount = recordWriter.replaceChunks(docId, row.kbId(), enhanced.blocks());
 
+            // `O9` 步 1/2：内容指纹 + 同库近重复提示。
+            // ⚠️ 位置在**清洗之后、向量化之前**：指纹的输入必须是**规范化文本**，
+            //    而清洗（`O3`）正是"去页眉页脚"的那一步 —— 在它之前取指纹，
+            //    同一份内容换个页眉就变成两份（`O9` §4 步 1 点名要与 O3 合流）。
+            //
+            // 提示**不阻断**（O9 判据 1）：`duplicateHint` 只进返回值与日志，
+            // 后面该向量化还是向量化。理由见 ContentDuplicateDetector 的类注释。
+            duplicateHint = detectDuplicate(docId, row.kbId(), cleaned);
+
             // 质量四列里的三个：表格两列由解析侧给，图片列由 `O3` 步 4 销掉 S4-B §9 第 3 条
             // 的"采了不用"（imageCount 早已在采，只是没写）。image_parsed 仍等 T-512 的 VL。
             // `S4-E2` 又加两列：pages_total / pages_with_text（`优化/O2` §4 步 6）。
@@ -195,6 +211,10 @@ public class DocParseService {
             ChunkVectorizer.Result vectorized = chunkVectorizer.vectorize(
                     docId, row.kbId(), row.generation(), chunkReader.readByDocId(docId));
             if (vectorized.allowsReady()) {
+                // `O9` 步 7：只有在**确实写了东西**之后才盖模型归因的章。
+                // 开关关掉时一条向量都没写，这时盖章等于声称"这些是某模型产的"
+                recordWriter.markVectorAttribution(docId,
+                        vectorized.modelRef().model(), vectorized.modelRef().version());
                 recordWriter.markReady(docId, row.generation());
             } else {
                 // 开关关掉时停在中途态 INDEXING —— 不谎报可检索。日志已在 vectorize 里记过。
@@ -243,7 +263,41 @@ public class DocParseService {
         result.put("tableParsed", parsed.tableParsed());
         result.put("chunkCount", chunkCount);
         result.put("parsePath", parsePath);
+        // `O9` 步 1/2：近重复提示走**任务结果**下发（`T-500` 的异步任务结果页能看见），
+        // 而不是让整篇文档失败 —— 提示型口径，见 ContentDuplicateDetector 的类注释
+        result.put("duplicate", duplicateHint.duplicated());
+        if (duplicateHint.duplicated()) {
+            result.put("duplicateDocId", duplicateHint.docId());
+            result.put("duplicateDocTitle", duplicateHint.docTitle());
+            result.put("duplicateHint", duplicateHint.message());
+        }
         return result;
+    }
+
+    /**
+     * 算内容指纹、落库、并在同库找近重复（`O9` 步 1/2）。
+     *
+     * <p>三件事放一个方法里，是因为它们**必须用同一个指纹**：分开写就有机会
+     * "落库用的是 A、比对用的是 B"，而那种不一致的表现是"去重时灵时不灵"。
+     *
+     * <p>任何一步失败都**不牵连解析** —— 去重是增强，不是解析的一部分。
+     * 失败留 warn 并返回"不重复"（宁可漏报，不可误报：误报会让用户以为传错了）。
+     */
+    private ContentDuplicateDetector.Hint detectDuplicate(long docId, long kbId, CleanedDocument cleaned) {
+        try {
+            String fingerprint = ContentFingerprint.of(cleaned.document().markdown());
+            recordWriter.markContentFingerprint(docId, fingerprint);
+            ContentDuplicateDetector.Hint hint = contentDuplicateDetector.detect(kbId, docId, fingerprint);
+            if (hint.duplicated()) {
+                log.warn("发现同库近重复内容（不阻断）：docId={} kbId={} 已有的={} 《{}》",
+                        docId, kbId, hint.docId(), hint.docTitle());
+            }
+            return hint;
+        } catch (Exception ex) {
+            log.warn("内容指纹计算或近重复检查失败，本次按「未发现重复」处理：docId={} err={}",
+                    docId, ex.getMessage());
+            return ContentDuplicateDetector.Hint.NONE;
+        }
     }
 
     /**

@@ -45,7 +45,7 @@ public class ChunkReader {
     public List<VectorChunk> readByDocId(long docId) {
         List<?> rows = entityManager.createNativeQuery("""
                         select c.id, c.chunk_type, c.raw_content, c.title_path, c.parent_id,
-                               k.secret_level
+                               k.secret_level, c.is_boilerplate
                           from sys_chunk c
                           join sys_document d on d.id = c.doc_id
                           join sys_kb k on k.id = d.kb_id
@@ -64,9 +64,26 @@ public class ChunkReader {
                     (String) c[2],
                     (String) c[3],
                     c[5] == null ? null : String.valueOf(c[5]),
-                    c[4] == null ? null : ((Number) c[4]).longValue()));
+                    c[4] == null ? null : ((Number) c[4]).longValue(),
+                    // `O9` 步 4：样板块**读得到、但不进召回池**。判据在 VectorChunk#inRecallPool，
+                    // 不在这里 —— 读取层的职责是"照实读出来"，不是"顺手筛掉"
+                    isTrue(c[6])));
         }
         log.debug("读取待向量化分片：docId={} 块数={}", docId, chunks.size());
         return chunks;
+    }
+
+    /**
+     * MySQL 的 {@code TINYINT(1)} 经原生查询回来是 {@code Integer}（0/1），
+     * 但驱动版本不同时可能是 {@code Boolean} 或 {@code Long} —— 三种都收。
+     *
+     * <p>直接强转 {@code (Boolean)} 会在某次驱动升级后变成 {@code ClassCastException}，
+     * 而那个异常发生在**向量化路径**上，现象是"解析失败"，与"布尔列读法"八竿子打不着。
+     */
+    private static boolean isTrue(Object value) {
+        if (value instanceof Boolean b) {
+            return b;
+        }
+        return value instanceof Number n && n.intValue() != 0;
     }
 }
