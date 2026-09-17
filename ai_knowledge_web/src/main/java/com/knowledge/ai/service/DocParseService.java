@@ -8,6 +8,7 @@ import com.knowledge.ai.core.text.ContentFingerprint;
 import com.knowledge.ai.pipeline.ChunkingOptions;
 import com.knowledge.ai.pipeline.ChunkingService;
 import com.knowledge.ai.pipeline.ParseException;
+import com.knowledge.ai.pipeline.ParseFingerprint;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import com.knowledge.ai.pipeline.PdfDocumentParser;
 import com.knowledge.ai.pipeline.PlainTextParser;
@@ -159,6 +160,12 @@ public class DocParseService {
             //      （T-508 属 S4-C3，紧随本批）。
             cleaned = documentCleaner.clean(parsed, cleaningOptions(row.kbId()));
 
+            // `T-O05` 步 3：**落盘之前**盖上版本指纹。位置有两条约束：
+            //   ① 在 storeArtifact **之前** —— 产物里没有指纹，等于这次白解析一次；
+            //   ② 在 `parsed` 被交给清洗/分片**之前**也无妨（指纹只多一个字段），
+            //      但放这里更清楚：它描述的是"这份产物是谁产的"。
+            parsed = parsed.withMeta(ParseFingerprint.snapshot());
+
             byte[] artifact = MAPPER.writerWithDefaultPrettyPrinter()
                     .writeValueAsBytes(parsed);
             parsePath = docStorage.storeArtifact(row.kbId(), docId, ARTIFACT_NAME, artifact);
@@ -194,9 +201,13 @@ public class DocParseService {
             //    两者的 pages 恒等 —— 用 cleaned 是为了与下面 `chars` 的取值同源，
             //    免得将来清洗真动了页结构时，两处各取各的。
             // 状态停在这里（INDEXING）—— 向量还没进 Milvus，见下。
+            // `chars` 取**原始产物**的（`parsed`），不是清洗后的 `cleaned`：
+            // 这一列要回答的是"解析器抽到了多少内容"，而清洗是**我们**减掉的量。
+            // 取清洗后的值会让"某天改严了页眉剥离规则"表现为"解析质量下降" —— 两件事混在一起。
             recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed(),
                     cleaned.document().imageCount(),
-                    cleaned.document().pages(), cleaned.document().pagesWithText());
+                    cleaned.document().pages(), cleaned.document().pagesWithText(),
+                    parsed.chars(), ParseFingerprint.version());
 
             // T-508 向量化：落库的块 → 嵌入 → Milvus。
             // ⚠️ 顺序是**硬约束**（本批 §3.4 假设 #1）：必须在 enhance **之后**，

@@ -138,15 +138,20 @@ public class DocRecordWriter {
      * {@code DocService} 的"质量待改进"过滤命中 —— 这是**刻意的**：
      * 图片确实还没被理解，页面上的"有 N 张图（未理解）"就是这个意思。
      */
+    /**
+     * @param chars        可检索文本量（`T-O05` 步 6 的「平均 chars/页」要用它，`V21`）
+     * @param parseVersion 解析产物版本指纹（`T-O05` 步 4），由 {@code ParseFingerprint#version()} 算
+     */
     @Transactional
     public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal,
-                           int pagesTotal, int pagesWithText) {
+                           int pagesTotal, int pagesWithText, int chars, String parseVersion) {
         entityManager.createNativeQuery("""
                         update sys_document
                            set status = 'INDEXING', parse_path = :path,
                                table_total = :tableTotal, table_parsed = :tableParsed,
                                image_total = :imageTotal,
                                pages_total = :pagesTotal, pages_with_text = :pagesWithText,
+                               chars = :chars, parse_version = :parseVersion,
                                error_msg = null, updated_at = :now
                          where id = :id
                         """)
@@ -156,6 +161,8 @@ public class DocRecordWriter {
                 .setParameter("imageTotal", imageTotal)
                 .setParameter("pagesTotal", pagesTotal)
                 .setParameter("pagesWithText", pagesWithText)
+                .setParameter("chars", chars)
+                .setParameter("parseVersion", parseVersion)
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", docId)
                 .executeUpdate();

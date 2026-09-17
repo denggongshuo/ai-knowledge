@@ -162,6 +162,34 @@ public class SysDocument {
     @Column(name = "pages_with_text", nullable = false)
     private Integer pagesWithText;
 
+    /**
+     * 可检索文本量（`V21` 新增 · `优化/O5` 步 6）。
+     *
+     * <p>取自**原始产物**（{@code ParsedDocument.chars}），不是清洗后的量 ——
+     * 这一列要回答"解析器抽到了多少内容"，而清洗是**我们**减掉的量，
+     * 混在一起会让"改严了页眉剥离规则"表现为"解析质量下降"。
+     *
+     * <p>它只为一件事存在：让「平均 `chars/页`」从一个**要遍历 MinIO 读几千个 JSON**
+     * 的操作，退化成一条 {@code sum(chars)/sum(pages_total)}。
+     */
+    @Column(name = "chars", nullable = false)
+    private Integer chars;
+
+    /**
+     * 解析产物版本指纹（`V20` 新增 · `T-O05` 步 4）—— "这份产物是谁产的"。
+     *
+     * <p>值 = {@code ParseFingerprint#version()}（解析器版本 + 解析开关 + 守卫常量 + 清洗版本
+     * 四段合一的 sha256）。与 {@link #parsePath} **并列**，不合并：一个是"产物在哪"，
+     * 一个是"产物是谁产的"。
+     *
+     * <p>⚠️ <b>可空，且 NULL 的语义是「版本未知」，不是「已是最新」</b>：
+     * 本批之前的产物都没有它，而它们恰恰是最需要被重解析的那批。
+     * 把它当成"最新"的话，重解析入口会永远筛出空集 ——
+     * 现象是"加了指纹、却没有任何文档需要重解析"，看着像一切正常。
+     */
+    @Column(name = "parse_version", length = 64)
+    private String parseVersion;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 

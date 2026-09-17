@@ -51,7 +51,23 @@ public record ParsedDocument(String format,
                              int paragraphs,
                              int imageCount,
                              List<DocumentIssue> issues,
-                             List<DocElement> elements) {
+                             List<DocElement> elements,
+                             Map<String, String> meta) {
+
+    /**
+     * 旧形态（无指纹）—— **解析器一律用这个**。
+     *
+     * <p>指纹不是解析器的观察对象：解析器只知道"我抽到了什么"，不知道"我是哪个版本、
+     * 上层用了哪些开关"。那是编排层（{@code DocParseService}）在**落盘之前**盖上去的章
+     * （见 {@link #withMeta}）。让四个解析器各自填一遍，等于把同一个事实写四份，
+     * 而其中三份迟早会漏（`PlainTextParser` 连 opendataloader 都没引，填不出来）。
+     */
+    public ParsedDocument(String format, int pages, int chars, String markdown, List<Heading> headings,
+                          List<ParsedTable> tables, int paragraphs, int imageCount,
+                          List<DocumentIssue> issues, List<DocElement> elements) {
+        this(format, pages, chars, markdown, headings, tables, paragraphs, imageCount, issues,
+                elements, Map.of());
+    }
 
     /** 紧凑构造器：把"没解析出东西"的两种表达统一成空列表，下游不必两处判空。 */
     public ParsedDocument {
@@ -60,6 +76,25 @@ public record ParsedDocument(String format,
         tables = tables == null ? List.of() : List.copyOf(tables);
         issues = issues == null ? List.of() : List.copyOf(issues);
         elements = elements == null ? List.of() : List.copyOf(elements);
+        meta = meta == null ? Map.of() : Map.copyOf(meta);
+    }
+
+    /**
+     * 盖上版本指纹（`T-O05` 步 3）—— 落盘**之前**由编排层调用。
+     *
+     * <p>为什么是"盖上"而不是"解析时就知道"：见 {@link #ParsedDocument 十参构造器} 的说明。
+     * 旧产物（没有这一项）反序列化出来是**空 Map**，那不是错误 —— 它正是
+     * "版本未知"的表达，与 {@code sys_document.parse_version IS NULL} 同义。
+     */
+    public ParsedDocument withMeta(Map<String, String> fingerprint) {
+        return new ParsedDocument(format, pages, chars, markdown, headings, tables, paragraphs,
+                imageCount, issues, elements, fingerprint);
+    }
+
+    /** 读一段指纹；没有时给空串（不是 {@code null}）—— 调用方只判空，不必两处判 null。 */
+    public String metaValue(String key) {
+        String value = meta.get(key);
+        return value == null ? "" : value;
     }
 
     /**
