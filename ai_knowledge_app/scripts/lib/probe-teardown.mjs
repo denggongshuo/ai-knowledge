@@ -102,6 +102,46 @@ export const USER_ARTIFACTS = [
     why: '登录日志。按 username 前缀删（用户行删掉后 user_id 就成孤儿了）',
   },
   { id: 'sql:sys_user_role', kind: 'sql-user', table: 'sys_user_role', via: 'user', why: '用户角色关联' },
+
+  // ---- S5-M08-A 新增（问答）：**子表排在父表之前**，顺序即执行顺序 ----
+  // 覆盖率闸在加进来之前就会点名这两张带 user_id 的表，所以它们是**被闸逼出来的**
+  // —— 与 sys_async_task 那一行同一种来历。
+  {
+    id: 'sql:sys_retrieval_trace_chunk', kind: 'sql-user', table: 'sys_retrieval_trace_chunk',
+    via: 'subquery',
+    deleteSql: 'delete from sys_retrieval_trace_chunk where trace_id in '
+      + "(select trace_id from sys_retrieval_trace t join sys_user u on u.id = t.user_id "
+      + "where u.username like '{prefix}%');",
+    countSql: 'select count(*) from sys_retrieval_trace_chunk where trace_id in '
+      + "(select trace_id from sys_retrieval_trace t join sys_user u on u.id = t.user_id "
+      + "where u.username like '{prefix}%');",
+    why: '检索打点的分片明细。⚠️ 它**没有 user_id**（归属要靠 trace_id 顺上去）——'
+      + '这正是「产物认识、归属维度不认识」的第 N 次变形，所以登记表多了一种 via',
+  },
+  {
+    id: 'sql:sys_chat_message', kind: 'sql-user', table: 'sys_chat_message',
+    via: 'subquery',
+    // ⚠️ 子查询里必须写 `s.id` 而不是 `id` —— sys_chat_session 与 sys_user **都有 id**，
+    // 不带别名限定会报 1052 Column 'id' in field list is ambiguous。
+    // 这个错第一次跑 E2E 时才暴露出来（`mysqlScalar` 把 stderr 吞了，报出来只有
+    // "mysql 查询失败（status=1）：" 后面一片空白），排查靠的是手工逐条复跑
+    deleteSql: 'delete from sys_chat_message where session_id in '
+      + "(select s.id from sys_chat_session s join sys_user u on u.id = s.user_id "
+      + "where u.username like '{prefix}%');",
+    countSql: 'select count(*) from sys_chat_message where session_id in '
+      + "(select s.id from sys_chat_session s join sys_user u on u.id = s.user_id "
+      + "where u.username like '{prefix}%');",
+    why: '问答消息。同上：归属靠 session_id 顺上去',
+  },
+  {
+    id: 'sql:sys_retrieval_trace', kind: 'sql-user', table: 'sys_retrieval_trace', via: 'user',
+    why: '检索链路打点（T-707）。⚠️ 只有 user_id 没有 kb_id/doc_id —— 库族清理看不见它',
+  },
+  {
+    id: 'sql:sys_chat_session', kind: 'sql-user', table: 'sys_chat_session', via: 'user',
+    why: '问答会话（T-802 建表半边）',
+  },
+
   { id: 'sql:sys_user', kind: 'sql-user', table: 'sys_user', via: 'username', why: '用户主表' },
 ]
 
@@ -434,6 +474,9 @@ export function teardownUserProbe(prefix) {
       if (a.via === 'user') {
         return `delete t from ${a.table} t join sys_user u on u.id = t.user_id where u.username like '${prefix}%';`
       }
+      // 子表没有 user_id，只能**顺着父表**找。⚠️ 它必须排在父表**之前**
+      // （父表行一删，这条子查询就再也定位不到那些子行了）
+      if (a.via === 'subquery') return a.deleteSql.replaceAll('{prefix}', prefix)
       throw new Error(`USER_ARTIFACTS 里 ${a.table} 的 via 取值无法处理：${a.via}`)
     }).reduce((acc, s) => acc + s, ''),
   )
@@ -474,9 +517,11 @@ export async function findKbProbeResidue(code, snapshot = {}) {
 export function findUserProbeResidue(prefix) {
   const sql = {}
   for (const a of USER_ARTIFACTS) {
+    // `subquery` 的计数必须**在父表被删之前**取 —— 它与删除用的是同一条子查询条件
     sql[a.table] = mysqlCount(
       a.via === 'username' ? `select count(*) from ${a.table} where username like '${prefix}%';`
-        : `select count(*) from ${a.table} t join sys_user u on u.id = t.user_id where u.username like '${prefix}%';`,
+        : a.via === 'subquery' ? a.countSql.replaceAll('{prefix}', prefix)
+          : `select count(*) from ${a.table} t join sys_user u on u.id = t.user_id where u.username like '${prefix}%';`,
     )
   }
   return { sql, sqlTotal: Object.values(sql).reduce((a, b) => a + b, 0) }
