@@ -45,6 +45,15 @@ import java.util.Locale;
  *       （纯 id 命名会让排查变成考古）。{@code safeName} 只清洗路径分隔符与控制字符，
  *       **不去中文** —— 它只进库（{@code sys_document.storage_path}），不下发 URL。</li>
  * </ul>
+ *
+ * <h3>删除：本类不定义"什么时候删"，只提供"怎么删"</h3>
+ * <p>「删一篇文档 / 删一个知识库到底删了什么」是一张**明文规则表**，在
+ * <b>{@code docs/后端开发文档/11-M05-存储生命周期规则（O7）.md}</b>（`优化/O7`，2026-09-17）。
+ * 改本类的删除行为前先读它 —— 那张表与本类的实现互为反证：
+ * 例如它写着"删除知识库**不动物件**"（软删可恢复），所以 {@link #remove} 在 `T-407`
+ * 落地时**刻意没有被接上**。谁哪天"顺手"在删库里加了 {@code remove(...)}，那张表就是发现它的依据。
+ *
+ * <p>{@link #remove} 目前仍无调用方（`T-616` 彻底删除时接），这**不是遗漏**。
  */
 @Slf4j
 @Component
@@ -70,6 +79,9 @@ public class DocStorage {
             "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md");
 
     private final MinioClient minioClient;
+
+    /** `T-O04` 的按内容准入检查（MIME 交叉校验 / ZIP 炸弹 / 加密）。 */
+    private final IngestGuard ingestGuard;
 
     @Value("${minio.bucket:rag-documents}")
     private String bucket;
@@ -224,6 +236,12 @@ public class DocStorage {
                     "不支持的文件类型「" + (ext.isEmpty() ? "无扩展名" : ext) + "」，"
                             + "仅支持 PDF / DOC / DOCX / XLS / XLSX / PPT / PPTX / TXT / MD");
         }
+        // `T-O04`：前三道都是"按名字"判（闸），这里补"按内容"判（防）——
+        // 真实类型交叉校验 + ZIP 炸弹限额 + 加密检测。见 IngestGuard 的类注释。
+        //
+        // ⚠️ 位置在**白名单之后**：扩展名不在白名单时先给 10034（用户能立刻明白是格式问题），
+        // 不必再花一次文件头探测。反过来排会让"不支持的类型"报成"疑似伪装"，指向错误的下一步动作。
+        ingestGuard.check(file);
     }
 
     /** 由文件名取小写扩展名；没有扩展名返回空串。 */
