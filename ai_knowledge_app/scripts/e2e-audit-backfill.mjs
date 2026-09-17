@@ -30,11 +30,13 @@
  *   运行：node scripts/e2e-audit-backfill.mjs --base=http://127.0.0.1:5174
  * </pre>
  */
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+// 探针自清 —— **登记表 + 覆盖率闸 + 残留自检**。S4-D2 起清理逻辑只此一份。
+import { assertArtifactCoverage, mysqlScalar, teardownUserProbe } from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_ROOT = resolve(ROOT, '..')
@@ -61,23 +63,14 @@ function check(ok, label, detail = '') {
   return !!ok
 }
 
-// ---------------------------------------------------------------- 数据库直连（仅自清）
-function mysqlScalar(sql) {
-  const envFile = `${REPO_ROOT.replace(/\\/g, '/')}/ai_knowledge_web/.env`
-  const script = `
-set -a; . ${JSON.stringify(envFile)}; set +a
-docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -N -e ${JSON.stringify(sql)} 2>/dev/null
-`.trim()
-  const r = spawnSync('C:/Program Files/Git/bin/bash.exe', ['-c', script], { cwd: REPO_ROOT, encoding: 'utf8' })
-  if (r.status !== 0) throw new Error(`mysql 查询失败（status=${r.status}）：${r.stderr || r.stdout}`)
-  return (r.stdout ?? '').trim()
-}
-
-/** 幂等清理探针账号（先关联后主表，避开外键）。 */
-function purgeProbeUsers() {
-  mysqlScalar(`delete ur from sys_user_role ur join sys_user u on u.id = ur.user_id where u.username like '${PROBE_PREFIX}%';`)
-  mysqlScalar(`delete from sys_user where username like '${PROBE_PREFIX}%';`)
-}
+// ---------------------------------------------------------------- 数据库直连（仅计数 / 读列）
+// `mysqlScalar` 与清理都来自 `./lib/probe-teardown.mjs`（S4-D2 起只此一份）。
+//
+// ⚠️ 本脚本原先的 `purgeProbeUsers` **只删 `sys_user_role` + `sys_user`**，
+// **漏了 `sys_login_log`** —— 而该表有 `username` 列，本可按前缀删。
+// 实测后果：`sys_login_log` 累积出 **3984 行孤儿**（`user_id` 指向已删用户，
+// 既 join 不回用户、又永远没人清）。这正是「新增持久化产物、清理函数不认识它」的第四例，
+// 所以本批顺手把它一起收敛掉。
 
 function userCount() {
   return Number(mysqlScalar('select count(*) from sys_user where deleted_at is null;'))
@@ -263,9 +256,14 @@ async function main() {
 
   try {
   // ==================== 0. 准备数据（直连 API + DB 自清） ====================
-  purgeProbeUsers()
+  // ⚠️ 覆盖率闸必须在建探针之前跑（放在 finally 里会导致「闸抛错 → 清理反而不执行」）
+  const cov = assertArtifactCoverage()
+  check(true, '准备：产物覆盖率闸通过',
+    `扫描 ${cov.scanned} 张带归属列的表 · 已登记 ${cov.registered} 张 · 显式豁免 ${cov.exempt} 张`)
+
+  teardownUserProbe(PROBE_PREFIX)
   usersBefore = userCount()
-  check(true, '准备：探针账号前缀幂等清空', `sys_user 当前 ${usersBefore} 行`)
+  check(true, '准备：探针账号前缀幂等清空（含登录日志）', `sys_user 当前 ${usersBefore} 行`)
 
   const login = await api('/auth/login', {
     method: 'POST',
@@ -516,11 +514,15 @@ async function main() {
     } catch {
       /* ignore */
     }
-    // ---- 自清：探针账号删除（先关联后主表；审计行不删，见脚本头注）----
+    // ---- 自清：探针账号删除（登录日志 → 关联 → 主表；审计行不删，见脚本头注）----
     try {
-      purgeProbeUsers()
+      const r = teardownUserProbe(PROBE_PREFIX)
       const after = userCount()
-      check(after === usersBefore, '收尾：探针账号已自清，sys_user 回到基线', `${usersBefore} → ${after}`)
+      check(
+        after === usersBefore && r.residue.sqlTotal === 0,
+        '收尾：探针账号已自清（含**登录日志**），sys_user 回到基线',
+        `${usersBefore} → ${after} · 残留 ${JSON.stringify(r.residue.sql)} · 本次删登录日志 ${r.loginLogs} 行`,
+      )
     } catch (e) {
       check(false, '收尾：自清失败，需人工检查', String(e.message))
     }
@@ -538,7 +540,7 @@ main()
     const failed = steps.filter((s) => !s.ok).length
     if (steps.length) console.log(`\n已执行 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     try {
-      purgeProbeUsers()
+      teardownUserProbe(PROBE_PREFIX)
     } catch {
       /* 已在 finally 里报过 */
     }

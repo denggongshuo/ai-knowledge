@@ -37,12 +37,18 @@
  *   运行：node scripts/e2e-doc-upload.mjs --base=http://127.0.0.1:5174
  * </pre>
  */
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+// 探针自清 —— **登记表 + 覆盖率闸 + 残留自检**。S4-D2 起清理逻辑只此一份，
+// 本脚本不再自己写 `purgeProbe` / `minioRemove` / Milvus 那几段（原先 5 个脚本各一份）。
+import {
+  assertArtifactCoverage, describeKbResidue, kbIdsOf, kbResidueClean,
+  milvusVectorCount, mysqlScalar, teardownKbProbe,
+} from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_ROOT = resolve(ROOT, '..')
@@ -86,153 +92,21 @@ function observe(label, detail = '') {
   console.log(`… ${label}${detail ? ` · ${detail}` : ''}`)
 }
 
-// ---------------------------------------------------------------- 数据库直连（仅自清 / 计数）
-function mysqlScalar(sql) {
-  const envFile = `${REPO_ROOT.replace(/\\/g, '/')}/ai_knowledge_web/.env`
-  const script = `
-set -a; . ${JSON.stringify(envFile)}; set +a
-docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -N -e ${JSON.stringify(sql)} 2>/dev/null
-`.trim()
-  const r = spawnSync('bash', ['-c', script], { cwd: REPO_ROOT, encoding: 'utf8' })
-  if (r.status !== 0) throw new Error(`mysql 查询失败（status=${r.status}）：${r.stderr || r.stdout}`)
-  return (r.stdout ?? '').trim()
-}
+// ---------------------------------------------------------------- 数据库直连（仅计数 / 读列）
+// `mysqlScalar` 从 `./lib/probe-teardown.mjs` 引入 —— 原先 5 个脚本各写一份，
+// 改一处漏四处的形态就是本批要消灭的（S4-D2）。
 
-/**
- * 删 MinIO 里的对象（**只删库行是不够的**）。
- *
- * <p>不删的后果是实测过的（`S4-M05-C2`，2026-09-16）：两个 E2E 各跑一轮就在桶里留下
- * 9 个对象，而 `GET /kb/storage-quota` 会**全桶递归列举**（`KbService#minioUsedBytes`）——
- * 攒到上千个之后慢到读超时，把毫不相干的 `KbWriteFlowTest` 拖红。
- * 那是最费时间的假红形态：错误的信号指向错误的地方。
- *
- * <p>对象名必须在**删行之前**取出来。`mysql -N` 的空值打印成字面量 `NULL`，要滤掉。
- *
- * <h3>⚠️ 必须把路径塞进 `sh -c` 里，不能当裸参数传给 `docker exec`</h3>
- * <p>Git Bash 会把形似 Unix 绝对路径的**裸参数**改写成 Windows 路径
- * （`/data/…` → `C:/Program Files/Git/data/…`，MSYS 的自动转换）。
- * 于是 `rm -rf` 删的是一个不存在的路径，而 `-f` 让它**静默返回 0** ——
- * 本轮实测就是这个形态：命令报成功，对象一个没少。
- * 塞进 `sh -c '...'` 的整串里就绕开了转换（容器内的 sh 才是解析者）。
- */
-function minioRemove(rawObjectKeys) {
-  const keys = (rawObjectKeys ?? '')
-    .split('\n')
-    .map((s) => s.trim())
-    .filter((s) => s && s !== 'NULL')
-  if (keys.length === 0) return
-  const paths = keys.map((k) => `'/data/rag-documents/${k}'`).join(' ')
-  spawnSync('bash', ['-c', `MSYS_NO_PATHCONV=1 docker exec kb-minio sh -c "rm -rf ${paths}"`],
-    { cwd: REPO_ROOT, encoding: 'utf8' })
-}
-
-/**
- * 幂等清理探针库及其文档（顺序：对象 → 问题行 → 分片 → 文档 → 授权 → 主表）。
- *
- * <p>对象排在最前：删了文档行，`storage_path`/`parse_path` 就查不出来了。
- */
-function purgeProbe() {
-  const probeDocs = `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}'`
-  minioRemove(mysqlScalar(`select d.storage_path ${probeDocs};`))
-  minioRemove(mysqlScalar(`select d.parse_path ${probeDocs};`))
-  // ①' Milvus 里的向量 —— **必须在删 sys_kb 行之前做**（按 probe kb id 删，删完就查不到了）。
-  //     `S4-M05-C3` 起探针文档也会被向量化（T-508）；不删就是"文档没了、向量还在"的幽灵数据。
-  //     这是 `汇总.md` §3 #79 那条教训的**第 N 次复发**：新增持久化产物时没人回头查清理函数。
-  milvusRemoveByProbeKb()
-  mysqlScalar(
-    `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
-      delete c from sys_chunk c join sys_document d on d.id=c.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
-      delete d from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';` +
-      `delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';` +
-      `delete from sys_kb where code='${PROBE_CODE}';`,
-  )
-}
+// `minioRemove` 与 `purgeProbe` 已收敛到 `./lib/probe-teardown.mjs` 的 `teardownKbProbe()`。
+// 那里是**登记表驱动**的：新增一种持久化产物只需在登记表加一行，不必回头改本脚本
+// —— 这正是本批要修的坑（三次复发的根因是「清理逻辑散在 5 个脚本里各写一遍」）。
 const kbCount = () => Number(mysqlScalar('select count(*) from sys_kb;'))
 
-/**
- * 探针库的 id **列表**（**要在 purgeProbe 之前取**：行删了就查不到 id 了）。
- *
- * <p>⚠️ 必须 split 成数组：`mysqlScalar` 返回的是**字符串**（`-N` 的多行文本），
- * 直接 `.join(',')` 会炸成 `ids.join is not a function` —— 本轮实测踩过。
- */
-const probeKbIds = () => (mysqlScalar(`select id from sys_kb where code='${PROBE_CODE}';`) ?? '')
-  .split('\n').map((s) => s.trim()).filter(Boolean)
+// 探针库 id 快照（`kbIdsOf`）、Milvus 计数 / 删点 / 删分区，全部来自 `./lib/probe-teardown.mjs`。
+// 那边把三条容易踩的口径写在了一处，不再各脚本抄一遍：
+//   ① 判残留必须用 `entities/query` 的 `count(*)`，`get_stats.rowCount` **只统计已 flush 的**；
+//   ② 删除可见性有几秒延迟 → 必须轮询，否则把「刚删完」读成「没删掉」；
+//   ③ drop 分区前必须先 release，且**要校验返回值**（裸 drop 只给 65535）。
 
-/**
- * 探针库在 **Milvus** 里残留的向量条数（`S4-M05-C3` / `T-508` 起会 > 0）。
- *
- * <p>走 Milvus REST v2，零新增依赖。**必须用 `entities/query` 的 `count(*)`，不能用
- * `get_stats` 的 `rowCount`** —— 后者只统计**已 flush** 的数据，而写入路径刻意不 flush
- * （见 `MilvusChunkWriter` 类 javadoc），拿它判残留恒得 0，等于没查。
- */
-const milvusVectorRowsOfProbeKb = async (ids) => {
-  if (!ids || ids.length === 0) return 0
-  // ⚠️ **删除的可见性有几秒延迟**（实测：`deleteCount=9` 之后立刻 count 仍得 9，过几秒才归 0）。
-  //    只查一次会把"刚删完"读成"没删掉" → 假失败。故轮询到 0 或超时为止。
-  for (let i = 0; i < 6; i++) {
-    const out = spawnSync('bash', ['-c',
-      `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/entities/query ` +
-      `-H 'Content-Type: application/json' ` +
-      `-d '{"collectionName":"knowledge_vectors","filter":"kb_id in [${ids.join(',')}]","outputFields":["count(*)"]}'`,
-    ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
-    const n = Number((out.match(/"count\(\*\)":(\d+)/) ?? [])[1] ?? -1)
-    if (n === 0) return 0
-    if (i < 5) await sleep(2000)
-    else return n
-  }
-  return -1
-}
-
-/** 删掉探针库的全部向量 + **丢掉它的代分区**。**调用必须在删 `sys_kb` 行之前。** */
-function milvusRemoveByProbeKb() {
-  const ids = probeKbIds()
-  if (ids.length === 0) return
-  spawnSync('bash', ['-c',
-    `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/entities/delete ` +
-    `-H 'Content-Type: application/json' ` +
-    `-d '{"collectionName":"knowledge_vectors","filter":"kb_id in [${ids.join(',')}]"}'`,
-  ], { cwd: REPO_ROOT, encoding: 'utf8' })
-  milvusDropProbePartitions(ids)
-}
-
-/**
- * 丢掉探针库的**代分区**。
- *
- * ⚠️ 为什么必须有这一步：`T-406` 起向量按 `kb{id}_g{代}` 分区存放，而上面的
- * `entities/delete` 只删**点**、不删**容器** —— 于是每次跑完都留下几个空分区。
- * 这是本项目「新增持久化产物、清理函数不认识它」的**第三次**复现
- * （前两次：`sys_chunk` 新表、Milvus 向量本身），所以这次把注释也写在这里。
- *
- * ⚠️ 顺序固定：**delete 实体 → release → drop**。裸 drop 会失败，
- * 服务端原话是 `partition cannot be dropped, partition is loaded, please release it first`
- * （步 0 探针在 Java SDK 那侧看到的是同一个原因，但只给了 65535）。
- */
-function milvusDropProbePartitions(ids) {
-  const listOut = spawnSync('bash', ['-c',
-    `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/list ` +
-    `-H 'Content-Type: application/json' -d '{"collectionName":"knowledge_vectors"}'`,
-  ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
-  let names = []
-  try { names = JSON.parse(listOut).data ?? [] } catch { return }
-  for (const id of ids) {
-    for (const name of names.filter((n) => n.startsWith(`kb${id}_g`))) {
-      spawnSync('bash', ['-c',
-        `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/release ` +
-        `-H 'Content-Type: application/json' ` +
-        `-d '{"collectionName":"knowledge_vectors","partitionNames":["${name}"]}'`,
-      ], { cwd: REPO_ROOT, encoding: 'utf8' })
-      spawnSync('bash', ['-c',
-        `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/drop ` +
-        `-H 'Content-Type: application/json' ` +
-        `-d '{"collectionName":"knowledge_vectors","partitionName":"${name}"}'`,
-      ], { cwd: REPO_ROOT, encoding: 'utf8' })
-    }
-  }
-}
-
-/** 探针库的分片行数 —— `S4-M05-C1` 起 `sys_chunk` 也要跟着清，否则留下**孤儿块**。 */
-const chunkRowsOfProbe = () =>
-  Number(mysqlScalar(`select count(*) from sys_chunk c join sys_kb k on k.id=c.kb_id where k.code='${PROBE_CODE}';`))
 const docRowsOfProbe = () =>
   Number(mysqlScalar(`select count(*) from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';`))
 
@@ -381,8 +255,13 @@ async function main() {
   rmSync(PROFILE, { recursive: true, force: true })
   mkdirSync(OUT_DIR, { recursive: true })
 
+  // ⚠️ 覆盖率闸**必须在建探针之前**跑：放在 finally 里会导致「闸抛错 → 清理反而不执行」，
+  //    等于用一道防残留的闸制造残留。失败要发生在还没弄脏之前。
+  const cov = assertArtifactCoverage()
+  observe('产物覆盖率闸通过', `扫描 ${cov.scanned} 张带归属列的表 · 已登记 ${cov.registered} 张 · 显式豁免 ${cov.exempt} 张`)
+
   // ---- 幂等自清 ----
-  purgeProbe()
+  await teardownKbProbe(PROBE_CODE)
   const before = kbCount()
   check(before === 8, '准备：sys_kb 回到 8 行（幂等清理探针库）', `行数=${before}`)
 
@@ -775,19 +654,15 @@ async function main() {
     }
     child.kill()
     try {
-      // ⚠️ 在 purgeProbe **之前**取探针库 id：行删掉后就再也定位不到 Milvus 里的向量了
-      const idsBefore = probeKbIds()
-      const vectorsBefore = await milvusVectorRowsOfProbeKb(idsBefore)
-      purgeProbe()
+      // ⚠️ 快照必须在 teardown **之前**取：行删掉后就再也定位不到 Milvus / MinIO 侧了
+      const idsBefore = kbIdsOf(PROBE_CODE)
+      const vectorsBefore = await milvusVectorCount(idsBefore)
+      const r = await teardownKbProbe(PROBE_CODE)
       const after = kbCount()
-      const docsLeft = docRowsOfProbe()
-      const chunksLeft = chunkRowsOfProbe()
-      const vectorsLeft = await milvusVectorRowsOfProbeKb(idsBefore)
       check(
-        after === 8 && docsLeft === 0 && chunksLeft === 0 && vectorsLeft === 0,
-        '收尾：探针库 / 文档 / 分片行 / **Milvus 向量**已自清，sys_kb 回到 8 行',
-        `库=${after} 文档残留=${docsLeft} 分片残留=${chunksLeft} ` +
-          `Milvus 向量残留=${vectorsLeft}（跑动前 ${Math.max(0, vectorsBefore)}）`,
+        after === 8 && kbResidueClean(r.residue),
+        '收尾：探针库 / 文档 / 分片行 / Milvus 向量 / **分区** / **MinIO 对象**已自清，sys_kb 回到 8 行',
+        `库=${after} · ${describeKbResidue(r.residue)}（跑动前向量 ${Math.max(0, vectorsBefore)}）`,
       )
     } catch (e) {
       check(false, '收尾：探针库自清失败，需人工检查', String(e.message))
@@ -809,12 +684,12 @@ main()
     console.log(`\n合计 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     process.exit(failed ? 1 : 0)
   })
-  .catch((e) => {
+  .catch(async (e) => {
     console.error(`\n✗ 中断：${e.message}`)
     const failed = steps.filter((s) => !s.ok).length
     if (steps.length) console.log(`\n已执行 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     try {
-      purgeProbe()
+      await teardownKbProbe(PROBE_CODE)
     } catch {
       /* 已在 finally 里报过 */
     }

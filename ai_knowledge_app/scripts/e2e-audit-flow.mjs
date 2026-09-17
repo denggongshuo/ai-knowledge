@@ -37,11 +37,13 @@
  *   运行：node scripts/e2e-audit-flow.mjs --base=http://127.0.0.1:5174
  * </pre>
  */
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+// 探针自清 —— **登记表 + 覆盖率闸 + 残留自检**。S4-D2 起清理逻辑只此一份。
+import { assertArtifactCoverage, describeKbResidue, kbResidueClean, mysqlScalar, teardownKbProbe } from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const REPO_ROOT = resolve(ROOT, '..')
@@ -75,23 +77,12 @@ function observe(label, detail = '') {
   console.log(`… ${label}${detail ? ` · ${detail}` : ''}`)
 }
 
-// ---------------------------------------------------------------- 数据库直连（仅自清）
-function mysqlScalar(sql) {
-  const envFile = `${REPO_ROOT.replace(/\\/g, '/')}/ai_knowledge_web/.env`
-  const script = `
-set -a; . ${JSON.stringify(envFile)}; set +a
-docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -N -e ${JSON.stringify(sql)} 2>/dev/null
-`.trim()
-  const r = spawnSync('bash', ['-c', script], { cwd: REPO_ROOT, encoding: 'utf8' })
-  if (r.status !== 0) throw new Error(`mysql 查询失败（status=${r.status}）：${r.stderr || r.stdout}`)
-  return (r.stdout ?? '').trim()
-}
-
-/** 幂等清理探针库（先授权后主表）。 */
-function purgeProbe() {
-  mysqlScalar(`delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';`)
-  mysqlScalar(`delete from sys_kb where code='${PROBE_CODE}';`)
-}
+// ---------------------------------------------------------------- 数据库直连（仅计数 / 读列）
+// `mysqlScalar` 与清理都来自 `./lib/probe-teardown.mjs`（S4-D2 起只此一份）。
+//
+// ⚠️ 本脚本原先的 `purgeProbe` **只删 `sys_kb_grant` + `sys_kb`**，对
+// `sys_document` / `sys_chunk` / `sys_parse_issue` / MinIO / Milvus **一无所知**。
+// 它当前是对的 —— 但纯属「本脚本恰好还没建文档」，**没有任何机制保证下次还对**。
 
 function kbCount() {
   return Number(mysqlScalar('select count(*) from sys_kb;'))
@@ -261,7 +252,11 @@ async function main() {
   mkdirSync(OUT_DIR, { recursive: true })
 
   // ==================== 0. 准备数据（直连 API，不点页面） ====================
-  purgeProbe()
+  // ⚠️ 覆盖率闸必须在建探针之前跑（放在 finally 里会导致「闸抛错 → 清理反而不执行」）
+  const cov = assertArtifactCoverage()
+  observe('产物覆盖率闸通过', `扫描 ${cov.scanned} 张带归属列的表 · 已登记 ${cov.registered} 张 · 显式豁免 ${cov.exempt} 张`)
+
+  await teardownKbProbe(PROBE_CODE)
   check(kbCount() === 8, '准备：sys_kb 回到 8 行（幂等清理探针库）', `行数=${kbCount()}`)
 
   const login = await api('/auth/login', {
@@ -614,8 +609,12 @@ async function main() {
         body: { changes: [{ roleId: MATRIX_ROLE_ID, permKey: MATRIX_ITEM, level: matrixBefore }] },
       })
       check(restore.json?.code === 0, '收尾：功能矩阵已还原', `level=${matrixLevel()}`)
-      purgeProbe()
-      check(kbCount() === 8, '收尾：探针库已自清，sys_kb 回到 8 行', `行数=${kbCount()}`)
+      const r = await teardownKbProbe(PROBE_CODE)
+      check(
+        kbCount() === 8 && kbResidueClean(r.residue),
+        '收尾：探针库及其全部产物（库行 / 文档 / 分片 / Milvus 向量与分区 / MinIO 对象）已自清',
+        `库=${kbCount()} · ${describeKbResidue(r.residue)}`,
+      )
     } catch (e) {
       check(false, '收尾：自清失败，需人工检查', String(e.message))
     }
@@ -631,12 +630,12 @@ main()
     console.log(`\n合计 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     process.exit(failed ? 1 : 0)
   })
-  .catch((e) => {
+  .catch(async (e) => {
     console.error(`\n✗ 中断：${e.message}`)
     const failed = steps.filter((s) => !s.ok).length
     if (steps.length) console.log(`\n已执行 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     try {
-      purgeProbe()
+      await teardownKbProbe(PROBE_CODE)
     } catch {
       /* 已在 finally 里报过 */
     }

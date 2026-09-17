@@ -30,11 +30,13 @@
  *   运行：node scripts/e2e-kb-flow.mjs --base=http://127.0.0.1:5174
  * </pre>
  */
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+// 探针自清 —— **登记表 + 覆盖率闸 + 残留自检**。S4-D2 起清理逻辑只此一份。
+import { assertArtifactCoverage, describeKbResidue, kbResidueClean, mysqlScalar, teardownKbProbe } from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /** 仓库根（前端模块的上一层）—— .env 在后端模块里，自清脚本要用。 */
@@ -75,24 +77,12 @@ function observe(label, detail = '') {
  * `docker exec` 能查库、宿主连上零字节）。`docker exec` 这条路不受端口转发影响，
  * 是**更可靠**的那条 —— 出问题时也能立刻分辨是"库挂了"还是"转发挂了"。
  */
-function mysqlScalar(sql) {
-  // ⚠️ 必须给 .env **绝对路径**（前端模块的上一层才是仓库根）：`bash -c` 的 cwd 虽然
-  // 已设为仓库根，但把路径写死更抗调用方式变化 —— 少一层"从哪跑"的隐式依赖。
-  const envFile = `${REPO_ROOT.replace(/\\/g, '/')}/ai_knowledge_web/.env`
-  const script = `
-set -a; . ${JSON.stringify(envFile)}; set +a
-docker exec kb-mysql mysql --default-character-set=utf8mb4 -u"$MYSQL_USERNAME" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -N -e ${JSON.stringify(sql)} 2>/dev/null
-`.trim()
-  const r = spawnSync('bash', ['-c', script], { cwd: REPO_ROOT, encoding: 'utf8' })
-  if (r.status !== 0) throw new Error(`mysql 查询失败（status=${r.status}）：${r.stderr || r.stdout}`)
-  return (r.stdout ?? '').trim()
-}
-
-/** 幂等清理探针库（先授权后主表；无外键，顺序只为口径一致）。 */
-function purgeProbe() {
-  mysqlScalar(`delete g from sys_kb_grant g join sys_kb k on k.id=g.kb_id where k.code='${PROBE_CODE}';`)
-  mysqlScalar(`delete from sys_kb where code='${PROBE_CODE}';`)
-}
+// `mysqlScalar` 与清理（`purgeProbe` → `teardownKbProbe`）都来自 `./lib/probe-teardown.mjs`。
+//
+// ⚠️ 本脚本原先的 `purgeProbe` **只删 `sys_kb_grant` + `sys_kb`**，对
+// `sys_document` / `sys_chunk` / `sys_parse_issue` / MinIO / Milvus **一无所知**。
+// 它当前是对的 —— 但纯属「本脚本恰好还没建文档」，**没有任何机制保证下次还对**。
+// 改用共享实现后，哪天这里开始建文档，清理会**自动**跟上。
 
 /** 当前 sys_kb 行数（自清判据）。 */
 function kbCount() {
@@ -258,8 +248,13 @@ async function main() {
   rmSync(PROFILE, { recursive: true, force: true })
   mkdirSync(OUT_DIR, { recursive: true })
 
+  // ⚠️ 覆盖率闸**必须在建探针之前**跑：放在 finally 里会导致「闸抛错 → 清理反而不执行」，
+  //    等于用一道防残留的闸制造残留。
+  const cov = assertArtifactCoverage()
+  observe('产物覆盖率闸通过', `扫描 ${cov.scanned} 张带归属列的表 · 已登记 ${cov.registered} 张 · 显式豁免 ${cov.exempt} 张`)
+
   // ---- 幂等自清：上一次中断的残留同样会污染这次的「列表 8 库」断言 ----
-  purgeProbe()
+  await teardownKbProbe(PROBE_CODE)
   const kbBefore = kbCount()
   check(kbBefore === 8, '准备：sys_kb 回到 8 行（幂等清理探针库）', `行数=${kbBefore}`)
 
@@ -598,9 +593,13 @@ async function main() {
     child.kill()
     // ---- 自清：无论成败都要把探针库删掉，否则下次跑列表断言就是 9 个库 ----
     try {
-      purgeProbe()
+      const r = await teardownKbProbe(PROBE_CODE)
       const after = kbCount()
-      check(after === 8, '收尾：探针库已自清，sys_kb 回到 8 行', `行数=${after}`)
+      check(
+        after === 8 && kbResidueClean(r.residue),
+        '收尾：探针库及其全部产物（库行 / 文档 / 分片 / Milvus 向量与分区 / MinIO 对象）已自清',
+        `库=${after} · ${describeKbResidue(r.residue)}`,
+      )
     } catch (e) {
       check(false, '收尾：探针库自清失败，需人工检查', String(e.message))
     }
@@ -616,12 +615,12 @@ main()
     console.log(`\n合计 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     process.exit(failed ? 1 : 0)
   })
-  .catch((e) => {
+  .catch(async (e) => {
     console.error(`\n✗ 中断：${e.message}`)
     const failed = steps.filter((s) => !s.ok).length
     if (steps.length) console.log(`\n已执行 ${steps.length} 步，通过 ${steps.length - failed}，失败 ${failed}`)
     try {
-      purgeProbe()
+      await teardownKbProbe(PROBE_CODE)
     } catch {
       /* 已在 finally 里报过 */
     }
