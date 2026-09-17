@@ -1,13 +1,11 @@
 package com.knowledge.ai.core.storage;
 
-import io.milvus.client.MilvusServiceClient;
-import io.milvus.grpc.DataType;
-import io.milvus.grpc.DescribeCollectionResponse;
-import io.milvus.grpc.FieldSchema;
-import io.milvus.grpc.KeyValuePair;
-import io.milvus.param.R;
-import io.milvus.param.collection.DescribeCollectionParam;
-import io.milvus.param.collection.HasCollectionParam;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.DataType;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.DescribeCollectionReq;
+import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 import io.minio.BucketExistsArgs;
 import io.minio.MinioClient;
 import lombok.RequiredArgsConstructor;
@@ -61,7 +59,7 @@ public class StorageConnectivityService {
 
     private final ObjectProvider<StringRedisTemplate> redisProvider;
 
-    private final ObjectProvider<MilvusServiceClient> milvusProvider;
+    private final ObjectProvider<MilvusClientV2> milvusProvider;
 
     private final ObjectProvider<MinioClient> minioProvider;
 
@@ -153,24 +151,23 @@ public class StorageConnectivityService {
      * 这里提前判成"不可用"，并在 detail 里说清期望值/实际值。
      */
     private String probeMilvus() {
-        MilvusServiceClient client = require(milvusProvider, StorageKind.MILVUS);
+        MilvusClientV2 client = require(milvusProvider, StorageKind.MILVUS);
         String collection = milvusProperties.getCollection();
 
-        R<Boolean> exists = client.hasCollection(
-                HasCollectionParam.newBuilder().withCollectionName(collection).build());
-        assertMilvusOk(exists, "hasCollection");
-        if (!Boolean.TRUE.equals(exists.getData())) {
+        // v2 客户端失败即抛 —— 不再有"status 非 0 而方法照常返回"的中间态，
+        // 所以这里没有 assertMilvusOk 那一层：能走到下一行就是成功了。
+        boolean exists = Boolean.TRUE.equals(client.hasCollection(
+                HasCollectionReq.builder().collectionName(collection).build()));
+        if (!exists) {
             throw new IllegalStateException("集合 " + collection
                     + " 不存在（初始化未执行或已被删除）→ 向量检索不可用");
         }
 
-        R<DescribeCollectionResponse> described = client.describeCollection(
-                DescribeCollectionParam.newBuilder().withCollectionName(collection).build());
-        assertMilvusOk(described, "describeCollection");
-        DescribeCollectionResponse response = described.getData();
+        DescribeCollectionResp response = client.describeCollection(
+                DescribeCollectionReq.builder().collectionName(collection).build());
 
         Integer actualDim = vectorDimensionOf(response);
-        int fields = response.getSchema().getFieldsCount();
+        int fields = response.getFieldNames() == null ? 0 : response.getFieldNames().size();
         String summary = "collection=" + collection + " fields=" + fields
                 + " dim=" + actualDim + " metric=" + milvusProperties.getMetricType();
 
@@ -237,33 +234,21 @@ public class StorageConnectivityService {
         return value;
     }
 
-    /** 校验 Milvus 的 {@code R} 包装结果；失败时把 status 与原始 message 一起抛出。 */
-    private void assertMilvusOk(R<?> result, String operation) {
-        Integer status = result.getStatus();
-        if (status != null && status == R.Status.Success.getCode()) {
-            return;
+    /**
+     * 从集合 schema 里读出向量字段的 dim。
+     *
+     * <p>⚠️ 这里**刻意不校验 Milvus 调用的返回值**：v2 客户端失败即抛异常，
+     * 不存在"status 非 0 而方法照常返回"的中间态 —— 当年那个 {@code assertMilvusOk}
+     * 是 v1 形态的产物，随本次迁移一并删掉（留着会让人以为还有中间态要防）。
+     */
+    private Integer vectorDimensionOf(DescribeCollectionResp response) {
+        CreateCollectionReq.CollectionSchema schema = response.getCollectionSchema();
+        if (schema == null || schema.getFieldSchemaList() == null) {
+            return null;
         }
-        String message = result.getMessage();
-        if (message == null && result.getException() != null) {
-            message = result.getException().toString();
-        }
-        throw new IllegalStateException("Milvus " + operation + " 返回失败（status=" + status + "）：" + message);
-    }
-
-    /** 从集合 schema 里读出向量字段的 dim。 */
-    private Integer vectorDimensionOf(DescribeCollectionResponse response) {
-        for (FieldSchema field : response.getSchema().getFieldsList()) {
-            if (field.getDataType() != DataType.FloatVector) {
-                continue;
-            }
-            for (KeyValuePair param : field.getTypeParamsList()) {
-                if ("dim".equals(param.getKey())) {
-                    try {
-                        return Integer.valueOf(param.getValue());
-                    } catch (NumberFormatException ex) {
-                        return null;
-                    }
-                }
+        for (CreateCollectionReq.FieldSchema field : schema.getFieldSchemaList()) {
+            if (field.getDataType() == DataType.FloatVector) {
+                return field.getDimension();
             }
         }
         return null;

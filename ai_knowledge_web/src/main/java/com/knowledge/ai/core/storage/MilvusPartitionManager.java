@@ -3,18 +3,16 @@ package com.knowledge.ai.core.storage;
 import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
-import io.milvus.client.MilvusServiceClient;
-import io.milvus.common.clientenum.ConsistencyLevelEnum;
-import io.milvus.grpc.QueryResults;
-import io.milvus.grpc.ShowPartitionsResponse;
-import io.milvus.param.R;
-import io.milvus.param.dml.QueryParam;
-import io.milvus.param.partition.CreatePartitionParam;
-import io.milvus.param.partition.DropPartitionParam;
-import io.milvus.param.partition.HasPartitionParam;
-import io.milvus.param.partition.LoadPartitionsParam;
-import io.milvus.param.partition.ReleasePartitionsParam;
-import io.milvus.param.partition.ShowPartitionsParam;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.ConsistencyLevel;
+import io.milvus.v2.service.partition.request.CreatePartitionReq;
+import io.milvus.v2.service.partition.request.DropPartitionReq;
+import io.milvus.v2.service.partition.request.HasPartitionReq;
+import io.milvus.v2.service.partition.request.ListPartitionsReq;
+import io.milvus.v2.service.partition.request.LoadPartitionsReq;
+import io.milvus.v2.service.partition.request.ReleasePartitionsReq;
+import io.milvus.v2.service.vector.request.QueryReq;
+import io.milvus.v2.service.vector.response.QueryResp;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -24,7 +22,7 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Milvus 分区的生命周期（`T-406` · D-7 的按代切换）。
+ * Milvus 分区的生命周期（`T-406` · D-7 的按代切换；`S5-M07-A` 迁到 v2）。
  *
  * <h3>为什么单独一个组件，而不是塞进 {@code MilvusChunkWriter}</h3>
  * <p>{@code MilvusChunkWriter} 的职责是"**文档的向量**怎么写"，分区是"**容器**怎么管" ——
@@ -36,19 +34,22 @@ import java.util.List;
  *   <li><b>写进不存在的分区会显式失败</b>（不会隐式创建）→ 写之前必须 {@link #ensure}；</li>
  *   <li><b>drop 前必须 release</b> —— 裸 {@code dropPartition} 会以 {@code 65535} 失败，
  *       而且**只体现在返回值里**（探针第一版没检查返回值，把"没删掉"误读成"删除延迟"，
- *       还泄漏了 32 个分区）。所以本类所有会失败的调用都走 {@link #assertOk}；</li>
+ *       还泄漏了 32 个分区）；</li>
  *   <li><b>查一个已 drop 的分区会报错</b>（不是返回空集）→ 检索侧绝不能指向不存在的分区。</li>
  * </ol>
  *
- * <p>本类**不负责**决定"该建哪些分区" —— 命名口径在
- * {@link MilvusConstants#partitionName}，保留代数与滚动策略在重建服务里。
+ * <p>⚠️ <b>v2 迁移后这三条一条没变</b>，只是"从返回值里读失败"换成了"抛异常"：
+ * v2 客户端失败即抛 {@code MilvusException}（unchecked），不再有
+ * "看起来成功、其实 status 非 0"的中间态 —— 这反而消掉了当年那个
+ * 「探针没看返回值，把没删掉误读成删除延迟」的坑。故本类的所有调用都包在
+ * {@link #guard} 里，把异常翻译成带**下一步动作**的 {@link BizException}。
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class MilvusPartitionManager {
 
-    private final MilvusServiceClient client;
+    private final MilvusClientV2 client;
 
     private final MilvusProperties properties;
 
@@ -61,32 +62,33 @@ public class MilvusPartitionManager {
     public void ensure(String partition) {
         String collection = properties.getCollection();
         if (!has(partition)) {
-            assertOk(client.createPartition(CreatePartitionParam.newBuilder()
-                    .withCollectionName(collection)
-                    .withPartitionName(partition)
-                    .build()), "createPartition(" + partition + ")");
+            guard("createPartition(" + partition + ")", () -> client.createPartition(
+                    CreatePartitionReq.builder()
+                            .collectionName(collection)
+                            .partitionName(partition)
+                            .build()));
             log.info("[Milvus] 分区已创建：{}", partition);
         }
-        assertOk(client.loadPartitions(LoadPartitionsParam.newBuilder()
-                .withCollectionName(collection)
-                .withPartitionNames(List.of(partition))
-                .build()), "loadPartitions(" + partition + ")");
+        guard("loadPartitions(" + partition + ")", () -> client.loadPartitions(
+                LoadPartitionsReq.builder()
+                        .collectionName(collection)
+                        .partitionNames(List.of(partition))
+                        .build()));
     }
 
     public boolean has(String partition) {
-        R<Boolean> result = client.hasPartition(HasPartitionParam.newBuilder()
-                .withCollectionName(properties.getCollection())
-                .withPartitionName(partition)
-                .build());
-        assertOk(result, "hasPartition(" + partition + ")");
-        return Boolean.TRUE.equals(result.getData());
+        return Boolean.TRUE.equals(guard("hasPartition(" + partition + ")", () -> client.hasPartition(
+                HasPartitionReq.builder()
+                        .collectionName(properties.getCollection())
+                        .partitionName(partition)
+                        .build())));
     }
 
     /**
      * 删除分区（**先 release 再 drop**，见类注释的约束 ②）。
      *
      * <p>分区不存在时静默返回 {@code false} —— 滚动清理会重复跑到已删的代上，
-     * 那不是错误。其余失败一律抛出（尤其是 drop 返回 65535 这种"看着成功其实没删"）。
+     * 那不是错误。
      *
      * @return true = 确实删掉了一个分区
      */
@@ -96,17 +98,19 @@ public class MilvusPartitionManager {
         }
         String collection = properties.getCollection();
         // release 可能因为"本来就没加载"而失败 —— 那不是问题，故只记日志不抛
-        R<?> released = client.releasePartitions(ReleasePartitionsParam.newBuilder()
-                .withCollectionName(collection)
-                .withPartitionNames(List.of(partition))
-                .build());
-        if (released.getStatus() == null || released.getStatus() != R.Status.Success.getCode()) {
-            log.debug("[Milvus] 释放分区未成功（继续尝试 drop）：{} 原因={}", partition, safeMessage(released));
+        try {
+            client.releasePartitions(ReleasePartitionsReq.builder()
+                    .collectionName(collection)
+                    .partitionNames(List.of(partition))
+                    .build());
+        } catch (Exception ex) {
+            log.debug("[Milvus] 释放分区未成功（继续尝试 drop）：{} 原因={}", partition, rootMessage(ex));
         }
-        assertOk(client.dropPartition(DropPartitionParam.newBuilder()
-                .withCollectionName(collection)
-                .withPartitionName(partition)
-                .build()), "dropPartition(" + partition + ")");
+        guard("dropPartition(" + partition + ")", () -> client.dropPartition(
+                DropPartitionReq.builder()
+                        .collectionName(collection)
+                        .partitionName(partition)
+                        .build()));
         log.info("[Milvus] 分区已删除：{}", partition);
         return true;
     }
@@ -137,52 +141,64 @@ public class MilvusPartitionManager {
 
     /** 分区里的向量条数。**取证一律用它**，不用 {@code get_stats.rowCount}（后者只算已 flush 的）。 */
     public long countIn(String partition) {
-        R<QueryResults> result = client.query(QueryParam.newBuilder()
-                .withCollectionName(properties.getCollection())
-                .withPartitionNames(List.of(partition))
-                .withExpr(MilvusConstants.FIELD_KB_ID + " >= 0")
-                .withOutFields(List.of("count(*)"))
-                .withConsistencyLevel(ConsistencyLevelEnum.STRONG)
-                .build());
-        assertOk(result, "count(" + partition + ")");
-        return countOf(result.getData());
+        QueryResp resp = guard("count(" + partition + ")", () -> client.query(QueryReq.builder()
+                .collectionName(properties.getCollection())
+                .partitionNames(List.of(partition))
+                .filter(MilvusConstants.FIELD_KB_ID + " >= 0")
+                .outputFields(List.of("count(*)"))
+                // STRONG：这是**取证**用的读数，不接受"可能读到旧值"
+                .consistencyLevel(ConsistencyLevel.STRONG)
+                .build()));
+        return countOf(resp);
     }
 
     public List<String> allPartitionNames() {
-        R<ShowPartitionsResponse> result = client.showPartitions(ShowPartitionsParam.newBuilder()
-                .withCollectionName(properties.getCollection())
-                .build());
-        assertOk(result, "showPartitions");
-        return result.getData() == null ? List.of() : List.copyOf(result.getData().getPartitionNamesList());
+        List<String> names = guard("listPartitions", () -> client.listPartitions(
+                ListPartitionsReq.builder()
+                        .collectionName(properties.getCollection())
+                        .build()));
+        return names == null ? List.of() : List.copyOf(names);
     }
 
     // ==================== 工具 ====================
 
-    /** {@code count(*)} 的结果形状：一个字段名为 {@code count(*)} 的 Int64 标量。 */
-    private static long countOf(QueryResults results) {
-        if (results == null) {
+    /** {@code count(*)} 的结果形状：一行 {@code {"count(*)": <Number>}}。 */
+    private static long countOf(QueryResp resp) {
+        if (resp == null || resp.getQueryResults() == null || resp.getQueryResults().isEmpty()) {
             return 0;
         }
-        return results.getFieldsDataList().stream()
-                .filter(f -> "count(*)".equals(f.getFieldName()))
-                .mapToLong(f -> f.getScalars().getLongData().getData(0))
-                .findFirst().orElse(0);
+        Object value = resp.getQueryResults().getFirst().getEntity().get("count(*)");
+        return value instanceof Number n ? n.longValue() : 0;
     }
 
-    private static void assertOk(R<?> result, String what) {
-        if (result.getStatus() == null || result.getStatus() != R.Status.Success.getCode()) {
+    /**
+     * 把 v2 客户端的异常翻译成带**下一步动作**的业务异常（硬口径：失败给「现象 + 下一步」）。
+     *
+     * <p>v2 客户端失败即抛，不再有"status 非 0 但方法正常返回"的中间态 ——
+     * 这正是当年那次分区泄漏的根因形态，故这里**不做返回值检查、只兜异常**。
+     */
+    private static <T> T guard(String what, java.util.function.Supplier<T> action) {
+        try {
+            return action.get();
+        } catch (Exception ex) {
             throw BizException.of(ErrorCode.SYSTEM_ERROR,
-                    "向量库分区操作失败（" + what + "）：" + safeMessage(result)
+                    "向量库分区操作失败（" + what + "）：" + rootMessage(ex)
                             + " —— 请确认 milvus-standalone 健康后重试");
         }
     }
 
-    /** 同 {@code MilvusChunkWriter#safeMessage}：{@code R#getMessage()} 在无异常对象时会 NPE。 */
-    private static String safeMessage(R<?> result) {
-        try {
-            return String.valueOf(result.getMessage());
-        } catch (RuntimeException ex) {
-            return "<Milvus 未提供错误文本，status=" + result.getStatus() + ">";
+    private static void guard(String what, Runnable action) {
+        guard(what, () -> {
+            action.run();
+            return null;
+        });
+    }
+
+    private static String rootMessage(Throwable ex) {
+        Throwable cursor = ex;
+        while (cursor.getCause() != null && cursor.getCause() != cursor) {
+            cursor = cursor.getCause();
         }
+        return cursor == ex ? ex.toString() : cursor.toString();
     }
 }

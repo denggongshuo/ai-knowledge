@@ -5,13 +5,12 @@ import com.jayway.jsonpath.JsonPath;
 import com.knowledge.ai.core.ai.ModelProperties;
 import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.model.ApiResponse;
-import io.milvus.client.MilvusServiceClient;
-import io.milvus.grpc.DataType;
-import io.milvus.grpc.DescribeCollectionResponse;
-import io.milvus.grpc.FieldSchema;
-import io.milvus.grpc.KeyValuePair;
-import io.milvus.param.collection.DescribeCollectionParam;
-import io.milvus.param.index.DescribeIndexParam;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.DataType;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.DescribeCollectionReq;
+import io.milvus.v2.service.collection.response.DescribeCollectionResp;
+import io.milvus.v2.service.index.request.ListIndexesReq;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,7 +57,7 @@ class S0VerificationTest {
     private MilvusProperties milvusProperties;
 
     @Autowired
-    private MilvusServiceClient milvusClient;
+    private MilvusClientV2 milvusClient;
 
     @Autowired
     private ModelProperties modelProperties;
@@ -88,15 +87,15 @@ class S0VerificationTest {
     @Test
     @DisplayName("G0-7：Milvus 集合建成且维度锁死 1024 / L2，标量字段齐备")
     void milvusSchemaIsLocked() {
-        DescribeCollectionResponse response = milvusClient.describeCollection(
-                        DescribeCollectionParam.newBuilder()
-                                .withCollectionName(milvusProperties.getCollection())
-                                .build())
-                .getData();
+        DescribeCollectionResp response = milvusClient.describeCollection(
+                DescribeCollectionReq.builder()
+                        .collectionName(milvusProperties.getCollection())
+                        .build());
         assertNotNull(response, "describeCollection 未返回数据");
 
-        Map<String, FieldSchema> fields = response.getSchema().getFieldsList().stream()
-                .collect(Collectors.toMap(FieldSchema::getName, f -> f));
+        Map<String, CreateCollectionReq.FieldSchema> fields = response.getCollectionSchema()
+                .getFieldSchemaList().stream()
+                .collect(Collectors.toMap(CreateCollectionReq.FieldSchema::getName, f -> f));
 
         // 契约要求的四个标量过滤字段（R-8 / G0-7）
         for (String scalar : List.of(MilvusConstants.FIELD_KB_ID, MilvusConstants.FIELD_DOC_ID,
@@ -104,15 +103,27 @@ class S0VerificationTest {
             assertTrue(fields.containsKey(scalar), "缺少标量字段：" + scalar);
         }
 
-        FieldSchema id = fields.get(MilvusConstants.FIELD_ID);
+        CreateCollectionReq.FieldSchema id = fields.get(MilvusConstants.FIELD_ID);
         assertNotNull(id, "缺少主键字段 " + MilvusConstants.FIELD_ID);
-        assertTrue(id.getIsPrimaryKey(), "主键字段必须标记为 primary key");
+        assertEquals(Boolean.TRUE, id.getIsPrimaryKey(), "主键字段必须标记为 primary key");
         assertEquals(DataType.VarChar, id.getDataType(),
                 "主键应为 VarChar（= MySQL chunk.id，非自增，便于两侧同值溯源）");
 
-        FieldSchema vector = fields.get(MilvusConstants.FIELD_VECTOR);
+        CreateCollectionReq.FieldSchema vector = fields.get(MilvusConstants.FIELD_VECTOR);
         assertNotNull(vector, "缺少向量字段 " + MilvusConstants.FIELD_VECTOR);
         assertEquals(DataType.FloatVector, vector.getDataType(), "向量字段必须是 FloatVector");
+
+        // ⚠️ 2026-09-17（S5-M07-A）新增：BM25 的两列必须在，且输入列真的开了 analyzer ——
+        //    "列在、analyzer 没开"会让 BM25 函数建不起来（Milvus 直接拒绝），
+        //    而"analyzer 开错类型"更隐蔽：能建能跑，只是标识符被切碎、结果悄悄不准。
+        assertTrue(fields.containsKey(MilvusConstants.FIELD_BM25_TEXT),
+                "缺少 BM25 输入列 " + MilvusConstants.FIELD_BM25_TEXT);
+        assertEquals(Boolean.TRUE, fields.get(MilvusConstants.FIELD_BM25_TEXT).getEnableAnalyzer(),
+                "BM25 输入列必须开 enable_analyzer，否则 BM25 函数建不起来");
+        assertTrue(fields.containsKey(MilvusConstants.FIELD_SPARSE),
+                "缺少 BM25 稀疏列 " + MilvusConstants.FIELD_SPARSE);
+        assertEquals(DataType.SparseFloatVector, fields.get(MilvusConstants.FIELD_SPARSE).getDataType(),
+                "BM25 输出列必须是 SparseFloatVector");
 
         // 维度是整个 S0 最贵的不可逆决策（D-4）：错一次要重建 38,502 条向量
         int dim = vectorDimension(vector);
@@ -123,7 +134,7 @@ class S0VerificationTest {
 
         System.out.printf("%n===== Milvus schema（S0 / G0-7）=====%n"
                         + "  collection=%s fields=%d dim=%d metric=%s index=%s nlist=%d%n",
-                milvusProperties.getCollection(), response.getSchema().getFieldsCount(),
+                milvusProperties.getCollection(), response.getFieldNames().size(),
                 dim, milvusProperties.getMetricType(), milvusProperties.getIndexType(),
                 milvusProperties.getIndexNlist());
     }
@@ -137,19 +148,20 @@ class S0VerificationTest {
         //    （按 fieldName 调 describeIndex，被 Milvus 忽略）恒为真，
         //    于是四个 INVERTED 索引从建表起就没建出来过，且静默无日志。
         //    字段在、索引不在，恰好落在两条断言的缝隙里。
-        Set<String> names = milvusClient.describeIndex(
-                        DescribeIndexParam.newBuilder()
-                                .withCollectionName(milvusProperties.getCollection())
-                                .build())
-                .getData()
-                .getIndexDescriptionsList().stream()
-                .map(io.milvus.grpc.IndexDescription::getIndexName)
-                .collect(Collectors.toSet());
+        Set<String> names = new java.util.LinkedHashSet<>(milvusClient.listIndexes(
+                ListIndexesReq.builder()
+                        .collectionName(milvusProperties.getCollection())
+                        .build()));
 
-        assertTrue(names.contains("idx_embedding"), "缺少向量索引：" + names);
+        assertTrue(names.contains(MilvusConstants.INDEX_VECTOR),
+                "缺少向量索引 " + MilvusConstants.INDEX_VECTOR + "：" + names);
+        // ⚠️ 2026-09-17（S5-M07-A）新增：BM25 稀疏索引必须也在。
+        //    它缺失的表现是"BM25 一路永远返回空"，而不是报错 —— 与下面那四个标量索引同一类静默故障。
+        assertTrue(names.contains(MilvusConstants.INDEX_SPARSE),
+                "缺少 BM25 稀疏索引 " + MilvusConstants.INDEX_SPARSE + "（缺了 BM25 会静默返回空）：" + names);
         for (String scalar : List.of(MilvusConstants.FIELD_KB_ID, MilvusConstants.FIELD_DOC_ID,
                 MilvusConstants.FIELD_CHUNK_TYPE, MilvusConstants.FIELD_SECRET_LEVEL)) {
-            assertTrue(names.contains("idx_" + scalar),
+            assertTrue(names.contains(MilvusConstants.INDEX_SCALAR_PREFIX + scalar),
                     "缺少标量过滤索引 idx_" + scalar + "（大集合下过滤会退化为逐行扫描）—— 实际索引：" + names);
         }
     }
@@ -278,11 +290,10 @@ class S0VerificationTest {
                 json.read("$.data.models", Map.class), configured);
     }
 
-    private int vectorDimension(FieldSchema vector) {
-        Optional<KeyValuePair> dim = vector.getTypeParamsList().stream()
-                .filter(p -> "dim".equals(p.getKey()))
-                .findFirst();
-        assertTrue(dim.isPresent(), "向量字段缺少 dim 参数");
-        return Integer.parseInt(dim.get().getValue());
+    private int vectorDimension(CreateCollectionReq.FieldSchema vector) {
+        // v2 把 dim 收成了字段上的强类型属性（v1 时代要在一串 KeyValuePair 里翻 "dim"）
+        Integer dim = vector.getDimension();
+        assertNotNull(dim, "向量字段缺少 dim 参数");
+        return dim;
     }
 }

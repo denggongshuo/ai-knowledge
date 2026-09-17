@@ -9,6 +9,23 @@ package com.knowledge.ai.core.constant;
  *
  * <p>字段名与《10-接口约定汇总》§14 的口径对应：
  * 接口字段名 {@code blockType} ↔ 入库列名 {@code chunk_type}。
+ *
+ * <h3>列数口径（2026-09-17 · S5-M07-A **订正**）</h3>
+ * <p>原 `G4-10` 的口径是「字段集<b>恰好 8 列</b>」，`S0VerificationTest#milvusSchemaIsLocked`
+ * 逐字钉着它。本批为 BM25 增加了 {@link #FIELD_BM25_TEXT} 与 {@link #FIELD_SPARSE} 两列
+ * （原因见 {@link #FIELD_BM25_TEXT}），故订正为：
+ *
+ * <blockquote>
+ * <b>载荷 9 列</b>（id / embedding / kb_id / doc_id / chunk_type / secret_level /
+ * content / title_path / bm25_text）+ <b>BM25 稀疏 1 列</b>（sparse）= <b>10 列</b>；
+ * 其中建 <b>INVERTED 索引的可过滤字段仍是 4 个</b>（kb_id / doc_id / chunk_type /
+ * secret_level）—— 后半句才是 `G4-10` 真正要锁的东西（见 `汇总.md` §3 #82 的裁定）。
+ * </blockquote>
+ *
+ * <p>⚠️ 这次订正是「门禁与需求直接冲突」的唯一解：`FR-RET-03` §3.2 把 BM25 定为必需品，
+ * `G5-1` 要求两路并行，而 Milvus 的 BM25 <b>必须</b>有稀疏字段承载 —— 且步 0 探针实测
+ * <b>稀疏字段加不进已有集合</b>（`not support to add vector field`），所以那次重建
+ * <b>只能趁向量数为 0 时做</b>。订正记录见 `plan/2026-09-17-S5-M07-A.md` §4 与 `汇总.md` §5。
  */
 public final class MilvusConstants {
 
@@ -35,11 +52,55 @@ public final class MilvusConstants {
     /** 密级（取值见 {@code SecretLevel}）。检索时按用户密级上限过滤。 */
     public static final String FIELD_SECRET_LEVEL = "secret_level";
 
-    /** 分片正文。用于 BM25 / 结果回填。 */
+    /** 分片正文。用于结果回填（**人读的那份**）。 */
     public static final String FIELD_CONTENT = "content";
 
     /** 标题路径（索引增强之一：标题路径注入）。 */
     public static final String FIELD_TITLE_PATH = "title_path";
+
+    // ---------- BM25 全文检索（2026-09-17 · S5-M07-A 步 0 探针定稿） ----------
+
+    /**
+     * BM25 的**输入文本列** —— 存 {@link #FIELD_CONTENT} 经
+     * {@code IdentifierTokenizer} 分词后的空格分隔形式。
+     *
+     * <h3>为什么不能直接拿 {@link #FIELD_CONTENT} 当 BM25 输入</h3>
+     * <p>因为分词器要**可控**。步 0 探针实测（2026-09-17，五组对照样本）：
+     * <ul>
+     *   <li>Milvus 内置 <b>standard</b> 分词：查 {@code A-100} <b>召回了 {@code A-1000}</b>
+     *       —— 它把标识符切成 {@code a} + {@code 100}，正是 `07` §3.2 点名的那个坑；</li>
+     *   <li>Milvus <b>jieba</b> 分词：保住 {@code A-100}/{@code v1.4}，
+     *       但<b>保不住</b> {@code ￥1,200} / {@code SKU-8890-A} / {@code 2026-09-11}；</li>
+     *   <li><b>whitespace + 本仓 {@code IdentifierTokenizer} 预分词</b>：
+     *       Q-4 的五类标识符 <b>10/10 零串扰</b>。</li>
+     * </ul>
+     * <p>所以 analyzer 固定为 {@link #ANALYZER_TOKENIZER_WHITESPACE}（只按空格切，
+     * **不做任何大小写归一**），分词责任全部收归本仓 —— 写入侧与查询侧**必须调同一个函数**，
+     * 否则会出现"查得到却排不上"的怪现象。
+     *
+     * <p>⚠️ 与 {@link #FIELD_CONTENT} 分成两列（而不是就地覆盖）是 `O8`「块存事实、视图是投影」
+     * 的同一条原则：同一段文本的两种**视图**（人读 / 检索）不该互相覆盖。
+     */
+    public static final String FIELD_BM25_TEXT = "bm25_text";
+
+    /**
+     * BM25 的**输出稀疏向量列** —— 由 Milvus 的 BM25 函数从
+     * {@link #FIELD_BM25_TEXT} 自动生成，**应用侧永不直接写它**。
+     */
+    public static final String FIELD_SPARSE = "sparse";
+
+    /** BM25 函数名（建集合时声明，检索时报它作为 {@code annsField} 的搭档）。 */
+    public static final String BM25_FUNCTION_NAME = "bm25_fn";
+
+    /**
+     * {@link #FIELD_BM25_TEXT} 的 analyzer 分词器。
+     *
+     * <p>取 {@code whitespace} 的唯一理由是**它什么都不做**（只按空白切、不改大小写）
+     * —— 这样"什么算一个 token"就完全由本仓的 {@code IdentifierTokenizer} 决定。
+     * 换成 {@code standard}/{@code jieba} 都会让标识符保护失效（见
+     * {@link #FIELD_BM25_TEXT} 的实测记录）。
+     */
+    public static final String ANALYZER_TOKENIZER_WHITESPACE = "whitespace";
 
     // ---------- 维度与度量 ----------
 
@@ -63,6 +124,17 @@ public final class MilvusConstants {
 
     /** 检索时探测的聚类数，取 nlist 的 1/4 ~ 1/8。 */
     public static final int INDEX_NPROBE = 16;
+
+    // ---------- 索引名（建索引与判存在都用同一处口径） ----------
+
+    /** 稠密向量索引名。 */
+    public static final String INDEX_VECTOR = "idx_embedding";
+
+    /** BM25 稀疏向量索引名（{@code SPARSE_INVERTED_INDEX} / {@code BM25}）。 */
+    public static final String INDEX_SPARSE = "idx_sparse";
+
+    /** 标量索引名前缀：{@code idx_<字段名>}。 */
+    public static final String INDEX_SCALAR_PREFIX = "idx_";
 
     // ---------- 分区（按代切换，`T-406` · D-7） ----------
 
