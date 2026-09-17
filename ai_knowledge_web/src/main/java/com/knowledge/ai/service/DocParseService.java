@@ -16,6 +16,7 @@ import com.knowledge.ai.pipeline.cleaning.CleanedDocument;
 import com.knowledge.ai.pipeline.cleaning.CleaningOptions;
 import com.knowledge.ai.pipeline.cleaning.DocumentCleaner;
 import com.knowledge.ai.pipeline.enhance.IndexEnhancer;
+import com.knowledge.ai.pipeline.routing.PageContentRouter;
 import com.knowledge.ai.pipeline.vectorize.ChunkVectorizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -91,6 +92,15 @@ public class DocParseService {
     /** 读已落库的块给向量化用（主键必须是落库后的 chunk.id）。 */
     private final ChunkReader chunkReader;
 
+    /**
+     * 页内容路由位（`优化/O2` 步 4）。
+     *
+     * <p>v1 注入的是 {@link com.knowledge.ai.pipeline.routing.NoOpPageContentRouter}
+     * —— **只登记不处理**。`S6` 接 OCR/VL 时改成注入 Ocr 实现即可，
+     * 本类、落库、前端都不必动（那正是把路由位抽出来的目的）。
+     */
+    private final PageContentRouter pageContentRouter;
+
     private final jakarta.persistence.EntityManager entityManager;
 
     /**
@@ -128,6 +138,11 @@ public class DocParseService {
             parsed = dispatch(row.type(), source, row.fileName());
             // ⚠️ 体检在清洗**之前**：TextLayerGuard 的判据吃 chars，而清洗只减不增。
             // 反过来排的话，一篇正常文档会因为"剥掉了页眉"而掉到扫描件的阈值以下 —— 误报。
+            //
+            // `S4-E2`：这里是**两层**判据，别搞混 ——
+            //   · check() 是**文档级兜底**：整篇不可用就抛（行为本批一行未改）；
+            //   · merge() 是**页级登记**：哪几页丢了内容（混合文档的 2 页扫描件就靠它）。
+            // 页级那半边**不在这里抛** —— 部分页缺失是"登记 + 路由"，不是"整篇失败"。
             TextLayerGuard.check(parsed);
 
             // `优化/O3` 逐文档清洗：页眉页脚剥离。位置有两条约束，缺一不可 ——
@@ -158,9 +173,14 @@ public class DocParseService {
 
             // 质量四列里的三个：表格两列由解析侧给，图片列由 `O3` 步 4 销掉 S4-B §9 第 3 条
             // 的"采了不用"（imageCount 早已在采，只是没写）。image_parsed 仍等 T-512 的 VL。
+            // `S4-E2` 又加两列：pages_total / pages_with_text（`优化/O2` §4 步 6）。
+            // ⚠️ 页数取 `cleaned.document()` 而不是 `parsed`：清洗只剥离不增删页，
+            //    两者的 pages 恒等 —— 用 cleaned 是为了与下面 `chars` 的取值同源，
+            //    免得将来清洗真动了页结构时，两处各取各的。
             // 状态停在这里（INDEXING）—— 向量还没进 Milvus，见下。
             recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed(),
-                    cleaned.document().imageCount());
+                    cleaned.document().imageCount(),
+                    cleaned.document().pages(), cleaned.document().pagesWithText());
 
             // T-508 向量化：落库的块 → 嵌入 → Milvus。
             // ⚠️ 顺序是**硬约束**（本批 §3.4 假设 #1）：必须在 enhance **之后**，
@@ -185,7 +205,12 @@ public class DocParseService {
             // **文档自身的问题**（无文本层 / 编码不对 / 已加密 / 文件损坏）→ **不可重试**。
             // 重试也还是这份文件；对用户撒谎说"重试中"比直接说"这文件不行"更糟（O1 §4 步 7）。
             recordWriter.markFailed(docId, ex.getMessage());
-            recordWriter.replaceIssues(docId, row.kbId(), parsed != null ? parsed.issues() : java.util.List.of());
+            // ⚠️ 走 **merge** 而不是 `parsed.issues()`：整篇扫描件的逐页问题现在由
+            //    `TextLayerGuard#pageIssues` 产出（解析器那边已移走，理由见 `PdfDocumentParser`）。
+            //    用 `parsed.issues()` 的话，这个分支会写出**零行** ——
+            //    而"整篇失败"恰恰是最需要逐页定位的情形（`G4-11`）。
+            recordWriter.replaceIssues(docId, row.kbId(),
+                    parsed != null ? TextLayerGuard.merge(parsed, pageContentRouter) : java.util.List.of());
             log.warn("文档解析失败：docId={} type={} 原因={}", docId, row.type(), ex.getMessage());
             return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", ex.getMessage());
         } catch (Exception ex) {
@@ -198,10 +223,13 @@ public class DocParseService {
             return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", reason);
         }
 
-        recordWriter.replaceIssues(docId, row.kbId(), parsed.issues());
+        // 成功路径：解析器自己的 issue（表格类 / 清洗类）+ **页级新增的**（混合文档的扫描页）
+        recordWriter.replaceIssues(docId, row.kbId(), TextLayerGuard.merge(parsed, pageContentRouter));
         log.info("文档解析完成：docId={} type={} pages={} chars={}(原始 {}) tables={}/{} images={} chunks={}",
                 docId, row.type(), parsed.pages(), cleaned.document().chars(), parsed.chars(),
                 parsed.tableParsed(), parsed.tableTotal(), parsed.imageCount(), chunkCount);
+        log.info("文档页级文本层：docId={} pagesWithText={}/{}",
+                docId, cleaned.document().pagesWithText(), cleaned.document().pages());
         Map<String, Object> result = new HashMap<>();
         result.put("docId", docId);
         // READY = 向量已入 Milvus、可被检索（`G4-3` 后半）。向量化关掉或没执行时，

@@ -70,8 +70,12 @@ public class AuditAspect {
         long startNanos = System.nanoTime();
         String result = AuditEvent.RESULT_SUCCESS;
         String failReason = null;
+        // `S4-E2`：接住返回值，供 target 里的 `#result` 用（见 `resolveTarget`）。
+        // 必须在这里接 —— 切面是 `@Around`，`finally` 里已经拿不到 `proceed()` 的返回了。
+        Object returnValue = null;
         try {
-            return joinPoint.proceed();
+            returnValue = joinPoint.proceed();
+            return returnValue;
         } catch (Throwable throwable) {
             result = AuditEvent.RESULT_FAILED;
             failReason = summarize(throwable);
@@ -79,7 +83,8 @@ public class AuditAspect {
         } finally {
             long costMs = (System.nanoTime() - startNanos) / 1_000_000L;
             try {
-                auditLogService.record(build(joinPoint, method, annotation, result, failReason, costMs));
+                auditLogService.record(build(joinPoint, method, annotation, returnValue,
+                        result, failReason, costMs));
             } catch (Exception persistError) {
                 // 审计落库失败不允许影响业务，只留日志
                 log.error("审计日志写入失败 module={} action={}", annotation.module(), annotation.action(), persistError);
@@ -90,14 +95,38 @@ public class AuditAspect {
     private AuditEvent build(ProceedingJoinPoint joinPoint,
                              Method method,
                              AuditLog annotation,
+                             Object returnValue,
                              String result,
                              String failReason,
                              long costMs) {
         LoginUser user = LoginUserContext.get();
         HttpServletRequest request = AuditEvent.currentRequest();
 
-        String operator = user == null ? "anonymous" : user.getUsername();
-        String operatorName = user == null ? "匿名" : user.getRealName();
+        String operator;
+        String operatorName;
+        if (user != null) {
+            operator = user.getUsername();
+            operatorName = user.getRealName();
+        } else if (request != null) {
+            // 请求线程但没有登录态 = **真的匿名访问**（比如未登录打到一个只要求登录的接口）
+            operator = ANONYMOUS_OPERATOR;
+            operatorName = ANONYMOUS_NAME;
+        } else {
+            // `S4-E2`（`O6` 判据 4）：**没有请求、也没有登录态 = 系统动作**。
+            // 这条来自解析 worker —— `T-O01` 把解析搬到后台之后，完成/失败两条记录
+            // 由工作线程写，那里既没有 `LoginUserContext` 也没有 `DispatcherServlet`。
+            //
+            // ⚠️ 原先这两种情形都被写成 `anonymous`/`匿名`，后果是审计页上
+            //    「系统自动跑完的解析」与「某个没登录的人干的事」**长得一模一样** ——
+            //    而 `O6` 判据 4 明确要求前者显示为「系统」。判据的措辞是
+            //    「不产生**假记录**」：说一次系统动作是"匿名用户"就是假记录。
+            //
+            // 为什么这条判据成立（"无请求即系统"不会误判）：所有 `@AuditLog` 方法
+            // 要么挂在请求线程的 Service 上（那时 request 必非 null），要么就是后台任务。
+            // 本地直接 `new` 一个 Service 调用的情形只出现在测试里 —— 那本来就该是系统身份。
+            operator = AuditEvent.SYSTEM_OPERATOR;
+            operatorName = AuditEvent.SYSTEM_OPERATOR_NAME;
+        }
         String roleName = user == null || user.getRoleCodes().isEmpty()
                 ? null
                 : String.join(",", user.getRoleCodes());
@@ -110,7 +139,7 @@ public class AuditAspect {
                 annotation.module(),
                 annotation.action(),
                 annotation.risk(),
-                resolveTarget(joinPoint, method, annotation),
+                resolveTarget(joinPoint, method, annotation, returnValue),
                 operator,
                 operatorName,
                 roleName,
@@ -130,7 +159,13 @@ public class AuditAspect {
         );
     }
 
-    private String resolveTarget(ProceedingJoinPoint joinPoint, Method method, AuditLog annotation) {
+    /** 请求线程里没有登录态时的身份（与下面的"系统"区分开，别合并成一个）。 */
+    private static final String ANONYMOUS_OPERATOR = "anonymous";
+
+    private static final String ANONYMOUS_NAME = "匿名";
+
+    private String resolveTarget(ProceedingJoinPoint joinPoint, Method method, AuditLog annotation,
+                                 Object returnValue) {
         String expression = annotation.target();
         if (expression == null || expression.isBlank()) {
             return method.getDeclaringClass().getSimpleName() + "#" + method.getName();
@@ -144,6 +179,16 @@ public class AuditAspect {
                     context.setVariable(names[i], args[i]);
                 }
             }
+            // `S4-E2` 新增：`#result` = 方法返回值，**仅正常返回时存在**。
+            // 动机：`DocService#upload` 的审计目标要细化到**具体文档**，而 docId 是
+            // 方法**内部**生成的（`recordWriter.insert` 的返回值），方法参数里没有它 ——
+            // 只有返回值带得出来（`UploadAccepted.docId`）。
+            //
+            // ⚠️ 异常路径上 `returnValue` 为 null，`#result.docId` 会求值失败 ——
+            // 那正是下面 catch 挡的：**降级为"类名#方法名"，不让审计把业务带崩**。
+            // 失败时目标退化是有意的取舍：宁可少一个精确的 target，也不能因为
+            // "取不到 docId" 而让整个上传接口报错。
+            context.setVariable("result", returnValue);
             Expression parsed = SPEL.parseExpression(expression);
             Object value = parsed.getValue(context);
             return value == null ? "" : String.valueOf(value);

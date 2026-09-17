@@ -166,26 +166,26 @@ public class PdfDocumentParser {
         List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
         int imageCount = scan.imageCount;
 
-        // ---- 「无文本层」的逐页问题（P0，T-0S1 §六-1）----
-        // 一行一页：15 页的扫描件就是 15 行 —— 「第几页」是 G4-11 点名的字段，
-        // 聚成一行会把它丢掉。TextLayerGuard 仍会整篇判失败（可执行的 error_msg），
-        // 这里的逐页行是"哪几页有问题"的定位面 —— 两条证据指向同一件事。
+        // ---- ⚠️ 「无文本层」的逐页问题**已移走**（`S4-E2`）----
+        // 原先在这里：`chars <= 0` 时逐页产 NO_TEXT_LAYER（一行一页）。
+        // 移到 `TextLayerGuard#pageIssues` 有两个理由，第二个是硬要求：
+        //   ① 「哪个页丢了文本」的判据**只能有一份** —— 留在这里，Tika 路径（不产这段）
+        //      与 PDF 路径就会各有一套行为，而本类与 `TextLayerGuard` 的类注释
+        //      都写着"两条路径才不会各写一份、各漂一份"；
+        //   ② **混合文档（38 页文本 + 2 页扫描）在这里永远产不出东西** —— `chars <= 0`
+        //      整篇为零才进这个分支，而那正是 `优化/O2` 要堵的形态。只加一个"每页判一次"
+        //      而不把整篇判据拆开，等于新旧两套逻辑并存。
+        // 落库时由 `TextLayerGuard#merge` 把本方法产的 issue（表格类）与页级产的合并。
         int chars = paragraphs.stream().mapToInt(String::length).sum()
                 + headings.stream().mapToInt(h -> h.text().length()).sum()
                 + tables.stream().mapToInt(PdfDocumentParser::tableCharCount).sum();
-        if (chars <= 0) {
-            for (int p = 1; p <= Math.max(pages, 1); p++) {
-                issues.add(new ParsedDocument.DocumentIssue(p,
-                        "该页未提取到任何可复制文本（疑似整页扫描图），内容无法参与检索",
-                        ParsedDocument.IssueKind.NO_TEXT_LAYER));
-            }
-        }
+
         // ---- 检出结构但抽不到内容的表格（G4-4 的"静默故障"正面）----
         // 结构在（rows/cols 都有）、格子全空 —— 正是"识别不出内容的真表格"，
         // 必须让人看见，而不是被 status 的成功掩盖。
         for (ParsedDocument.ParsedTable t : tables) {
             if (!t.layoutArtifact() && !t.hasContent()) {
-                issues.add(new ParsedDocument.DocumentIssue(t.pageNo(),
+                issues.add(ParsedDocument.DocumentIssue.missing(t.pageNo(),
                         "第 " + t.pageNo() + " 页的表格检出了结构（" + t.rowCount() + " 行 × "
                                 + t.colCount() + " 列）但未提取到内容，该表无法参与检索；"
                                 + "疑似扫描件中的表格，请补录文本或启用 OCR 后重建索引",

@@ -144,6 +144,24 @@ public class SysDocument {
     @Column(name = "image_parsed", nullable = false)
     private Integer imageParsed;
 
+    /**
+     * 解析出的总页数 / 判定为「有文本层」的页数（`V18` 新增 · `优化/O2` §4 步 6）。
+     *
+     * <p>为什么它比 {@code chars} 更能说明问题：「3000 字 / 40 页」的 `chars=3000`、
+     * `charsPerPage=75` 看着健康，而 `pagesWithText=6` 说明 **34 页是扫描页** ——
+     * 平均值把「丢了 85% 的页」稀释成了「每页字有点少」。**这是 `O2` 要堵的静默故障形态。**
+     *
+     * <p>⚠️ `pagesTotal == 0` 有两种含义，**消费侧必须按 status 分开对待**：
+     * 「本批之前落的旧行，尚未统计」（READY/INDEXING）与「整篇扫描件，统计结果确实是 0」
+     * （FAILED）。前端把前者渲染成「—」而不是「0/0 页有文本」，理由见 `V18` 的列注释。
+     */
+    @Column(name = "pages_total", nullable = false)
+    private Integer pagesTotal;
+
+    /** 其中判定为「有文本层」的页数。口径 = 该页 `chars > 0`（**无密度阈值**，见 `V18`）。 */
+    @Column(name = "pages_with_text", nullable = false)
+    private Integer pagesWithText;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 

@@ -1,6 +1,7 @@
 package com.knowledge.ai.config;
 
 import lombok.extern.slf4j.Slf4j;
+import com.knowledge.ai.core.trace.TraceContext;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -57,9 +58,49 @@ public class AsyncConfig {
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        // `S4-E2`：把 traceId 带过线程边界（见下方 traceIdPropagating）。
+        executor.setTaskDecorator(AsyncConfig::traceIdPropagating);
         executor.initialize();
         log.info("异步任务线程池已就绪 core={} max={} queue={}", corePoolSize, maxPoolSize, queueCapacity);
         return executor;
+    }
+
+    /**
+     * 把提交线程的 {@code traceId} 传给工作线程（`S4-E2` · `T-O06` 判据 2 的前提）。
+     *
+     * <h3>为什么现在才补 —— 这是一句"写了但没做"的承诺</h3>
+     * <p>{@link com.knowledge.ai.core.trace.TraceContext} 的类注释一直写着：
+     * 「异步任务在提交时通过 {@code current()} 取出 traceId，在工作线程里重新 {@code set()}，
+     * 并在 finally 里 {@code clear()}」—— **而在此之前没有任何地方实现它**
+     * （本类的 {@code taskExecutor} 从建起来就没有 {@code TaskDecorator}）。
+     *
+     * <p>这个缺口不显眼，因为它的默认行为**看起来是对的**：`TraceContext.current()`
+     * 在工作线程里会**现场生成一个**新 traceId（它兜底生成，不返回 null），
+     * 于是每条日志都有 traceId、都不为 null —— 只是**与触发它的那次请求不是同一个**。
+     * 异步链路的日志因此无法用 traceId 串起来，而这正是 traceId 存在的唯一理由。
+     *
+     * <p>`O6` 的判据 2（「提交记录与完成记录**同 traceId**」）踩的就是这条 ——
+     * 不补它，判据 2 无论怎么写都过不去。
+     *
+     * <h3>为什么"提交线程没有就跳过 set"</h3>
+     * <p>那时工作线程会自己生成一个。**不要**在这里造一个再传 —— 那会让"这条异步任务
+     * 是被谁触发的"永远查不出来（一个凭空生成的 id 与任何请求都对不上）。
+     */
+    private static Runnable traceIdPropagating(Runnable task) {
+        String submitted = TraceContext.get();   // 提交线程的值；非请求线程时为 null
+        if (submitted == null) {
+            return task;
+        }
+        return () -> {
+            TraceContext.set(submitted);
+            try {
+                task.run();
+            } finally {
+                // 池化线程必须清 —— 不清的话下一条不相关的任务会**继承**上一个请求的 traceId，
+                // 那比没有 traceId 更糟：日志里会出现两个不相干的操作共用一个 id。
+                TraceContext.clear();
+            }
+        };
     }
 
     /**

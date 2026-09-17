@@ -547,16 +547,39 @@ export interface KbDocRow {
   imageTotal?: number
   /** 已理解图片数（VL 描述成功，V2 新增） */
   imageParsed?: number
+  /**
+   * 解析出的总页数 / 判定为「有文本层」的页数（`S4-E2` 新增 · `优化/O2`）。
+   *
+   * ⚠️ **`pagesTotal === 0` 必须渲染成「—」而不是「0/0 页有文本」**：
+   * 后端那两列是 `NOT NULL DEFAULT 0`，「0」既可能是"本批之前落的旧行、尚未统计"，
+   * 也可能是"整篇扫描件、统计结果确实是 0"。后者状态必是 `FAILED`，
+   * 前者只可能出现在 READY/INDEXING 的历史行上 —— 判据写在后端 `V18` 的列注释里。
+   */
+  pagesTotal?: number
+  /** 其中判定为「有文本层」的页数。口径 = 该页 `chars > 0`（**无密度阈值**）。 */
+  pagesWithText?: number
   owner: string
   uploadedAt: string
 }
 
-/** 未识别表格问题项（驱动顶部告警条） */
+/**
+ * 逐页解析问题项（驱动顶部告警条）。
+ *
+ * ⚠️ `S4-E2` 起多两个字段（后端 `V18` 的列）。在此之前「种类」是**拼在 `reason`
+ * 前面的文字前缀**（`【无文本层】…`），前端只能靠关键词猜 —— 现在它是结构化字段。
+ *
+ * 两者**都可空**：本批之前的旧行没有这两列的值（后端刻意不回填 —— 回填出来的是猜的）。
+ * 空值时按"未知"处理，**不伪造**。
+ */
 export interface ParseIssue {
   docId: number
   docTitle: string
   pageNo: number
   reason: string
+  /** 问题种类：`NO_TEXT_LAYER` / `TABLE_NOT_PARSED` / `HEADER_FOOTER_STRIPPED` / `EMPTY_PAGE` / `OTHER` */
+  kind?: string | null
+  /** 处置结果：`MISSING`（未处理）/ `OCR_FILLED`（已补全）/ `EMPTY_PAGE`（空白页，不算问题） */
+  disposition?: string | null
 }
 
 /** 只读解析配置（继承自知识库，上传页三栏展示） */

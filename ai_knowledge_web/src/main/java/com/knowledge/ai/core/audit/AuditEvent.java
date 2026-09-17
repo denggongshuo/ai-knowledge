@@ -51,6 +51,24 @@ public record AuditEvent(
 
     public static final String RESULT_FAILED = "FAILED";
 
+    /**
+     * **系统动作**的操作人取值（`S4-E2` · `O6` 判据 4）。
+     *
+     * <p>由 {@code AuditAspect} 在「既没有登录态、也不在 Web 请求中」时写入 ——
+     * 也就是后台 worker（解析 / 索引 / 打包）自己产生的那些记录。
+     *
+     * <p>为什么必须是**一个明确的值**而不是 {@code null} 或沿用 {@code anonymous}：
+     * 审计页要能一眼分清「系统自动跑完的解析」与「某个没登录的人干的事」。
+     * `O6` 判据 4 的原话是「**不产生假记录**」—— 把系统动作写成匿名用户就是假记录。
+     *
+     * <p>⚠️ 与 {@code anonymous} **不是一回事**，别合并：后者是"真的有人匿名为之"。
+     * 取值用英文小写 `system` 与 `sys_user.username` 的命名习惯一致（账号名是英文）。
+     */
+    public static final String SYSTEM_OPERATOR = "system";
+
+    /** 系统动作的展示名（前端审计页「操作人」列展示这个）。 */
+    public static final String SYSTEM_OPERATOR_NAME = "系统";
+
     public AuditEvent {
         changes = (changes == null) ? List.of() : List.copyOf(changes);
     }

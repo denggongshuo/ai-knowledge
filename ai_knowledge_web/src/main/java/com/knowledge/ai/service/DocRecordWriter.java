@@ -135,12 +135,14 @@ public class DocRecordWriter {
      * 图片确实还没被理解，页面上的"有 N 张图（未理解）"就是这个意思。
      */
     @Transactional
-    public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal) {
+    public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal,
+                           int pagesTotal, int pagesWithText) {
         entityManager.createNativeQuery("""
                         update sys_document
                            set status = 'INDEXING', parse_path = :path,
                                table_total = :tableTotal, table_parsed = :tableParsed,
                                image_total = :imageTotal,
+                               pages_total = :pagesTotal, pages_with_text = :pagesWithText,
                                error_msg = null, updated_at = :now
                          where id = :id
                         """)
@@ -148,6 +150,8 @@ public class DocRecordWriter {
                 .setParameter("tableTotal", tableTotal)
                 .setParameter("tableParsed", tableParsed)
                 .setParameter("imageTotal", imageTotal)
+                .setParameter("pagesTotal", pagesTotal)
+                .setParameter("pagesWithText", pagesWithText)
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", docId)
                 .executeUpdate();
@@ -214,13 +218,18 @@ public class DocRecordWriter {
         LocalDateTime now = LocalDateTime.now();
         for (ParsedDocument.DocumentIssue issue : issues) {
             entityManager.createNativeQuery("""
-                            insert into sys_parse_issue (doc_id, kb_id, page_no, reason, created_at)
-                            values (:docId, :kbId, :pageNo, :reason, :now)
+                            insert into sys_parse_issue
+                                (doc_id, kb_id, page_no, reason, kind, disposition, created_at)
+                            values (:docId, :kbId, :pageNo, :reason, :kind, :disposition, :now)
                             """)
                     .setParameter("docId", docId)
                     .setParameter("kbId", kbId)
                     .setParameter("pageNo", issue.pageNo())
-                    .setParameter("reason", truncate(kindTagOf(issue) + issue.reason()))
+                    // `reason` 是**纯原因文本**（`S4-E2` 起不再拼种类前缀 —— 种类有列了）。
+                    // 同一信息存两份必然漂：改一次文案，前缀与列就对不上。
+                    .setParameter("reason", truncate(issue.reason()))
+                    .setParameter("kind", issue.kind().name())
+                    .setParameter("disposition", issue.disposition().name())
                     .setParameter("now", now)
                     .executeUpdate();
         }
@@ -372,20 +381,6 @@ public class DocRecordWriter {
             // 连"记下失败"都失败了 —— 只能留日志，不能让异常再往上冒把任务体的原始失败原因盖掉
             log.error("回写文档失败状态时出错：docId={} 原始原因={} err={}", docId, msg, ex.getMessage());
         }
-    }
-
-    /**
-     * 把问题**种类**拼成 {@code reason} 的文字前缀。
-     *
-     * <p>{@code sys_parse_issue} 没有种类列（本批不加迁移，见计划 §4），所以种类在库里
-     * 是**文字**而不是可查询的列。{@link ParsedDocument.IssueKind#tag()} 就是那个前缀，
-     * 这里只负责接上 —— 前缀的形状由枚举定，不在这里另写一份字面量。
-     *
-     * <p>为什么不干脆扔掉种类、只留 reason：那等于把"哪一类问题"的信息
-     * 塞回自由文本里靠人眼识别，也就没法写出"断言种类是 X"的测试。
-     */
-    private static String kindTagOf(ParsedDocument.DocumentIssue issue) {
-        return issue.kind() == null ? "" : issue.kind().tag();
     }
 
     /** reason 截断到 {@code sys_parse_issue.reason} 的列宽 512。 */

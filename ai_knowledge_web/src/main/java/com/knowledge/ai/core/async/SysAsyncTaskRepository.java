@@ -161,8 +161,10 @@ public class SysAsyncTaskRepository {
     @Transactional
     public List<ClaimedJob> claim(String type, int limit, String lockedBy) {
         LocalDateTime now = LocalDateTime.now();
+        // `trace_id` / `owner_id` 与 `attempt` 一起查回来：领取方要用它们写**系统审计**
+        // （`S4-E2` · `O6` 判据 2/4）。多查两列不额外走一次库 —— 反正已经在读这一行了。
         List<Object[]> rows = entityManager.createNativeQuery(
-                        "select task_id, kb_id, doc_id, attempt from sys_async_task "
+                        "select task_id, kb_id, doc_id, attempt, trace_id, owner_id from sys_async_task "
                                 + "where type = :type and status = 'PENDING' "
                                 + "and (next_retry_at is null or next_retry_at <= :now) "
                                 + "order by created_at "
@@ -180,6 +182,8 @@ public class SysAsyncTaskRepository {
             Long kbId = r[1] == null ? null : ((Number) r[1]).longValue();
             Long docId = r[2] == null ? null : ((Number) r[2]).longValue();
             int attempt = ((Number) r[3]).intValue() + 1;
+            String traceId = (String) r[4];
+            Long ownerId = r[5] == null ? null : ((Number) r[5]).longValue();
             entityManager.createNativeQuery(
                             "update sys_async_task set status = 'RUNNING', attempt = :attempt, "
                                     + "locked_by = :by, locked_at = :now, updated_at = :now "
@@ -189,7 +193,7 @@ public class SysAsyncTaskRepository {
                     .setParameter("now", now)
                     .setParameter("taskId", taskId)
                     .executeUpdate();
-            claimed.add(new ClaimedJob(taskId, kbId, docId, attempt));
+            claimed.add(new ClaimedJob(taskId, kbId, docId, attempt, traceId, ownerId));
         }
         return claimed;
     }
@@ -284,7 +288,19 @@ public class SysAsyncTaskRepository {
     // ==================== 小工具 ====================
 
     /** 领取到的一条作业。 */
-    public record ClaimedJob(String taskId, Long kbId, Long docId, int attempt) {
+    /**
+     * 领到手的作业。字段是**执行它所需要的全部**（领取方不必再查一次库）。
+     *
+     * @param attempt 已开始的执行次数（领取时 +1）
+     * @param traceId 提交该作业时的 traceId（`S4-E2` 新增）——
+     *                领取方在工作线程里 {@code TraceContext.set(traceId)}，于是
+     *                「提交」与「完成」两条审计记录**共用一个 traceId**（`O6` 判据 2）。
+     *                为 {@code null} 时（老行 / 提交线程本来就没有）不设，让工作线程自己生成。
+     * @param ownerId 提交人（`S4-E2` 新增）—— 审计记录里标注"谁触发的这次解析"。
+     *                它**不是**用来重新鉴权的（授权已在提交点做完，见 `O6` §2 的立场）。
+     */
+    public record ClaimedJob(String taskId, Long kbId, Long docId, int attempt,
+                             String traceId, Long ownerId) {
     }
 
     private static String truncate(String reason) {

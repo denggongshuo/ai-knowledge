@@ -90,6 +90,16 @@ public class DocService {
      */
     private final ParseWorker parseWorker;
 
+    /**
+     * 解析链路的审计留痕点（`S4-E2` · `T-O06` 步 1）。
+     *
+     * <p>⚠️ 是**另一个 Bean**，不是本类的一个私有方法 —— 审计靠 `@AuditLog` 注解 + AOP 代理，
+     * 而**同类内部自调用不走代理**（本仓已为此踩过两次：`ReindexService#switchGeneration`
+     * 的 `@Transactional`、以及 `KbController` 那批注释）。写成私有方法的话，
+     * 审计会**静默不落库**，而接口一切正常。
+     */
+    private final ParseAuditTrail parseAuditTrail;
+
     // ==================== T-501 · MD5 去重（秒传判断）====================
 
     /**
@@ -155,7 +165,7 @@ public class DocService {
      */
     @Transactional
     @AuditLog(module = AuditModule.DOC, action = "上传文档", risk = RiskLevel.NORMAL,
-            target = "'知识库#' + #kbId")
+            target = "'文档#' + #result.docId")
     public DocDtos.UploadAccepted upload(long kbId, MultipartFile file) {
         LoginUser user = LoginUserContext.require();
         requireKbVisible(kbId);
@@ -175,6 +185,15 @@ public class DocService {
         //    详见 `DocStorage` 的 `spillToTemp` 注释（那条竞态在 `S4-E1` 被确定性触发过）。
         String contentType = file.getContentType();
         Path staged = docStorage.spillToTemp(file);
+
+        // ---- `S4-E2`（`O6` 步 1）：**在这里**留痕「谁触发了这篇文档的解析」----
+        // 为什么是这里而不是真正投递作业的那一步：投递发生在**异步体里**（转存成功之后
+        // 才入队，理由见下面 `parseWorker.enqueue` 的注释），那一刻请求线程的
+        // `LoginUserContext` 已经不存在了 —— 在那儿写审计只会得到一条"匿名"的假记录。
+        //
+        // 这就是 `O6` §2 的立场：**授权与留痕都发生在有身份的那一刻**，工作线程只执行
+        // 已被授权过的既定作业。它与 `ParseWorker` 的执行用同一个 traceId 串起来。
+        parseAuditTrail.parseSubmitted(kbId, docId);
 
         // 幂等键含 (kbId, ownerId, md5)：同一个人对同一个库传同一个文件，连点也只跑一次。
         // ⚠️ 刻意**不含 docId** —— 那样每次调用都是新 key，幂等就失效了；
@@ -303,6 +322,7 @@ public class DocService {
         Query query = entityManager.createNativeQuery("""
                         select d.id, d.title, d.type, d.size_bytes, d.chunk_count, d.status,
                                d.table_total, d.table_parsed, d.image_total, d.image_parsed,
+                               d.pages_total, d.pages_with_text,
                                u.real_name, d.created_at
                         from sys_document d
                         left join sys_user u on u.id = d.owner_id
@@ -326,8 +346,10 @@ public class DocService {
                     ((Number) r[7]).longValue(),
                     ((Number) r[8]).longValue(),
                     ((Number) r[9]).longValue(),
-                    r[10] == null ? "—" : (String) r[10],
-                    formatTime(r[11])));
+                    ((Number) r[10]).longValue(),
+                    ((Number) r[11]).longValue(),
+                    r[12] == null ? "—" : (String) r[12],
+                    formatTime(r[13])));
         }
         return new DocDtos.DocPage(list, total, list.size());
     }
@@ -353,7 +375,7 @@ public class DocService {
 
         @SuppressWarnings("unchecked")
         List<Object[]> rows = entityManager.createNativeQuery("""
-                        select i.doc_id, d.title, i.page_no, i.reason
+                        select i.doc_id, d.title, i.page_no, i.reason, i.kind, i.disposition
                         from sys_parse_issue i
                         join sys_document d on d.id = i.doc_id and d.deleted_at is null
                         where i.kb_id = :kbId
@@ -369,7 +391,9 @@ public class DocService {
                     ((Number) r[0]).longValue(),
                     (String) r[1],
                     ((Number) r[2]).intValue(),
-                    (String) r[3]));
+                    (String) r[3],
+                    (String) r[4],
+                    (String) r[5]));
         }
         return new DocDtos.ParseIssuePage(list, list.size());
     }

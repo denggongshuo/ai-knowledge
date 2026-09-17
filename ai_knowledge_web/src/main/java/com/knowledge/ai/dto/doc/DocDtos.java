@@ -31,6 +31,7 @@ public final class DocDtos {
     public record DocRow(long id, String title, String type, long size, long chunkCount,
                          String status, long tableTotal, long tableParsed,
                          long imageTotal, long imageParsed,
+                         long pagesTotal, long pagesWithText,
                          String owner, String uploadedAt) {
     }
 
@@ -119,8 +120,20 @@ public final class DocDtos {
      *
      * <p>{@code docTitle} 冗余进每一行而不是让前端 join：告警条一次渲染就要标题，
      * 而文档标题在展示期间不会变（改名走的是另一条接口），冗余是安全的。
+     *
+     * <p>⚠️ <b>`S4-E2` 起多两个字段</b>（{@code V18} 的 `kind`/`disposition` 列）——
+     * 在此之前"种类"是**拼在 {@code reason} 前面的文字前缀**，前端只能靠关键词猜。
+     * 现在它是可查、可筛选的结构化字段，前端据此把告警条分成
+     * 「内容缺失（未处理）」（{@code MISSING}）与「空白页」（{@code EMPTY_PAGE}）两类。
+     *
+     * <p>两字段**可空**：本批之前落的旧行没有这两列的值（`V18` 的列注释写了为什么
+     * 不做回填 —— 回填出来的是猜的）。前端按"未知"展示，**不伪造**。
+     *
+     * @param kind        问题种类（{@code ParsedDocument.IssueKind} 名；旧行为 {@code null}）
+     * @param disposition 处置结果（{@code MISSING}/{@code OCR_FILLED}/{@code EMPTY_PAGE}；旧行为 {@code null}）
      */
-    public record ParseIssueRow(long docId, String docTitle, int pageNo, String reason) {
+    public record ParseIssueRow(long docId, String docTitle, int pageNo, String reason,
+                                String kind, String disposition) {
     }
 
     /**

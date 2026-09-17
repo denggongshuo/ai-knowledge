@@ -1,7 +1,9 @@
 package com.knowledge.ai.core.async;
 
 import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.trace.TraceContext;
 import com.knowledge.ai.service.DocParseService;
+import com.knowledge.ai.service.ParseAuditTrail;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -65,6 +67,14 @@ public class ParseWorker implements SmartLifecycle {
     private final AsyncTaskService asyncTaskService;
 
     private final DocParseService docParseService;
+
+    /**
+     * 解析完成/失败两条**系统审计**的落点（`S4-E2` · `O6` 步 3）。
+     *
+     * <p>它是个 `@AuditLog` 承载点（方法体为空），切面在本线程采集 ——
+     * 无请求、无登录态 → 操作人写为 {@code system}/「系统」（`O6` 判据 4）。
+     */
+    private final ParseAuditTrail parseAuditTrail;
 
     @Value("${app.parse.worker.enabled:true}")
     private boolean enabled;
@@ -259,11 +269,24 @@ public class ParseWorker implements SmartLifecycle {
 
     private void execute(SysAsyncTaskRepository.ClaimedJob job) {
         executedTotal.incrementAndGet();
-        asyncTaskService.reportStage(job.taskId(), "解析中", 10);
+        // ---- `S4-E2`：把提交时的 traceId 恢复到本线程 ----
+        // 这条池是**自建**的（不走 `taskExecutor`，因此没有 `AsyncConfig` 的 TaskDecorator），
+        // 所以传播只能在这里手动做。不做的后果不是报错而是**串不起来**：
+        // `TraceContext.current()` 在工作线程会现场生成一个新 id，
+        // 于是"提交"与"完成"两条审计的 traceId 不同（`O6` 判据 2 直接失败），
+        // 而且**看起来完全正常** —— 每条日志都有 traceId。
+        String traceId = job.traceId();
+        if (traceId != null && !traceId.isBlank()) {
+            TraceContext.set(traceId);
+        }
         try {
+            asyncTaskService.reportStage(job.taskId(), "解析中", 10);
             Map<String, Object> result = docParseService.parseDocument(job.docId());
             if (!"FAILED".equals(result.get("status"))) {
                 asyncTaskService.reportDone(job.taskId(), 0, 0);
+                // 完成审计：与"触发解析"同 target、同 traceId，操作人为「系统」
+                // （`AuditAspect` 在无请求无登录态时判为 system —— `O6` 判据 4）
+                parseAuditTrail.parseDone(job.docId());
                 log.info("解析作业完成 taskId={} docId={} 第 {} 次尝试 status={}",
                         job.taskId(), job.docId(), job.attempt(), result.get("status"));
                 return;
@@ -273,6 +296,7 @@ public class ParseWorker implements SmartLifecycle {
         } catch (BizException ex) {
             // 文档行没了（被删 / 从未转存成功）—— 重试也不会变出来，直接终态
             asyncTaskService.reportFailed(job.taskId(), ex.getMessage());
+            parseAuditTrail.parseFailed(job.docId());
             log.warn("解析作业终态失败（业务性）taskId={} docId={} 原因={}",
                     job.taskId(), job.docId(), ex.getMessage());
         } catch (Exception ex) {
@@ -280,6 +304,10 @@ public class ParseWorker implements SmartLifecycle {
             // （拿行、写状态、线程被中断……），属基础设施类，值得重试
             onFailure(job, "解析执行异常：" + ex.getClass().getSimpleName()
                     + (ex.getMessage() == null ? "" : "：" + ex.getMessage()), true);
+        } finally {
+            // 池化线程必须清 —— 不清的话下一个作业会继承上一个的 traceId，
+            // 那比没有更糟：两条不相干的解析会共用一个 id，排查时被引向错误的方向。
+            TraceContext.clear();
         }
     }
 
@@ -296,6 +324,10 @@ public class ParseWorker implements SmartLifecycle {
                 ? reason + "（已重试 " + maxAttempts + " 次仍未成功）"
                 : reason;
         asyncTaskService.reportFailed(job.taskId(), finalReason);
+        // 只有**终态**才留审计 —— 可重试失败（上面 return 掉的那条）不留：
+        // 那个作业还会被重新领走，现在写"解析失败"是**当时不成立**的记录。
+        // `O6` 判据 4 要的是"不产生假记录"，这里正是最容易产假记录的一处。
+        parseAuditTrail.parseFailed(job.docId());
         log.warn("解析作业终态失败 taskId={} docId={} 尝试 {}/{} retryable={} 原因={}",
                 job.taskId(), job.docId(), job.attempt(), maxAttempts, retryable, finalReason);
     }

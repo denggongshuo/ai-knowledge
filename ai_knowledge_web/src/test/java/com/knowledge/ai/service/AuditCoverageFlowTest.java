@@ -119,8 +119,14 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // 所以搬表这一步没人替你做（AuditRiskPolicy 里留了注释）
         expected.put(AuditModule.KB + " 删除知识库", RiskLevel.HIGH);
         expected.put(AuditModule.KB + " 清空索引", RiskLevel.HIGH);
-        // ---- 文档（1）---- （S4-M05-A 新增：上传入库）
+        // ---- 文档（4）---- （S4-M05-A 新增：上传入库；S4-E2 新增解析链路三条）
         expected.put(AuditModule.DOC + " 上传文档", RiskLevel.NORMAL);
+        // `T-O06`（S4-E2）：同一件事的三个时点 —— 谁触发 / 跑成了 / 跑砸了。
+        // 三点都是 NORMAL（不改权限、不删数据、不导出），但**都必须留痕**：
+        // 企业审计的第一问就是「谁在什么时候触发了 X 的解析」。
+        expected.put(AuditModule.DOC + " 触发解析", RiskLevel.NORMAL);
+        expected.put(AuditModule.DOC + " 解析完成", RiskLevel.NORMAL);
+        expected.put(AuditModule.DOC + " 解析失败", RiskLevel.NORMAL);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -264,13 +270,15 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 27 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 30 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
         assertThat(actual)
-                .as("总数变化必须是有意为之：新增审计点请同步改本用例与 AuditRiskPolicy")
-                .hasSize(27);
+                .as("总数变化必须是有意为之：新增审计点请同步改本用例与 AuditRiskPolicy。"
+                        + "25（S4-M05-A）→ 27（S4-D 的 T-407 两条）→ **30**（S4-E2 的 T-O06 三条："
+                        + "触发解析 / 解析完成 / 解析失败）")
+                .hasSize(30);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

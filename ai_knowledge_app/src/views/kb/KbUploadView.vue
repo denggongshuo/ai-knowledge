@@ -30,13 +30,6 @@ const queue = ref<UploadItem[]>([])
 const docs = ref<KbDocRow[]>([])
 const total = ref(0)
 const issues = ref<ParseIssue[]>([])
-/**
- * 告警条的「篇数」：按 {@code docId} 去重，**不能直接用 issues.length**。
- *
- * 后端的行粒度是 (文档, 页码) —— 一份 15 页的扫描件会返回 15 行
- * （「第几页」是 `G4-11` 点名的字段），直接数行会把"1 篇"说成"15 篇"。
- */
-const issueDocCount = computed(() => new Set(issues.value.map((i) => i.docId)).size)
 const parseConfig = ref<ParseConfigView | null>(null)
 const loading = ref(false)
 const selected = ref<KbDocRow[]>([])
@@ -406,9 +399,35 @@ function qualityText(d: KbDocRow) {
     parts.push(`图片 ${ip}/${it}`)
     if (ip < it) danger = true
   }
+  // 页级文本层覆盖（`S4-E2` 新增）：`40 页里 38 页有文本` 比 `平均 300 字/页` 信息量大得多 ——
+  // 后者会被平均值稀释，前者直接指出"少了 2 页"。
+  //
+  // ⚠️ 它**只展示、不标红**，这是刻意的：这一列分不清"少的那 2 页是扫描页"还是
+  //    "少的那 2 页本来就是空白页"。后者在正常文档里很常见（章节隔页、末尾空白页），
+  //    拿 `pagesWithText < pagesTotal` 标红会让**大量正常文档常年显示"需补录"** ——
+  //    而常见的红标等于没有红标（本仓的「误报比漏报更伤」，S4-B 的 W1' 已为此返工过）。
+  //    "要不要处理"的唯一权威信号是顶部告警条 —— 它由后端的 **SCANNED** 页驱动
+  //    （`disposition = MISSING`），空白页在那条链路上已经被排除掉了。
+  const pt = d.pagesTotal ?? 0
+  if (pt > 0) {
+    parts.push(`${d.pagesWithText ?? 0}/${pt} 页有文本`)
+  }
   if (!parts.length) return { text: '无表格 / 图片', type: 'info' as const }
   return { text: parts.join(' · ') + (danger ? '（需补录）' : ''), type: danger ? ('danger' as const) : ('success' as const) }
 }
+
+/**
+ * 告警条只数**真正需要处理**的那些问题（`S4-E2`）。
+ *
+ * 后端 `disposition = 'EMPTY_PAGE'` 的是**空白页/纯版式页** —— 它不是"内容丢了"，
+ * 用户对一张空白页没有任何可采取的动作。把它算进"N 篇文档存在解析问题"会让告警条
+ * **常态化变红**（有版式页的文档很常见），红条一旦常见就没人看了。
+ *
+ * 旧行（`disposition` 为 null）按"未知"计 —— 它们落库时只有"内容缺失"一种语义
+ * （那时没有 OCR/VL），所以计入是**还原当时的事实**，不是猜。
+ */
+const actionableIssues = computed(() => issues.value.filter((i) => i.disposition !== 'EMPTY_PAGE'))
+const issueDocCount = computed(() => new Set(actionableIssues.value.map((i) => i.docId)).size)
 function sizeText(b: number) {
   const mb = b / 1024 / 1024
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`
@@ -445,7 +464,7 @@ async function batchReindex() {
   selected.value = []
 }
 function gotoIssue() {
-  if (issues.value[0]) router.push(`/doc/${issues.value[0].docId}/preview`)
+  if (actionableIssues.value[0]) router.push(`/doc/${actionableIssues.value[0].docId}/preview`)
 }
 </script>
 
@@ -663,10 +682,10 @@ function gotoIssue() {
       </template>
 
       <!-- 解析问题告警条 -->
-      <div v-if="issues.length" class="issue-bar">
+      <div v-if="actionableIssues.length" class="issue-bar">
         <el-icon class="issue-icon"><WarningFilled /></el-icon>
         <span class="issue-text">
-          <b>{{ issueDocCount }} 篇文档存在解析问题</b>：{{ issues[0]?.docTitle }} 第 {{ issues[0]?.pageNo }} 页 —— {{ issues[0]?.reason }}。
+          <b>{{ issueDocCount }} 篇文档存在解析问题</b>：{{ actionableIssues[0]?.docTitle }} 第 {{ actionableIssues[0]?.pageNo }} 页 —— {{ actionableIssues[0]?.reason }}。
           有问题的页面内容无法被检索命中，建议改用可复制文本的源文件后重建索引。
         </span>
         <el-button size="small" @click="gotoIssue">查看详情</el-button>

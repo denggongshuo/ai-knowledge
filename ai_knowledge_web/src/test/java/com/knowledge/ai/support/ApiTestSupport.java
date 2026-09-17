@@ -183,6 +183,39 @@ public abstract class ApiTestSupport {
     }
 
     /**
+     * 发一次 GET，**路径里的百分号编码原样保留**（`S4-E2` 新增）。
+     *
+     * <p>为什么 {@link #get(String, String)} 不够用：它走
+     * {@code RestClient.uri(String)}，而那是个 **URI 模板** —— 模板里的 {@code %}
+     * 会被再编码一次（{@code %23} → {@code %2523}），服务端解码后拿到的是字面量
+     * {@code %23}。凡是查询串里**必须**带 {@code #}（如审计的
+     * {@code keyword=文档%23123}）的用例都会因此静默拿不到结果。
+     *
+     * <p>而 {@code #} 不编码也不行 —— 它是 URL 的 fragment 分隔符。
+     * 两头都不能省，所以只能走 {@code URI.create} + {@code uri(URI)}：
+     * 前者不做编码、后者不做模板展开。
+     *
+     * <p>这**不是**为测试造的偏门路径：前端的 axios 用 params 传参，
+     * {@code #} 正是被编成 {@code %23} 发出去的。
+     *
+     * <p>⚠️ <b>调用方必须传入**完整**百分号编码的查询串</b>（含非 ASCII —— 用
+     * {@code URLEncoder}）。只编 {@code #} 而把中文原样留着，Tomcat 会在请求行
+     * 校验阶段直接 400，响应体是一段 HTML，症状是"取 {@code $['code']} 失败"，
+     * 看着像接口坏了。
+     */
+    protected RawResponse getEncoded(String pathWithEncodedQuery, String accessToken) {
+        RestClient.RequestHeadersSpec<?> spec = client.method(HttpMethod.GET)
+                .uri(java.net.URI.create(url(pathWithEncodedQuery)));
+        if (accessToken != null && !accessToken.isBlank()) {
+            spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
+        }
+        return spec.exchange((request, response) -> new RawResponse(
+                response.getStatusCode().value(),
+                response.bodyTo(String.class),
+                response.getHeaders().getValuesAsList("Set-Cookie")));
+    }
+
+    /**
      * 发一次 {@code multipart/form-data} 请求（头像上传这类接口用）。
      *
      * <p>必须手工构造 {@link MultipartBodyBuilder} —— 直接塞 {@code byte[]} 进去

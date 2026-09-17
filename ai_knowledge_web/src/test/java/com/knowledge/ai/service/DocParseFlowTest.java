@@ -372,7 +372,7 @@ class DocParseFlowTest extends ApiTestSupport {
         ParsedDocument emptyTableDoc = new ParsedDocument("PDF", 1, 10, "占位",
                 List.of(), List.of(new ParsedDocument.ParsedTable("", 3,
                         List.of(List.of("", ""), List.of("", "")))),
-                1, 0, List.of(new ParsedDocument.DocumentIssue(3, "表格检出结构（2 行 × 2 列）但未提取到内容",
+                1, 0, List.of(ParsedDocument.DocumentIssue.missing(3, "表格检出结构（2 行 × 2 列）但未提取到内容",
                         ParsedDocument.IssueKind.TABLE_NOT_PARSED)),
                 List.of());
 
@@ -386,14 +386,24 @@ class DocParseFlowTest extends ApiTestSupport {
                 "select count(*) from sys_parse_issue where doc_id = ?", Integer.class, docId);
         assertThat(issueCount).as("问题行已落库").isEqualTo(1);
         Map<String, Object> issue = jdbcTemplate.queryForMap(
-                "select page_no, reason from sys_parse_issue where doc_id = ?", docId);
+                "select page_no, reason, kind, disposition from sys_parse_issue where doc_id = ?", docId);
         assertThat(((Number) issue.get("page_no")).intValue()).isEqualTo(3);
         assertThat((String) issue.get("reason")).contains("未提取到内容");
+        // ⚠️ `S4-E2` 订正：种类**不再**是 reason 的文字前缀，而是 `kind` 列（`V18`）。
+        // 旧断言 `startsWith(TABLE_NOT_PARSED.tag())` 反的是"没有列、只能拼前缀"那个形态；
+        // 现在前缀与列同时存在会是**同一信息存两份、且必然漂**，所以写入侧改用列、reason 回归纯文本。
         assertThat((String) issue.get("reason"))
-                .as("问题**种类**在库里是可读的文字前缀（S4-M05-C2 步 0.6）。"
-                        + "sys_parse_issue 没有种类列、本批不加迁移，所以种类只能这样落 —— "
-                        + "但「这是哪一类问题」必须看得见，否则按关键词瞎猜是唯一手段")
-                .startsWith(ParsedDocument.IssueKind.TABLE_NOT_PARSED.tag());
+                .as("reason 是**纯原因文本**，不再带【种类】前缀（S4-E2 起种类有列了）")
+                .doesNotContain(ParsedDocument.IssueKind.TABLE_NOT_PARSED.tag());
+        assertThat((String) issue.get("kind"))
+                .as("「这是哪一类问题」现在落在可查询的 kind 列上（V18）—— "
+                        + "在此之前只能靠 reason 里的关键词瞎猜，而那正是加列要摆脱的形态")
+                .isEqualTo(ParsedDocument.IssueKind.TABLE_NOT_PARSED.name());
+        assertThat((String) issue.get("disposition"))
+                .as("处置结果是独立的第二个轴（O2 §4 步 3）：种类说『是什么问题』，"
+                        + "处置说『这问题被怎么办了』—— 合成一个字段，接 OCR 那天就分不清"
+                        + "『还会复发』与『已解决』")
+                .isEqualTo(ParsedDocument.Disposition.MISSING.name());
         assertThat(row.get("status")).isIn("INDEXING", "FAILED");
     }
 

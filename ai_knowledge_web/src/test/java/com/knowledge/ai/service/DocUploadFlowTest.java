@@ -491,9 +491,14 @@ class DocUploadFlowTest extends ApiTestSupport {
                 "select coalesce(max(id), 0) from sys_audit_log", Long.class);
         upload(kbId, "# 判据16：审计\n\n正文。".getBytes(StandardCharsets.UTF_8), "审计探针.md", token).assertOk("上传");
 
+        // ⚠️ `S4-E2` 起**一次上传落两条**审计：「触发解析」（方法体内，请求线程）与
+        //    「上传文档」（切面在方法**返回后**的 finally 里写）。
+        //    所以不能再用 `order by id limit 1` 拿"第一条" —— 那会拿到「触发解析」。
+        //    这个顺序是注解式审计的固有形状（外层动作的记录必然晚于内层），不是缺陷：
+        //    两条的 id 顺序不代表因果，审计页按时间倒序展示，用户看到的是同一秒的两条。
         Map<String, Object> log = jdbcTemplate.queryForMap("""
                 select module, action, risk_level, operator, result, api_path
-                from sys_audit_log where id > ? order by id limit 1
+                from sys_audit_log where id > ? and action = '上传文档' order by id limit 1
                 """, maxBefore);
 
         assertThat(log.get("module")).isEqualTo("文档");

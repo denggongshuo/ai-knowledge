@@ -145,7 +145,7 @@ public class DocumentCleaner {
             List<CleanedDocument.StrippedPattern> stripped) {
         List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
         for (CleanedDocument.StrippedPattern s : stripped) {
-            issues.add(new ParsedDocument.DocumentIssue(s.firstPage(),
+            issues.add(ParsedDocument.DocumentIssue.missing(s.firstPage(),
                     "该文档的「" + s.sample() + "」出现在 " + s.occurrences() + " 页的页面边缘位置，"
                             + "判定为页眉/页脚样板，已从正文中剥离（共 " + s.chars()
                             + " 字符），以免它每页都进入检索、稀释语义。"
