@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -72,6 +73,9 @@ public class ReindexService {
     private final DocRecordWriter recordWriter;
 
     private final AsyncTaskService asyncTaskService;
+
+    /** 见 {@link #switchGeneration} 的注释：同类自调用不经过事务代理，只能用模板显式开。 */
+    private final TransactionTemplate transactionTemplate;
 
     // ==================== 入口 ====================
 
@@ -143,10 +147,20 @@ public class ReindexService {
             } catch (Exception ex) {
                 String reason = ex.getMessage() == null || ex.getMessage().isBlank()
                         ? ex.getClass().getSimpleName() : ex.getMessage();
-                // 单篇失败不中断整批 —— 继续跑完，最后统一决定切不切（见类注释）
-                recordWriter.markFailed(doc.id(), "重建索引失败：" + reason);
+                // ⚠️ 这里**刻意不改文档状态**（原来写成 markFailed，2026-09-17 由
+                // `ReindexFlowTest#resumesFromBreakpointWithoutRedoingFinishedDocs` 逼出来的订正）。
+                //
+                // 两个理由：
+                //   ① 标 FAILED 是**误报** —— 这篇文档在**当前代**里的向量完好无损、检索得到，
+                //      它只是在**新代**里还没写成功。而本方法失败时不切代，所以它一点没坏。
+                //   ② 标了 FAILED 之后，本方法下一轮的筛选（`status in ('READY','INDEXING')`）
+                //      就再也捞不到它 —— **重试永远修不好它**，用户只能删了重传。
+                //
+                // 诚实的落点是：状态不动（仍是 READY）+ index_generation 仍指旧代（= 它在新代里
+                // 还没齐），两者合起来精确表达了"可用，但没跟上新代"。失败清单照实返回给调用方。
                 failures.add(new Failure(doc.id(), doc.title(), reason));
-                log.warn("[重建] 文档失败（继续下一篇）：kbId={} docId={} 原因={}", kbId, doc.id(), reason);
+                log.warn("[重建] 文档失败（继续下一篇，状态与旧代向量保持不变）：kbId={} docId={} 原因={}",
+                        kbId, doc.id(), reason);
             }
         }
 
@@ -195,16 +209,21 @@ public class ReindexService {
      * **原子切换点**（`D-7`）：一次 UPDATE 把检索指向新代，并清掉"待重建"标记。
      *
      * <p>这一步之前，检索读到的仍是旧代；这一步之后才是新代。中间没有第三态。
+     *
+     * <p>⚠️ <b>为什么用 {@link TransactionTemplate} 而不是在这个方法上挂 {@code @Transactional}</b>：
+     * 它是由 {@link #reindex} **同类自调用**的，而 Spring 的事务是代理实现的 ——
+     * 自调用不经过代理，注解形同虚设（实测报 {@code TransactionRequiredException: No active transaction}）。
+     * 同一族的坑在 {@code SysDocument} 的类注释里已经记过一次（"实体落库会被 @Transactional 的
+     * 代理语义限制（同类自调用不生效）"）。模板是显式开事务，绕开代理。
      */
-    @Transactional
     void switchGeneration(long kbId, int generation) {
-        entityManager.createNativeQuery(
+        transactionTemplate.executeWithoutResult(status -> entityManager.createNativeQuery(
                         "update sys_kb set index_generation = :generation, reindex_required = 0, "
                                 + "updated_at = :now where id = :id")
                 .setParameter("generation", generation)
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", kbId)
-                .executeUpdate();
+                .executeUpdate());
     }
 
     /**
