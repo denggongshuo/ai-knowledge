@@ -72,33 +72,48 @@ public class MilvusChunkWriter implements VectorWriter {
      * @return 实际写入的条数
      */
     @Override
-    public int replaceDocument(long docId, List<VectorRecord> records) {
-        String collection = properties.getCollection();
-        deleteByDocId(docId, collection);
+    public int replaceDocument(String partition, long docId, List<VectorRecord> records) {
+        deleteByDocId(docId, partition);
         if (records.isEmpty()) {
-            log.info("[Milvus] 该文档没有需要写入的块（全部被跳过）：docId={}", docId);
+            log.info("[Milvus] 该文档没有需要写入的块（全部被跳过）：docId={} 分区={}", docId, partition);
             return 0;
         }
-        insert(records, collection);
+        insert(records, partition);
         return records.size();
     }
 
-    /** 删掉某文档的全部向量。先删后插的第一步；也是"删除文档"将来要复用的入口。 */
-    public void deleteByDocId(long docId, String collection) {
+    /**
+     * 删掉某文档**在该分区**的全部向量。先删后插的第一步；也是"删除文档"要复用的入口。
+     *
+     * <p>⚠️ 分区是必填参数，不是可选优化 —— 步 0 探针实测：不指定分区时删的是
+     * **整个集合**（含别的库、别的代），那会把别的库的向量一起删掉。
+     */
+    public void deleteByDocId(long docId, String partition) {
         // doc_id 是 long，直接拼进表达式不存在注入面（不经用户输入）
         String expr = MilvusConstants.FIELD_DOC_ID + " in [" + docId + "]";
         R<MutationResult> result = client.delete(DeleteParam.newBuilder()
-                .withCollectionName(collection)
+                .withCollectionName(properties.getCollection())
+                .withPartitionName(partition)
                 .withExpr(expr)
                 .build());
-        assertOk(result, "delete(" + expr + ")");
+        assertOk(result, "delete(" + expr + " @" + partition + ")");
         long deleted = result.getData() == null ? 0 : result.getData().getDeleteCnt();
         if (deleted > 0) {
-            log.info("[Milvus] 清除旧的文档向量：docId={} 条数={}", docId, deleted);
+            log.info("[Milvus] 清除旧的文档向量：docId={} 分区={} 条数={}", docId, partition, deleted);
         }
     }
 
-    private void insert(List<VectorRecord> records, String collection) {
+    /** 删掉某文档在**全部分区**的向量（含 `_default`）——「彻底删除文档」用，日常不用它。 */
+    public void deleteByDocIdEverywhere(long docId) {
+        String expr = MilvusConstants.FIELD_DOC_ID + " in [" + docId + "]";
+        R<MutationResult> result = client.delete(DeleteParam.newBuilder()
+                .withCollectionName(properties.getCollection())
+                .withExpr(expr)
+                .build());
+        assertOk(result, "delete(" + expr + ")");
+    }
+
+    private void insert(List<VectorRecord> records, String partition) {
         List<String> ids = new ArrayList<>(records.size());
         // Int64 字段要 Java 的 Long（Integer 会被 Milvus 拒绝：实测 "field value type must be Long"）
         List<Long> ownerKbIds = new ArrayList<>(records.size());
@@ -136,10 +151,11 @@ public class MilvusChunkWriter implements VectorWriter {
                 new InsertParam.Field(MilvusConstants.FIELD_TITLE_PATH, titlePaths));
 
         R<MutationResult> result = client.insert(InsertParam.newBuilder()
-                .withCollectionName(collection)
+                .withCollectionName(properties.getCollection())
+                .withPartitionName(partition)
                 .withFields(fields)
                 .build());
-        assertOk(result, "insert(" + records.size() + " 条)");
+        assertOk(result, "insert(" + records.size() + " 条 @" + partition + ")");
 
         long inserted = result.getData() == null ? 0 : result.getData().getInsertCnt();
         if (inserted != records.size()) {
@@ -147,7 +163,7 @@ public class MilvusChunkWriter implements VectorWriter {
                     "向量写入条数不符：期望 " + records.size() + " 条，Milvus 报告 " + inserted
                             + " 条 —— 拒绝按「成功了」处理，请重试该文档的解析");
         }
-        log.info("[Milvus] 文档向量写入完成：{} 条 → {}", inserted, collection);
+        log.info("[Milvus] 文档向量写入完成：{} 条 → {} @{}", inserted, properties.getCollection(), partition);
     }
 
     private static List<Float> asFloatList(float[] vector) {
@@ -174,8 +190,23 @@ public class MilvusChunkWriter implements VectorWriter {
     private static void assertOk(R<?> result, String what) {
         if (result.getStatus() == null || result.getStatus() != R.Status.Success.getCode()) {
             throw BizException.of(ErrorCode.SYSTEM_ERROR,
-                    "向量库操作失败（" + what + "）：" + result.getMessage()
+                    "向量库操作失败（" + what + "）：" + safeMessage(result)
                             + " —— 请确认 milvus-standalone 健康后重试");
+        }
+    }
+
+    /**
+     * 安全取 {@code R} 的文本。
+     *
+     * <p>⚠️ {@code R#getMessage()} 在内部 {@code exception} 为 {@code null} 时会 **NPE**
+     * （步 0 探针实测，见 {@code MilvusPartitionProbeTest}）—— 而这段代码正是**出错路径**上的，
+     * 让"报错"本身再抛一个 NPE 会把真正的原因盖掉。
+     */
+    private static String safeMessage(R<?> result) {
+        try {
+            return String.valueOf(result.getMessage());
+        } catch (RuntimeException ex) {
+            return "<Milvus 未提供错误文本，status=" + result.getStatus() + ">";
         }
     }
 

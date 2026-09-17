@@ -161,9 +161,9 @@ public class DocParseService {
             // ⚠️ 与增强相反，向量化失败**必须牵连文档** —— 「块都在、向量一个没有」
             // 却标着可检索，是这个项目最不能接受的静默故障形态。所以这里不 catch。
             ChunkVectorizer.Result vectorized = chunkVectorizer.vectorize(
-                    docId, row.kbId(), chunkReader.readByDocId(docId));
+                    docId, row.kbId(), row.generation(), chunkReader.readByDocId(docId));
             if (vectorized.allowsReady()) {
-                recordWriter.markReady(docId);
+                recordWriter.markReady(docId, row.generation());
             } else {
                 // 开关关掉时停在中途态 INDEXING —— 不谎报可检索。日志已在 vectorize 里记过。
                 log.warn("向量化未执行，文档停在中途态 INDEXING：docId={} 原因={}",
@@ -345,7 +345,10 @@ public class DocParseService {
     private Row requireRow(long docId) {
         @SuppressWarnings("unchecked")
         java.util.List<Object[]> rows = entityManager.createNativeQuery("""
-                        select kb_id, file_name, type, storage_path from sys_document where id = :id
+                        select d.kb_id, d.file_name, d.type, d.storage_path, k.index_generation
+                          from sys_document d
+                          join sys_kb k on k.id = d.kb_id
+                         where d.id = :id
                         """)
                 .setParameter("id", docId)
                 .getResultList();
@@ -353,10 +356,18 @@ public class DocParseService {
             throw new BizException(ErrorCode.DOC_NOT_FOUND, "文档不存在或尚未转存完成，无法解析");
         }
         Object[] r = rows.getFirst();
-        return new Row(((Number) r[0]).longValue(), (String) r[1], (String) r[2], (String) r[3]);
+        return new Row(((Number) r[0]).longValue(), (String) r[1], (String) r[2], (String) r[3],
+                ((Number) r[4]).intValue());
     }
 
-    /** 解析所需的文档行快照（读一次，全程用快照 —— 解析期间行可能被改名，不应半路换文件）。 */
-    private record Row(long kbId, String fileName, String type, String storagePath) {
+    /**
+     * 解析所需的文档行快照（读一次，全程用快照 —— 解析期间行可能被改名，不应半路换文件）。
+     *
+     * @param generation 该库**当前**的代（{@code sys_kb.index_generation}）。日常解析写进这一代；
+     *                   重建索引（{@code T-406}）走另一条路，传"新代"。取快照而不是每次现查，
+     *                   是为了让"这一篇文档全程只认一个代" —— 否则解析中途该库被切了代，
+     *                   会写出一个前半在新代、后半在旧代的文档。
+     */
+    private record Row(long kbId, String fileName, String type, String storagePath, int generation) {
     }
 }

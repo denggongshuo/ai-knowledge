@@ -570,8 +570,11 @@ public class UserAdminService {
      * 背道而驰。
      */
     private boolean hasBusinessData(Long userId) {
+        // 已软删的库不算业务数据（`T-407`，2026-09-17）：与下面 sys_document 那段同一条口径 ——
+        // 回收站里的东西不该拦住账号清理。删库后用户看到列表里已经没有它了，
+        // 若这里还拦着，他会卡在一个**看不见的**依赖上（下方 javadoc 说的正是这类问题）。
         Number ownedKb = (Number) entityManager.createNativeQuery(
-                        "select count(*) from sys_kb where owner_id = :uid limit 1")
+                        "select count(*) from sys_kb where owner_id = :uid and deleted_at is null limit 1")
                 .setParameter("uid", userId)
                 .getSingleResult();
         if (ownedKb != null && ownedKb.longValue() > 0) {

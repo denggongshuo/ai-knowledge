@@ -221,8 +221,11 @@ public class DeptService {
         // T-3C3：三道闸过完、确定要删了才登记（删完查不到，这条日志是唯一追溯线索）
         AuditContext.change("部门名称", dept.getName(), null);
         AuditContext.change("上级部门", parentNameOf(dept.getParentId()), null);
+        // 已软删的库不算"业务数据"（`T-407`）：与 `UserAdminService#hasBusinessData` 同一条口径 ——
+        // 回收站里的库不该拦住部门/账号的清理，否则用户会卡在一个**看不见的**依赖上
+        // （列表里已经没有那个库了，却被告知"该部门下仍有知识库"）。
         Long kbs = (Long) entityManager.createNativeQuery(
-                        "select count(*) from sys_kb where dept_id = :id")
+                        "select count(*) from sys_kb where dept_id = :id and deleted_at is null")
                 .setParameter("id", id)
                 .getSingleResult();
         if (kbs != null && kbs > 0) {

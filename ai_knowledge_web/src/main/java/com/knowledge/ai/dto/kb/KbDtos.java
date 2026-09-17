@@ -277,4 +277,40 @@ public final class KbDtos {
     public record ParseConfigView(List<ParseConfigGroup> split, List<ParseConfigGroup> table,
                                   List<ParseConfigGroup> image, List<ParseConfigGroup> enhance) {
     }
+
+    // ==================== T-406 / T-407 生命周期 ====================
+
+    /**
+     * 重建索引的入参（`10` §5：body {@code {mode, scheduledAt}}）。
+     *
+     * <p>{@code mode} 取值 {@code IMMEDIATE} / {@code SCHEDULED}；两者在本批的**行为一致**
+     * —— 都立即受理并异步执行，{@code SCHEDULED} 只把 {@code scheduledAt} 原样回显。
+     * 定时执行需要调度器（`O1` 的任务态持久化），本批不做，已在 §9 登记。
+     */
+    public record ReindexRequest(String mode, String scheduledAt) {
+    }
+
+    /**
+     * 重建的受理回执（前端 {@code api/index.ts:164} 的返回类型逐字段对齐，
+     * 见 {@code D-8}：字段名不一致不会报错，只会静默丢字段）。
+     *
+     * @param taskId 轮询用；重建是**长时间异步任务**，接口只负责受理
+     * @param status 受理后的状态字面量（{@code ACCEPTED}）
+     */
+    public record ReindexAccepted(String taskId, String mode, String status, String scheduledAt) {
+    }
+
+    /** 清空索引的结果（前端 {@code api/index.ts:166}）。 */
+    public record IndexCleared(boolean cleared) {
+    }
+
+    /**
+     * 软删知识库的结果（前端 {@code api/index.ts:169}）。
+     *
+     * @param deleted  是否真的删了（并发下别人先删 → false）
+     * @param recycled 是否进回收站（本批恒 true —— 删除即进回收站，保留 30 天）
+     * @param name     删除前的库名（删完页面上就没有它了，回执里带上是**为了让用户能确认删对了**）
+     */
+    public record KbDeleted(long id, boolean deleted, boolean recycled, String name) {
+    }
 }

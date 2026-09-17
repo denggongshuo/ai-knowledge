@@ -20,11 +20,14 @@ import java.util.List;
 public interface VectorWriter {
 
     /**
-     * 用给定记录**整篇替换**某文档在向量库里的全部条目（先删后插，天然幂等）。
+     * 用给定记录**整篇替换**某文档在**指定分区**里的全部条目（先删后插，天然幂等）。
      *
-     * @param docId   文档 id
-     * @param records 要写入的记录；**空列表 = 只删不插**（清掉上一次的残留）
+     * @param partition 目标分区名（口径见 {@code MilvusConstants#partitionName}）。
+     *                  ⚠️ <b>必填，不是可选优化</b> —— 不指定分区时删的是**整个集合**
+     *                  （含别的库、别的代），步 0 探针实测过这条语义。
+     * @param docId     文档 id
+     * @param records   要写入的记录；**空列表 = 只删不插**（清掉上一次的残留）
      * @return 实际写入的条数
      */
-    int replaceDocument(long docId, List<VectorRecord> records);
+    int replaceDocument(String partition, long docId, List<VectorRecord> records);
 }

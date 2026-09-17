@@ -356,8 +356,11 @@ public class DocService {
      * 这里只要一个"放行/拒绝"的判定，所以只查 {@code count}。
      */
     private void requireKbVisible(long kbId) {
+        // 软删的库视为不存在（`T-407`）：回收站里的库不该还能上传文档。
+        // 下面那条按可见性求交的 SQL 已自动带上同一条件（`DataScopeService#kbVisibility`），
+        // 这一条是**先判存在、再判可见**的第一道，所以它自己也要带。
         Number exists = (Number) entityManager.createNativeQuery(
-                        "select count(*) from sys_kb where id = :id")
+                        "select count(*) from sys_kb where id = :id and deleted_at is null")
                 .setParameter("id", kbId)
                 .getSingleResult();
         if (exists == null || exists.longValue() == 0) {

@@ -48,12 +48,14 @@ class ChunkVectorizerTest {
     private static final class FakeWriter implements VectorWriter {
 
         private long lastDocId = -1;
+        private String lastPartition = null;
         private List<VectorRecord> lastRecords = List.of();
         private int calls = 0;
 
         @Override
-        public int replaceDocument(long docId, List<VectorRecord> records) {
+        public int replaceDocument(String partition, long docId, List<VectorRecord> records) {
             calls++;
+            lastPartition = partition;
             lastDocId = docId;
             lastRecords = List.copyOf(records);
             return records.size();
@@ -62,6 +64,20 @@ class ChunkVectorizerTest {
 
     private static VectorChunk chunk(long id, String type, String raw, String titlePath, Long parentId) {
         return new VectorChunk(id, type, raw, titlePath, "INTERNAL", parentId);
+    }
+
+    @Test
+    @DisplayName("写出的分区名 = kb{kbId}_g{代}（T-406 按代切换的命名口径，读写两侧必须一致）")
+    void writesIntoThePartitionOfThatGeneration() {
+        FakeWriter writer = new FakeWriter();
+        ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
+
+        vectorizer.vectorize(100L, 8L, 3, List.of(chunk(1, "PARAGRAPH", "正文", null, null)));
+
+        assertThat(writer.lastPartition)
+                .as("分区名由 MilvusConstants#partitionName 统一给出 —— 读取侧（T-406 切代后查哪个分区）"
+                        + "与写入侧若各拼各的，就会写出一个检索永远不去查的分区")
+                .isEqualTo("kb8_g3");
     }
 
     @Test
@@ -76,7 +92,7 @@ class ChunkVectorizerTest {
                 chunk(3, "TABLE", "型号 A-100，单价 ￥1,200", null, 2L), // 子块 → 进
                 chunk(4, "SUMMARY", "摘要", null, null));
 
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, chunks);
+        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1, chunks);
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.OK);
         assertThat(r.written()).isEqualTo(3);
@@ -117,7 +133,7 @@ class ChunkVectorizerTest {
         ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
 
         // 只有表格父块 → 进池的是 0 个
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L,
+        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1,
                 List.of(chunk(2, "TABLE", "| a |", null, null)));
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.EMPTY);
@@ -135,7 +151,7 @@ class ChunkVectorizerTest {
         FakeWriter writer = new FakeWriter();
         ChunkVectorizer vectorizer = new ChunkVectorizer(embedding, writer, false);
 
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L,
+        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1,
                 List.of(chunk(1, "PARAGRAPH", "正文", null, null)));
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.DISABLED);
@@ -155,7 +171,7 @@ class ChunkVectorizerTest {
             chunks.add(chunk(i, "PARAGRAPH", "正文 " + i, null, null));
         }
 
-        vectorizer.vectorize(100L, 1L, chunks);
+        vectorizer.vectorize(100L, 1L, 1, chunks);
 
         // ⚠️ 本用例**测的不是分批** —— 分批在 EmbeddingClient.RegistryEmbeddingClient 里
         // （那里才碰得到模型、才有 batchSize）。这一层要保证的是：
@@ -176,7 +192,7 @@ class ChunkVectorizerTest {
         };
         ChunkVectorizer vectorizer = new ChunkVectorizer(shortChanged, new FakeWriter(), true);
 
-        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, List.of(
+        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1, List.of(
                 chunk(1, "PARAGRAPH", "a", null, null),
                 chunk(2, "PARAGRAPH", "b", null, null))))
                 .isInstanceOf(BizException.class)
@@ -192,7 +208,7 @@ class ChunkVectorizerTest {
         };
         ChunkVectorizer vectorizer = new ChunkVectorizer(boom, new FakeWriter(), true);
 
-        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, List.of(
+        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1, List.of(
                 chunk(1, "PARAGRAPH", "a", null, null),
                 chunk(2, "PARAGRAPH", "b", null, null))))
                 .isInstanceOf(BizException.class)

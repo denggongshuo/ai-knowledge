@@ -113,6 +113,17 @@ public final class AuditRiskPolicy {
         // ---------- 第 3 类 · 内容删除 ----------
         register(AuditModule.USER, "删除用户", Category.CONTENT_DELETE, RiskLevel.HIGH,
                 "§4.3③内容删除：软删账号，不可逆（保留历史记录但不可再用）");
+        // `T-407` 落地（2026-09-17 · S4-D）：下面两条**从 PLANNED 移入 IMPLEMENTED**。
+        // 移入的判据是"注解真的挂上去了" —— 本类的正向断言（注解 → 策略）会当场发现漏登记，
+        // 而反向断言（策略 → 注解）会排除 PLANNED，所以**留在 PLANNED 里不会再报错**，
+        // 必须靠人工在实装那一刻把它搬过来（这一步漏了就是"策略表说它是计划、而它已经在跑"）。
+        register(AuditModule.KB, "删除知识库", Category.CONTENT_DELETE, RiskLevel.HIGH,
+                "§4.3③内容删除：软删进回收站（`T-407`）。`G3-8` 的判据正要求它标高危 —— "
+                        + "口径侧早在 S3-D 冻结（本条原先就在 PLANNED 表里），本批补的是**运行时**那一半："
+                        + "在这之前 `KbController` 无任何 `DeleteMapping`，这条策略**没有任何触发点**");
+        register(AuditModule.KB, "清空索引", Category.CONTENT_DELETE, RiskLevel.HIGH,
+                "§4.3③内容删除：清空后该库文档全部检索不到（块还在 MySQL，但向量已删）—— "
+                        + "对用户而言与删除内容等价。`T-407` 的清空半边，与「删除知识库」同批落地");
 
         // ---------- 第 5 类扩展 · 账号安全变更（2026-09-14 定案） ----------
         register(AuditModule.AUTH, "修改密码", Category.ACCOUNT_SECURITY, RiskLevel.HIGH,
@@ -198,8 +209,6 @@ public final class AuditRiskPolicy {
                 "§4.3②数据导出：批量形态属数据外带风险（与单文件下载的分界就在「批量」）");
         register(PLANNED, AuditModule.DOC, "删除文档", Category.CONTENT_DELETE, RiskLevel.HIGH,
                 "§4.3③内容删除");
-        register(PLANNED, AuditModule.KB, "删除知识库", Category.CONTENT_DELETE, RiskLevel.HIGH,
-                "§4.3③内容删除；G3-8 判据正要求它标高危");
         register(PLANNED, AuditModule.SYSTEM, "启用模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
                 "§4.3④模型配置变更，**含启用切换**");
         register(PLANNED, AuditModule.SYSTEM, "切换重排模型", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,

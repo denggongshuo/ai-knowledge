@@ -1,5 +1,6 @@
 package com.knowledge.ai.pipeline.vectorize;
 
+import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import lombok.extern.slf4j.Slf4j;
@@ -51,26 +52,29 @@ public class ChunkVectorizer {
     }
 
     /**
-     * 把一篇文档的块全部向量化并写入 Milvus。
+     * 把一篇文档的块全部向量化并写入 Milvus 的**指定代**。
      *
-     * @param docId  文档 id（Milvus 的删除按它走）
-     * @param kbId   所属知识库
-     * @param chunks 该文档的全部块（**含不进池的**：本方法自己挑，调用方不必先过滤 ——
-     *               让"哪些块进池"只有一个口径）
+     * @param docId      文档 id（Milvus 的删除按它走）
+     * @param kbId       所属知识库
+     * @param generation 写进哪一代分区（{@code T-406} 的按代切换）。
+     *                   日常解析传 {@code sys_kb.index_generation}；重建索引传"新代"。
+     * @param chunks     该文档的全部块（**含不进池的**：本方法自己挑，调用方不必先过滤 ——
+     *                   让"哪些块进池"只有一个口径）
      * @return 实际写入的条数
      */
-    public Result vectorize(long docId, long kbId, List<VectorChunk> chunks) {
+    public Result vectorize(long docId, long kbId, int generation, List<VectorChunk> chunks) {
         if (!enabled) {
             log.info("向量化开关未开启（m05.vectorize.enabled=false），跳过：docId={}", docId);
             return new Result(0, 0, Status.DISABLED, "向量化开关未开启（m05.vectorize.enabled=false）");
         }
 
+        String partition = MilvusConstants.partitionName(kbId, generation);
         List<VectorChunk> candidates = VectorChunk.onlyVectorized(chunks);
         int skipped = chunks.size() - candidates.size();
         if (candidates.isEmpty()) {
             // 空块集也要走一次删除：上一次解析若写过向量，不清掉就会留下"文档没有块、
             // 却检索得到"的幽灵 —— 与 DocRecordWriter 空块集也要回填 chunk_count = 0 同一条理由
-            writer.replaceDocument(docId, List.of());
+            writer.replaceDocument(partition, docId, List.of());
             log.info("没有需要向量化的块（全部被跳过）：docId={} 跳过={}", docId, skipped);
             return new Result(0, skipped, Status.EMPTY, "没有需要向量化的块");
         }
@@ -93,9 +97,9 @@ public class ChunkVectorizer {
         for (int i = 0; i < candidates.size(); i++) {
             records.add(new VectorRecord(candidates.get(i), kbId, docId, vectors.get(i)));
         }
-        int written = writer.replaceDocument(docId, records);
-        log.info("文档向量化完成：docId={} 写入={} 跳过={}（跳过 = 表格父块 / 未实现的图片块）",
-                docId, written, skipped);
+        int written = writer.replaceDocument(partition, docId, records);
+        log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={}（跳过 = 表格父块 / 未实现的图片块）",
+                docId, partition, written, skipped);
         return new Result(written, skipped, Status.OK, "已写入 " + written + " 个向量");
     }
 

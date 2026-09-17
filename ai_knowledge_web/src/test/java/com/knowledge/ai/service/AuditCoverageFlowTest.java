@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 25 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 27 个动作逐条写死，少一个、多一个、等级错一档都红。
  *
  * <p>⚠️ 与计划书的算术偏差（实测为准）：计划头写「总数由 12 → 23」，实测 HEAD 为 <b>13</b>、
  * C2 结束时为 <b>24</b>（新增 11 条不变）。差异来自撰写时把 {@code AuditContext} 的 javadoc 示例
@@ -42,6 +42,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>S4-M05-A（2026-09-16）加 1 条 → 25</b>：`T-500` `DocService#upload` 的
  * 「文档 / 上传文档 / NORMAL」。同步三处（本仓冻结口径）：① 注解 ②
  * {@code AuditRiskPolicy.IMPLEMENTED} 登记带理由 ③ 本清单 —— 漏任一处本用例即红。
+ *
+ * <p><b>S4-D（2026-09-17）加 2 条 → 27</b>：`T-407` 的「知识库 / 删除知识库 / HIGH」与
+ * 「知识库 / 清空索引 / HIGH」。这两条**不是新裁定** —— 它们早在 S3-D 就写进了
+ * {@code AuditRiskPolicy.PLANNED}，只是当时没有任何触发接口。本批实装后必须从 PLANNED
+ * **搬进 IMPLEMENTED**：PLANNED 不参与「策略 → 注解」的反向断言，所以**搬表这步没有自动检查兜底**，
+ * 漏了就是"策略表说它是计划、而它已经在跑"（{@code AuditRiskPolicy} 的 PLANNED 段留了注释提醒）。
  */
 class AuditCoverageFlowTest extends ApiTestSupport {
 
@@ -105,9 +111,14 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         expected.put(AuditModule.GRANT + " 启用/停用角色", RiskLevel.HIGH);
         expected.put(AuditModule.GRANT + " 新建角色", RiskLevel.NORMAL);
         expected.put(AuditModule.GRANT + " 删除角色", RiskLevel.NORMAL);
-        // ---- 知识库（2）----
+        // ---- 知识库（4）---- （+2 由 S4-D 的 T-407 新增）
         expected.put(AuditModule.KB + " 保存配置", RiskLevel.HIGH);
         expected.put(AuditModule.KB + " 创建知识库", RiskLevel.NORMAL);
+        // 下面两条在 S3-D 就**裁定过**（原先躺在 AuditRiskPolicy.PLANNED 里），
+        // 但直到 T-407 落地才有了注解 —— PLANNED 不参与"策略 → 注解"的反向断言，
+        // 所以搬表这一步没人替你做（AuditRiskPolicy 里留了注释）
+        expected.put(AuditModule.KB + " 删除知识库", RiskLevel.HIGH);
+        expected.put(AuditModule.KB + " 清空索引", RiskLevel.HIGH);
         // ---- 文档（1）---- （S4-M05-A 新增：上传入库）
         expected.put(AuditModule.DOC + " 上传文档", RiskLevel.NORMAL);
         // ---- 认证（2）----
@@ -253,13 +264,13 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 25 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 27 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
         assertThat(actual)
                 .as("总数变化必须是有意为之：新增审计点请同步改本用例与 AuditRiskPolicy")
-                .hasSize(25);
+                .hasSize(27);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

@@ -4,9 +4,12 @@ import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.PermissionLogic;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.dto.kb.KbDtos;
+import com.knowledge.ai.service.KbLifecycleService;
 import com.knowledge.ai.service.KbService;
+import com.knowledge.ai.service.ReindexService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -66,6 +69,12 @@ import org.springframework.web.bind.annotation.RestController;
 public class KbController {
 
     private final KbService kbService;
+
+    /** `T-406`：重建索引 + 清空索引（索引侧的两个写操作）。 */
+    private final ReindexService reindexService;
+
+    /** `T-407`：删除知识库（软删）。 */
+    private final KbLifecycleService kbLifecycleService;
 
     /**
      * {@code GET /kb?scope=&keyword=&deptId=&status=} —— 列表（数据范围 ∩ 授权，SQL 层）。
@@ -166,5 +175,66 @@ public class KbController {
     @RequiresPerm("kb:view")
     public ApiResponse<KbDtos.StorageQuota> storageQuota() {
         return ApiResponse.ok(kbService.storageQuota());
+    }
+
+    // ==================== T-406 / T-407 生命周期（2026-09-17 · S4-D）====================
+
+    /**
+     * {@code POST /kb/{kbId}/reindex} —— 重建索引（`T-406`，🚩 高危）。
+     *
+     * <p><b>只负责受理</b>：重建是长任务（示例 42 分钟），同步做会把请求挂死，
+     * 所以立刻返回 {@code taskId}，进度走 {@code GET /doc/tasks/{taskId}}（`T-509` 的投影）。
+     *
+     * <p>权限挂 {@code kb:update}：它是"改这个库的索引"的写操作。库里实际写的是
+     * {@code sys_kb.index_generation}（代）与 {@code sys_document}（状态/断点），
+     * 都属该库的写 —— 与 {@code kb:config}（改参数）不是一回事，但档位相同。
+     *
+     * <p>⚠️ 不走 {@code @AuditLog}：重建**不改变业务语义**（内容一样，只是重算索引），
+     * 《10》§4.3 的高危四类也不含它。它留下的是任务记录，不是审计事件 ——
+     * 与"删除知识库"必须留痕形成对照。
+     */
+    @PostMapping("/{kbId}/reindex")
+    @RequiresPerm("kb:update")
+    public ApiResponse<KbDtos.ReindexAccepted> reindex(@PathVariable long kbId,
+                                                       @RequestBody(required = false) KbDtos.ReindexRequest request) {
+        String mode = request == null || request.mode() == null || request.mode().isBlank()
+                ? "IMMEDIATE" : request.mode();
+        String scheduledAt = request == null ? null : request.scheduledAt();
+        String taskId = reindexService.submit(kbId);
+        return ApiResponse.ok(new KbDtos.ReindexAccepted(taskId, mode, "ACCEPTED", scheduledAt));
+    }
+
+    /**
+     * {@code DELETE /kb/{kbId}/index} —— 清空索引（`T-407`，🚩 高危）。
+     *
+     * <p>与"重建"的区别：清空是**真的把向量删掉**（用户明确要求），不保留旧代；
+     * 清完该库的文档全部退回 {@code INDEXING}（有块、但不可检索）。
+     *
+     * <p>⚠️ 走 {@code @AuditLog} 且**标高危**：它是"内容删除"——
+     * 删掉之后这些文档**检索不到了**，属《10》§4.3 的高危四类。
+     */
+    @DeleteMapping("/{kbId}/index")
+    @RequiresPerm("kb:update")
+    public ApiResponse<KbDtos.IndexCleared> clearIndex(@PathVariable long kbId) {
+        int dropped = reindexService.clearIndex(kbId);
+        return ApiResponse.ok(new KbDtos.IndexCleared(dropped > 0));
+    }
+
+    /**
+     * {@code DELETE /kb/{kbId}} —— 删除知识库（`T-407`，🚩 高危，**软删进回收站**）。
+     *
+     * <p>权限 {@code kb:delete} —— 它在权限矩阵里是**唯一只授给超级管理员「管理」**的一项
+     * （{@code V5} 的注释：删除知识库是数据范围之外的最高危动作）。
+     *
+     * <p>审计在 Service 层做（{@code KbLifecycleService#softDelete}）：那里才拿得到
+     * 删除前的库名与计数，注解挂在 Controller 上就只能记一个 id。
+     *
+     * <p>⚠️ 路径段数与 {@code /kb/{kbId}/index} 不同（2 段 vs 3 段），不冲突；
+     * 与 {@code GET /kb/storage-quota} 同型（见上面那条的注释）。
+     */
+    @DeleteMapping("/{kbId}")
+    @RequiresPerm("kb:delete")
+    public ApiResponse<KbDtos.KbDeleted> delete(@PathVariable long kbId) {
+        return ApiResponse.ok(kbLifecycleService.softDelete(kbId));
     }
 }

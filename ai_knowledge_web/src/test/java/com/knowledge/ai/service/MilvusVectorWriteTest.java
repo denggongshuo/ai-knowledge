@@ -2,6 +2,7 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.storage.MilvusPartitionManager;
 import com.knowledge.ai.core.storage.MilvusProperties;
 import com.knowledge.ai.pipeline.vectorize.VectorChunk;
 import com.knowledge.ai.pipeline.vectorize.VectorRecord;
@@ -10,7 +11,6 @@ import io.milvus.common.clientenum.ConsistencyLevelEnum;
 import io.milvus.grpc.QueryResults;
 import io.milvus.param.ConnectParam;
 import io.milvus.param.R;
-import io.milvus.param.collection.FlushParam;
 import io.milvus.param.dml.QueryParam;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -45,9 +45,20 @@ class MilvusVectorWriteTest {
 
     private static final long TEST_KB_ID = 1L;
 
+    /**
+     * 测试专用分区（`T-406` 起写入必须指定分区）。
+     *
+     * <p>用 {@code zzvecprobe} 前缀而不是复用真实的 {@code kb1_g1}：真实分区里可能有
+     * 真实文档的向量，测试的清理会把它们一起删掉 —— 取证脚本最怕的就是"跑一遍把库清了"。
+     * 也刻意与 `MilvusPartitionProbeTest` 的 {@code zzprobe_} 区分开，两者互不干扰。
+     */
+    private static final String TEST_PARTITION = "zzvecprobe";
+
     private static MilvusServiceClient client;
 
     private static MilvusChunkWriter writer;
+
+    private static MilvusPartitionManager partitions;
 
     @BeforeAll
     static void setUp() {
@@ -58,16 +69,18 @@ class MilvusVectorWriteTest {
                 .withConnectTimeout(props.getConnectTimeoutMs(), java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build());
         writer = new MilvusChunkWriter(client, props);
-        writer.deleteByDocId(TEST_DOC_ID, props.getCollection());
+        partitions = new MilvusPartitionManager(client, props);
+        // 写进不存在的分区会**显式失败**（步 0 探针），所以先 ensure
+        partitions.ensure(TEST_PARTITION);
+        writer.deleteByDocId(TEST_DOC_ID, TEST_PARTITION);
     }
 
     @AfterAll
     static void tearDown() {
         if (writer != null && client != null) {
-            writer.deleteByDocId(TEST_DOC_ID, new MilvusProperties().getCollection());
-            client.flush(FlushParam.newBuilder()
-                    .withCollectionNames(List.of(new MilvusProperties().getCollection()))
-                    .build());
+            // 清文档 + 丢分区（分区留着就是幽灵分区，且下次 ensure 到它里面还有脏数据）
+            writer.deleteByDocId(TEST_DOC_ID, TEST_PARTITION);
+            partitions.dropQuietly(TEST_PARTITION);
             client.close();
         }
     }
@@ -75,7 +88,7 @@ class MilvusVectorWriteTest {
     @Test
     @DisplayName("G4-10：向量真进 Milvus，且标量字段集就是契约的那 4+2 列（I-9 无标签字段）")
     void vectorsAreWrittenWithContractFieldsOnly() {
-        writer.replaceDocument(TEST_DOC_ID, List.of(
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of(
                 record(1, "PARAGRAPH", "正文一", "1. 总则", null),
                 record(2, "TABLE", "型号 A-100，单价 ￥1,200", "2. 报价", 2L),
                 record(3, "SUMMARY", "本文是……", null, null)));
@@ -98,8 +111,8 @@ class MilvusVectorWriteTest {
                 record(11, "PARAGRAPH", "第一版", null, null),
                 record(12, "PARAGRAPH", "第二版", null, null));
 
-        writer.replaceDocument(TEST_DOC_ID, records);
-        writer.replaceDocument(TEST_DOC_ID, records);
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, records);
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, records);
 
         assertThat(rowCount(queryByDocId())).isEqualTo(2);
     }
@@ -107,14 +120,14 @@ class MilvusVectorWriteTest {
     @Test
     @DisplayName("重写时旧条被清掉：块少了不会留下幽灵向量")
     void shrinkRemovesStaleVectors() {
-        writer.replaceDocument(TEST_DOC_ID, List.of(
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of(
                 record(21, "PARAGRAPH", "a", null, null),
                 record(22, "PARAGRAPH", "b", null, null),
                 record(23, "PARAGRAPH", "c", null, null)));
         assertThat(rowCount(queryByDocId())).isEqualTo(3);
 
         // 模拟重解析后只剩 2 块：旧的第 3 条必须消失
-        writer.replaceDocument(TEST_DOC_ID, List.of(
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of(
                 record(31, "PARAGRAPH", "a", null, null),
                 record(32, "PARAGRAPH", "b", null, null)));
 
@@ -126,10 +139,10 @@ class MilvusVectorWriteTest {
     @Test
     @DisplayName("空列表 = 只删不插（清空该文档的向量）")
     void emptyListDeletesOnly() {
-        writer.replaceDocument(TEST_DOC_ID, List.of(record(41, "PARAGRAPH", "x", null, null)));
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of(record(41, "PARAGRAPH", "x", null, null)));
         assertThat(rowCount(queryByDocId())).isEqualTo(1);
 
-        writer.replaceDocument(TEST_DOC_ID, List.of());
+        writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of());
         assertThat(rowCount(queryByDocId())).isZero();
     }
 
@@ -140,7 +153,7 @@ class MilvusVectorWriteTest {
                 new VectorChunk(51, "PARAGRAPH", "x", null, "INTERNAL", null),
                 TEST_KB_ID, TEST_DOC_ID, new float[512]);
 
-        assertThatThrownBy(() -> writer.replaceDocument(TEST_DOC_ID, List.of(bad)))
+        assertThatThrownBy(() -> writer.replaceDocument(TEST_PARTITION, TEST_DOC_ID, List.of(bad)))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("向量维度不符")
                 .hasMessageContaining("1024");
@@ -176,6 +189,7 @@ class MilvusVectorWriteTest {
         // STRONG：本测试要读回**刚写进去的**数据，不能受 Bounded 一致性影响
         R<QueryResults> result = client.query(QueryParam.newBuilder()
                 .withCollectionName(new MilvusProperties().getCollection())
+                .withPartitionNames(List.of(TEST_PARTITION))
                 .withExpr(MilvusConstants.FIELD_DOC_ID + " in [" + TEST_DOC_ID + "]")
                 .withOutFields(outFields)
                 .withConsistencyLevel(ConsistencyLevelEnum.STRONG)

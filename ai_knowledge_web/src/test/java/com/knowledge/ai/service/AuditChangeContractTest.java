@@ -125,8 +125,11 @@ class AuditChangeContractTest extends ApiTestSupport {
         assertThat(batch.risk()).isEqualTo(RiskLevel.HIGH);
         assertThat(batch.category()).isEqualTo(AuditRiskPolicy.Category.DATA_EXPORT);
 
-        // 「删除知识库」是 G3-8 的另一半：它必须标高危
-        AuditRiskPolicy.Rule kbDelete = AuditRiskPolicy.findPlanned("知识库", "删除知识库").orElseThrow();
+        // 「删除知识库」是 G3-8 的另一半：它必须标高危。
+        // ⚠️ 查的是 findImplemented 而不是 findPlanned —— T-407 于 2026-09-17（S4-D）落地，
+        // 该动作已从 PLANNED 移入 IMPLEMENTED（策略没变，只是**有了触发点**）。
+        // 本断言跟着搬，断的仍然是"必须标高危"这一件事。
+        AuditRiskPolicy.Rule kbDelete = AuditRiskPolicy.findImplemented("知识库", "删除知识库").orElseThrow();
         assertThat(kbDelete.risk()).isEqualTo(RiskLevel.HIGH);
         assertThat(kbDelete.category()).isEqualTo(AuditRiskPolicy.Category.CONTENT_DELETE);
     }

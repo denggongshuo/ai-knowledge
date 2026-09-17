@@ -165,10 +165,12 @@ public class DocRecordWriter {
      * （{@code ChunkVectorizer.Result#allowsReady()}）。
      */
     @Transactional
-    public void markReady(long docId) {
+    public void markReady(long docId, int generation) {
         entityManager.createNativeQuery(
-                        "update sys_document set status = 'READY', error_msg = null, updated_at = :now "
+                        "update sys_document set status = 'READY', error_msg = null, "
+                                + "index_generation = :generation, updated_at = :now "
                                 + "where id = :id")
+                .setParameter("generation", generation)
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", docId)
                 .executeUpdate();

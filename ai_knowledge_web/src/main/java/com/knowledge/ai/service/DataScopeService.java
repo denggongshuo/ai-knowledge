@@ -118,7 +118,21 @@ public class DataScopeService {
         // 停用账号恒不可见（W7）：与授权、部门两维**硬交**，不设豁免
         String active = """
                 EXISTS (SELECT 1 FROM sys_user u WHERE u.id = :ds_uid AND u.status <> 'DISABLED')""";
-        String visible = granted + " AND " + active;
+        // 软删的库恒不可见（`T-407`，2026-09-17 新增）：与授权、部门、账号状态三维**硬交**，不设豁免。
+        //
+        // ⚠️ 为什么加在**这里**而不是每个查询各加一遍：本片段的调用方是"所有按可见性读 sys_kb 的地方"
+        // （列表 / 配置 / 解析配置 / 授权页 / 单库校验）。散着加就等于给每个调用点一次漏掉的机会，
+        // 而**漏掉的表现是"删掉的库照样出现在列表里、还能被上传文档"** —— 静默且危险。
+        // 这正是类注释那句"任何绕过它直接 select * from sys_kb 的写法，都会让 G2-7/G2-8 已有的
+        // SQL 层取证失去意义"要防的事，所以判据必须长在这条唯一的路上。
+        String notDeleted = "k.deleted_at IS NULL";
+        // ⚠️ 末尾**必须**留一个空格：下面 DEPT 两分支用 `visible + """..."""` 拼装，
+        // 而那段 text block 的内容以 `AND` 开头、**不带前导空白**。少这个空格就会拼出
+        // `k.deleted_at IS NULLAND (k.dept_id = ...)` —— MySQL 把 `NULLAND` 当成**一个标识符**，
+        // 报的是语法错，而错误信息指的是别处，第一眼看不出来。
+        // 这与类注释里 B1 那次 `andEXISTS` 是**同一形状**（text block 会剥掉行尾空白）。
+        // 实测于 2026-09-17：`KbGrantFlowTest#deptAndChild` 当场转红。
+        String visible = granted + " AND " + active + " AND " + notDeleted + " ";
         return switch (scope) {
             case ALL -> new ScopeCondition(visible, params);
             case DEPT_AND_CHILD -> {

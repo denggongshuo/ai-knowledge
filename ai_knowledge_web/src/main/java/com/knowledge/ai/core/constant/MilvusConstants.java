@@ -64,6 +64,39 @@ public final class MilvusConstants {
     /** 检索时探测的聚类数，取 nlist 的 1/4 ~ 1/8。 */
     public static final int INDEX_NPROBE = 16;
 
+    // ---------- 分区（按代切换，`T-406` · D-7） ----------
+
+    /**
+     * 分区名前缀与分隔符 —— 分区名 = {@code kb<kbId>_g<generation>}，如 {@code kb8_g2}。
+     *
+     * <h3>为什么用分区做"重建的原子切换"</h3>
+     * <p>{@code D-7} 要求重建"写新 collection + 原子切换、不得原地删旧索引"，而
+     * {@code D-4}/{@code R-8} 定死了单 collection —— 整集合的切换做不了"只换 8 个库里的某一个"。
+     * 分区正是这个夹缝里的解：**同一个 collection 内**按代分组，切换 = 换一个分区名去查。
+     *
+     * <p>⚠️ <b>代价与硬约束</b>（步 0 探针实测，见 {@code MilvusPartitionProbeTest}）：
+     * <ul>
+     *   <li>写进**不存在**的分区会**显式失败**，不会隐式创建 → 写前必须 ensure-exists；</li>
+     *   <li>查一个**已 drop** 的分区会**报错**（65535），不是返回空集 → 检索侧绝不能
+     *       指向一个可能不存在的分区，否则整个检索请求炸掉而不是少几条结果；</li>
+     *   <li>drop 前必须 {@code releasePartitions}，否则以 65535 静默失败。</li>
+     * </ul>
+     */
+    public static final String PARTITION_PREFIX = "kb";
+
+    /** 代与库 id 的分隔符。 */
+    public static final String PARTITION_GENERATION_SEPARATOR = "_g";
+
+    /**
+     * 分区名（唯一口径处 —— 读写两侧都必须叫它，不许各自拼字符串）。
+     *
+     * @param kbId       知识库 id
+     * @param generation 代（从 1 起；见 {@code sys_kb.index_generation} 的注释里"为什么不是 0"）
+     */
+    public static String partitionName(long kbId, int generation) {
+        return PARTITION_PREFIX + kbId + PARTITION_GENERATION_SEPARATOR + generation;
+    }
+
     private MilvusConstants() {
     }
 }

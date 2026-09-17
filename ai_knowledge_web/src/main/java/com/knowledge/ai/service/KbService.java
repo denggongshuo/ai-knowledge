@@ -472,9 +472,12 @@ public class KbService {
      */
     @Transactional(readOnly = true)
     public KbDtos.StorageQuota storageQuota() {
+        // 软删的库不计入配额（`T-407`）：用户看到的用量应与列表里的库对得上 ——
+        // 回收站里的库还在列表外，却把用量算进去，就是"数字对不上"的那类投诉
         Object[] agg = (Object[]) entityManager.createNativeQuery("""
                         select count(*), coalesce(sum(doc_count), 0), coalesce(sum(chunk_count), 0)
                         from sys_kb
+                        where deleted_at is null
                         """).getSingleResult();
         return new KbDtos.StorageQuota(
                 humanSize(minioUsedBytes()),
@@ -839,7 +842,10 @@ public class KbService {
     // ==================== 内部：校验 ====================
 
     private void requireKb(long kbId) {
-        Number n = (Number) entityManager.createNativeQuery("select count(*) from sys_kb where id = :id")
+        // 软删的库视为不存在（`T-407`）：对已删除的库读配置/存配置都应得到 10043，
+        // 而不是"能读能改"（那会让回收站里的库看起来还活着）
+        Number n = (Number) entityManager.createNativeQuery(
+                        "select count(*) from sys_kb where id = :id and deleted_at is null")
                 .setParameter("id", kbId)
                 .getSingleResult();
         if (n == null || n.longValue() == 0) {
