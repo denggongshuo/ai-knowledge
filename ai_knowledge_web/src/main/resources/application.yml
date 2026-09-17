@@ -179,6 +179,31 @@ spring:
 # ============================================================
 app:
   # ------------------------------------------------------------
+  # 解析调度（T-O01 · S4-E1）—— 解析从 `ak-task-*` 池里独立出来
+  #
+  # 解析作业是**库里的行**（sys_async_task），由 `ParseWorker` 用
+  # `SELECT ... FOR UPDATE SKIP LOCKED` 领取后执行。三项旋钮：
+  #   · threads        —— 解析池大小（线程名 `ak-parse-*`，与 `ak-task-*` 分得清）
+  #   · kb-concurrency —— **按知识库**的并发上限。一个库的批量导入不得饿死别人
+  #   · max-attempts   —— 最多尝试次数（**含首次**）。仅"基础设施类"失败才重试；
+  #                       文档自身的问题（无文本层/编码/加密）直接终态，不浪费用户时间
+  #
+  # ⚠️ 测试期关掉（`src/test/resources/application.properties`）：后台轮询会让断言
+  #    依赖时序（"上传后等多久才 INDEXING"）。关掉之后由用例显式调 `ParseWorker#drainOnce()`
+  #    驱动 —— **确定性且不丢覆盖**，比"关掉然后只断言 UPLOADED"诚实。
+  # ------------------------------------------------------------
+  parse:
+    worker:
+      enabled: ${PARSE_WORKER_ENABLED:true}
+      threads: ${PARSE_WORKER_THREADS:4}
+      poll-interval-ms: ${PARSE_WORKER_POLL_MS:1000}
+      # RUNNING 超过这个时长没有心跳 → 认为持有者已被强杀，回收为 PENDING（O1 判据 4）
+      stale-seconds: ${PARSE_STALE_SECONDS:900}
+      max-attempts: ${PARSE_MAX_ATTEMPTS:3}
+      retry-backoff-seconds: ${PARSE_RETRY_BACKOFF_SECONDS:30}
+    kb-concurrency: ${PARSE_KB_CONCURRENCY:2}
+
+  # ------------------------------------------------------------
   # M05 索引增强（T-507）—— 生产默认开，测试期关
   #
   # 每次上传解析会真调一次对话模型（文档级摘要 + 内容标签 + 实体关系，共享同一上下文）。

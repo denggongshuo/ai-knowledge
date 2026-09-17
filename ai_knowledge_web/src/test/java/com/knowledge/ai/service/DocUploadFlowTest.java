@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.async.ParseWorker;
 import com.knowledge.ai.core.storage.DocStorage;
 import com.knowledge.ai.support.ApiTestSupport;
 import org.junit.jupiter.api.AfterEach;
@@ -46,6 +47,15 @@ class DocUploadFlowTest extends ApiTestSupport {
 
     /** 本用例造过的库 id（每个用例结束一并清掉：文档 + 授权 + 库）。 */
     private final List<Long> probeKbIds = new ArrayList<>();
+
+    /**
+     * 解析作业的执行者（`S4-E1`）。
+     *
+     * <p>测试期后台轮询关掉了，上传之后由用例显式 `drainOnce()` 驱动解析 ——
+     * 断言仍是确定性的，走的也仍是同一条 领取 → 执行 → 回报 的路。
+     */
+    @Autowired
+    private ParseWorker parseWorker;
 
     @Autowired
     private DocStorage docStorage;
@@ -138,8 +148,9 @@ class DocUploadFlowTest extends ApiTestSupport {
         assertThat(row.get("md5")).as("md5 由服务端按字节重算，不是客户端传的")
                 .isEqualTo(md5Hex(content));
         assertThat(row.get("status"))
-                .as("S4-B 起上传即解析：终态是 INDEXING（解析完成、等待建立索引），"
-                        + "READY 要等向量入 Milvus（S4-C）—— 那才是「报告说成功」")
+                .as("`S4-E1` 起上传与解析是**两个作业**：上传任务只负责转存（终态 UPLOADED），"
+                        + "解析由 ParseWorker 领作业执行（夹具里 drainOnce() 已驱动一轮）。"
+                        + "所以这里读到的 INDEXING 是**解析作业**给的 —— READY 还要等向量入 Milvus")
                 .isEqualTo("INDEXING");
         assertThat(row.get("storage_path")).as("对象名由任务体回写").isNotNull();
 
@@ -544,6 +555,10 @@ class DocUploadFlowTest extends ApiTestSupport {
         }
         String taskId = accepted.data("$.taskId");
         awaitTaskDone(taskId, token);
+        // ⚠️ `S4-E1` 起上传（转存）与解析是**两个作业**：上传任务终态是 UPLOADED，
+        //    解析由 ParseWorker 领作业执行。测试期后台轮询关掉了，这里显式驱动一轮，
+        //    返回时文档已到 INDEXING / FAILED —— 与本批之前的语义一致。
+        parseWorker.drainOnce();
         return accepted;
     }
 

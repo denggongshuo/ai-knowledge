@@ -15,6 +15,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 /**
@@ -40,7 +42,9 @@ import java.util.stream.Stream;
  *   <li><b>图片输出必须关</b>（{@code IMAGE_OUTPUT_OFF}）：21.8MB 那类图多的手册
  *       开了会把产物撑到几百 MB（`T-0S1` §二原话）；</li>
  *   <li><b>全局串行</b>（见 {@link #LOCK}）：API 是静态入口（含 {@code shutdown()}），
- *       线程安全性未验证 —— 宁可排队，不要"偶发跨文档串内容"这种没法复现的错。</li>
+ *       线程安全性未验证 —— 宁可排队，不要"偶发跨文档串内容"这种没法复现的错。
+ *       `S4-E1` 起**等锁带超时**（{@link #LOCK_WAIT_SECONDS}），排不上队的一方会拿到
+ *       明确原因而不是无限期挂起。</li>
  * </ol>
  */
 @Slf4j
@@ -49,10 +53,25 @@ public class PdfDocumentParser {
     /**
      * opendataloader 的调用锁 —— **全局串行**的落点。
      *
-     * <p>{@code AsyncConfig} 的任务池是 core=4/max=8；没有这把锁，四个解析任务
-     * 会同时走进这个静态 API。S9 的吞吐优化若证实线程安全，去掉它即可（计划 §3.4 假设 5）。
+     * <p>没有这把锁，多个解析任务会同时走进这个静态 API。S9 的吞吐优化若证实线程安全，
+     * 去掉它即可（计划 §3.4 假设 5）。
+     *
+     * <h3>⚠️ `S4-E1` 为什么把它从 {@code Object} 换成 {@link ReentrantLock}</h3>
+     * 原实现是 {@code private static final Object LOCK} + {@code synchronized (LOCK)}。
+     * 而 {@code O1` §4 步 5 要的是「带超时的 {@code tryLock}」—— **{@code synchronized} 没有超时**，
+     * 这是 `优化/O1` 文档写错的一处（它把这里描述成 {@code ReentrantLock}，见计划 §1-6）。
+     *
+     * <p>换成 {@code ReentrantLock} 之后，**等锁的那一方**可以带超时放弃：
+     * 一个畸形 PDF 长时间占着锁时，后面的作业不再无限期挂起，而是拿到
+     * {@code PARSE_QUEUE_TIMEOUT} 的明确原因（"解析排队时间过长，请稍后重试"）。
+     * 这是 `O1` 痛点 #3「一把锁卡死整个队列」在本进程内能做的全部 ——
+     * ⚠️ **注意它限的是"等锁方"，不是"持锁方"**：持锁的那个线程仍要等本地调用自己返回。
+     * 因为同 JVM 下无法安全强杀一个卡在本地代码里的线程（计划 §9）。
      */
-    private static final Object LOCK = new Object();
+    private static final ReentrantLock LOCK = new ReentrantLock(true);
+
+    /** 等锁超时（秒）。超过就放弃并给可执行原因，而不是无限期排队。 */
+    private static final long LOCK_WAIT_SECONDS = Long.getLong("m05.parse.lock-wait-seconds", 120L);
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -79,8 +98,23 @@ public class PdfDocumentParser {
             // 多行单元格压平会让行列错位（T-0S1 §三），所以必须保留换行
             config.setKeepLineBreaks(true);
 
-            synchronized (LOCK) {
+            // 等锁带超时：拿不到就抛**可执行**的原因回去，而不是无限期挂着
+            // （`O1` 痛点 #3：一个畸形 PDF 占住锁 → 整个队列停摆且没有 kill 手段）。
+            boolean acquired;
+            try {
+                acquired = LOCK.tryLock(LOCK_WAIT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw ParseException.of("解析被中断（服务正在停止或该任务已超时），请重新提交", ex);
+            }
+            if (!acquired) {
+                throw new ParseException("解析排队时间过长（前面有文档正在解析且耗时异常），"
+                        + "请稍后重试；若持续出现，请检查是否有超大或损坏的文件");
+            }
+            try {
                 OpenDataLoaderPDF.processFile(pdfPath.toAbsolutePath().toString(), config);
+            } finally {
+                LOCK.unlock();
             }
 
             Path json = findFirst(outDir, JSON_SUFFIX);

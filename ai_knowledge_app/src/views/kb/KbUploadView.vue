@@ -285,6 +285,39 @@ function finishItem(item: UploadItem, ok: boolean) {
   maybeNotify()
 }
 
+/**
+ * 继续盯文档状态直到终态（`S4-E1` 新增）。
+ *
+ * <h3>为什么必须有这一步</h3>
+ * `S4-E1` 起**上传与解析是两个作业**：队列项的「已完成」只代表**转存**完成
+ * （D-5 里"上传"的边界），文档此刻如实是「已上传」。解析由后端的 ParseWorker
+ * 领作业执行，几秒后才推进到「索引中」→「已就绪」。
+ *
+ * <p>没有这一步的话，页面在"上传完成"那一刻刷一次列表就把「已上传」定住了 ——
+ * 用户看到的是一篇永远停在"已上传"的文档，**而这正是本项目最不能接受的形态**：
+ * 状态停在一个不再是事实的值上，且没有任何东西会去纠正它。
+ *
+ * <p>为什么是轮询列表而不是继续轮询上传任务：转存任务已经终态了，它不会再有变化；
+ * 真相在**文档行**上（由解析作业推进）。轮询在全部行进入终态或超时后自停，
+ * 不会留一个空转的定时器。
+ */
+function watchDocsUntilTerminal() {
+  const NON_TERMINAL = ['UPLOADED', 'PARSING', 'INDEXING']
+  const MAX_TICKS = 40 // 40 × 2s = 80s，覆盖单篇解析（含向量化）的正常耗时
+  let ticks = 0
+  const timer = setInterval(async () => {
+    ticks += 1
+    await loadDocs()
+    await loadIssues()
+    const stillRunning = docs.value.some((d) => NON_TERMINAL.includes(d.status))
+    if (!stillRunning || ticks >= MAX_TICKS) {
+      clearInterval(timer)
+      timers.delete(timer)
+    }
+  }, 2000)
+  timers.add(timer)
+}
+
 /** 整批完成通知（与告警区分） */
 function maybeNotify() {
   const pending = queue.value.filter((q) => q.status === 'UPLOADING' || q.status === 'PARSING')
@@ -306,6 +339,8 @@ function maybeNotify() {
   }
   loadDocs()
   loadIssues()
+  // `S4-E1`：转存完成 ≠ 解析完成 —— 继续盯到文档行进入终态为止（见该函数注释）
+  watchDocsUntilTerminal()
 }
 
 function retry(item: UploadItem) {

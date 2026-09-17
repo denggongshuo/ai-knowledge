@@ -2,6 +2,7 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.async.AsyncTaskInfo;
 import com.knowledge.ai.core.async.AsyncTaskService;
+import com.knowledge.ai.core.async.ParseWorker;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
@@ -20,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -79,7 +81,14 @@ public class DocService {
 
     private final AsyncTaskService asyncTaskService;
 
-    private final DocParseService docParseService;
+    /**
+     * 解析作业的投递口（`S4-E1`）。
+     *
+     * <p>⚠️ 这里依赖的是 **`ParseWorker` 的入队方法**，不是 `DocParseService` 本身 ——
+     * 上传**不再直接解析**（原因见 {@code upload} 里的注释）。本类因此不再需要
+     * `DocParseService`，那正是这次拆分在依赖图上的样子。
+     */
+    private final ParseWorker parseWorker;
 
     // ==================== T-501 · MD5 去重（秒传判断）====================
 
@@ -161,52 +170,70 @@ public class DocService {
         long docId = recordWriter.insert(kbId, user.getUserId(), title, realName,
                 type.isEmpty() ? "UNKNOWN" : type, size, md5);
 
+        // ⚠️ **必须在请求线程把字节定下来**（`S4-E1`）：`MultipartFile` 是请求作用域的，
+        //    请求一结束容器就清掉它。转存跑在异步任务里，不落暂存就是**赌一个竞态**——
+        //    详见 `DocStorage` 的 `spillToTemp` 注释（那条竞态在 `S4-E1` 被确定性触发过）。
+        String contentType = file.getContentType();
+        Path staged = docStorage.spillToTemp(file);
+
         // 幂等键含 (kbId, ownerId, md5)：同一个人对同一个库传同一个文件，连点也只跑一次。
         // ⚠️ 刻意**不含 docId** —— 那样每次调用都是新 key，幂等就失效了；
         //    代价是"刚传完立刻再传同一文件"会复用已完成的任务（拿回同一个 taskId），
         //    这是可接受的：完成态的任务读出来仍是 DONE，前端展示"已完成"而非"进行中"。
         String idempotencyKey = TASK_TYPE + ":" + kbId + ":" + user.getUserId() + ":" + md5;
-        String taskId = asyncTaskService.submit(TASK_TYPE, idempotencyKey, 0, context -> {
-            context.stage("接收文件");
-            context.percent(20);
-            context.stage("转存对象存储");
-            context.percent(60);
-            try {
-                String objectKey = docStorage.store(kbId, docId, file);
-                context.stage("写入文档记录");
-                context.percent(90);
-                recordWriter.markStored(docId, objectKey);
+        long ownerId = user.getUserId();
+        // 任务投不出去（如落库失败）时，没人会删暂存文件 —— 这里兜住
+        String taskId;
+        try {
+            taskId = asyncTaskService.submit(TASK_TYPE,
+                    AsyncTaskService.TaskSubject.of(kbId, docId, ownerId), idempotencyKey, 0, context -> {
+                        context.stage("接收文件");
+                        context.percent(20);
+                        context.stage("转存对象存储");
+                        context.percent(60);
+                        try {
+                            String objectKey = docStorage.storeFromFile(kbId, docId, staged, realName, size, contentType);
+                            context.stage("写入文档记录");
+                            context.percent(90);
+                            recordWriter.markStored(docId, objectKey);
 
-                // ---- S4-B：转存完成即解析（同一任务体的后续阶段，不另立任务）----
-                // 阶段文案与百分比对齐"上传只是受理、解析才是内容"的语义；
-                // parseDocument 内部已把失败落成 FAILED + error_msg，这里只透传结果形状。
-                context.stage("解析中");
-                Map<String, Object> parseResult = docParseService.parseDocument(docId);
-                boolean parseOk = "INDEXING".equals(parseResult.get("status"));
-                context.stage(parseOk ? "解析完成，等待建立索引" : "解析失败，详见文档列表");
-                context.percent(100);
+                            // ---- `S4-E1`：转存完成后**只投作业，不解析** ----
+                            // 这次拆分不是设计偏好，是技术必然（计划 §3.4 假设 1）：
+                            // `file`（MultipartFile）的字节只活在这次请求的内存里，任务体的闭包把它捕获了。
+                            // 若解析仍在同一个任务体里跑，「进程被杀后重启接着做」（O1 判据 4）
+                            // 就永远不成立 —— 重启后源文件只剩 MinIO 里那份，而它要等 store 成功才有。
+                            // 所以解析必须成为一个**可被重新领取的作业**，而它只能在 store 之后入队。
+                            //
+                            // 上传任务的终态因此回到 UPLOADED（不是 INDEXING）：转存是它负责的全部。
+                            // 解析的成败由解析作业 + 文档状态共同承载（`G4-3` 的 errorMsg 通道不变）。
+                            String parseTaskId = parseWorker.enqueue(kbId, docId, ownerId);
+                            context.stage("已转存，等待解析");
+                            context.percent(100);
 
-                Map<String, Object> payload = new HashMap<>();
-                payload.put("docId", docId);
-                payload.put("objectKey", objectKey);
-                payload.put("bytes", size);
-                payload.put("parse", parseResult);
-                // 解析失败时任务本身仍算"完成"（受理与转存都成功了）；
-                // 失败的事实由文档状态（FAILED + error_msg）与任务 payload 共同承载，
-                // 前端轮询读 errorMsg 的通道不变（G4-3）。
-                context.complete(payload);
-                log.info("文档上传完成：kbId={} docId={} taskId={} name={} bytes={} parse={}",
-                        kbId, docId, context.taskId(), realName, size,
-                        parseResult.get("status"));
-            } catch (BizException ex) {
-                // 业务异常的消息本来就是给用户看的（如"文件超过 100 MB 上限"），直接用
-                recordWriter.markFailed(docId, ex.getMessage());
-                throw ex;
-            } catch (Exception ex) {
-                recordWriter.markFailed(docId, "文件存储失败，请稍后重试");
-                throw ex;
-            }
-        });
+                            Map<String, Object> payload = new HashMap<>();
+                            payload.put("docId", docId);
+                            payload.put("objectKey", objectKey);
+                            payload.put("bytes", size);
+                            payload.put("parseTaskId", parseTaskId);
+                            context.complete(payload);
+                            log.info("文档转存完成，已投解析作业：kbId={} docId={} taskId={} parseTaskId={} name={} bytes={}",
+                                    kbId, docId, context.taskId(), parseTaskId, realName, size);
+                        } catch (BizException ex) {
+                            // 业务异常的消息本来就是给用户看的（如"文件超过 100 MB 上限"），直接用
+                            recordWriter.markFailed(docId, ex.getMessage());
+                            throw ex;
+                        } catch (Exception ex) {
+                            recordWriter.markFailed(docId, "文件存储失败，请稍后重试");
+                            throw ex;
+                        } finally {
+                            // 暂存文件**无论成败都要删** —— 100MB 一份，漏删就是按篇吃磁盘
+                            docStorage.discardTemp(staged);
+                        }
+                    });
+        } catch (RuntimeException ex) {
+            docStorage.discardTemp(staged);
+            throw ex;
+        }
 
         return new DocDtos.UploadAccepted(docId, taskId, realName, kbId, 0);
     }

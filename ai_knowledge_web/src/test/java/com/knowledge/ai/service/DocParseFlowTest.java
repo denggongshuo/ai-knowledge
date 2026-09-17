@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.async.ParseWorker;
 import com.knowledge.ai.core.storage.DocStorage;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import com.knowledge.ai.support.ApiTestSupport;
@@ -51,6 +52,16 @@ class DocParseFlowTest extends ApiTestSupport {
 
     @Autowired
     private DocParseService docParseService;
+
+    /**
+     * 解析作业的执行者（`S4-E1`）。
+     *
+     * <p>测试期后台轮询是**关掉的**（`app.parse.worker.enabled=false`），
+     * 所以上传之后必须由用例显式 `drainOnce()` 驱动解析 —— 这样断言是**确定性**的，
+     * 而覆盖一点没少：走的仍是同一条 领取 → 执行 → 回报 的路。
+     */
+    @Autowired
+    private ParseWorker parseWorker;
 
     @AfterEach
     void cleanProbeData() {
@@ -567,9 +578,21 @@ class DocParseFlowTest extends ApiTestSupport {
             sleep(50);
         }
 
+        // ⚠️ `S4-E1` 起上传与解析是**两个作业**：上面那个循环只覆盖到"转存完成"（终态 UPLOADED），
+        //    文档状态机的后半段（PARSING → INDEXING）由解析作业推进。
+        //    测试期后台轮询是关的，所以这里显式驱动一轮，再把最终状态采进序列 ——
+        //    这样"状态机单调推进"这条判据覆盖的仍是**完整**的两段，没有被削弱。
+        parseWorker.drainOnce();
+        String finalStatus = jdbcTemplate.queryForObject(
+                "select status from sys_document where file_name = '状态机探针.md' "
+                        + "and kb_id = ? order by id desc limit 1", String.class, kbId);
+        if (!seen.contains(finalStatus)) {
+            seen.add(finalStatus);
+        }
+
         assertThat(lastStage).as("stage 终态：complete() 会统一覆写成「已完成」（AsyncTaskService 的调度层语义），"
-                + "解析自己的阶段文案在 percent=100 前的最后一次采样里")
-                .containsAnyOf("解析完成", "已完成");
+                + "解析自己的阶段文案在自己那个任务里（见下一条用例）")
+                .containsAnyOf("已转存，等待解析", "已完成");
         assertThat(seen).as("状态序列只含合法前缀（UPLOADED→PARSING→INDEXING 的子序列，不回退）")
                 .isSubsetOf("UPLOADED", "PARSING", "INDEXING", "FAILED");
         assertThat(seen.getLast()).isEqualTo("INDEXING");
@@ -714,6 +737,10 @@ class DocParseFlowTest extends ApiTestSupport {
             return accepted;
         }
         awaitTaskDone(accepted.data("$.taskId"), token);
+        // ⚠️ `S4-E1` 起上传与解析是**两个作业**：上传任务只负责转存（终态 UPLOADED），
+        //    解析由 ParseWorker 领作业执行。测试期后台轮询关掉了，这里显式驱动一轮。
+        //    返回时文档已到 INDEXING / READY / FAILED —— 与拆分之前的语义一致。
+        parseWorker.drainOnce();
         return accepted;
     }
 

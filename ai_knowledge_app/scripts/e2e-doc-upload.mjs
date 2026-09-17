@@ -488,6 +488,14 @@ async function main() {
 
     // ---- 列表落地 ----
     await waitFor(`window.__t.docRows().length === 1`, { label: '文档列表出现该行', timeout: 20000 })
+    // ⚠️ `S4-E1` 起**上传与解析是两个作业**：上面那句「队列项已完成」只代表**转存**完成
+    //    （D-5 里"上传"的边界），文档此刻**如实**是「已上传」。解析由 ParseWorker 领作业执行，
+    //    要等下一轮轮询/刷新才推进到「已就绪」。
+    //    所以这里补一等 —— 它才是"上传之后最终会变成什么"的判据；直接断言会读到中间态。
+    await waitFor(
+      `['已就绪', '解析失败'].includes(window.__t.docRowOf(${JSON.stringify('E2E回归探针')})?.[5])`,
+      { label: '文档进入终态（解析作业跑完）', timeout: 90000 },
+    )
     const row = await evaluate(`window.__t.docRowOf(${JSON.stringify('E2E回归探针')})`)
     check(Array.isArray(row) && row.length > 0, 'G4-1：上传完成后文档列表出现该行（真刷新的列表）', row ? `列数=${row.length}` : '—')
     check(row && row.includes('已就绪'), 'G4-3（后半收口）：状态列渲染「已就绪」（域内真值 READY → 展示文案；S4-C3 起向量已入 Milvus，不再是 INDEXING）', `状态=${row?.[5]}`)

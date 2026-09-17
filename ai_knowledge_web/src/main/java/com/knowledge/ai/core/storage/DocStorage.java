@@ -13,6 +13,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Locale;
 
 /**
@@ -96,28 +99,110 @@ public class DocStorage {
      */
     public String store(long kbId, long docId, MultipartFile file) {
         validate(file);
+        try (InputStream in = file.getInputStream()) {
+            return putObject(kbId, docId, in, file.getOriginalFilename(), file.getSize(), contentTypeOf(file));
+        } catch (BizException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            log.error("读取上传流失败：kbId={} docId={} err={}", kbId, docId, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "文件存储失败，请稍后重试");
+        }
+    }
 
-        String objectKey = PREFIX + kbId + "/" + docId + "/" + safeName(file.getOriginalFilename());
+    // ==================================================================
+    // `S4-E1` 新增：把上传字节**与请求生命周期解耦**
+    //
+    // 为什么必须做：`MultipartFile` 是**请求作用域**的 —— 请求一结束，Servlet 容器
+    // 就清掉底层的 multipart 临时文件，`file.isEmpty()` 随之变 true。而转存跑在
+    // **异步任务**里（`T-006` 的立意：100MB 不让请求线程挂着），于是整条上传链路
+    // 一直在**赌一个竞态**：任务必须在请求结束之前读完这个文件。
+    //
+    // 这个竞态在 `S4-E1` 之前一直侥幸赢着（任务线程从提交到读文件几乎不做事），
+    // 直到本批给它加了两次进度落库 —— 十几毫秒的延迟就让它**确定性地输**。
+    // 现象极具迷惑性：任务落库为 FAILED，`error_msg` 是
+    // 「请选择要上传的文件」（`validate` 的 `isEmpty()` 分支），看起来像前端没传文件。
+    //
+    // 修法不是"把落库挪走好让竞态继续赢"，而是**把字节定下来**：
+    // 在请求线程把它复制到一个临时文件，异步任务从该文件转存，用完即删。
+    // 代价是每次上传多一遍本地磁盘写（100MB ≈ 百毫秒级），换来的是
+    // **不再依赖任何时序**。见 `plan/2026-09-17-S4-E1.md` §9 遗留。
+    // ==================================================================
+
+    /**
+     * 把上传字节复制到临时文件，返回该路径（**在请求线程调用**）。
+     *
+     * <p>调用方负责删除 —— 见 {@link #discardTemp}。异步任务成功与否都要删
+     * （否则 100MB 的临时文件会以"每篇文档一份"的速度把磁盘吃光）。
+     */
+    public Path spillToTemp(MultipartFile file) {
+        try {
+            Path tmp = Files.createTempFile("kb-upload-", ".bin");
+            try (InputStream in = file.getInputStream()) {
+                Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return tmp;
+        } catch (Exception ex) {
+            log.error("上传文件落暂存失败：name={} size={} err={}",
+                    file.getOriginalFilename(), file.getSize(), ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "文件存储失败，请稍后重试");
+        }
+    }
+
+    /** 删掉暂存文件。**静默**：它是收尾动作，删不掉不该把已经成功的转存变成失败（只留日志）。 */
+    public void discardTemp(Path staged) {
+        if (staged == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(staged);
+        } catch (Exception ex) {
+            log.warn("删除上传暂存文件失败（不影响业务）：path={} err={}", staged, ex.getMessage());
+        }
+    }
+
+    /**
+     * 从暂存文件转存（**异步任务调用**）。
+     *
+     * <p>与 {@link #store} 共用同一段 PUT 逻辑（{@link #putObject}）——
+     * 两处实现必然漂移，本仓已经吃过这个亏。
+     */
+    public String storeFromFile(long kbId, long docId, Path source, String fileName,
+                                long size, String contentType) {
+        try (InputStream in = Files.newInputStream(source)) {
+            return putObject(kbId, docId, in, fileName, size, contentType);
+        } catch (BizException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            log.error("打开上传暂存文件失败：path={} err={}", source, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "文件存储失败，请稍后重试");
+        }
+    }
+
+    /** 两个入口共用的 PUT。 */
+    private String putObject(long kbId, long docId, InputStream in, String fileName,
+                             long size, String contentType) {
+        String objectKey = PREFIX + kbId + "/" + docId + "/" + safeName(fileName);
         // partSize 传 -1 = 单次 PUT；传正数 = multipart（MinIO 客户端自动分段与提交）。
         // 用 stream 三参重载而不是四参：四参的重载需要知道 partCount，
         // 而 partCount 得先算 ceil(size/partSize) —— 那正是客户端在内部做的事，不必自己算。
-        long partSize = file.getSize() >= PART_SIZE ? PART_SIZE : -1L;
-        try (InputStream in = file.getInputStream()) {
+        long partSize = size >= PART_SIZE ? PART_SIZE : -1L;
+        try {
             minioClient.putObject(PutObjectArgs.builder()
                     .bucket(bucket)
                     .object(objectKey)
-                    .stream(in, file.getSize(), partSize)
-                    .contentType(contentTypeOf(file))
+                    .stream(in, size, partSize)
+                    .contentType(contentType == null || contentType.isBlank()
+                            ? "application/octet-stream" : contentType)
                     .build());
         } catch (Exception ex) {
             // 转存失败是**基础设施**问题，不是用户输入问题 —— 给系统错误码，
             // 但把原因写进日志（用户看到的仍是可读文案，不含栈）
             log.error("文档转存 MinIO 失败：kbId={} docId={} object={} size={} err={}",
-                    kbId, docId, objectKey, file.getSize(), ex.getMessage(), ex);
+                    kbId, docId, objectKey, size, ex.getMessage(), ex);
             throw new BizException(ErrorCode.SYSTEM_ERROR, "文件存储失败，请稍后重试");
         }
         log.info("文档已转存：kbId={} docId={} object={} size={} partSize={}",
-                kbId, docId, objectKey, file.getSize(), partSize);
+                kbId, docId, objectKey, size, partSize);
         return objectKey;
     }
 

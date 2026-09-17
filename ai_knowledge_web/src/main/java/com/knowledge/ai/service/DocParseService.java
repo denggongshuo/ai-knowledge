@@ -112,7 +112,19 @@ public class DocParseService {
         String parsePath = null;
         int chunkCount = 0;
         try {
-            byte[] source = docStorage.open(row.storagePath());
+            byte[] source;
+            try {
+                source = docStorage.open(row.storagePath());
+            } catch (Exception ex) {
+                // ⚠️ **取源文件失败是基础设施问题**（MinIO 抖动 / 超时 / 对象暂时不可达），
+                //    与"这份文件本身不行"是**两件事**。一起判死，会让一次网络抖动永久毁掉
+                //    一篇本来能解析的文档 —— 这是 `O1` §4 步 7 点名的那个区分。
+                //    故单独 catch 并标 `retryable=true`，由 `ParseWorker` 退避重试。
+                String why = "读取源文件失败：" + readable(ex) + "，稍后会自动重试";
+                recordWriter.markFailed(docId, why);
+                log.error("读取源文件失败（基础设施类，可重试）：docId={}", docId, ex);
+                return Map.of("docId", docId, "status", "FAILED", "retryable", true, "reason", why);
+            }
             parsed = dispatch(row.type(), source, row.fileName());
             // ⚠️ 体检在清洗**之前**：TextLayerGuard 的判据吃 chars，而清洗只减不增。
             // 反过来排的话，一篇正常文档会因为"剥掉了页眉"而掉到扫描件的阈值以下 —— 误报。
@@ -170,17 +182,20 @@ public class DocParseService {
                         docId, vectorized.detail());
             }
         } catch (ParseException ex) {
+            // **文档自身的问题**（无文本层 / 编码不对 / 已加密 / 文件损坏）→ **不可重试**。
+            // 重试也还是这份文件；对用户撒谎说"重试中"比直接说"这文件不行"更糟（O1 §4 步 7）。
             recordWriter.markFailed(docId, ex.getMessage());
             recordWriter.replaceIssues(docId, row.kbId(), parsed != null ? parsed.issues() : java.util.List.of());
             log.warn("文档解析失败：docId={} type={} 原因={}", docId, row.type(), ex.getMessage());
-            return Map.of("docId", docId, "status", "FAILED", "reason", ex.getMessage());
+            return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", ex.getMessage());
         } catch (Exception ex) {
-            String reason = "解析失败：" + (ex.getMessage() == null || ex.getMessage().isBlank()
-                    ? ex.getClass().getSimpleName() : ex.getMessage());
+            String reason = "解析失败：" + readable(ex);
             recordWriter.markFailed(docId, reason);
             recordWriter.replaceIssues(docId, row.kbId(), java.util.List.of());
             log.error("文档解析异常：docId={} type={}", docId, row.type(), ex);
-            return Map.of("docId", docId, "status", "FAILED", "reason", reason);
+            // 未知异常标**不可重试**：它更可能是代码缺陷而不是临时故障，
+            // 重试只会把同一个 bug 重放三遍并拖长用户等待，而栈已经在 error 日志里了。
+            return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", reason);
         }
 
         recordWriter.replaceIssues(docId, row.kbId(), parsed.issues());
@@ -339,6 +354,25 @@ public class DocParseService {
                 }
             }
         }
+    }
+
+    /**
+     * 把异常压成**给人看的一句话**（`S4-E1` 新增）。
+     *
+     * <p>为什么不用 {@code ex.getClass().getSimpleName()}：那会把
+     * {@code S3Exception} / {@code ConnectException} 这类东西原样甩给用户，
+     * 而用户需要的是"发生了什么 + 我该怎么办"。类名进日志（`log.error` 已经带了栈），
+     * 给人看的这句话只说人能处理的部分。
+     */
+    private static String readable(Exception ex) {
+        String msg = ex.getMessage();
+        if (msg == null || msg.isBlank()) {
+            return ex.getClass().getSimpleName();
+        }
+        // 只取第一行：SDK 的异常消息常常是多行 XML，全塞进 error_msg 会把列撑爆
+        int nl = msg.indexOf('\n');
+        String oneLine = nl > 0 ? msg.substring(0, nl) : msg;
+        return oneLine.length() > 160 ? oneLine.substring(0, 160) : oneLine;
     }
 
     /** 文档行必须存在，否则解析无从谈起（正常流程不会走到，防御并发清理）。 */

@@ -266,6 +266,14 @@ async function uploadAndAwaitRow(path, title, { timeout = 120000 } = {}) {
   check(true, `上传受理：${title}`, assertBizOk(entry, `upload(${title})`))
   // 前端轮询到终态后会刷新列表 —— 等那一行出现，就说明解析已落库
   await waitFor(`!!window.__t.docRowOf(${JSON.stringify(title)})`, { label: `列表出现「${title}」`, timeout })
+  // ⚠️ `S4-E1` 起**上传与解析是两个作业**：上传任务完成时文档如实是「已上传」，
+  //    解析由后端的 ParseWorker 领作业执行，几秒后才推进到终态。
+  //    所以要等到状态列进入终态（「已就绪」/「解析失败」）—— 这才是"解析已落库"的证据。
+  //    页面侧由 `KbUploadView#watchDocsUntilTerminal` 负责持续刷新（本批新增）。
+  await waitFor(
+    `['已就绪', '解析失败'].includes(window.__t.docRowOf(${JSON.stringify(title)})?.[5])`,
+    { label: `「${title}」进入终态（解析作业跑完）`, timeout: Math.max(timeout, 90000) },
+  )
 }
 
 async function main() {

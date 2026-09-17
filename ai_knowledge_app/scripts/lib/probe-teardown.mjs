@@ -77,6 +77,11 @@ export const KB_ARTIFACTS = [
     id: 'milvus:partitions', kind: 'milvus-partitions',
     why: 'T-406 起按代分区存放。entities/delete 只删**点**不删**容器**，于是每次跑完留下空分区',
   },
+  {
+    id: 'sql:sys_async_task', kind: 'sql', table: 'sys_async_task', via: 'kb_id',
+    why: 'T-O01 起探针上传会入队解析作业。⚠️ 这一行是**被覆盖率闸逼出来的** —— '
+      + 'S4-E1 新增了这张表，闸立刻点名它"未登记"，正好验证了 S4-D2 那道闸的价值',
+  },
   { id: 'sql:sys_parse_issue', kind: 'sql', table: 'sys_parse_issue', via: 'kb_id', why: '未识别表格清单' },
   { id: 'sql:sys_chunk', kind: 'sql', table: 'sys_chunk', via: 'kb_id', why: '分片（C1 起）' },
   { id: 'sql:sys_document', kind: 'sql', table: 'sys_document', via: 'kb_id', why: '文档行' },
@@ -326,6 +331,51 @@ export function assertArtifactCoverage() {
 /** 探针库的 id 列表（**必须在删 `sys_kb` 行之前取**，否则再也定位不到 Milvus 侧）。 */
 export const kbIdsOf = (code) => normalizeKeys(mysqlScalar(`select id from sys_kb where code='${code}';`))
 
+/**
+ * 让该探针库的**解析作业停下来**（`S4-E1` 新增）。
+ *
+ * <h3>⚠️ 为什么这是必须的，而不是"顺手多加一步"</h3>
+ * `T-O01` 把解析搬进了后台 worker，于是出现了一个**清理与执行赛跑**的新形态：
+ * 清理把探针库删干净的那一刻，worker 可能正拿着这个库的解析作业在跑 ——
+ * 它跑完之后会**继续往这个已经不存在的库里写**（`sys_chunk` 行、Milvus 代分区）。
+ * 实测现象：4 个 E2E 全绿、收尾判据也全绿（那一刻确实干净），**几分钟后**回头看，
+ * 库里多了 6 行孤儿块、Milvus 里多了 2 个空分区。
+ *
+ * <p>这比"清理漏了一处"更难发现 —— **残留自检本身是对的，只是它跑在竞态之前**。
+ * 所以修法不是"再查一遍"，而是把顺序改成：**先让写入方停手，再清理**。
+ *
+ * <h3>两步各自能做什么、不能做什么</h3>
+ * <ul>
+ *   <li><b>PENDING</b> → 直接判死（还没被领走，改状态即可，worker 不会再领它）；</li>
+ *   <li><b>RUNNING</b> → **只能等**。同 JVM 里没有安全的手段强杀一个正在跑的解析线程
+ *       （这与"不拆进程"是同一个限制，见 `ai_knowledge_web/plan/2026-09-17-S4-E1.md` §9）。
+ *       等不到就**照实把它报出来**，交给残留自检去红 —— 不静默。</li>
+ * </ul>
+ */
+async function quiesceParseJobs(code) {
+  const cancelled = mysqlCount(
+    `select count(*) from sys_async_task a join sys_kb k on k.id = a.kb_id `
+    + `where k.code='${code}' and a.type='doc-parse' and a.status='PENDING';`)
+  if (cancelled > 0) {
+    mysqlScalar(
+      `update sys_async_task a join sys_kb k on k.id = a.kb_id `
+      + `set a.status='FAILED', a.stage='失败', a.error_msg='探针清理：作业已取消', a.finished_at=now(), a.updated_at=now() `
+      + `where k.code='${code}' and a.type='doc-parse' and a.status='PENDING';`)
+  }
+  const runningSql =
+    `select count(*) from sys_async_task a join sys_kb k on k.id = a.kb_id `
+    + `where k.code='${code}' and a.type='doc-parse' and a.status='RUNNING';`
+  for (let i = 0; i < 30; i++) {
+    if (mysqlCount(runningSql) === 0) {
+      return { cancelled, waitedMs: i * 2000 }
+    }
+    await sleep(2000)
+  }
+  // 等不到就说出来（调用方的残留自检会把它变成一条红判据，而不是悄悄过去）
+  console.warn(`⚠️ 探针库 ${code} 仍有解析作业在跑（等了 60s）—— 它跑完可能留下块与分区，残留自检会报`)
+  return { cancelled, waitedMs: 60000, timedOut: true }
+}
+
 /** 探针库在 MinIO 里的对象名（`storage_path` / `parse_path`）—— 同样**必须在删行前取**。 */
 function minioKeysOf(code) {
   const keys = []
@@ -347,6 +397,9 @@ function minioKeysOf(code) {
  * @returns {Promise<{code:string, ids:string[], minioKeys:string[], removed:object, residue:object}>}
  */
 export async function teardownKbProbe(code) {
+  // ⓪ `S4-E1` 起多了一步：**先让解析作业停下来**，否则它们是"删完之后还在写"的源头
+  await quiesceParseJobs(code)
+
   // ① 快照 —— 删行之后就取不到了
   const ids = kbIdsOf(code)
   const minioKeys = minioKeysOf(code)
