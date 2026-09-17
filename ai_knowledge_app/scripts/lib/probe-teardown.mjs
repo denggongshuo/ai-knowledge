@@ -49,6 +49,19 @@ const MINIO_ROOT = '/data/rag-documents'
 /** 覆盖率闸扫描的列 —— 三个都是「外键式归属列」，能间接枚举出会被探针写脏的表。 */
 const SCOPE_COLUMNS = ['kb_id', 'doc_id', 'user_id']
 
+/**
+ * 归属列 → 它指向的**父表**。用来数「无主残留」（指向一个已不存在的父行）。
+ *
+ * <p>⚠️ 这张表存在的理由本身就是一条教训：**只要"删除"与"自检"都依赖同一个会被删掉的父行，
+ * 它们就永远是同一句话** —— 旧版按 `join sys_kb ... where k.code=?` 数残留，
+ * 而 `sys_kb` 被同一轮清理删掉 ⇒ 恒返回 0（`#136`）。
+ * 换成"父行还在不在"来问，就绕开了那个循环。
+ *
+ * <p>`user_id` 刻意**不在**这里：`sys_login_log` 的设计就是"用户删了日志要留"（风控证据），
+ * 按它数会把**设计如此**当成残留。
+ */
+const PARENT_TABLE = { kb_id: 'sys_kb', doc_id: 'sys_document' }
+
 // ---------------------------------------------------------------------------
 // 登记表 —— **新增持久化产物只改这里**
 // ---------------------------------------------------------------------------
@@ -110,32 +123,37 @@ export const USER_ARTIFACTS = [
     id: 'sql:sys_retrieval_trace_chunk', kind: 'sql-user', table: 'sys_retrieval_trace_chunk',
     via: 'subquery',
     deleteSql: 'delete from sys_retrieval_trace_chunk where trace_id in '
-      + "(select trace_id from sys_retrieval_trace t join sys_user u on u.id = t.user_id "
-      + "where u.username like '{prefix}%');",
+      + '(select t.trace_id from sys_retrieval_trace t where t.user_id in ({userIds}));',
     countSql: 'select count(*) from sys_retrieval_trace_chunk where trace_id in '
-      + "(select trace_id from sys_retrieval_trace t join sys_user u on u.id = t.user_id "
-      + "where u.username like '{prefix}%');",
+      + '(select t.trace_id from sys_retrieval_trace t where t.user_id in ({userIds}));',
     why: '检索打点的分片明细。⚠️ 它**没有 user_id**（归属要靠 trace_id 顺上去）——'
       + '这正是「产物认识、归属维度不认识」的第 N 次变形，所以登记表多了一种 via',
   },
   {
     id: 'sql:sys_chat_message', kind: 'sql-user', table: 'sys_chat_message',
     via: 'subquery',
-    // ⚠️ 子查询里必须写 `s.id` 而不是 `id` —— sys_chat_session 与 sys_user **都有 id**，
-    // 不带别名限定会报 1052 Column 'id' in field list is ambiguous。
-    // 这个错第一次跑 E2E 时才暴露出来（`mysqlScalar` 把 stderr 吞了，报出来只有
-    // "mysql 查询失败（status=1）：" 后面一片空白），排查靠的是手工逐条复跑
+    // ⚠️ 子查询里仍写 `s.id` 而不是 `id`：不带别名限定会报
+    // 1052 Column 'id' in field list is ambiguous（这个错第一次跑 E2E 才暴露，
+    // 而 `mysqlScalar` 把 stderr 吞了，报出来只有 "mysql 查询失败（status=1）：" 后面一片空白）
     deleteSql: 'delete from sys_chat_message where session_id in '
-      + "(select s.id from sys_chat_session s join sys_user u on u.id = s.user_id "
-      + "where u.username like '{prefix}%');",
+      + '(select s.id from sys_chat_session s where s.user_id in ({userIds}));',
     countSql: 'select count(*) from sys_chat_message where session_id in '
-      + "(select s.id from sys_chat_session s join sys_user u on u.id = s.user_id "
-      + "where u.username like '{prefix}%');",
+      + '(select s.id from sys_chat_session s where s.user_id in ({userIds}));',
     why: '问答消息。同上：归属靠 session_id 顺上去',
   },
   {
     id: 'sql:sys_retrieval_trace', kind: 'sql-user', table: 'sys_retrieval_trace', via: 'user',
     why: '检索链路打点（T-707）。⚠️ 只有 user_id 没有 kb_id/doc_id —— 库族清理看不见它',
+  },
+  {
+    // ⚠️ 同一张表要有**两条**登记：库族那条走 `kb_id`，这条走 `owner_id`。
+    // 导出类任务（`audit-export`）**没有知识库维度**（`kb_id` 为 NULL），
+    // 只按 `kb_id` 清理会把它们永远留在表里 —— 实测 E2E 跑完就剩这一行，
+    // 而它的 `owner_id` 当时也是 NULL（`AuditExportService` 没传业务坐标，已一并修好）
+    id: 'sql:sys_async_task_by_owner', kind: 'sql-user', table: 'sys_async_task', via: 'subquery',
+    deleteSql: 'delete from sys_async_task where owner_id in ({userIds});',
+    countSql: 'select count(*) from sys_async_task where owner_id in ({userIds});',
+    why: '异步任务按**提交人**清。⚠️ 归属列是 `owner_id` 不是 `user_id` —— 别按 `user_id` 写，那会报未知列',
   },
   {
     id: 'sql:sys_chat_session', kind: 'sql-user', table: 'sys_chat_session', via: 'user',
@@ -452,11 +470,21 @@ export async function teardownKbProbe(code) {
   milvusDropPartitions(ids)
 
   // ④ SQL：子表 → 主表（一条语句跑完，减少往返）
+  //
+  // ⚠️ 归属列是 `kb_id`/`doc_id` 的那些表**改用 ① 抓到的 ids 直删**，不再 `join sys_kb`。
+  // 原来的写法看着没问题（join 在删 kb 之前执行），但它把「能不能删到」绑在
+  // `sys_kb` 行还在不在上 —— 而**残留自检**那一步 `sys_kb` 必然已经没了，
+  // 于是同一个 join 在那边**恒不命中 ⇒ 恒返回 0**（`#136`）。
+  // 删与查必须用**同一份 ids**，才能保证"删了什么"与"查了什么"是同一个集合。
+  const idList = ids.join(',')
   mysqlScalar(
     KB_ARTIFACTS.filter((a) => a.kind === 'sql')
-      .map((a) => (a.via === 'code'
-        ? `delete from ${a.table} where code='${code}';`
-        : `delete t from ${a.table} t join sys_kb k on k.id = t.${a.via} where k.code='${code}';`))
+      .map((a) => {
+        if (a.via === 'code') return `delete from ${a.table} where code='${code}';`
+        // 探针库压根没建过（teardown 幂等重入）—— 没有行可删，也不该拼出 `in ()`
+        if (idList === '') return ''
+        return `delete from ${a.table} where ${a.via} in (${idList});`
+      })
       .reduce((acc, s) => acc + s, ''),
   )
 
@@ -468,19 +496,36 @@ export async function teardownKbProbe(code) {
 /** 用户族探针（`e2e-audit-backfill` 那类）。幂等。 */
 export function teardownUserProbe(prefix) {
   const loginLogs = mysqlCount(`select count(*) from sys_login_log where username like '${prefix}%';`)
+
+  // ⚠️ **必须在删 `sys_user` 之前**把 id 抓下来 —— 与 kb 族是同一条教训（`#136`/`#137`）：
+  // 旧写法 `join sys_user u on u.id = t.user_id where u.username like ?`，
+  // 而 `sys_user` 就是这条语句自己要删的表之一 ⇒ 删除与自检都依赖同一行，
+  // 自检那边必然恒返回 0。抓成 ids 之后两边用的是**同一个集合**，且不再依赖 `sys_user` 还在。
+  const userIds = userIdsOf(prefix)
+  const userList = userIds.join(',')
+
   mysqlScalar(
     USER_ARTIFACTS.filter((a) => a.kind === 'sql-user').map((a) => {
       if (a.via === 'username') return `delete from ${a.table} where username like '${prefix}%';`
-      if (a.via === 'user') {
-        return `delete t from ${a.table} t join sys_user u on u.id = t.user_id where u.username like '${prefix}%';`
-      }
-      // 子表没有 user_id，只能**顺着父表**找。⚠️ 它必须排在父表**之前**
-      // （父表行一删，这条子查询就再也定位不到那些子行了）
-      if (a.via === 'subquery') return a.deleteSql.replaceAll('{prefix}', prefix)
+      // 探针账号压根没建过（幂等重入）—— 没有行可删，也不该拼出 `in ()`
+      if (userList === '') return ''
+      if (a.via === 'user') return `delete from ${a.table} where user_id in (${userList});`
+      // 子表没有 user_id，顺着父表找。⚠️ 它仍必须排在父表**之前**（顺序即执行顺序）
+      if (a.via === 'subquery') return a.deleteSql.replaceAll('{userIds}', userList)
       throw new Error(`USER_ARTIFACTS 里 ${a.table} 的 via 取值无法处理：${a.via}`)
     }).reduce((acc, s) => acc + s, ''),
   )
-  return { prefix, loginLogs, residue: findUserProbeResidue(prefix) }
+  return { prefix, loginLogs, userIds, residue: findUserProbeResidue(prefix, { userIds }) }
+}
+
+/**
+ * 探针账号在清理**前**的 id 集合。
+ *
+ * <p>⚠️ 删完 `sys_user` 再查就永远是空的 —— 而"空"与"真的没有"看起来一模一样。
+ * 这是本批修的那条教训在用户族的同一个形状。
+ */
+export function userIdsOf(prefix) {
+  return normalizeKeys(mysqlScalar(`select id from sys_user where username like '${prefix}%';`))
 }
 
 // ---------------------------------------------------------------------------
@@ -488,24 +533,61 @@ export function teardownUserProbe(prefix) {
 // ---------------------------------------------------------------------------
 
 /**
- * 探针库是否还有残留。四类独立观测点：SQL 行 / Milvus 向量 / Milvus 分区 / MinIO 对象。
+ * 探针库是否还有残留。**五类**独立观测点：SQL 行 / **无主残留** / Milvus 向量 / Milvus 分区 / MinIO 对象。
+ *
+ * <h3>⚠️ 这一版修的是一个「假绿」（`#136`）</h3>
+ * <p>旧写法是 `join sys_kb k on k.id = t.kb_id where k.code=?` —— 看着没问题，
+ * 但 `sys_kb` 那一行**被同一轮清理删掉了**（`KB_ARTIFACTS` 里它排最后），
+ * 于是这个 join **永远不命中**，六个表**恒返回 0**。
+ * 实测反例：自检报「库行=0 文档=0 分片=0 …」的同时，`sys_async_task` 里躺着 **634 行**
+ * （`kb_id` 全指向已删的库）。**「闸说干净」与「真的干净」是两件事。**
+ *
+ * <p>修法不是"改个 join 条件"，而是**换一个与归属无关的观测点**（见 {@link #orphans}）：
+ * 只要"删除"与"自检"都依赖同一个会被删掉的父行，它们就永远是同一句话。
  *
  * @param code 探针库 code
- * @param snapshot 清理**前**取的 `{ids, minioKeys}`；不给则只能查 SQL 侧
+ * @param snapshot 清理**前**取的 `{ids, minioKeys}`；不给则 `ids` 类计数无意义（见 {@link #idsUsed}）
  */
 export async function findKbProbeResidue(code, snapshot = {}) {
   const { ids = [], minioKeys = [] } = snapshot
 
+  // ① 按**清理前抓到的 ids** 数 —— 与 `teardownKbProbe` 的删除用的是同一份 ids，
+  //    所以"删了什么"与"查了什么"是同一个集合（旧版差的就是这一点）
+  const idList = ids.join(',')
   const sql = {}
   for (const a of KB_ARTIFACTS.filter((x) => x.kind === 'sql')) {
-    sql[a.table] = mysqlCount(a.via === 'code'
-      ? `select count(*) from ${a.table} where code='${code}';`
-      : `select count(*) from ${a.table} t join sys_kb k on k.id = t.${a.via} where k.code='${code}';`)
+    if (a.via === 'code') {
+      sql[a.table] = mysqlCount(`select count(*) from ${a.table} where code='${code}';`)
+    } else {
+      sql[a.table] = idList === '' ? 0
+        : mysqlCount(`select count(*) from ${a.table} where ${a.via} in (${idList});`)
+    }
+  }
+
+  // ② **无主残留**：归属列指向一个**已不存在的父行**的行。
+  //
+  //    这一类与"这轮探针是谁"无关 —— 它问的是"库里有没有孤儿"，
+  //    所以**任何一轮**留下的都会被逮到。这正是旧版白丢掉的观测点：
+  //    一旦 `sys_kb` 行被删，按归属数就永远是 0，而孤儿数照样数得出来。
+  //
+  //    ⚠️ **刻意不计入 `sqlTotal`/`kbResidueClean`**：它跨轮、跨来源，
+  //    把它并进去会让"跑完 mvn test 再跑 E2E"变成假红（Java 侧的历史残留会被算到 E2E 头上）。
+  //    它的用法是**报警**（`describeKbResidue` 会打出来），以及在自检脚本里被负向锚断言。
+  const orphans = {}
+  for (const a of KB_ARTIFACTS.filter((x) => x.kind === 'sql' && PARENT_TABLE[x.via])) {
+    const parent = PARENT_TABLE[a.via]
+    orphans[a.table] = mysqlCount(
+      `select count(*) from ${a.table} t left join ${parent} p on p.id = t.${a.via} `
+      + `where t.${a.via} is not null and p.id is null;`)
   }
 
   return {
     sql,
     sqlTotal: Object.values(sql).reduce((a, b) => a + b, 0),
+    /** 本轮的 ids 抓到了几个 —— **0 表示上表里 `in (ids)` 那几格无从查起**（不是"干净"）。 */
+    idsUsed: ids.length,
+    orphans,
+    orphanTotal: Object.values(orphans).reduce((a, b) => a + b, 0),
     milvusVectors: await milvusVectorCount(ids),
     milvusPartitions: await milvusLeftoverPartitions(ids),
     /** ⚠️ 只有「清理前快照到的那些对象」能这么查 —— 更早的轮次留下的孤儿对象查不到。 */
@@ -513,28 +595,57 @@ export async function findKbProbeResidue(code, snapshot = {}) {
   }
 }
 
-/** 用户族探针是否还有残留。 */
-export function findUserProbeResidue(prefix) {
+/**
+ * 用户族探针是否还有残留。
+ *
+ * <p>⚠️ `via: 'user'` / `'subquery'` 两类**必须**用清理前抓到的 `userIds` 来数 ——
+ * 它们旧版都 `join sys_user`，而 `sys_user` 正是被删的那一行 ⇒ 恒返回 0。
+ *
+ * @param snapshot 清理**前**取的 `{userIds}`；不给则现查一次（此时若账号已删，只能得到空集 ——
+ *                 返回值里用 {@link #idsUsed} 标出来，调用方**不许**把 0 当"干净"）
+ */
+export function findUserProbeResidue(prefix, snapshot = {}) {
+  const userIds = snapshot.userIds ?? userIdsOf(prefix)
+  const userList = userIds.join(',')
   const sql = {}
   for (const a of USER_ARTIFACTS) {
-    // `subquery` 的计数必须**在父表被删之前**取 —— 它与删除用的是同一条子查询条件
-    sql[a.table] = mysqlCount(
-      a.via === 'username' ? `select count(*) from ${a.table} where username like '${prefix}%';`
-        : a.via === 'subquery' ? a.countSql.replaceAll('{prefix}', prefix)
-          : `select count(*) from ${a.table} t join sys_user u on u.id = t.user_id where u.username like '${prefix}%';`,
-    )
+    if (a.via === 'username') {
+      // 按 username 删的那些**不依赖 sys_user**，所以它任何时候都是真的
+      sql[a.table] = mysqlCount(`select count(*) from ${a.table} where username like '${prefix}%';`)
+    } else if (userList === '') {
+      sql[a.table] = 0
+    } else {
+      // `via: 'user'` 没有专属 SQL，用通用的一条；`subquery` 自带
+      const text = a.countSql ?? `select count(*) from ${a.table} where user_id in ({userIds});`
+      sql[a.table] = mysqlCount(text.replaceAll('{userIds}', userList))
+    }
   }
-  return { sql, sqlTotal: Object.values(sql).reduce((a, b) => a + b, 0) }
+  return {
+    sql,
+    sqlTotal: Object.values(sql).reduce((a, b) => a + b, 0),
+    /** 本轮抓到几个用户 id —— **0 表示上面那几格无从查起**（不是"干净"）。 */
+    idsUsed: userIds.length,
+  }
 }
 
 /** 把 `findKbProbeResidue` 的结果压成一行中文，给脚本的 `check(...)` 描述用。 */
 export function describeKbResidue(r) {
+  // ⚠️ `无主` 是**跨轮**的数（任何一轮留下的孤儿都算），所以它出现在这一行里是**报警**，
+  // 不参与 `kbResidueClean` —— 见 findKbProbeResidue 的注释
   return `库行=${r.sql.sys_kb} 文档=${r.sql.sys_document} 分片=${r.sql.sys_chunk} `
-    + `问题行=${r.sql.sys_parse_issue} 授权=${r.sql.sys_kb_grant} · `
+    + `问题行=${r.sql.sys_parse_issue} 授权=${r.sql.sys_kb_grant} 作业=${r.sql.sys_async_task} · `
+    + `无主残留=${r.orphanTotal} · `
     + `Milvus 向量=${r.milvusVectors} 分区=[${r.milvusPartitions.join(',') || '—'}] `
     + `MinIO 对象=${r.minioStillThere.length}`
+    + (r.idsUsed === 0 ? ' · ⚠️ 本轮没抓到 kb ids，上述按归属的数**无从查起**（不是"干净"）' : '')
 }
 
-/** `findKbProbeResidue` 是否全清。 */
+/**
+ * `findKbProbeResidue` 是否全清。
+ *
+ * <p>⚠️ **`orphanTotal` 刻意不在条件里** —— 它是跨轮的，并进来会让"跑完 `mvn test`
+ * 再跑 E2E"变成假红（Java 侧的历史残留被算到 E2E 头上）。
+ * 它由 `describeKbResidue` 打出来报警，并由 `selftest-residue.mjs` 的负向锚钉住"它数得出来"。
+ */
 export const kbResidueClean = (r) =>
   r.sqlTotal === 0 && r.milvusVectors === 0 && r.milvusPartitions.length === 0 && r.minioStillThere.length === 0
