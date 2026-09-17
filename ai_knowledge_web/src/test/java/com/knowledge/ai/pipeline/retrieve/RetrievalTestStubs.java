@@ -184,4 +184,72 @@ public class RetrievalTestStubs {
         executor.initialize();
         return executor;
     }
+
+    // ==================================================================
+    // M08（`T-800`）的流式对话替身
+    // ==================================================================
+
+    /**
+     * 流式对话替身被调用过几次。
+     *
+     * <p>`G5-11` 前半「空召回**不调大模型**」的唯一硬证据就是这个计数器为 0 ——
+     * 光断言"回答了兜底话术"是不够的：真调了模型再把它的话丢掉，看起来一模一样。
+     */
+    public static final java.util.concurrent.atomic.AtomicInteger STREAM_CALLS =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** 最后一次流式调用收到的提示词 —— 用来验"分片正文真的进了提示词"。 */
+    public static volatile String LAST_PROMPT = "";
+
+    /** 默认替身：回一段固定文本并按句切分，模拟真流式。 */
+    private static final com.knowledge.ai.pipeline.chat.StreamingChatCaller DEFAULT_STREAM = canned(
+            "这是替身模型的回答。它由两句话组成。");
+
+    /** 用例可替换的流式替身。 */
+    public static volatile com.knowledge.ai.pipeline.chat.StreamingChatCaller streamStub = DEFAULT_STREAM;
+
+    /** 每个用例前后复位 —— 免得一个用例装的替身漏给下一个（与 {@link #resetRerank} 同理）。 */
+    public static void resetStream() {
+        streamStub = DEFAULT_STREAM;
+        STREAM_CALLS.set(0);
+        LAST_PROMPT = "";
+    }
+
+    /**
+     * 造一个"按句吐字"的替身。
+     *
+     * <p>**按句切分而不是整段一次给**：`T-801` 的事件序列要验 `delta*`（可多次），
+     * 一次性吐完的话"发了几个 delta"恒为 1，那条判据就退化成了摆设。
+     */
+    public static com.knowledge.ai.pipeline.chat.StreamingChatCaller canned(String answer) {
+        return (prompt, onDelta) -> {
+            LAST_PROMPT = prompt;
+            for (String piece : answer.split("(?<=。)")) {
+                if (!piece.isEmpty()) {
+                    onDelta.accept(piece);
+                }
+            }
+            return new com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome(
+                    7L, "stub-chat-model",
+                    new com.knowledge.ai.pipeline.chat.ChatDtos.TokenUsage(11, 22, 33), "stop");
+        };
+    }
+
+    /**
+     * 流式对话替身 Bean。
+     *
+     * <p>与 {@link #rerankOverridingFactory} 同一个理由返回**转发器**而不是当时的
+     * {@code streamStub}：Spring 上下文整个测试类是共用的，直接返回当时的替身会被
+     * **第一个**用到它的用例钉死，后面所有用例改 {@code streamStub} 都不生效
+     * （现象是"改一行测试没反应"）。
+     */
+    @Bean
+    @Primary
+    com.knowledge.ai.pipeline.chat.StreamingChatCaller streamingChatCallerStub() {
+        return (prompt, onDelta) -> {
+            STREAM_CALLS.incrementAndGet();
+            return streamStub.stream(prompt, onDelta);
+        };
+    }
+
 }
