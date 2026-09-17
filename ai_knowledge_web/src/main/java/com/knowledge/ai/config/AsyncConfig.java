@@ -35,6 +35,9 @@ public class AsyncConfig {
     /** 业务异步任务执行器（文档解析、索引、打包、导出）。 */
     public static final String TASK_EXECUTOR = "taskExecutor";
 
+    /** 检索召回执行器（`T-700` 的两路并行召回）。**与上面的池子分开**，理由见 {@link #retrievalExecutor()}。 */
+    public static final String RETRIEVAL_EXECUTOR = "retrievalExecutor";
+
     @Value("${app.async.core-pool-size:4}")
     private int corePoolSize;
 
@@ -101,6 +104,44 @@ public class AsyncConfig {
                 TraceContext.clear();
             }
         };
+    }
+
+    /**
+     * 检索召回执行器（`T-700`）—— 向量与 BM25 两路**并行**跑在这里。
+     *
+     * <h3>为什么不复用 {@link #TASK_EXECUTOR}</h3>
+     * <p>两个池的**背压形状完全相反**：
+     * <ul>
+     *   <li>解析/索引任务：用户主动触发、可等、队列积压是正常的 → {@code CallerRunsPolicy}
+     *       把压力反推给提交者；</li>
+     *   <li>检索召回：**在线请求的关键路径**，用户正等着答案。此处若排队，
+     *       正确的反应是"尽早失败"而不是"让请求线程去跑"—— 后者会把一次慢查询
+     *       扩散成整条 HTTP 线程池的阻塞。所以这里用 {@code AbortPolicy}。</li>
+     * </ul>
+     * <p>共用另一个后果是：一次批量重建索引能把队列占满，于是**问答同时被拖慢** ——
+     * 两类负载互相踩踏，且现象是"有时候慢"，极难归因。分开池子是廉价的隔离。
+     *
+     * <p>线程数 4 是"两路 × 并发几个用户"的折中：每次检索占 2 个线程，
+     * 高峰期不让它去挤 CPU。它做的是**阻塞式网络 IO**（Milvus search），不占 CPU。
+     *
+     * <p>⚠️ 与 {@code taskExecutor} 同一条纪律：**必须**带上
+     * {@code traceIdPropagating}。少了它，并行召回那两跳的日志会各自生成一个
+     * 新 traceId，于是"检索详情里的耗时分解"永远对不上同一次请求（`G5-12` 的前提）。
+     */
+    @Bean(name = RETRIEVAL_EXECUTOR)
+    public Executor retrievalExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(4);
+        // 无队列：宁可当场拒绝，也不让请求在队列里排队 —— 见上方 javadoc
+        executor.setQueueCapacity(0);
+        executor.setThreadNamePrefix("ak-recall-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(10);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setTaskDecorator(AsyncConfig::traceIdPropagating);
+        executor.initialize();
+        return executor;
     }
 
     /**

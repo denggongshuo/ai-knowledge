@@ -1,0 +1,111 @@
+package com.knowledge.ai.core.setting;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * 系统参数读取（`sys_setting` · `S5-M07-A` 步 9）。
+ *
+ * <h3>为什么一次读一批，而不是逐个键查</h3>
+ * <p>检索侧一次要拿三个阈值（未命中线 / 降警线 / 默认 rerankTopK）。逐个查就是三次
+ * 往返，而这三次的数据在同一个 KV 表里、生命周期完全一致。
+ * {@link #snapshot()} 一次取回**本类关心的那几个键**，调用方再按需取值 ——
+ * 顺带把"三个值来自同一时刻"这件事变成结构性事实，而不是靠"三次查询之间没人改配置"的运气。
+ *
+ * <h3>缺行为什么兜底而不是抛</h3>
+ * <p>见 {@link SystemSettings} 的类注释。这里补一条：兜底**必须有痕**。
+ * 每次兜底都打 {@code warn}，并在返回值里给出"这个值是默认的还是读到的"
+ * （{@link Snapshot#sourceOf}），这样取证时能分辨 ——
+ * 否则一次"种子没种上"的部署会表现为"阈值就是 0.35 呀，没问题"。
+ */
+@Slf4j
+@Service
+public class SystemSettingService {
+
+    /** 本类关心的键 —— 也是 {@link #snapshot()} 的查询范围。 */
+    private static final List<String> KEYS = List.of(
+            SystemSettings.RETRIEVAL_RECALL_THRESHOLD,
+            SystemSettings.RETRIEVAL_MISS_THRESHOLD,
+            SystemSettings.RETRIEVAL_LOW_SCORE_WARN,
+            SystemSettings.RETRIEVAL_RERANK_TOP_K);
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * 一批系统参数（同一时刻的快照）。
+     *
+     * <p>值是**字符串原样**：{@code sys_setting.value_type} 有五种，
+     * 在这里统一转型会让"这个键本该是 DECIMAL 却存了 'abc'"从一条可定位的解析日志
+     * 变成一次启动期崩溃。转型放在 {@link #decimal} / {@link #integer}，
+     * 失败时**回退到默认值并留 warn**（与缺行同一条口径）。
+     */
+    @Transactional(readOnly = true)
+    public Snapshot snapshot() {
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select setting_key, setting_value from sys_setting where setting_key in (:keys)")
+                .setParameter("keys", KEYS)
+                .getResultList();
+
+        Map<String, String> values = new HashMap<>(KEYS.size());
+        for (Object[] row : rows) {
+            values.put(String.valueOf(row[0]), (String) row[1]);
+        }
+        for (String key : KEYS) {
+            if (!values.containsKey(key)) {
+                log.warn("系统参数缺失，本次使用兜底默认值：key={}（请确认 V2 种子是否已执行）", key);
+            }
+        }
+        return new Snapshot(values);
+    }
+
+    /**
+     * 一批系统参数 + 取值口径。
+     *
+     * @param values 键 → 原样字符串（缺行时该键不出现）
+     */
+    public record Snapshot(Map<String, String> values) {
+
+        /** 十进制取值；缺行或解析失败 → {@code fallback} 并留 warn。 */
+        public double decimal(String key, double fallback) {
+            String raw = values.get(key);
+            if (raw == null || raw.isBlank()) {
+                return fallback;
+            }
+            try {
+                return Double.parseDouble(raw.trim());
+            } catch (NumberFormatException ex) {
+                log.warn("系统参数不是合法的十进制数，改用默认值：key={} 实际={} 默认={}", key, raw, fallback);
+                return fallback;
+            }
+        }
+
+        /** 整数取值；缺行或解析失败 → {@code fallback} 并留 warn。 */
+        public int integer(String key, int fallback) {
+            String raw = values.get(key);
+            if (raw == null || raw.isBlank()) {
+                return fallback;
+            }
+            try {
+                return Integer.parseInt(raw.trim());
+            } catch (NumberFormatException ex) {
+                log.warn("系统参数不是合法的整数，改用默认值：key={} 实际={} 默认={}", key, raw, fallback);
+                return fallback;
+            }
+        }
+
+        /** 供取证：某键的值是**读到的**还是**兜底的**。 */
+        public Optional<String> sourceOf(String key) {
+            return Optional.ofNullable(values.get(key));
+        }
+    }
+}

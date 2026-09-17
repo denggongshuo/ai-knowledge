@@ -84,6 +84,38 @@ public class ModelClientRegistry {
         return getOrCreate(spec, () -> clientFactory.createEmbedding(spec), EmbeddingModel.class);
     }
 
+    /**
+     * 取重排客户端（`T-702`）。**未配置时返回 {@link NoOpRerankClient}，不抛**。
+     *
+     * <h3>为什么这里与 {@link #chatClient()} / {@link #embeddingModel()} 口径不同</h3>
+     * <p>那两类的"没配置"是**硬失败**：没有对话模型就没有问答，没有嵌入模型就建不了索引
+     * —— 继续往下走只会得到一个更晚、更难懂的错。所以 {@link #activeSpec} 直接抛
+     * {@code MODEL_NOT_CONFIGURED}。
+     *
+     * <p>重排不一样：它是检索链路上的**可选一跳**，`.env` 里 {@code RERANKER_API_*}
+     * 允许为空，知识库配置里 {@code rerankEnabled} 也可以关。没配重排的机器上
+     * 检索**必须照常可用**（只是少了一跳精排），所以这里是"**降级**"而不是"**报错**"。
+     *
+     * <p>⚠️ 但"配置来源**抛异常**"是另一回事：那代表读不到，不是真的没有。
+     * 这种情况下也降级（检索不能被配置中心抖动打断），**但留 warn 日志** ——
+     * 静默降级会让"重排悄悄失效了"永远没人发现。
+     */
+    public RerankClient rerankClient() {
+        List<ModelConfigSpec> specs;
+        try {
+            specs = configSource.listEnabled(ModelType.RERANK);
+        } catch (Exception ex) {
+            log.warn("模型配置来源不可用，本次检索不重排：source={} 原因={}",
+                    configSource.sourceName(), ex.getMessage());
+            return NoOpRerankClient.INSTANCE;
+        }
+        if (specs == null || specs.isEmpty()) {
+            return NoOpRerankClient.INSTANCE;
+        }
+        ModelConfigSpec spec = activeSpec(ModelType.RERANK);
+        return getOrCreate(spec, () -> clientFactory.createRerank(spec), RerankClient.class);
+    }
+
     // ==================================================================
     // 规格解析
     // ==================================================================

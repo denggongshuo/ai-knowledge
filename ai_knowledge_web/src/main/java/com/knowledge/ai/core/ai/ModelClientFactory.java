@@ -76,6 +76,22 @@ public class ModelClientFactory {
                 .build();
     }
 
+    /**
+     * 构造重排客户端（`T-702`）。
+     *
+     * <p><b>为什么不走 Spring AI、也不走 {@link #buildSdkClient}</b>：Spring AI 2.0 没有
+     * Rerank 抽象，而 OpenAI 官方 SDK 也没有 {@code /rerank} 端点（那是各家网关自己加的）。
+     * 这里返回的是自写的 {@link SiliconFlowRerankClient}，只用 {@code RestClient}——
+     * 决策与理由见 `S5-M07-A` §5（不引依赖）。
+     *
+     * <p>超时取 {@code app.model.timeout-seconds}（与对话/嵌入同一个值）：
+     * 另立一个旋钮的收益是零，而"改了超时却没生效"这类问题会多一处来源。
+     * 客户端内部对该值有下限保护（重排不该比生成还慢等）。
+     */
+    public RerankClient createRerank(ModelConfigSpec spec) {
+        return new SiliconFlowRerankClient(spec, modelProperties.getTimeoutSeconds());
+    }
+
     private OpenAIClient buildSdkClient(ModelConfigSpec spec) {
         return OpenAiSetup.setupSyncClient(
                 spec.baseUrl(),   // baseUrl
