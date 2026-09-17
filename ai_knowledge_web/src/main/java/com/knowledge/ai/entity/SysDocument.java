@@ -159,4 +159,18 @@ public class SysDocument {
      */
     @Column(name = "deleted_at")
     private LocalDateTime deletedAt;
+
+    /**
+     * 这篇文档的向量**写齐了哪一代**（{@code V16} 新增 · {@code T-406} 的断点依据）。
+     * {@code 0} = 没有向量；首代从 {@code 1} 起，故 {@code 0} 是不会被真实代占用的哨兵值。
+     *
+     * <p>与 {@code sys_kb.index_generation}（检索该查哪一代）**不是一回事**：重建期间两者
+     * 故意不一致 —— 库还指旧代（检索照旧可用），文档一篇篇变成新代，全部完成才切库那一列。
+     *
+     * <p>⚠️ 不能用「查 Milvus 里有没有这篇文档的点」代替本列：写入是先删后插，
+     * 半截写入会被误判成"已完成"而 skip，留下一篇缺块却标着可检索的文档。
+     * 详见 {@code V16} 的注释。
+     */
+    @Column(name = "index_generation", nullable = false)
+    private Integer indexGeneration;
 }
