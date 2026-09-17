@@ -1,6 +1,8 @@
 package com.knowledge.ai.pipeline.vectorize;
 
 import com.knowledge.ai.core.ai.ModelClientRegistry;
+import com.knowledge.ai.core.ai.ModelConfigSpec;
+import com.knowledge.ai.core.enums.ModelType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,6 +33,44 @@ public interface EmbeddingClient {
      * @throws EmbeddingFailedException 调用失败或返回条数不匹配（不静默截断）
      */
     List<float[]> embed(List<String> texts);
+
+    /**
+     * 当前生效的嵌入模型标识（`O9` 步 7）—— **"这条向量是谁产的"**。
+     *
+     * <p>为什么放在这个接口上、而不是让调用方去问 {@code ModelClientRegistry}：
+     * 向量化这一跳才是"决定了用哪个模型"的那一跳，让它把归因一并报出来，
+     * 调用方（{@code ChunkVectorizer}）就不必再持有模型注册中心 ——
+     * 那条依赖会让 {@code ChunkVectorizer} 没法用假 client 单测。
+     *
+     * <p>默认实现返回 {@link EmbeddingModelRef#NONE}（空标识）：接口是
+     * {@link FunctionalInterface}，加了抽象方法就不再是函数式接口，
+     * 而那会波及所有用 lambda 造 client 的用例 —— 用一个 default 方法
+     * 既拿回了信息，又保住了"假 client 可以用 lambda 写"。
+     *
+     * <p>⚠️ 读到的必须是**此刻**的配置：换模型之后写进来的向量要能被区分出来，
+     * 而那正是这个字段存在的全部理由。所以实现方**不要**把它缓存成字段。
+     */
+    default EmbeddingModelRef modelRef() {
+        return EmbeddingModelRef.NONE;
+    }
+
+    /**
+     * 产出向量的模型归因。
+     *
+     * @param model   模型标识，如 {@code BAAI/bge-m3}
+     * @param version 配置版本（{@code ModelConfigSpec#version()}）——
+     *                与 {@code model} 合起来唯一标识"哪一版配置干的"
+     */
+    record EmbeddingModelRef(String model, String version) {
+
+        /** 未知 / 不可得。**不是"没有模型"** —— 只是这一路没报出来。 */
+        public static final EmbeddingModelRef NONE = new EmbeddingModelRef("", "");
+
+        /** 是否拿到了归因。**不静默**：false 时落库要留空串而不是编一个值。 */
+        public boolean known() {
+            return model != null && !model.isBlank();
+        }
+    }
 
     /**
      * 走 {@link ModelClientRegistry#embeddingModel()} 的真实实现。
@@ -82,6 +122,18 @@ public interface EmbeddingClient {
             }
             log.debug("嵌入完成：{} 批 / {} 条", (texts.size() + batchSize - 1) / batchSize, texts.size());
             return out;
+        }
+
+        /**
+         * ⚠️ 每次**现查**，刻意不缓存成字段。
+         *
+         * <p>缓存了就会在"运维换掉嵌入模型"之后继续上报旧标识 —— 于是新写入的向量被标成
+         * 老模型的，而这个字段的全部价值恰恰是**区分新旧**。查一次是内存/配置读，不值得为它冒险。
+         */
+        @Override
+        public EmbeddingModelRef modelRef() {
+            ModelConfigSpec spec = registry.activeSpec(ModelType.EMBEDDING);
+            return new EmbeddingModelRef(spec.model(), spec.version());
         }
     }
 

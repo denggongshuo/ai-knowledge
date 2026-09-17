@@ -65,7 +65,8 @@ public class ChunkVectorizer {
     public Result vectorize(long docId, long kbId, int generation, List<VectorChunk> chunks) {
         if (!enabled) {
             log.info("向量化开关未开启（m05.vectorize.enabled=false），跳过：docId={}", docId);
-            return new Result(0, 0, Status.DISABLED, "向量化开关未开启（m05.vectorize.enabled=false）");
+            return new Result(0, 0, Status.DISABLED, "向量化开关未开启（m05.vectorize.enabled=false）",
+                    EmbeddingClient.EmbeddingModelRef.NONE);
         }
 
         String partition = MilvusConstants.partitionName(kbId, generation);
@@ -76,10 +77,16 @@ public class ChunkVectorizer {
             // 却检索得到"的幽灵 —— 与 DocRecordWriter 空块集也要回填 chunk_count = 0 同一条理由
             writer.replaceDocument(partition, docId, List.of());
             log.info("没有需要向量化的块（全部被跳过）：docId={} 跳过={}", docId, skipped);
-            return new Result(0, skipped, Status.EMPTY, "没有需要向量化的块");
+            return new Result(0, skipped, Status.EMPTY, "没有需要向量化的块",
+                    EmbeddingClient.EmbeddingModelRef.NONE);
         }
 
         List<String> texts = candidates.stream().map(VectorChunk::vectorText).toList();
+
+        // 归因先取：它在 embed 之前失败的话，本次什么都没写，比"写进去了但归因取不到"干净。
+        // 而且 embed 内部同样要解析模型配置 —— 这一步过了，那一步基本不会因配置失败。
+        EmbeddingClient.EmbeddingModelRef modelRef = embeddingClient.modelRef();
+
         List<float[]> vectors;
         try {
             vectors = embeddingClient.embed(texts);
@@ -95,12 +102,13 @@ public class ChunkVectorizer {
 
         List<VectorRecord> records = new ArrayList<>(candidates.size());
         for (int i = 0; i < candidates.size(); i++) {
-            records.add(new VectorRecord(candidates.get(i), kbId, docId, vectors.get(i)));
+            records.add(new VectorRecord(candidates.get(i), kbId, docId, vectors.get(i),
+                    modelRef.model(), modelRef.version()));
         }
         int written = writer.replaceDocument(partition, docId, records);
-        log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={}（跳过 = 表格父块 / 未实现的图片块）",
-                docId, partition, written, skipped);
-        return new Result(written, skipped, Status.OK, "已写入 " + written + " 个向量");
+        log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={} 模型={}（跳过 = 表格父块 / 未实现的图片块）",
+                docId, partition, written, skipped, modelRef.model().isBlank() ? "<未报出>" : modelRef.model());
+        return new Result(written, skipped, Status.OK, "已写入 " + written + " 个向量", modelRef);
     }
 
     /** 向量化的三种结局。**只有 {@link #OK} 允许把文档标成可检索。** */
@@ -114,10 +122,17 @@ public class ChunkVectorizer {
     }
 
     /**
-     * @param written 实际写入 Milvus 的条数
-     * @param skipped 被跳过的块数（表格父块 + 图片块）
+     * @param written  实际写入 Milvus 的条数
+     * @param skipped  被跳过的块数（表格父块 + 图片块）
+     * @param status   三种结局之一
+     * @param detail   给人看的说明
+     * @param modelRef 产出这批向量的模型归因（`O9` 步 7）。调用方据此回填
+     *                 {@code sys_chunk.embed_model_id/version} —— 有了它，换嵌入模型
+     *                 才能"按模型筛出旧向量"，而不是只能全库重建。
+     *                 非 OK 路径上是 {@link EmbeddingClient.EmbeddingModelRef#NONE}（没写就没归因）。
      */
-    public record Result(int written, int skipped, Status status, String detail) {
+    public record Result(int written, int skipped, Status status, String detail,
+                         EmbeddingClient.EmbeddingModelRef modelRef) {
 
         /** 是否可以把文档推进到「可被检索」。 */
         public boolean allowsReady() {
