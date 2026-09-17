@@ -10,6 +10,7 @@ import com.knowledge.ai.pipeline.vectorize.EmbeddingClient;
 import com.knowledge.ai.pipeline.vectorize.VectorChunk;
 import com.knowledge.ai.pipeline.vectorize.VectorRecord;
 import com.knowledge.ai.pipeline.vectorize.VectorWriter;
+import com.knowledge.ai.support.ProbeCleanup;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -374,21 +375,20 @@ public abstract class RetrievalFlowSupport {
 
     /** 收尾：先丢 Milvus 分区（指向它的是 sys_kb），再删库/文档/分片。 */
     protected void cleanProbeData() {
+        // 分区**先**丢：它按 kbId 命名，库行没了就再也找不回这些分区
         for (Long id : createdKbIds) {
-            // 分区先丢：它按 kbId 命名，库行没了就再也找不回这些分区
             for (int generation : partitions.generationsOf(id)) {
                 partitions.dropQuietly(MilvusConstants.partitionName(id, generation));
             }
-            jdbc.update("delete from sys_chunk where kb_id = ?", id);
-            jdbc.update("delete from sys_document where kb_id = ?", id);
-            jdbc.update("delete from sys_kb_grant where kb_id = ?", id);
-            jdbc.update("delete from sys_kb where id = ?", id);
         }
+        // ⚠️ `S5` 起委托给**共用**清理器：此前每个基座自己写一遍，而这里漏了 `sys_async_task`
+        // —— 实测 **+76 行/轮**，且因为 `sys_kb` 行先被删，那些孤儿行在库里**谁也看不见**
+        //（`#130`：「产物认识、归属维度不认识」的用例侧那一半）。
+        // ⚠️ 必须传**删任何行之前**抓到的 id 列表：共用清理器一律用 id 直删，不 join `sys_kb`
+        //（join 的版本会在自检那一步必然失效 —— `#136`）
+        ProbeCleanup.cleanKb(jdbc, List.copyOf(createdKbIds));
         createdKbIds.clear();
-        for (Long docId : docIds) {
-            jdbc.update("delete from sys_chunk where doc_id = ?", docId);
-            jdbc.update("delete from sys_document where id = ?", docId);
-        }
+        ProbeCleanup.cleanDocs(jdbc, List.copyOf(docIds));
         docIds.clear();
         resetProbeState();
     }

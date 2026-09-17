@@ -6,6 +6,7 @@ import com.knowledge.ai.core.async.AsyncTaskInfo;
 import com.knowledge.ai.core.async.AsyncTaskService;
 import com.knowledge.ai.core.async.AsyncTaskStatus;
 import com.knowledge.ai.support.ApiTestSupport;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -71,9 +72,28 @@ class AuditQueryFlowTest extends ApiTestSupport {
 
     private String token;
 
+    /**
+     * 本类跑出来的导出任务 id —— 收尾逐个删。
+     *
+     * <p>⚠️ `audit-export` 的任务行 **`kb_id` 为 NULL**（导出不是知识库级动作），
+     * 所以基类那道「无主 kb 产物」兜底扫**根本扫不到它** —— 它没有归属维度可查。
+     * 这类"压根没有归属列"的产物只能由**造它的用例**自己点名清。
+     * 实测不删的代价：一轮全量留 **2 行/轮**（`S5` 修复前是 76 行/轮，那 74 行是 kb 族的）。
+     */
+    private final List<String> exportTaskIds = new ArrayList<>();
+
     @BeforeEach
     void loginAdmin() {
         token = loginAsAdmin().data("$.accessToken");
+    }
+
+    /** 收尾：删掉本类造出来的导出任务行（不做的话它们会一轮轮攒在 `sys_async_task` 里）。 */
+    @AfterEach
+    void cleanExportTasks() {
+        for (String taskId : exportTaskIds) {
+            jdbc.update("delete from sys_async_task where task_id = ?", taskId);
+        }
+        exportTaskIds.clear();
     }
 
     // ==================================================================
@@ -285,6 +305,7 @@ class AuditQueryFlowTest extends ApiTestSupport {
                 Map.of("startTime", today, "endTime", today), token).assertOk("提交导出");
         String taskId = accepted.data("$.taskId");
         assertThat(taskId).isNotBlank();
+        exportTaskIds.add(taskId);
         assertThat((String) accepted.data("$.note")).as("提示语非空（前端直接展示它）").isNotBlank();
 
         // ② 等任务真跑完 —— 只断言"接口返回了 taskId"是不够的：
@@ -448,6 +469,7 @@ class AuditQueryFlowTest extends ApiTestSupport {
             // 判据 16：导出 CSV 里也不能有明文 Key
             RawResponse accepted = post("/api/audit/export", Map.of("keyword", "知识库#" + kbId), token)
                     .assertOk("导出含探针的那一页");
+            exportTaskIds.add(accepted.data("$.taskId"));
             AsyncTaskInfo<?> info = awaitTerminal(accepted.data("$.taskId"));
             String objectKey = String.valueOf(
                     ((Map<?, ?>) info.getResult()).get("objectKey"));

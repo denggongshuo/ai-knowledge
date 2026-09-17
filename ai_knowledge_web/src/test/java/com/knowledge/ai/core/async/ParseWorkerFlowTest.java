@@ -3,6 +3,7 @@ package com.knowledge.ai.core.async;
 import com.knowledge.ai.core.storage.DocStorage;
 import com.knowledge.ai.support.ApiTestSupport;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,6 +59,36 @@ class ParseWorkerFlowTest extends ApiTestSupport {
     private AsyncTaskService asyncTaskService;
 
     private final List<Long> probeKbIds = new ArrayList<>();
+
+    /**
+     * 驱动前先确认**没有别人留下的** PENDING 解析作业。
+     *
+     * <h3>这一条是 `#128` 的机制落点（`S5` 测试可靠性批查明的）</h3>
+     * <p>{@code ParseWorker#drainOnce()} 领的是**全局最老**的那一条 PENDING
+     * （`V17` 的 {@code idx_task_claim} 就是按 {@code created_at} 排的）。
+     * 于是库里只要躺着**别人**的陈旧作业，它就会被先领走，
+     * 而**本用例的作业永远轮不到** —— 现象是"入队了却没执行"、状态停在 {@code PENDING}，
+     * 且**失败的方法每次不同**（看谁的作业排在后面）。
+     *
+     * <p>实测（双向）：往表里灌 80 行一天前的 PENDING {@code doc-parse} 后，本类
+     * **8 个用例里 6 个转红**；清掉后立刻 **8/8 绿**。所以它不是并发 bug，
+     * 是**残留累积** —— 而残留的来源（{@code cleanProbeData} 漏删 {@code sys_async_task}）
+     * 已在同批修掉（见 {@code ProbeCleanup}）。
+     *
+     * <p>⚠️ 这条断言真红了**不要**去改本类 —— 去查**谁没清自己的作业行**。
+     * 它把那个"看起来像并发问题的偶发"变成一句能直接读懂的话。
+     */
+    @BeforeEach
+    void noForeignPendingJobs() {
+        Integer foreign = jdbcTemplate.queryForObject(
+                "select count(*) from sys_async_task where type = 'doc-parse' and status = 'PENDING'",
+                Integer.class);
+        assertThat(foreign)
+                .as("表里有 %s 行**别人留下的** PENDING 解析作业 —— drainOnce() 领的是全局最老的那条，"
+                        + "本用例的作业会被永远压在后面（#128）。真红了请去查谁没清自己的作业行"
+                        + "（S5 测试可靠性批实测：灌 80 行 ⇒ 本类 6 处红）", foreign)
+                .isZero();
+    }
 
     @AfterEach
     void cleanProbeData() {

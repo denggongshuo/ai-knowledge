@@ -3,6 +3,7 @@ package com.knowledge.ai.support;
 import com.jayway.jsonpath.JsonPath;
 import com.knowledge.ai.core.security.CaptchaStore;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -101,17 +102,75 @@ public abstract class ApiTestSupport {
     /** 兜底清理：用例失败也会执行，避免残留账号污染后续运行。 */
     @AfterEach
     void removeCreatedUsers() {
-        for (String username : createdUsers) {
-            deleteUser(username);
+        if (!createdUsers.isEmpty()) {
+            // 一次清完（原先是逐个账号跑两三条 SQL）
+            ProbeCleanup.cleanUsers(jdbc, List.copyOf(createdUsers));
         }
         createdUsers.clear();
     }
 
-    /** 删掉一个测试账号（先删关联再删主表，避开外键）。 */
+    /**
+     * 本次用例开始前 `sys_login_log` 的最大 id —— 收尾把本用例造的登录日志删干净。
+     *
+     * <h3>为什么登录日志要清（`#98`）</h3>
+     * <p>实测：一轮全量 **+242 行**，而**测试侧此前没有任何一个类删过它**。
+     * 它们在库里长得和真实登录一模一样（这正是 append-only 表的本意），
+     * 于是"清不掉"与"不该清"很容易被混为一谈。判据只有一条：
+     * **这些行是测试跑出来的，不是用户登出来的** —— 而水位线是唯一能区分这两者的东西
+     * （探针账号的由 {@link ProbeCleanup#cleanUsers} 点名清；
+     * 而 `admin` 这类**种子账号**不会被删，只能靠水位线）。
+     *
+     * <h3>⚠️ 为什么是水位线而不是"按 username 清"</h3>
+     * <p>种子账号（`admin`）的登录日志按 username 清就等于把**种子的**日志也删了，
+     * 而测试恰恰要断言"登录会留痕"。水位线只删**本次用例之后新增的**，
+     * 两种需求同时成立。
+     */
+    private long loginLogFloor;
+
+    @BeforeEach
+    void markLoginLogFloor() {
+        Long max = jdbc.queryForObject("select coalesce(max(id), 0) from sys_login_log", Long.class);
+        loginLogFloor = max == null ? 0L : max;
+    }
+
+    /**
+     * 收尾：删掉本用例期间新增的登录日志。
+     *
+     * <p>⚠️ 与 {@link #removeCreatedUsers} 一样放在 `@AfterEach` ——
+     * 用例**失败时更要清**，否则一次红会污染后面所有对"日志条数"敏感的用例。
+     */
+    @AfterEach
+    void removeLoginLogsCreatedByThisTest() {
+        jdbc.update("delete from sys_login_log where id > ?", loginLogFloor);
+    }
+
+    /**
+     * 收尾兜底：扫掉**无主**的 kb 族产物（`kb_id` 指向一个已经不存在的库）。
+     *
+     * <h3>这一条是 `#130` 的解药</h3>
+     * <p>"每个用例类自己清干净"已经被证明会漏 —— 十来个类各写一份 `cleanProbeData`，
+     * 而其中漏掉的那张表（`sys_async_task`）一轮就留 **76 行**，且因为 `sys_kb` 先被删，
+     * 那些行在库里**谁也看不见**。兜底换了个问法：**不问"你清了没有"，
+     * 只问"库里还剩不剩无主的东西"** —— 于是漏一处的代价从"永久累积"变成"多一次 DELETE"。
+     *
+     * <p>⚠️ 顺序：JUnit 先跑**子类**的 `@AfterEach`（各用例类自己的清理，会把 `sys_kb` 删掉），
+     * 再跑本类的 —— 所以到这里，那些没被清掉的产物正好**变成了无主**，一次扫干净。
+     */
+    @AfterEach
+    void sweepOrphanKbArtifacts() {
+        ProbeCleanup.sweepOrphanKbArtifacts(jdbc);
+    }
+
+    /**
+     * 删掉一个测试账号及其全部产物。
+     *
+     * <p>⚠️ `S5` 起委托给 {@link ProbeCleanup} —— 原先这里只有两行
+     * （`sys_user_role` + `sys_user`），比它该删的**少三张表**。
+     * 其中最要命的是 `sys_login_log`：**测试侧一个类都没删过**，
+     * 实测每轮全量留 **+242 行**（`#98`），而它们的 `user_id` 指向已删账号 ⇒ 全是孤儿。
+     */
     protected void deleteUser(String username) {
-        jdbc.update("delete ur from sys_user_role ur join sys_user u on u.id = ur.user_id "
-                + "where u.username = ?", username);
-        jdbc.update("delete from sys_user where username = ?", username);
+        ProbeCleanup.cleanUsers(jdbc, List.of(username));
     }
 
     /** 登记一个待清理账号（一般情况下用 {@link #createUser} 就够了）。 */
