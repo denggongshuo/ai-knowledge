@@ -1,0 +1,77 @@
+{
+  "_note": "T-711 评测语料（合成报价单）。**以「已入库的分片」形态给出，不进 upload→parse→chunk 链路** —— 理由见 RetrievalEvalTest 的类 javadoc。表格子块的形态（「列名 值，列名 值」）与 TableRenderer 的产出逐字一致。",
+  "documents": [
+    {
+      "docKey": "gw",
+      "title": "智能网关设备报价单（A 系列）",
+      "chunks": [
+        { "key": "gw-h1", "chunkType": "HEADING", "titlePath": "智能网关设备报价单（A 系列）",
+          "content": "智能网关设备报价单（A 系列）" },
+        { "key": "gw-p1", "chunkType": "PARAGRAPH", "titlePath": "智能网关设备报价单（A 系列） > 一、报价说明",
+          "content": "本报价单有效期 90 天，自签发之日起算。报价为含税单价，币种为人民币。所有型号均支持 7×24 小时技术支持，质保期 3 年。" },
+        { "key": "gw-p2", "chunkType": "PARAGRAPH", "titlePath": "智能网关设备报价单（A 系列） > 二、交付与付款",
+          "content": "交期以收到预付款之日起算。订单金额超过 20 万元可申请分批发货。预付款比例 30%，验收合格后 15 个工作日内结清余款。" },
+        { "key": "gw-tbl", "chunkType": "TABLE", "parentKey": null, "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "| 型号 | 产品名称 | 单价 | 交期 | 起订量 |\n|---|---|---|---|---|\n| A-100 | 智能网关标准版 | 1800 | 30 | 10 |\n| A-200 | 智能网关增强版 | 2600 | 35 | 10 |\n| A-300 | 智能网关边缘版 | 3300 | 40 | 5 |\n| A-400 | 智能网关工业版 | 5100 | 60 | 2 |\n| A-1000 | 智能网关企业版 | 4200 | 45 | 5 |\n" },
+        { "key": "a100-row", "chunkType": "TABLE", "parentKey": "gw-tbl", "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "型号 A-100，产品名称 智能网关标准版，单价 1800，交期 30，起订量 10" },
+        { "key": "a200-row", "chunkType": "TABLE", "parentKey": "gw-tbl", "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "型号 A-200，产品名称 智能网关增强版，单价 2600，交期 35，起订量 10" },
+        { "key": "a300-row", "chunkType": "TABLE", "parentKey": "gw-tbl", "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "型号 A-300，产品名称 智能网关边缘版，单价 3300，交期 40，起订量 5" },
+        { "key": "a400-row", "chunkType": "TABLE", "parentKey": "gw-tbl", "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "型号 A-400，产品名称 智能网关工业版，单价 5100，交期 60，起订量 2" },
+        { "key": "a1000-row", "chunkType": "TABLE", "parentKey": "gw-tbl", "titlePath": "智能网关设备报价单（A 系列） > 三、型号与价格",
+          "content": "型号 A-1000，产品名称 智能网关企业版，单价 4200，交期 45，起订量 5" }
+      ]
+    },
+    {
+      "docKey": "sensor",
+      "title": "传感器与配件报价单（S 系列）",
+      "chunks": [
+        { "key": "sn-h1", "chunkType": "HEADING", "titlePath": "传感器与配件报价单（S 系列）",
+          "content": "传感器与配件报价单（S 系列）" },
+        { "key": "sn-p1", "chunkType": "PARAGRAPH", "titlePath": "传感器与配件报价单（S 系列） > 一、通用条款",
+          "content": "全部传感器防护等级 IP65 及以上，工作温度 -20℃ ~ 60℃。支持 LoRa 与 NB-IoT 两种回传方式，默认发 LoRa 版本。" },
+        { "key": "sn-p2", "chunkType": "PARAGRAPH", "titlePath": "传感器与配件报价单（S 系列） > 二、安装与调试",
+          "content": "随货提供安装支架与说明书。批量超过 100 只可申请现场调试服务，调试服务按人天单独计费。" },
+        { "key": "sn-tbl", "chunkType": "TABLE", "parentKey": null, "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "| 型号 | 产品名称 | 单价 | 交期 | 起订量 |\n|---|---|---|---|---|\n| S-10 | 温湿度传感器 | 320 | 15 | 50 |\n| S-20 | 烟感传感器 | 480 | 20 | 30 |\n| S-30 | 水浸传感器 | 560 | 25 | 20 |\n| S-40 | 门磁传感器 | 260 | 12 | 50 |\n| S-50 | 红外人体传感器 | 390 | 18 | 30 |\n| S-60 | 气体检测传感器 | 1280 | 35 | 10 |\n" },
+        { "key": "s10-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-10，产品名称 温湿度传感器，单价 320，交期 15，起订量 50" },
+        { "key": "s20-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-20，产品名称 烟感传感器，单价 480，交期 20，起订量 30" },
+        { "key": "s30-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-30，产品名称 水浸传感器，单价 560，交期 25，起订量 20" },
+        { "key": "s40-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-40，产品名称 门磁传感器，单价 260，交期 12，起订量 50" },
+        { "key": "s50-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-50，产品名称 红外人体传感器，单价 390，交期 18，起订量 30" },
+        { "key": "s60-row", "chunkType": "TABLE", "parentKey": "sn-tbl", "titlePath": "传感器与配件报价单（S 系列） > 三、型号与价格",
+          "content": "型号 S-60，产品名称 气体检测传感器，单价 1280，交期 35，起订量 10" }
+      ]
+    },
+    {
+      "docKey": "platform",
+      "title": "平台软件与服务报价单（P 系列）",
+      "chunks": [
+        { "key": "pf-h1", "chunkType": "HEADING", "titlePath": "平台软件与服务报价单（P 系列）",
+          "content": "平台软件与服务报价单（P 系列）" },
+        { "key": "pf-p1", "chunkType": "PARAGRAPH", "titlePath": "平台软件与服务报价单（P 系列） > 一、授权方式",
+          "content": "平台软件按套授权，含一年免费升级。第二年起按合同金额的 15% 收取年度维护费。源码不随软件交付。" },
+        { "key": "pf-p2", "chunkType": "PARAGRAPH", "titlePath": "平台软件与服务报价单（P 系列） > 二、实施服务",
+          "content": "标准实施服务按 3500 元/人天计费，通常需要 20 至 40 人天。定制开发另行报价，需在合同签订前确认需求范围。" },
+        { "key": "pf-tbl", "chunkType": "TABLE", "parentKey": null, "titlePath": "平台软件与服务报价单（P 系列） > 三、型号与价格",
+          "content": "| 型号 | 产品名称 | 单价 | 交期 | 起订量 |\n|---|---|---|---|---|\n| P-100 | 设备管理平台基础版 | 38000 | 30 | 1 |\n| P-200 | 设备管理平台专业版 | 86000 | 45 | 1 |\n| P-300 | 数据分析平台 | 128000 | 60 | 1 |\n| P-400 | 运维工单平台 | 52000 | 40 | 1 |\n" },
+        { "key": "p100-row", "chunkType": "TABLE", "parentKey": "pf-tbl", "titlePath": "平台软件与服务报价单（P 系列） > 三、型号与价格",
+          "content": "型号 P-100，产品名称 设备管理平台基础版，单价 38000，交期 30，起订量 1" },
+        { "key": "p200-row", "chunkType": "TABLE", "parentKey": "pf-tbl", "titlePath": "平台软件与服务报价单（P 系列） > 三、型号与价格",
+          "content": "型号 P-200，产品名称 设备管理平台专业版，单价 86000，交期 45，起订量 1" },
+        { "key": "p300-row", "chunkType": "TABLE", "parentKey": "pf-tbl", "titlePath": "平台软件与服务报价单（P 系列） > 三、型号与价格",
+          "content": "型号 P-300，产品名称 数据分析平台，单价 128000，交期 60，起订量 1" },
+        { "key": "p400-row", "chunkType": "TABLE", "parentKey": "pf-tbl", "titlePath": "平台软件与服务报价单（P 系列） > 三、型号与价格",
+          "content": "型号 P-400，产品名称 运维工单平台，单价 52000，交期 40，起订量 1" }
+      ]
+    }
+  ]
+}

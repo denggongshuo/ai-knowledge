@@ -1,0 +1,37 @@
+{
+  "_note": "T-711 评测题集。三种题型各 8 条（需求要求 20~30 条、含单跳/多跳/聚合）。golden 是**金标分片键**（对应 corpus.json 里的 key），mustNotRecall 是**负向锚**（G4-8：查 A-100 不应召回 A-1000）。",
+  "_types": {
+    "SINGLE": "单跳：一条分片就能答（直接查某型号某属性）",
+    "MULTI": "多跳：要两条以上分片组合才能答（比较、联合计算、求最值）",
+    "AGGREGATE": "聚合：要对一组行做计数/筛选，考验召回的**完整性**而非精确度"
+  },
+  "_note_on_sizes": "聚合题的 golden 有多达 6 条的（如「S 系列共有几款」）—— **Recall@5 天然到不了 1.0**（只有 5 个名额）。这不是缺陷，它正是「表格类聚合问题需要独立召回通道（T-710）」这条判断的量化依据，所以照实报而不削足适履。",
+  "queries": [
+    { "id": "Q01", "type": "SINGLE", "query": "A-100 的报价是多少", "golden": ["a100-row"], "mustNotRecall": [] },
+    { "id": "Q02", "type": "SINGLE", "query": "S-30 水浸传感器的单价是多少钱", "golden": ["s30-row"], "mustNotRecall": [] },
+    { "id": "Q03", "type": "SINGLE", "query": "P-200 的交期要多久", "golden": ["p200-row"], "mustNotRecall": [] },
+    { "id": "Q04", "type": "SINGLE", "query": "温湿度传感器的起订量是多少", "golden": ["s10-row"], "mustNotRecall": [] },
+    { "id": "Q05", "type": "SINGLE", "query": "运维工单平台多少钱一套", "golden": ["p400-row"], "mustNotRecall": [] },
+    { "id": "Q06", "type": "SINGLE", "query": "A-400 工业网关的交期是多少天", "golden": ["a400-row"], "mustNotRecall": [] },
+    { "id": "Q07", "type": "SINGLE", "query": "气体检测传感器的价格是多少", "golden": ["s60-row"], "mustNotRecall": [] },
+    { "id": "Q08", "type": "SINGLE", "query": "A-100 这一款的价格和交期", "golden": ["a100-row"], "mustNotRecall": ["a1000-row"] },
+
+    { "id": "Q09", "type": "MULTI", "query": "A 系列里交期最长的是哪个型号，它卖多少钱", "golden": ["a400-row"], "mustNotRecall": [] },
+    { "id": "Q10", "type": "MULTI", "query": "单价最低的传感器是哪一款", "golden": ["s40-row"], "mustNotRecall": [] },
+    { "id": "Q11", "type": "MULTI", "query": "P-100 和 P-200 的差价是多少", "golden": ["p100-row", "p200-row"], "mustNotRecall": [] },
+    { "id": "Q12", "type": "MULTI", "query": "智能网关里面起订量最低的是哪款", "golden": ["a400-row"], "mustNotRecall": [] },
+    { "id": "Q13", "type": "MULTI", "query": "A-100 和 S-10 各买 10 套一共要多少钱", "golden": ["a100-row", "s10-row"], "mustNotRecall": [] },
+    { "id": "Q14", "type": "MULTI", "query": "哪款平台软件的单价是运维工单平台的两倍以上", "golden": ["p300-row", "p400-row"], "mustNotRecall": [] },
+    { "id": "Q15", "type": "MULTI", "query": "交期不超过 20 天的传感器有哪些型号", "golden": ["s10-row", "s20-row", "s40-row", "s50-row"], "mustNotRecall": [] },
+    { "id": "Q16", "type": "MULTI", "query": "智能网关企业版和工业版哪个交期更长", "golden": ["a1000-row", "a400-row"], "mustNotRecall": [] },
+
+    { "id": "Q17", "type": "AGGREGATE", "query": "单价超过 3000 元的网关型号有几款", "golden": ["a300-row", "a400-row", "a1000-row"], "mustNotRecall": [] },
+    { "id": "Q18", "type": "AGGREGATE", "query": "S 系列一共有多少款传感器", "golden": ["s10-row", "s20-row", "s30-row", "s40-row", "s50-row", "s60-row"], "mustNotRecall": [] },
+    { "id": "Q19", "type": "AGGREGATE", "query": "全部报价单里单价最高的型号是哪一个", "golden": ["p300-row"], "mustNotRecall": [] },
+    { "id": "Q20", "type": "AGGREGATE", "query": "交期达到 60 天的型号有哪些", "golden": ["a400-row", "p300-row"], "mustNotRecall": [] },
+    { "id": "Q21", "type": "AGGREGATE", "query": "起订量为 1 的产品有哪些", "golden": ["p100-row", "p200-row", "p300-row", "p400-row"], "mustNotRecall": [] },
+    { "id": "Q22", "type": "AGGREGATE", "query": "单价低于 500 元的传感器有几款", "golden": ["s10-row", "s20-row", "s40-row", "s50-row"], "mustNotRecall": [] },
+    { "id": "Q23", "type": "AGGREGATE", "query": "网关系列里单价低于 3000 元的有几款", "golden": ["a100-row", "a200-row"], "mustNotRecall": [] },
+    { "id": "Q24", "type": "AGGREGATE", "query": "起订量不超过 2 的产品有哪些型号", "golden": ["a400-row", "p100-row", "p200-row", "p300-row", "p400-row"], "mustNotRecall": [] }
+  ]
+}
