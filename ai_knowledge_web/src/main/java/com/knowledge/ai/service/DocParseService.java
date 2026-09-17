@@ -16,6 +16,7 @@ import com.knowledge.ai.pipeline.cleaning.CleanedDocument;
 import com.knowledge.ai.pipeline.cleaning.CleaningOptions;
 import com.knowledge.ai.pipeline.cleaning.DocumentCleaner;
 import com.knowledge.ai.pipeline.enhance.IndexEnhancer;
+import com.knowledge.ai.pipeline.vectorize.ChunkVectorizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -84,6 +85,12 @@ public class DocParseService {
     /** 索引增强（`T-507`）—— 分片之后的文档级摘要调用，见 {@link IndexEnhancer}。 */
     private final IndexEnhancer indexEnhancer;
 
+    /** 向量化（`T-508`）—— 分片之后的嵌入 + Milvus 写入，见 {@link ChunkVectorizer}。 */
+    private final ChunkVectorizer chunkVectorizer;
+
+    /** 读已落库的块给向量化用（主键必须是落库后的 chunk.id）。 */
+    private final ChunkReader chunkReader;
+
     private final jakarta.persistence.EntityManager entityManager;
 
     /**
@@ -139,8 +146,29 @@ public class DocParseService {
 
             // 质量四列里的三个：表格两列由解析侧给，图片列由 `O3` 步 4 销掉 S4-B §9 第 3 条
             // 的"采了不用"（imageCount 早已在采，只是没写）。image_parsed 仍等 T-512 的 VL。
+            // 状态停在这里（INDEXING）—— 向量还没进 Milvus，见下。
             recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed(),
                     cleaned.document().imageCount());
+
+            // T-508 向量化：落库的块 → 嵌入 → Milvus。
+            // ⚠️ 顺序是**硬约束**（本批 §3.4 假设 #1）：必须在 enhance **之后**，
+            // 否则摘要块永远没有向量；而向量一旦生成，改回来就是全库重建。
+            //
+            // 输入从库里读（ChunkReader）而不是复用上面的 `enhanced.blocks()`：
+            // 向量的主键必须是**已落库的 chunk.id**，而且要读回子块落库后被回填的 parent_id。
+            // 这同时让 T-406 的重建索引将来能复用同一条路（那时手上只有 docId）。
+            //
+            // ⚠️ 与增强相反，向量化失败**必须牵连文档** —— 「块都在、向量一个没有」
+            // 却标着可检索，是这个项目最不能接受的静默故障形态。所以这里不 catch。
+            ChunkVectorizer.Result vectorized = chunkVectorizer.vectorize(
+                    docId, row.kbId(), chunkReader.readByDocId(docId));
+            if (vectorized.allowsReady()) {
+                recordWriter.markReady(docId);
+            } else {
+                // 开关关掉时停在中途态 INDEXING —— 不谎报可检索。日志已在 vectorize 里记过。
+                log.warn("向量化未执行，文档停在中途态 INDEXING：docId={} 原因={}",
+                        docId, vectorized.detail());
+            }
         } catch (ParseException ex) {
             recordWriter.markFailed(docId, ex.getMessage());
             recordWriter.replaceIssues(docId, row.kbId(), parsed != null ? parsed.issues() : java.util.List.of());
@@ -161,7 +189,9 @@ public class DocParseService {
                 parsed.tableParsed(), parsed.tableTotal(), parsed.imageCount(), chunkCount);
         Map<String, Object> result = new HashMap<>();
         result.put("docId", docId);
-        result.put("status", "INDEXING");
+        // READY = 向量已入 Milvus、可被检索（`G4-3` 后半）。向量化关掉或没执行时，
+        // 文档停在中途态 INDEXING —— 这里照实报状态，不让返回值比库里的更乐观
+        result.put("status", recordWriter.statusOf(docId));
         result.put("pages", parsed.pages());
         // chars 报**清洗后**的值：前端"本页多少字"问的是"进了索引多少字"，
         // 而原始值仍留在 parse.json 里可查（两个数都打进了上面的日志）

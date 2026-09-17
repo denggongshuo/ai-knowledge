@@ -154,6 +154,43 @@ public class DocRecordWriter {
     }
 
     /**
+     * 可检索：向量已全部落 Milvus（`T-508`），推进 {@code INDEXING → READY}。
+     *
+     * <p><b>为什么必须是独立的一步、而不是并进 {@link #markParsed}</b>：
+     * {@code READY} 的语义是「**唯一可被检索的状态**」（《03》§4.2）。解析完只完成了
+     * "块有了"，向量还没进 Milvus —— 那时标 READY 就是本项目最怕的"报告说成功"
+     * （`G4-3` 后半句盯的就是这一跳，也是 C2 §9 #52 登记的那条）。
+     *
+     * <p>调用方是 {@code DocParseService}，**只在向量化确实成功之后**调
+     * （{@code ChunkVectorizer.Result#allowsReady()}）。
+     */
+    @Transactional
+    public void markReady(long docId) {
+        entityManager.createNativeQuery(
+                        "update sys_document set status = 'READY', error_msg = null, updated_at = :now "
+                                + "where id = :id")
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /**
+     * 读文档当前状态（供编排层"照实回报"用）。
+     *
+     * <p>存在的理由：{@code DocParseService} 的返回值以前写死 {@code "INDEXING"} ——
+     * 向量化开关关掉、文档真停在中途态时，返回值会**比库里的状态更乐观**。
+     * 状态只有一个事实源，回报要查它，而不是猜。
+     */
+    @Transactional(readOnly = true)
+    public String statusOf(long docId) {
+        List<?> rows = entityManager.createNativeQuery(
+                        "select status from sys_document where id = :id")
+                .setParameter("id", docId)
+                .getResultList();
+        return rows.isEmpty() || rows.getFirst() == null ? "UNKNOWN" : String.valueOf(rows.getFirst());
+    }
+
+    /**
      * 整批重建逐页问题（先删后插）。
      *
      * <p>调用时机：解析成功与失败**两条路都调** —— 失败的文档也要看得见
