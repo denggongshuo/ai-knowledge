@@ -32,6 +32,7 @@ import java.util.List;
  * @param recallMillis      两路召回**并行**的墙钟耗时（`G5-1`：应小于两路耗时之和）
  * @param fuseMillis        融合耗时
  * @param rerankMillis      重排耗时；未重排为 0
+ * @param tableMillis       表格回表耗时（`T-705`；`G5-6`）。没有表格命中时接近 0
  * @param totalMillis       端到端耗时
  * @param recallTopK        每路召回条数
  * @param recallThreshold   本次使用的库级召回阈值
@@ -61,6 +62,7 @@ public record RetrievalTrace(String query,
                              long recallMillis,
                              long fuseMillis,
                              long rerankMillis,
+                             long tableMillis,
                              long totalMillis,
                              int recallTopK,
                              double recallThreshold,
@@ -89,7 +91,8 @@ public record RetrievalTrace(String query,
         }
         return new RetrievalTrace(query, mode, kbIds, kbCount, docScopeCount, docScopeFallback,
                 vectorHits, bm25Hits, fusedCount, scopeMillis, recallMillis, fuseMillis,
-                rerankMillis, totalMillis, recallTopK, recallThreshold, rerankTopK, rerankEnabled,
-                tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote, miss, newChunks);
+                rerankMillis, tableMillis, totalMillis, recallTopK, recallThreshold, rerankTopK,
+                rerankEnabled, tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote,
+                miss, newChunks);
     }
 }

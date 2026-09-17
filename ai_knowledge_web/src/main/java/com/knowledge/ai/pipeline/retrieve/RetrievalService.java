@@ -61,6 +61,9 @@ public class RetrievalService {
 
     private final SystemSettingService systemSettingService;
 
+    /** `T-705`：把命中的表格子块换成它所在的表（`G5-6`）。 */
+    private final TableLookupService tableLookupService;
+
     /**
      * 检索。
      *
@@ -109,26 +112,35 @@ public class RetrievalService {
         // ---------- ⑤ 精排（可降级）----------
         RerankOutcome rerank = rerank(trimmed, fused, params);
 
+        // ---------- ⑤.5 表格回表（T-705 · G5-6）----------
+        // 位置在精排**之后**，两个理由：
+        //   ① 窗口要"命中哪一行"，而命中哪几条是精排 + 裁剪才定下来的 —— 放前面会为
+        //      一堆随后被裁掉的分片白查父块（N+1 的代价白付一半）；
+        //   ② 回表**不改名次也不改分数**，所以它不会让精排的结果失真。
+        // 它只换内容：命中子块（一行）→ 父块或其行窗口（`TableLookup`）。
+        long tableStart = System.nanoTime();
+        List<RetrievedChunk> chunks = tableLookupService.apply(rerank.chunks());
+        long tableMillis = elapsed(tableStart);
+
         // ---------- ⑥ 契约 ----------
         int kbCount = scope.kbIds().size();
         long totalMillis = elapsed(start);
-        List<RetrievedChunk> chunks = rerank.chunks();
 
         RetrievalTrace trace = new RetrievalTrace(trimmed, params.mode(), scope.kbIds(), kbCount,
                 scope.docScopeCount(), scope.docFallback(),
                 recall.vectorHits().size(), recall.bm25Hits().size(), fused.size(),
-                scopeMillis, recallMillis, fuseMillis, rerank.millis(), totalMillis,
+                scopeMillis, recallMillis, fuseMillis, rerank.millis(), tableMillis, totalMillis,
                 params.recallTopK(), params.recallThreshold(), params.rerankTopK(),
                 params.rerankEnabled(), params.tableWeight(), params.missThreshold(),
                 params.lowScoreWarn(), rerank.applied(), rerank.note(),
                 rerank.miss(chunks, params), chunks);
 
         log.info("[检索] 完成：query={} 库数={} 可见文档={} 向量={} BM25={} 融合={} 返回={} "
-                        + "重排={} 未命中={} 耗时={}ms（范围 {} + 召回 {} + 融合 {} + 重排 {}）",
+                        + "重排={} 回表={} 未命中={} 耗时={}ms（范围 {} + 召回 {} + 融合 {} + 重排 {} + 回表 {}）",
                 abbreviate(trimmed), kbCount, scope.docScopeCount(),
                 recall.vectorHits().size(), recall.bm25Hits().size(), fused.size(), chunks.size(),
-                rerank.applied() ? "已执行" : "未执行", trace.miss(), totalMillis,
-                scopeMillis, recallMillis, fuseMillis, rerank.millis());
+                rerank.applied() ? "已执行" : "未执行", tableWindowCount(chunks), trace.miss(), totalMillis,
+                scopeMillis, recallMillis, fuseMillis, rerank.millis(), tableMillis);
 
         return new RetrievalResult(chunks, trace, kbCount);
     }
@@ -226,7 +238,10 @@ public class RetrievalService {
                     rawRerank,
                     weighted,
                     hit.channelRanks(),
-                    warn));
+                    warn,
+                    // `T-705`：表格上下文由第 ⑤.5 步（`tableLookupService.apply`）补。
+                    // 这里**必须**给 null —— 回表放在精排之后，这一层还不知道哪几条会被留下
+                    null));
         }
 
         // 重排过就按加权分重排；没重排时保持融合名次（融合分本来就是降序的）
@@ -285,9 +300,21 @@ public class RetrievalService {
                                                long scopeMillis, long start, String note) {
         RetrievalTrace trace = new RetrievalTrace(query, null, scope.kbIds(), scope.kbIds().size(),
                 scope.docScopeCount(), scope.docFallback(),
-                0, 0, 0, scopeMillis, 0L, 0L, 0L, elapsed(start),
+                0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, elapsed(start),
                 0, 0d, 0, false, 0d, 0d, 0d, false, note, false, List.of());
         return new RetrievalResult(List.of(), trace, scope.kbIds().size());
+    }
+
+    /**
+     * 本次有几条走了表格回表。
+     *
+     * <p>**从 {@code chunks} 派生，不另存一个计数** —— {@code trace.chunks} 与顶层
+     * {@code chunks} 是同一个实例（`G5-9`），所以这个数在 trace 里也查得到，
+     * 再存一份就是给同一个事实两个来源（它们迟早不一致）。
+     * 这正是"同源由构造器强制"换来的好处：能派生的东西就不必存。
+     */
+    private static long tableWindowCount(List<RetrievedChunk> chunks) {
+        return chunks.stream().filter(c -> c.tableContext() != null).count();
     }
 
     private static long elapsed(long startNanos) {

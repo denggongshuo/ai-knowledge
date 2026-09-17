@@ -30,6 +30,8 @@ import java.util.Map;
  *                     未重排时等于 {@link #score}
  * @param channelRanks 各通道的名次（1 起），见 {@link RrfFusion.FusedHit#channelRanks()}
  * @param warn         是否低于降权提示线 —— **只标黄，不过滤**（`G5-5`）
+ * @param tableContext 表格回表的结果（`T-705`）；{@code null} = 这条不是表格子块，
+ *                     或回表没取到父块。见 {@link TableContext}
  */
 public record RetrievedChunk(String chunkId,
                              long docId,
@@ -44,7 +46,44 @@ public record RetrievedChunk(String chunkId,
                              Double rerankScore,
                              double rankedScore,
                              Map<RetrievalHit.Channel, Integer> channelRanks,
-                             boolean warn) {
+                             boolean warn,
+                             TableContext tableContext) {
+
+    /**
+     * 表格回表的结果（`T-705` · `G5-6`）。
+     *
+     * <h3>{@link #content()} 被**换掉**了，所以必须解释换成了什么</h3>
+     * <p>命中一条表格子块（一行）时，真正该给大模型看的是**它所在的表**，而不是孤立的一行
+     * —— 孤立的「型号 A-100，单价 1800」没有列含义，问「交期最长的型号」时也答不了。
+     * 所以回表之后 {@link RetrievedChunk#content()} 是**父块（或它的行窗口）的 Markdown**，
+     * 不再是那一行。
+     *
+     * <p>换掉内容是有代价的：**"到底哪一行命中了"这个信息会丢**。引用卡片要能高亮那一行，
+     * 生成侧也不该被整表淹没。所以原始命中行的原文留在 {@link #matchedRow()} 里 ——
+     * 它是**唯一没有第二个来源**的东西（父块随时能从库里再取一次，那一行不能）。
+     *
+     * <h3>{@link #windowed()} 为什么必须显式记，而不是靠行数推</h3>
+     * <p>{@code totalRows == rowTo - rowFrom + 1} 也成立时（表恰好和窗口一样大），
+     * 光看数字分不出"整表"与"窗口"。而这两件事对用户是不同的承诺：
+     * 前者是"这就是全部"，后者是"还有更多，只是没给你"。前端要据此决定要不要显示
+     * 「仅显示第 12~22 行 / 共 80 行」。
+     *
+     * @param parentChunkId 父块（{@code TABLE} 且 {@code parentId is null} 的那个）的分片 id
+     * @param rowFrom       窗口起始数据行，**1 起、含**（不含表头；表头永远被带上）
+     * @param rowTo         窗口结束数据行，**1 起、含**
+     * @param totalRows     父块的数据行总数（不含表头）
+     * @param windowed      {@code true} = 只取了行窗口；{@code false} = 返回的是整表
+     * @param matchedRow    原始命中子块的内容（行式文本，**永不改写**）
+     * @param note          回表过程中的非常规情况（如行数对不上而退回整表）；正常为 {@code null}
+     */
+    public record TableContext(long parentChunkId,
+                               int rowFrom,
+                               int rowTo,
+                               int totalRows,
+                               boolean windowed,
+                               String matchedRow,
+                               String note) {
+    }
 
     /** {@link RetrievedChunk#score()} 的量纲。 */
     public enum ScoreKind {
@@ -79,6 +118,23 @@ public record RetrievedChunk(String chunkId,
      */
     public RetrievedChunk withRank(int newRank) {
         return new RetrievedChunk(chunkId, docId, kbId, blockType, titlePath, content,
-                score, scoreKind, newRank, fusionRank, rerankScore, rankedScore, channelRanks, warn);
+                score, scoreKind, newRank, fusionRank, rerankScore, rankedScore, channelRanks, warn,
+                tableContext);
+    }
+
+    /**
+     * 回表结果（`T-705`）：**换掉 {@link #content()}** 并挂上 {@link TableContext}。
+     *
+     * <p>只此一处改写内容，且必须由 {@code TableLookup} 调用 —— 回表是"把一行的上下文补回来"，
+     * 不是"再做一次检索"。别把它实现成往列表里**追加**一条父块：那会让同一次命中共出现两条
+     * （一条行、一条表），引用角标指到两处，而两条的分数还一样。
+     *
+     * @param newContent   父块或它的行窗口 Markdown（{@link #matchedRow} 仍留在 context 里）
+     * @param newTableContext 回表结果
+     */
+    public RetrievedChunk withTableContext(String newContent, TableContext newTableContext) {
+        return new RetrievedChunk(chunkId, docId, kbId, blockType, titlePath, newContent,
+                score, scoreKind, rank, fusionRank, rerankScore, rankedScore, channelRanks, warn,
+                newTableContext);
     }
 }

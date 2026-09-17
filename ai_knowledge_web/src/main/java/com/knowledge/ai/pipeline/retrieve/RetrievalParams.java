@@ -103,12 +103,19 @@ public record RetrievalParams(RetrievalMode mode,
         double lowScoreWarn =
                 settings.decimal(SystemSettings.RETRIEVAL_LOW_SCORE_WARN,
                         SystemSettings.DEFAULT_LOW_SCORE_WARN);
+        // `T-706` 查出：这个键此前**取了却没用** —— `SystemSettingService.KEYS` 一直在查
+        // `retrieval.rerank-top-k`，而本方法读的是 Java 常量 `KbConfigDefaults.RERANK_TOP_K`。
+        // 两个真值源当时都等于 5，所以没有任何现象；一旦有人在 `sys_setting` 里把它改成 7，
+        // 就会出现「`GET /system/thresholds` 报 7、检索实际用 5」—— 两边都不报错。
+        // 兜底仍取常量（与 `V2` 种子、`KbConfigDefaults` 三者同值，含义是"键缺行"）。
+        int globalRerankTopK = settings.integer(SystemSettings.RETRIEVAL_RERANK_TOP_K,
+                SystemSettings.DEFAULT_RERANK_TOP_K);
 
         RetrievalMode mode = kbConfig == null
                 ? KbConfigDefaults.RETRIEVAL_MODE
                 : parseMode(kbConfig.mode());
         double recallThreshold = kbConfig == null ? globalRecall : kbConfig.recallThreshold();
-        int rerankTopK = kbConfig == null ? KbConfigDefaults.RERANK_TOP_K : kbConfig.rerankTopK();
+        int rerankTopK = kbConfig == null ? globalRerankTopK : kbConfig.rerankTopK();
         boolean rerankEnabled = kbConfig == null || kbConfig.rerankEnabled();
         double tableWeight = kbConfig == null ? KbConfigDefaults.TABLE_WEIGHT : kbConfig.tableWeight();
 
