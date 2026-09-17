@@ -135,6 +135,10 @@ function purgeProbe() {
   const probeDocs = `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}'`
   minioRemove(mysqlScalar(`select d.storage_path ${probeDocs};`))
   minioRemove(mysqlScalar(`select d.parse_path ${probeDocs};`))
+  // ①' Milvus 里的向量 —— **必须在删 sys_kb 行之前做**（按 probe kb id 删，删完就查不到了）。
+  //     `S4-M05-C3` 起探针文档也会被向量化（T-508）；不删就是"文档没了、向量还在"的幽灵数据。
+  //     这是 `汇总.md` §3 #79 那条教训的**第 N 次复发**：新增持久化产物时没人回头查清理函数。
+  milvusRemoveByProbeKb()
   mysqlScalar(
     `delete i from sys_parse_issue i join sys_document d on d.id=i.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
       delete c from sys_chunk c join sys_document d on d.id=c.doc_id join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}';
@@ -144,6 +148,52 @@ function purgeProbe() {
   )
 }
 const kbCount = () => Number(mysqlScalar('select count(*) from sys_kb;'))
+
+/**
+ * 探针库的 id **列表**（**要在 purgeProbe 之前取**：行删了就查不到 id 了）。
+ *
+ * <p>⚠️ 必须 split 成数组：`mysqlScalar` 返回的是**字符串**（`-N` 的多行文本），
+ * 直接 `.join(',')` 会炸成 `ids.join is not a function` —— 本轮实测踩过。
+ */
+const probeKbIds = () => (mysqlScalar(`select id from sys_kb where code='${PROBE_CODE}';`) ?? '')
+  .split('\n').map((s) => s.trim()).filter(Boolean)
+
+/**
+ * 探针库在 **Milvus** 里残留的向量条数（`S4-M05-C3` / `T-508` 起会 > 0）。
+ *
+ * <p>走 Milvus REST v2，零新增依赖。**必须用 `entities/query` 的 `count(*)`，不能用
+ * `get_stats` 的 `rowCount`** —— 后者只统计**已 flush** 的数据，而写入路径刻意不 flush
+ * （见 `MilvusChunkWriter` 类 javadoc），拿它判残留恒得 0，等于没查。
+ */
+const milvusVectorRowsOfProbeKb = async (ids) => {
+  if (!ids || ids.length === 0) return 0
+  // ⚠️ **删除的可见性有几秒延迟**（实测：`deleteCount=9` 之后立刻 count 仍得 9，过几秒才归 0）。
+  //    只查一次会把"刚删完"读成"没删掉" → 假失败。故轮询到 0 或超时为止。
+  for (let i = 0; i < 6; i++) {
+    const out = spawnSync('bash', ['-c',
+      `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/entities/query ` +
+      `-H 'Content-Type: application/json' ` +
+      `-d '{"collectionName":"knowledge_vectors","filter":"kb_id in [${ids.join(',')}]","outputFields":["count(*)"]}'`,
+    ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
+    const n = Number((out.match(/"count\(\*\)":(\d+)/) ?? [])[1] ?? -1)
+    if (n === 0) return 0
+    if (i < 5) await sleep(2000)
+    else return n
+  }
+  return -1
+}
+
+/** 删掉探针库的全部向量。**调用必须在删 `sys_kb` 行之前。** */
+function milvusRemoveByProbeKb() {
+  const ids = probeKbIds()
+  if (ids.length === 0) return
+  spawnSync('bash', ['-c',
+    `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/entities/delete ` +
+    `-H 'Content-Type: application/json' ` +
+    `-d '{"collectionName":"knowledge_vectors","filter":"kb_id in [${ids.join(',')}]"}'`,
+  ], { cwd: REPO_ROOT, encoding: 'utf8' })
+}
+
 /** 探针库的分片行数 —— `S4-M05-C1` 起 `sys_chunk` 也要跟着清，否则留下**孤儿块**。 */
 const chunkRowsOfProbe = () =>
   Number(mysqlScalar(`select count(*) from sys_chunk c join sys_kb k on k.id=c.kb_id where k.code='${PROBE_CODE}';`))
@@ -525,15 +575,15 @@ async function main() {
     await waitFor(`window.__t.docRows().length === 1`, { label: '文档列表出现该行', timeout: 20000 })
     const row = await evaluate(`window.__t.docRowOf(${JSON.stringify('E2E回归探针')})`)
     check(Array.isArray(row) && row.length > 0, 'G4-1：上传完成后文档列表出现该行（真刷新的列表）', row ? `列数=${row.length}` : '—')
-    check(row && row.includes('索引中'), 'G4-3：状态列渲染「索引中」（域内真值 INDEXING → 展示文案；S4-B 起上传即解析）', row ? row[5] : '—')
+    check(row && row.includes('已就绪'), 'G4-3（后半收口）：状态列渲染「已就绪」（域内真值 READY → 展示文案；S4-C3 起向量已入 Milvus，不再是 INDEXING）', `状态=${row?.[5]}`)
 
     // ---- G4-4：状态列与解析质量列**独立** ----
     // 列索引：0 勾选 · 1 文件名 · 2 类型 · 3 大小 · 4 分片数 · 5 状态 · 6 解析质量 · 7 上传人 · 8 上传时间 · 9 操作
-    // S4-B 起：MD 文本解析成功 → INDEXING；无表格 → 质量列「无表格 / 图片」。
+    // S4-C3 起：MD 文本解析成功 → READY（向量已入 Milvus）；无表格 → 质量列「无表格 / 图片」。
     // 两列各自反映一件独立的事实（状态来自 status，质量来自 table_*/image_*），这正是 §3.6 的设计目的。
     check(
-      row && row[5] === '索引中' && row[6] === '无表格 / 图片',
-      'G4-4：《06》§3.6 的两列独立 —— 状态列「索引中」而质量列「无表格 / 图片」（MD 无表格，质量列如实为 0）',
+      row && row[5] === '已就绪' && row[6] === '无表格 / 图片',
+      'G4-4：《06》§3.6 的两列独立 —— 状态列「已就绪」而质量列「无表格 / 图片」（MD 无表格）',
       `状态=${row?.[5]} 质量=${row?.[6]}`,
     )
     // ⚠️ 本条在 `S4-M05-C1` 被**改写**（原断言：`row[4] === '—'`）。
@@ -689,14 +739,19 @@ async function main() {
     }
     child.kill()
     try {
+      // ⚠️ 在 purgeProbe **之前**取探针库 id：行删掉后就再也定位不到 Milvus 里的向量了
+      const idsBefore = probeKbIds()
+      const vectorsBefore = await milvusVectorRowsOfProbeKb(idsBefore)
       purgeProbe()
       const after = kbCount()
       const docsLeft = docRowsOfProbe()
       const chunksLeft = chunkRowsOfProbe()
+      const vectorsLeft = await milvusVectorRowsOfProbeKb(idsBefore)
       check(
-        after === 8 && docsLeft === 0 && chunksLeft === 0,
-        '收尾：探针库 / 文档 / **分片行**已自清，sys_kb 回到 8 行',
-        `库=${after} 文档残留=${docsLeft} 分片残留=${chunksLeft}`,
+        after === 8 && docsLeft === 0 && chunksLeft === 0 && vectorsLeft === 0,
+        '收尾：探针库 / 文档 / 分片行 / **Milvus 向量**已自清，sys_kb 回到 8 行',
+        `库=${after} 文档残留=${docsLeft} 分片残留=${chunksLeft} ` +
+          `Milvus 向量残留=${vectorsLeft}（跑动前 ${Math.max(0, vectorsBefore)}）`,
       )
     } catch (e) {
       check(false, '收尾：探针库自清失败，需人工检查', String(e.message))
