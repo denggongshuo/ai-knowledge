@@ -1,4 +1,15 @@
-> 状态：⬜ 待认领 · 优先级 **P0** · 预估 5 人天 · 依赖：无
+> 状态：✅ 已完成（`S4-E1`，2026-09-17 · **降级版**，见下）· 优先级 **P0** · 预估 5 人天 · 依赖：无
+>
+> ⚠️ **交付时的两处范围收窄 + 两处实物订正**（全文 `plan/2026-09-17-S4-E1.md`）：
+> ① **worker 取「同 JVM、独立线程池 + 有界队列」**（用户 2026-09-17 裁定）→
+>    痛点 #2 的 **OOM 隔离本批没解决**，登记为遗留；
+> ② **步 5 的「整篇 wall-clock 超时」只做了一半** —— 等锁超时已落地，强杀运行中的解析线程
+>    在同 JVM 下做不到（与 ① 同一限制）；
+> ③ **订正 `:14`**：「一把 `ReentrantLock`（`PdfDocumentParser.java:55`）」**实物不是** ——
+>    那是 `private static final Object LOCK` + `synchronized (LOCK)`，`synchronized` **没有 `tryLock`**，
+>    照原文写会编译不过。本批已把它**换成** `ReentrantLock` 才实现了超时；
+> ④ **订正步 2**：「新增 QUEUED 态」—— `AsyncTaskStatus.PENDING` 的 label **本来就是「排队中」**，
+>    复用即可，不加同义词。
 
 # O1 · 解析执行架构解耦
 
@@ -11,7 +22,7 @@
 
 | # | 现状 | 后果 |
 |---|---|---|
-| 1 | `PdfDocumentParser` 一把 `ReentrantLock`（`PdfDocumentParser.java:55`），**全局串行** | 并发上传时解析全部排队。`T-513` 文件夹批量导入落地后，一个库几千篇 = **数小时**，期间所有人的单篇上传一起等这一把锁 |
+| 1 | ~~`PdfDocumentParser` 一把 `ReentrantLock`（`PdfDocumentParser.java:55`），**全局串行**~~ ⚠️ **订正**：实物是 `private static final Object LOCK` + `synchronized (LOCK)`（`Object` **没有 `tryLock`**，见文件头订正 ③）。全局串行的性质不变 | 并发上传时解析全部排队。`T-513` 文件夹批量导入落地后，一个库几千篇 = **数小时**，期间所有人的单篇上传一起等这一把锁 |
 | 2 | 解析跑在 `ak-task-*`（core=4/max=8，`AsyncConfig.java`），与 Web 请求**共享同一个 JVM 与堆** | PDFBox/opendataloader 的 OOM **直接打死 API 进程** —— 解析和在线服务是最不该共享堆的两件事 |
 | 3 | **无 wall-clock 超时** | 一个畸形 PDF 能占住那把锁无限久 → **整个解析队列停摆**，且没有 kill 手段 |
 | 4 | 100MB 源文件要**落临时文件**（opendataloader 只吃路径），`parse.json` 用 Jackson 全量 `writeValueAsBytes` / 全量 `readTree` | 单篇解析峰值内存 ≈ 源文件 × 2~3；`sys_parse_issue` 无行数上限，2000 页扫描件 = 2000 行 |
@@ -48,7 +59,7 @@ flowchart TD
 | 步 | 做什么 | 为什么这样切 |
 |---|---|---|
 | 1 | **任务态落库** `sys_async_task`（`task_id` / `type` / `status` / `owner_id` / `trace_id` / `stage` / `percent` / `attempt` / `error_msg` / `created_at` / `updated_at`） | 这张表是后面所有事的地基：配额、重试、审计（O6）都要读它 |
-| 2 | **新增 QUEUED 态**（`DocStatus` 不新增，用任务态承载） | 文档状态机是"用户可见的生命周期"，排队属于"任务调度"，两者不该混在一个枚举里 |
+| 2 | **新增 QUEUED 态**（`DocStatus` 不新增，用任务态承载）⚠️ **订正**：`AsyncTaskStatus.PENDING` 的 label 本来就是「排队中」，**直接复用**，不加同义词 | 文档状态机是"用户可见的生命周期"，排队属于"任务调度"，两者不该混在一个枚举里 |
 | 3 | **worker 独立进程**：新增 `ParseWorkerApplication`（同仓库第二个 `main`），只加载解析所需依赖（MinIO + MySQL + Jackson + opendataloader + Tika），**不加载 Web/Security/Neo4j/Milvus** | 内存隔离；OOM 打死的是 worker，API 继续服务 |
 | 4 | **领取式消费**：`select ... for update skip locked` 从 `sys_async_task` 领 RUNNING | 不用引入 MQ（Redis 已有 → 也可用 Stream，但表驱动更简单且天然持久） |
 | 5 | **超时**：`parseDocument` 外层包 `Future.get(timeout)` + 超时中断；PDF 路径的 `ReentrantLock` 换成**带超时的 `tryLock`** | 超时必须有可执行文案（`G4-3`）："解析超时（超过 5 分钟），该文档可能已损坏或异常复杂，请确认后重试" |

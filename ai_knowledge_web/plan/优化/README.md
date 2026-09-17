@@ -17,7 +17,7 @@
 
 | # | ID | 方案 | 主题 | 优先级 | 依赖 | 预估 | 状态 | 落哪批 | 落地点 |
 |---|---|---|---|---|---|---|---|---|---|
-| **O1** | `T-O01` | [解析执行架构解耦](./O1-parse-worker-decouple.md) | 独立 worker + 超时 + 并发配额 + 任务态持久化 | **P0** | — | 5 人天 | 🟢 已认领 | **`S4-E`** | `pipeline/` · `AsyncConfig` · `New: V15` |
+| **O1** | `T-O01` | [解析执行架构解耦](./O1-parse-worker-decouple.md) | ~~独立 worker~~ → **同 JVM 专用解析池** + 超时 + 并发配额 + 任务态持久化 | **P0** | — | 5 → **实际 ≈7** 人天 | ✅ **已完成**（`S4-E1`，2026-09-17）**降级版**：OOM 隔离与整篇 wall-clock 超时未做（同源限制），登记为遗留 | **`S4-E1`** ✅ | `core/async/{ParseWorker, SysAsyncTaskRepository}` · `New: V17` |
 | **O2** | `T-O02` | [页级文本层与多模态路由](./O2-page-level-guard-and-ocr-routing.md) | 检测下沉到页 + OCR/VL 页级路由 | **P0** | O1 | 4 人天 | 🟢 已认领 | **`S4-E`** | `TextLayerGuard` · `ParsedDocument` |
 | **O3** | `T-O03` | [噪音清洗层](./O3-noise-cleaning.md) | 页眉页脚剥离 + 装饰图 + 跨文档样板 | **P0** | **O8 ✅**（真实依赖）· O1（软，已推后） | 4 人天 | 🟡 **部分完成**（`S4-M05-C2`，2026-09-16）—— 页眉页脚剥离 ✅ / 装饰图 ⏸️ S6 / 跨文档样板 → `O9` | `S4-M05-C2`（部分）/ 装饰图 → `S6` | `pipeline/cleaning/` |
 | **O4** | `T-O04` | [入库准入加固](./O4-ingest-admission-hardening.md) | MIME 交叉校验 + ZIP 炸弹限额 + 恶意扫描 | **P0** | — | 3 人天 | 🟡 **部分完成**（`S4-D`，2026-09-17）—— 同步三道已交（`10072`/`10073`/`10074`）· **恶意扫描随 `T-O01`（`S4-E`）** · 宏标记未做 | `S4-D` 部分 / 余下 → `S4-E` | `core/storage/IngestGuard` |
