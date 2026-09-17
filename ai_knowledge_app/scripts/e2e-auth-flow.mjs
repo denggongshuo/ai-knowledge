@@ -28,6 +28,7 @@ import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { teardownUserProbe } from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
@@ -473,5 +474,21 @@ try {
     ws?.close()
   } catch {}
   child?.kill()
+
+  // ⚠️ 自清（`S5` 测试可靠性修复批 · `#120`）：本脚本会**真注册**一个 `e2e<stamp>` 账号。
+  // 此前它不删 —— 跑一轮就在 `sys_user` 里留一行，把 `sys_user` 从 128 顶到 129，
+  // 而 `e2e-admin-flow` 有一条「总用户数 = 128」的断言 ⇒ **跑完 auth 再跑 admin 必红**。
+  // 现象离原因很远（报的是"用户数不对"），所以此前一直当成"admin 脚本自己有问题"。
+  try {
+    const r = teardownUserProbe(USERNAME)
+    const residue = Object.entries(r.residue.sql).filter(([, n]) => n > 0)
+    console.log(`  ↩︎ 已清理探针账号 ${USERNAME}：登录日志 ${r.loginLogs} 行`
+      + (residue.length ? ` · ⚠️ 仍有残留 ${JSON.stringify(Object.fromEntries(residue))}` : ' · 残留 0'))
+  } catch (e) {
+    // 清理失败**不改退出码**（用例结论由 steps 决定），但必须喊出来 ——
+    // 静默的清理失败正是 `#120` 之所以能藏这么久的原因
+    console.warn(`  ⚠️ 探针账号清理失败：${e.message}`)
+  }
+
   await sleep(300)
 }

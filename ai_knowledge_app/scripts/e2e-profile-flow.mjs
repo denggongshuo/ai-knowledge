@@ -29,6 +29,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { mysqlScalar } from './lib/probe-teardown.mjs'
 
 const arg = (name, fallback) => (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
 const BASE = arg('base', 'http://localhost:5174')
@@ -41,6 +42,16 @@ const CDP_PORT = Number(process.env.E2E_CDP_PORT || 9334)
 
 /** 固定探针账号：`e2e-profile-flow.mjs` 专用，不要拿去当业务数据。 */
 const PROBE = { username: 'probe.profile', phone: '13900000001', password: 'Probe@1234' }
+
+/**
+ * 本脚本把 `probe.profile` 的手机号改成了什么（`null` = 没改过）。
+ *
+ * <p>⚠️ 换绑之后**必须还原**（见 {@link #restoreProbe}）。不还原的后果很具体：
+ * 本脚本断言的号码是常量 {@link #PROBE}`.phone`，而第二轮跑时库里已经是上一轮改过的号
+ * ⇒ **同一个库只能跑绿一次**（`#120`/`#133`）。
+ * 这正是"两个一次性 E2E 脚本"里"一次性"三个字的字面意思。
+ */
+let mutatedPhone = null
 
 /** 1x1 PNG（68 字节）：喂给 `.avatar-file` 的真图片，用来走通 multipart 上传。 */
 const PNG_1X1 =
@@ -441,6 +452,8 @@ async function main() {
     check(true, 'A-3 提交换绑走真接口', assertBizOk(chgEntry, 'POST /user/change-phone'))
     await waitFor(`window.__t.tags().some(t => t === ${JSON.stringify(fmtPhone(newPhone))})`, { label: '换绑后号码刷新', timeout: 15000 })
     check(true, 'A-3 换绑后页面自动刷新为新号', fmtPhone(newPhone))
+    // 记下来，收尾还原 —— 不记的话脚本自己都不知道该还成什么
+    mutatedPhone = newPhone
 
     // ---- 9. 无未捕获异常 ----
     const bad = consoleMsgs.filter((m) => /Failed to resolve component|Unhandled error|TypeError|is not a function/.test(m.text))
@@ -461,6 +474,33 @@ async function main() {
       /* ignore */
     }
     child.kill()
+    restoreProbe()
+  }
+}
+
+/**
+ * 把本脚本改过的探针状态**还原**（`S5` 测试可靠性修复批 · `#120`/`#133`）。
+ *
+ * <p>⚠️ 放在 `finally` 里：用例**失败时更要还原** —— 失败往往发生在换绑之后，
+ * 而"失败了反而把探针留在脏状态"正是让下一次运行也失败的原因。
+ *
+ * <p>⚠️ 还原后**回读校验**，不信 UPDATE 的返回值（硬口径「Success 不等于执行了」）。
+ */
+function restoreProbe() {
+  if (!mutatedPhone) {
+    return
+  }
+  try {
+    mysqlScalar(`update sys_user set phone='${PROBE.phone}' where username='${PROBE.username}';`)
+    const now = mysqlScalar(`select phone from sys_user where username='${PROBE.username}';`)
+    if (now === PROBE.phone) {
+      console.log(`  ↩︎ 已还原 ${PROBE.username} 手机号 ${mutatedPhone} → ${PROBE.phone}`)
+    } else {
+      console.warn(`  ⚠️ ${PROBE.username} 手机号还原失败：库里是 ${now}，期望 ${PROBE.phone}`
+        + ' —— 不还原的话本脚本**同一个库只能跑绿一次**')
+    }
+  } catch (e) {
+    console.warn(`  ⚠️ ${PROBE.username} 手机号还原出错：${e.message}`)
   }
 }
 
