@@ -20,10 +20,10 @@
 | **O1** | `T-O01` | [解析执行架构解耦](./O1-parse-worker-decouple.md) | 独立 worker + 超时 + 并发配额 + 任务态持久化 | **P0** | — | 5 人天 | 🟢 已认领 | **`S4-E`** | `pipeline/` · `AsyncConfig` · `New: V15` |
 | **O2** | `T-O02` | [页级文本层与多模态路由](./O2-page-level-guard-and-ocr-routing.md) | 检测下沉到页 + OCR/VL 页级路由 | **P0** | O1 | 4 人天 | 🟢 已认领 | **`S4-E`** | `TextLayerGuard` · `ParsedDocument` |
 | **O3** | `T-O03` | [噪音清洗层](./O3-noise-cleaning.md) | 页眉页脚剥离 + 装饰图 + 跨文档样板 | **P0** | **O8 ✅**（真实依赖）· O1（软，已推后） | 4 人天 | 🟡 **部分完成**（`S4-M05-C2`，2026-09-16）—— 页眉页脚剥离 ✅ / 装饰图 ⏸️ S6 / 跨文档样板 → `O9` | `S4-M05-C2`（部分）/ 装饰图 → `S6` | `pipeline/cleaning/` |
-| **O4** | `T-O04` | [入库准入加固](./O4-ingest-admission-hardening.md) | MIME 交叉校验 + ZIP 炸弹限额 + 恶意扫描 | **P0** | — | 3 人天 | 🟢 已认领 | **`S4-D`** —— 与 `T-O07` **同改 `DocStorage`**，一次改完胜过两次 | `DocStorage#validate` |
+| **O4** | `T-O04` | [入库准入加固](./O4-ingest-admission-hardening.md) | MIME 交叉校验 + ZIP 炸弹限额 + 恶意扫描 | **P0** | — | 3 人天 | 🟡 **部分完成**（`S4-D`，2026-09-17）—— 同步三道已交（`10072`/`10073`/`10074`）· **恶意扫描随 `T-O01`（`S4-E`）** · 宏标记未做 | `S4-D` 部分 / 余下 → `S4-E` | `core/storage/IngestGuard` |
 | **O5** | `T-O05` | [解析质量基线与可追溯](./O5-parse-quality-baseline.md) | 夹具进 CI + 产物版本指纹 + 质量看板 | **P1** | O1 | 3 人天 | 🟢 已认领 | **`S5` 并行轨** | `New: ParseBaselineTest` |
 | **O6** | `T-O06` | [审计与合规留痕](./O6-audit-trail-for-pipeline.md) | 解析提交人留痕 + 预签名 TTL | **P1** | O1 | 1.5 人天 | 🟢 已认领 | **`S4-E`** | `AsyncTaskService` · `AuditLog` |
-| **O7** | `T-O07` | [存储寻址与生命周期](./O7-content-addressed-storage.md) | 内容寻址（sha256）+ 三前缀留存规则 | **P1** | — | 2 人天 | 🟢 已认领 | ⚠️ **`S4-D`（硬窗）** —— `T-407` 要定「删库到底删什么」，**同一设计决定** | `DocStorage` |
+| **O7** | `T-O07` | [存储寻址与生命周期](./O7-content-addressed-storage.md) | 内容寻址（sha256）+ 三前缀留存规则 | **P1** | — | 2 人天 | ✅ **已完成（降级版）**（`S4-D`，2026-09-17）—— **只做留存规则表**，内容寻址不做（用户裁定：与同批 `T-407` 是同一个设计决定） | `S4-D` | `docs/后端开发文档/11-M05-存储生命周期规则（O7）.md` |
 | **O8** | `T-O08` | [分片契约：块视图分离](./O8-chunk-view-separation.md) | 块内容与嵌入视图分离 + 多视图泛化 | **P0** | — | 3 人天 | ✅ 已完成（`S4-M05-C1` 步 0 · 2026-09-16） | `S4-M05-C1` 步 0 | `10-M05-分片产出契约（D-5）` |
 | **O9** | `T-O09` | [去重与成本治理](./O9-dedup-and-cost-control.md) | 内容指纹 + 样板抑制 + HyQ 门控 | **P2** | O8 | 3 人天 | 🟢 已认领 | **`S5` 并行轨** | `T-504`~`T-507` 下游 |
 
