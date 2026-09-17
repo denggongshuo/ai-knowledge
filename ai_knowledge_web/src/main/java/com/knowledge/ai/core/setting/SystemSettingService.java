@@ -35,7 +35,8 @@ public class SystemSettingService {
             SystemSettings.RETRIEVAL_RECALL_THRESHOLD,
             SystemSettings.RETRIEVAL_MISS_THRESHOLD,
             SystemSettings.RETRIEVAL_LOW_SCORE_WARN,
-            SystemSettings.RETRIEVAL_RERANK_TOP_K);
+            SystemSettings.RETRIEVAL_RERANK_TOP_K,
+            SystemSettings.RETRIEVAL_DEGRADE_DURING_REINDEX);
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -106,6 +107,32 @@ public class SystemSettingService {
         /** 供取证：某键的值是**读到的**还是**兜底的**。 */
         public Optional<String> sourceOf(String key) {
             return Optional.ofNullable(values.get(key));
+        }
+
+        /**
+         * 布尔取值；缺行或认不出来 → {@code fallback} 并留 warn。
+         *
+         * <p>取值域**刻意只认 {@code "true"} / {@code "false"}**（忽略大小写与首尾空白）：
+         * 不认 {@code 1/0}、不认 {@code on/off}。理由是这一列是 {@code VARCHAR}，
+         * 宽松解析会让"有人手写了 {@code yes}"变成**看起来生效了但实际走了 fallback** ——
+         * 而 fallback 恰好就是 {@code true} 时，这个错永远不会被发现。
+         * 认不出来的当场留 warn，是这里唯一能自证的方式。
+         */
+        public boolean bool(String key, boolean fallback) {
+            String raw = values.get(key);
+            if (raw == null || raw.isBlank()) {
+                return fallback;
+            }
+            String trimmed = raw.trim();
+            if ("true".equalsIgnoreCase(trimmed)) {
+                return true;
+            }
+            if ("false".equalsIgnoreCase(trimmed)) {
+                return false;
+            }
+            log.warn("系统参数不是合法的布尔值（只认 true/false），改用默认值：key={} 实际={} 默认={}",
+                    key, raw, fallback);
+            return fallback;
         }
     }
 }

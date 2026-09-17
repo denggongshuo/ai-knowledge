@@ -4,10 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.knowledge.ai.core.ai.RerankClient;
 import com.knowledge.ai.core.ai.SiliconFlowRerankClient;
 import com.knowledge.ai.core.ai.ModelClientRegistry;
+import com.knowledge.ai.core.enums.RetrievalMode;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.setting.SystemSettingService;
+import com.knowledge.ai.core.setting.SystemSettings;
+import com.knowledge.ai.service.RebuildStateService;
 import com.knowledge.ai.dto.kb.KbDtos;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -64,6 +67,9 @@ public class RetrievalService {
     /** `T-705`：把命中的表格子块换成它所在的表（`G5-6`）。 */
     private final TableLookupService tableLookupService;
 
+    /** `T-709`：重建索引期间降级为关键词检索。 */
+    private final RebuildStateService rebuildStateService;
+
     /**
      * 检索。
      *
@@ -97,6 +103,13 @@ public class RetrievalService {
         // ---------- ② 合成参数 ----------
         SystemSettingService.Snapshot settings = systemSettingService.snapshot();
         RetrievalParams params = RetrievalParams.conservative(paramsOf(scope.kbIds(), settings));
+
+        // ---------- ②.5 重建期降级（T-709）----------
+        // 需求《11》§2.1：「重建索引期间 —— **降级而非中断**：可切「降级为关键词检索」，
+        // 问答仍可用（精度下降）」。所以这里不拒绝请求，只把通道收窄到 BM25。
+        Degrade degrade = degradeIfRebuilding(scope.kbIds(), settings, params);
+        params = degrade.params();
+        String degradeNote = degrade.note();
 
         // ---------- ③ 两路并行召回 ----------
         long recallStart = System.nanoTime();
@@ -133,7 +146,7 @@ public class RetrievalService {
                 params.recallTopK(), params.recallThreshold(), params.rerankTopK(),
                 params.rerankEnabled(), params.tableWeight(), params.missThreshold(),
                 params.lowScoreWarn(), rerank.applied(), rerank.note(),
-                rerank.miss(chunks, params), chunks);
+                degradeNote, rerank.miss(chunks, params), chunks);
 
         log.info("[检索] 完成：query={} 库数={} 可见文档={} 向量={} BM25={} 融合={} 返回={} "
                         + "重排={} 回表={} 未命中={} 耗时={}ms（范围 {} + 召回 {} + 融合 {} + 重排 {} + 回表 {}）",
@@ -295,13 +308,54 @@ public class RetrievalService {
         }
     }
 
+    /**
+     * 重建期降级（`T-709`）—— 决定本次是否把通道收窄到只走 BM25。
+     *
+     * <p>三条**不降级**的理由，各自独立：
+     * <ol>
+     *   <li>全局开关关着（`sys_setting` 的 `retrieval.degrade-during-reindex`）——
+     *       需求把「重建期间的服务状态」做成二选一，这是"另一个选项"那一侧；</li>
+     *   <li>本次本来就走 `KEYWORD` —— 没有可降的东西。**这条不是优化，是正确性**：
+     *       不判它的话「本来就只有关键词」会被报成一次降级，而 trace 上写着
+     *       "因重建降级"——那是一句假话，运维会去查一个根本没发生的降级；</li>
+     *   <li>参与检索的库里没有正在重建的。</li>
+     * </ol>
+     */
+    private Degrade degradeIfRebuilding(List<Long> kbIds, SystemSettingService.Snapshot settings,
+                                        RetrievalParams params) {
+        if (!settings.bool(SystemSettings.RETRIEVAL_DEGRADE_DURING_REINDEX,
+                SystemSettings.DEFAULT_DEGRADE_DURING_REINDEX)) {
+            return Degrade.none(params);
+        }
+        if (params.mode() == RetrievalMode.KEYWORD) {
+            return Degrade.none(params);
+        }
+        if (!rebuildStateService.isAnyRebuilding(kbIds)) {
+            return Degrade.none(params);
+        }
+
+        String note = "知识库正在重建索引，本次已降级为关键词检索（" + params.mode().getLabel()
+                + " → 关键词检索）。精度下降但问答仍可用，重建完成后自动恢复";
+        log.warn("[检索] 重建期降级：{} → KEYWORD，库={}", params.mode(), kbIds);
+        return new Degrade(params.withMode(RetrievalMode.KEYWORD), note);
+    }
+
+    /** 降级的结果：换过的参数 + 说明（没有降级时说明为空串）。 */
+    private record Degrade(RetrievalParams params, String note) {
+
+        static Degrade none(RetrievalParams params) {
+            return new Degrade(params, "");
+        }
+    }
+
     /** 空结果：**仍然带完整 trace** —— "为什么什么都没搜到"必须能回答。 */
     private static RetrievalResult emptyResult(String query, RetrievalScope.Scope scope,
                                                long scopeMillis, long start, String note) {
         RetrievalTrace trace = new RetrievalTrace(query, null, scope.kbIds(), scope.kbIds().size(),
                 scope.docScopeCount(), scope.docFallback(),
                 0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, elapsed(start),
-                0, 0d, 0, false, 0d, 0d, 0d, false, note, false, List.of());
+                0, 0d, 0, false, 0d, 0d, 0d, false, note, "",
+                false, List.of());
         return new RetrievalResult(List.of(), trace, scope.kbIds().size());
     }
 

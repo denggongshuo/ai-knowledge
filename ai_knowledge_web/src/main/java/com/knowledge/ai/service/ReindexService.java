@@ -7,6 +7,7 @@ import com.knowledge.ai.core.audit.RiskLevel;
 import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.storage.MilvusPartitionManager;
 import com.knowledge.ai.pipeline.vectorize.ChunkVectorizer;
 import jakarta.persistence.EntityManager;
@@ -87,7 +88,16 @@ public class ReindexService {
      */
     public String submit(long kbId) {
         requireActiveKb(kbId);
-        String taskId = asyncTaskService.submit(TASK_TYPE, TASK_TYPE + ":" + kbId, 0, context -> {
+        // ⚠️ 必须带**业务坐标**（`T-709` 查出）：不带的话 `AsyncTaskService` 走的是
+        // `TaskSubject.none()`，`sys_async_task.kb_id` 被写成 NULL ——
+        // 于是任务看得出来"有东西在重建"，却认不出是**哪个库**。
+        // 检索侧的"这个库正在重建吗"（`RebuildStateService`）就是靠这一列判断的，
+        // 写 NULL 会让重建期降级**永不触发，而且不报错**。
+        // 顺带补上 `owner_id`：`O6` 的「谁触发了这次重建」正是读它。
+        // 提交发生在**请求线程**上，`LoginUserContext` 此刻还有值（工作线程里就没有了）。
+        Long ownerId = LoginUserContext.userIdOrNull();
+        String taskId = asyncTaskService.submit(TASK_TYPE,
+                AsyncTaskService.TaskSubject.of(kbId, null, ownerId), TASK_TYPE + ":" + kbId, 0, context -> {
             context.stage("准备新代分区");
             Result result = reindex(kbId);
             context.stage(switch (result.status()) {

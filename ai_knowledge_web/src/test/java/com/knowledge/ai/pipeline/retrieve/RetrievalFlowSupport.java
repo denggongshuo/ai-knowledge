@@ -56,7 +56,12 @@ import java.util.List;
 @org.springframework.test.context.TestPropertySource(properties = {
         "app.model.rerank.base-url=http://127.0.0.1:1/v1",
         "app.model.rerank.api-key=test-key-not-used",
-        "app.model.rerank.model=test-reranker-not-used"})
+        "app.model.rerank.model=test-reranker-not-used",
+        // `T-709`：`RebuildStateService` 的缓存设成 0 = 每次都真查库。
+        // 生产默认 2000ms（检索在热路径上，绝大多数请求都是"没有库在重建"）；
+        // 但用例要在同一个方法里"建任务 → 立刻看到降级"，2000ms 的缓存会让它随机转红 ——
+        // 而那种红看起来像"降级没实现"，排查方向会被完全带偏。
+        "app.retrieval.rebuild-cache-ms=0"})
 // ⚠️ 必须是**显式** @Import：父类里的嵌套 @TestConfiguration **不会**被自动发现，
 // 而失败是静默的（替身没注册 → 用例真去打模型网关，见 RetrievalTestStubs 的类注释）
 @org.springframework.context.annotation.Import(RetrievalTestStubs.class)

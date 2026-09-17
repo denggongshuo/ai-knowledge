@@ -43,6 +43,9 @@ import java.util.List;
  * @param lowScoreWarn      本次使用的全局降权提示线
  * @param rerankApplied     重排**实际是否执行**（开关开着但服务不可用时为 {@code false}）
  * @param rerankNote        重排的处置说明（降级原因 / 未执行原因）；无特殊情况为空串
+ * @param degradeNote       检索方式**降级**的说明（`T-709`，如"该库正在重建索引"）；
+ *                          没有降级时为空串。⚠️ {@link #mode()} 记的是**降级之后**实际用的方式，
+ *                          降级前的那一个只在这段文字里 —— 见 {@link #degraded()}
  * @param miss              是否判定未命中。⚠️ **只在 {@code rerankApplied=true} 时才有意义** ——
  *                          未重排时分数是融合分，与 {@code missThreshold} 不同量纲，恒为 {@code false}
  * @param chunks            本次返回的分片。**与 {@link RetrievalResult#chunks()} 是同一个
@@ -73,8 +76,21 @@ public record RetrievalTrace(String query,
                              double lowScoreWarn,
                              boolean rerankApplied,
                              String rerankNote,
+                             String degradeNote,
                              boolean miss,
                              List<RetrievedChunk> chunks) {
+
+    /**
+     * 本次检索是否发生了**降级**（`T-709`）。
+     *
+     * <p>从 {@link #degradeNote} **派生**，不另存一个布尔 —— 两者是同生同灭的一个事实，
+     * 存两份迟早出现"说是降级了但没有原因"或反之。这条与
+     * {@code RetrievalService#tableWindowCount} 从 {@code chunks} 派生是同一条纪律：
+     * **能派生的就不必存**。
+     */
+    public boolean degraded() {
+        return degradeNote != null && !degradeNote.isBlank();
+    }
 
     /**
      * 换掉 {@link #chunks}，其余字段原样。
@@ -93,6 +109,6 @@ public record RetrievalTrace(String query,
                 vectorHits, bm25Hits, fusedCount, scopeMillis, recallMillis, fuseMillis,
                 rerankMillis, tableMillis, totalMillis, recallTopK, recallThreshold, rerankTopK,
                 rerankEnabled, tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote,
-                miss, newChunks);
+                degradeNote, miss, newChunks);
     }
 }

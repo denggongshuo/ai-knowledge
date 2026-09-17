@@ -117,8 +117,9 @@ class RetrievalResultContractTest {
 
     private static RetrievalTrace trace(List<RetrievedChunk> chunks, int kbCount) {
         // 耗时字段依次是：范围 1 / 召回 2 / 融合 1 / 重排 3 / 回表 1 / 合计 7
+        // 两个说明串都留空 = **没有**降级、没有重排异常；`degraded()` 由 degradeNote 派生
         return new RetrievalTrace("测试提问", RetrievalMode.HYBRID, List.of(1L), kbCount,
                 10, false, 5, 5, 6, 1L, 2L, 1L, 3L, 1L, 7L, 20, 0.15, 5, true, 1.2,
-                0.35, 0.65, true, "", false, chunks);
+                0.35, 0.65, true, "", "", false, chunks);
     }
 }

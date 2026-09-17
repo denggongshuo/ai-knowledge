@@ -166,6 +166,22 @@ public record RetrievalParams(RetrievalMode mode,
     }
 
     /**
+     * 换一种检索方式，其余参数原样（`T-709` 的重建期降级用它）。
+     *
+     * <p>为什么是"换 mode"而不是"重算一遍 params"：降级**只改开哪几路通道**，
+     * 阈值、`rerankTopK`、`tableWeight` 一个都不该动 —— 那些是库级配置的表达，
+     * 重建与它们无关。重算一遍会顺带把库配置重新读一次，于是"降级期间改了个阈值"
+     * 这种无关改动会混进同一次行为变化里，排查时分不清是哪件事生效了。
+     */
+    public RetrievalParams withMode(RetrievalMode newMode) {
+        if (newMode == mode) {
+            return this;
+        }
+        return new RetrievalParams(newMode, recallThreshold, rerankTopK, rerankEnabled,
+                tableWeight, missThreshold, lowScoreWarn, recallTopK);
+    }
+
+    /**
      * `I-11`：未命中判定线必须**严格高于**召回阈值。
      *
      * <p>错误信息里给出原因（"未命中无从判定"），而不只是"参数不合法" ——

@@ -36,6 +36,18 @@ public final class SystemSettings {
     /** Rerank 保留数的全局默认值（库级可覆盖）。 */
     public static final String RETRIEVAL_RERANK_TOP_K = "retrieval.rerank-top-k";
 
+    /**
+     * 重建索引期间是否把检索降级为关键词（`T-709` · 《11》§2.1「降级而非中断」）。
+     *
+     * <p>需求把「重建期间的服务状态」做成一个**二选一**：降级为关键词检索（推荐）
+     * 或暂停问答服务。本键是**全站默认**，那个二选一的对话框（属 S6 的 `T-906`）
+     * 会按库/按次覆盖它。
+     *
+     * <p>默认 {@code true}：重建期间向量代正在切换，继续走向量路会召回**旧代或半截**
+     * 的内容；而降级后问答仍然可用（只是精度下降）—— 这正是需求选的"降级而非中断"。
+     */
+    public static final String RETRIEVAL_DEGRADE_DURING_REINDEX = "retrieval.degrade-during-reindex";
+
     // ==================== 缺行时的兜底值 ====================
 
     public static final double DEFAULT_RECALL_THRESHOLD = 0.15;
@@ -45,4 +57,6 @@ public final class SystemSettings {
     public static final double DEFAULT_LOW_SCORE_WARN = 0.65;
 
     public static final int DEFAULT_RERANK_TOP_K = 5;
+
+    public static final boolean DEFAULT_DEGRADE_DURING_REINDEX = true;
 }
