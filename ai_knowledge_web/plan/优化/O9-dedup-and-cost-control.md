@@ -1,4 +1,7 @@
-> 状态：⬜ 待认领 · 优先级 **P2** · 预估 3 人天 · 依赖：O8
+> 状态：🟡 **部分已交（`S5-M07-A`，2026-09-17）** —— **步 1/2/3/4/7 已交付**，判据 1/2/3/4/7 全通过；**步 5（HyQ 门控）/ 步 6（章节级摘要）顺延到与 `O5` 同批**（依赖未开工的 `O5` 基线），**步 3 的语料级历史回扫**顺延独立小批。
+>
+> **落地实况**：`V19` 加列（`sys_document.content_sha256` / `sys_chunk.{content_sha256,is_boilerplate,embed_model_id,embed_model_version}`）· `core/text/{ContentFingerprint,BoilerplateRule}` · `service/ContentDuplicateDetector` · `DocRecordWriter` 三个写点 · `VectorChunk#inRecallPool` 作为"不进召回池"的唯一判据。
+> ⚠️ **两处与本文档正文的偏差**（以结项文档为准）：① 步 7 的归因列落 **MySQL `sys_chunk`** 而非 Milvus 标量列（集合本批已为 BM25 重建过一次，再加两列是第二次重建）；② 样板标记会**顺带回填同库同指纹的历史行**（否则 `is_boilerplate` 的含义会依赖入库顺序），但**那些行已经写进 Milvus 的向量不会被删** —— 那个缺口需要离线回扫，属顺延项。
 
 # O9 · 去重与成本治理
 
