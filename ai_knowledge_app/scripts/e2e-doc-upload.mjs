@@ -183,7 +183,7 @@ const milvusVectorRowsOfProbeKb = async (ids) => {
   return -1
 }
 
-/** 删掉探针库的全部向量。**调用必须在删 `sys_kb` 行之前。** */
+/** 删掉探针库的全部向量 + **丢掉它的代分区**。**调用必须在删 `sys_kb` 行之前。** */
 function milvusRemoveByProbeKb() {
   const ids = probeKbIds()
   if (ids.length === 0) return
@@ -192,6 +192,42 @@ function milvusRemoveByProbeKb() {
     `-H 'Content-Type: application/json' ` +
     `-d '{"collectionName":"knowledge_vectors","filter":"kb_id in [${ids.join(',')}]"}'`,
   ], { cwd: REPO_ROOT, encoding: 'utf8' })
+  milvusDropProbePartitions(ids)
+}
+
+/**
+ * 丢掉探针库的**代分区**。
+ *
+ * ⚠️ 为什么必须有这一步：`T-406` 起向量按 `kb{id}_g{代}` 分区存放，而上面的
+ * `entities/delete` 只删**点**、不删**容器** —— 于是每次跑完都留下几个空分区。
+ * 这是本项目「新增持久化产物、清理函数不认识它」的**第三次**复现
+ * （前两次：`sys_chunk` 新表、Milvus 向量本身），所以这次把注释也写在这里。
+ *
+ * ⚠️ 顺序固定：**delete 实体 → release → drop**。裸 drop 会失败，
+ * 服务端原话是 `partition cannot be dropped, partition is loaded, please release it first`
+ * （步 0 探针在 Java SDK 那侧看到的是同一个原因，但只给了 65535）。
+ */
+function milvusDropProbePartitions(ids) {
+  const listOut = spawnSync('bash', ['-c',
+    `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/list ` +
+    `-H 'Content-Type: application/json' -d '{"collectionName":"knowledge_vectors"}'`,
+  ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
+  let names = []
+  try { names = JSON.parse(listOut).data ?? [] } catch { return }
+  for (const id of ids) {
+    for (const name of names.filter((n) => n.startsWith(`kb${id}_g`))) {
+      spawnSync('bash', ['-c',
+        `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/release ` +
+        `-H 'Content-Type: application/json' ` +
+        `-d '{"collectionName":"knowledge_vectors","partitionNames":["${name}"]}'`,
+      ], { cwd: REPO_ROOT, encoding: 'utf8' })
+      spawnSync('bash', ['-c',
+        `curl -s -m 15 -X POST http://127.0.0.1:19530/v2/vectordb/partitions/drop ` +
+        `-H 'Content-Type: application/json' ` +
+        `-d '{"collectionName":"knowledge_vectors","partitionName":"${name}"}'`,
+      ], { cwd: REPO_ROOT, encoding: 'utf8' })
+    }
+  }
 }
 
 /** 探针库的分片行数 —— `S4-M05-C1` 起 `sys_chunk` 也要跟着清，否则留下**孤儿块**。 */

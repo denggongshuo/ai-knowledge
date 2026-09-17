@@ -68,9 +68,11 @@ class MilvusVectorWriteTest {
                 .withPort(props.getPort())
                 .withConnectTimeout(props.getConnectTimeoutMs(), java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build());
-        writer = new MilvusChunkWriter(client, props);
         partitions = new MilvusPartitionManager(client, props);
-        // 写进不存在的分区会**显式失败**（步 0 探针），所以先 ensure
+        writer = new MilvusChunkWriter(client, partitions, props);
+        // 收尾用的删除需要分区**先存在**（删一个不存在的分区会报 partition not found）——
+        // 这与"写入自带 ensure"不矛盾：清理路径不该为了删而**创建**一个分区。
+        // 「写入一张白纸分区也能成功」由 `writingIntoAFreshPartitionJustWorks` 单独钉。
         partitions.ensure(TEST_PARTITION);
         writer.deleteByDocId(TEST_DOC_ID, TEST_PARTITION);
     }
@@ -147,6 +149,25 @@ class MilvusVectorWriteTest {
     }
 
     @Test
+    @DisplayName("回归：写进一个**从未建过**的分区也能成功 —— replaceDocument 自带 ensure")
+    void writingIntoAFreshPartitionJustWorks() {
+        // 2026-09-17 页面级 E2E 逮到过一次：按代分区刚上线时，日常解析路径没人调 ensure，
+        // 于是每篇文档解析到向量化那一步就抛，终态「解析失败」——而块已经落库了，
+        // 现象是"内容都出来了却说失败"，极难反推。所以这条回归必须钉住。
+        String fresh = "zzvecprobe_fresh";
+        assertThat(partitions.has(fresh)).as("前提：这个分区确实还不存在，否则本用例是空断言").isFalse();
+        try {
+            writer.replaceDocument(fresh, TEST_DOC_ID, List.of(record(71, "PARAGRAPH", "新分区", null, null)));
+            assertThat(rowCount(query(fresh, List.of(MilvusConstants.FIELD_ID))))
+                    .as("向量应写进那个刚被自动建出来的分区")
+                    .isEqualTo(1);
+        } finally {
+            writer.deleteByDocId(TEST_DOC_ID, fresh);
+            partitions.dropQuietly(fresh);
+        }
+    }
+
+    @Test
     @DisplayName("维度不符当场失败，且原因可行动（不是把 1024 维的东西硬写进去）")
     void wrongDimensionFailsLoudly() {
         VectorRecord bad = new VectorRecord(
@@ -185,11 +206,16 @@ class MilvusVectorWriteTest {
         return query(List.of("*"));
     }
 
+    /** 查测试分区里的点（绝大多数用例都走它）。 */
     private static QueryResults query(List<String> outFields) {
+        return query(TEST_PARTITION, outFields);
+    }
+
+    private static QueryResults query(String partition, List<String> outFields) {
         // STRONG：本测试要读回**刚写进去的**数据，不能受 Bounded 一致性影响
         R<QueryResults> result = client.query(QueryParam.newBuilder()
                 .withCollectionName(new MilvusProperties().getCollection())
-                .withPartitionNames(List.of(TEST_PARTITION))
+                .withPartitionNames(List.of(partition))
                 .withExpr(MilvusConstants.FIELD_DOC_ID + " in [" + TEST_DOC_ID + "]")
                 .withOutFields(outFields)
                 .withConsistencyLevel(ConsistencyLevelEnum.STRONG)

@@ -3,6 +3,7 @@ package com.knowledge.ai.service;
 import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.storage.MilvusPartitionManager;
 import com.knowledge.ai.core.storage.MilvusProperties;
 import com.knowledge.ai.pipeline.vectorize.VectorChunk;
 import com.knowledge.ai.pipeline.vectorize.VectorRecord;
@@ -62,6 +63,9 @@ public class MilvusChunkWriter implements VectorWriter {
 
     private final MilvusServiceClient client;
 
+    /** 见 {@link #replaceDocument}：写入前必须确保分区存在（不存在就建）。 */
+    private final MilvusPartitionManager partitionManager;
+
     private final MilvusProperties properties;
 
     /**
@@ -73,6 +77,14 @@ public class MilvusChunkWriter implements VectorWriter {
      */
     @Override
     public int replaceDocument(String partition, long docId, List<VectorRecord> records) {
+        // ⚠️ 先确保分区存在 —— **这一步不能省，也不能交给调用方去记**。
+        // 步 0 探针实测：写进不存在的分区会**显式失败**（不会隐式创建）。2026-09-17 的
+        // 页面级 E2E 正是被这一点咬到的：按代分区刚上线时，日常解析路径没人调 ensure，
+        // 于是每一篇文档解析到向量化那一步就抛，终态是「解析失败」——
+        // 而块已经落库了（chunk_count 有值），现象是"内容都出来了却说失败"，极难反推。
+        // 放在这里而不是调用方：本方法的契约是"把这个文档的向量放进这个分区"，
+        // 分区不存在就该由**它自己**补上，否则每个新调用点都要记得同一件事。
+        partitionManager.ensure(partition);
         deleteByDocId(docId, partition);
         if (records.isEmpty()) {
             log.info("[Milvus] 该文档没有需要写入的块（全部被跳过）：docId={} 分区={}", docId, partition);
