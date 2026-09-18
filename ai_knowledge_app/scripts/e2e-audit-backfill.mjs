@@ -185,6 +185,9 @@ window.__t = {
     return dt ? window.__t.norm(dt.nextElementSibling?.textContent) : null
   },
   openModuleSelect: () => {
+    // ⚠️ #160 顺一遍查过这里，**结论是"不用改"** —— 与 e2e-audit-flow 同因同结论，
+    //    详见那里的长注释（两个 select 都可见、且开错了下一步会当场转红；
+    //    试过"按文案选"被探针否掉：el-select 显示的是**选中的值**不是占位符）。
     const wraps = [...document.querySelectorAll('.head-right .el-select')]
     if (!wraps.length) throw new Error('页头没有 el-select')
     wraps[0].querySelector('.el-select__wrapper')?.click() || wraps[0].click()
