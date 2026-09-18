@@ -3,6 +3,7 @@ package com.knowledge.ai.pipeline.enhance;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.knowledge.ai.core.enums.BlockType;
+import com.knowledge.ai.service.ModelUsageRecorder;
 import com.knowledge.ai.core.text.IdentifierTokenizer;
 import com.knowledge.ai.pipeline.Block;
 import com.knowledge.ai.pipeline.ParsedDocument;
@@ -180,7 +181,7 @@ public class IndexEnhancer {
         String prompt = EnhancePrompts.documentLevel(content.text(), content.truncated());
         String raw;
         try {
-            raw = chatCaller.call(prompt);
+            raw = chatCaller.call(prompt, ModelUsageRecorder.Purpose.SUMMARY);
         } catch (Exception ex) {
             // 模型侧的异常一律不往上抛：摘要失败不该让一篇可用的文档失败
             String reason = "模型调用失败：" + readable(ex);
@@ -289,7 +290,8 @@ public class IndexEnhancer {
             try {
                 questions = parseQuestions(chatCaller.call(
                         EnhancePrompts.hypotheticalQuestions(clip(block.rawContent(), HYQ_INPUT_MAX),
-                                EnhancePrompts.MAX_HYQ_QUESTIONS)));
+                                EnhancePrompts.MAX_HYQ_QUESTIONS),
+                        ModelUsageRecorder.Purpose.HYQ));
             } catch (Exception ex) {
                 // 与文档级同一条纪律：模型侧异常不往上抛
                 log.warn("HyQ 生成失败（该块不出假设问句，不影响其它块）：orderNo={} err={}",

@@ -3,6 +3,7 @@ package com.knowledge.ai.pipeline.chat;
 import com.knowledge.ai.core.ai.ModelClientRegistry;
 import com.knowledge.ai.core.ai.ModelConfigSpec;
 import com.knowledge.ai.core.enums.ModelType;
+import com.knowledge.ai.service.ModelUsageRecorder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -37,6 +38,9 @@ public class RegistryStreamingChatCaller implements StreamingChatCaller {
 
     private final ModelClientRegistry registry;
 
+    /** `T-905` 的用量落点。见 {@link #recordUsage}。 */
+    private final ModelUsageRecorder usageRecorder;
+
     @Override
     public Outcome stream(String prompt, Consumer<String> onDelta) {
         // 先取 spec 再取客户端：`activeSpec` 在未配置对话模型时**抛**
@@ -61,7 +65,31 @@ public class RegistryStreamingChatCaller implements StreamingChatCaller {
                 usageOf(last), finishReasonOf(last));
         log.info("[问答] 生成结束：model={} finish={} tokens={}",
                 outcome.modelName(), outcome.finishReason(), outcome.tokenUsage());
+        recordUsage(spec, outcome);
         return outcome;
+    }
+
+    /**
+     * 记一次问答生成用量（`T-905`）。
+     *
+     * <p>⚠️ 记在**这一层**而不是编排层：只有这里同时握着 {@code spec} 与 {@code usage}
+     * —— 编排层手上只有 {@code Outcome}（有 usage 没有 spec）。为了统计把注册中心
+     * 再塞进编排层，等于让"谁在碰模型客户端"多一处。
+     *
+     * <p>⚠️ 失败只 warn：一次生成已经在流里发完了，为了记一行统计把它变成错误，
+     * 用户看到的是"答案突然断了"。与 {@code TaskContext#persistProgress} 同一条取舍。
+     */
+    private void recordUsage(ModelConfigSpec spec, Outcome outcome) {
+        try {
+            ChatDtos.TokenUsage usage = outcome.tokenUsage();
+            usageRecorder.record(spec, ModelUsageRecorder.Purpose.CHAT, 1,
+                    usage == null || usage.prompt() == null ? 0L : usage.prompt(),
+                    usage == null || usage.completion() == null ? 0L : usage.completion(),
+                    null);
+        } catch (Exception ex) {
+            log.warn("问答用量记录失败（不影响本轮回答）：model={} 原因={}",
+                    outcome.modelName(), ex.getMessage());
+        }
     }
 
     /** 一帧里的增量正文；没有内容（如只有元数据的收尾帧）时返回空串。 */

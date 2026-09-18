@@ -168,6 +168,106 @@ public final class ModelConfigDtos {
     public record DeletedResult(long id, boolean deleted) {
     }
 
+    // ==================================================================
+    // T-904 —— 问答页模型选项
+    // ==================================================================
+
+    /**
+     * 问答页切换器的一项（`GET /system/model/options`，前端 {@code ModelOption}）。
+     *
+     * <h3>为什么它比 {@link ModelConfigItem} 少那么多字段</h3>
+     * <p>因为它是**给普通用户看的**，而 {@code ModelConfigItem} 是给管理员看的。
+     * 需求 §1.14 对此的约束是「**不含密钥**」（本批连密钥都没落库，见 `#173`），
+     * 而更实际的一条是：问答页不需要知道 base URL、计费单价、批大小这些东西。
+     * 少发字段本身就是一种最小暴露面 —— 这与 `G6-5` 的"密钥不外泄"是同一条纪律的延伸。
+     *
+     * <p>⚠️ {@link #id} 是 {@code long}（前端类型 {@code number}），
+     * 与 {@code ChatDtos} 里那些"字符串形式的 id"**不是一回事** ——
+     * 那边是因为前端把会话/消息 id 声明成了 {@code string}。
+     * DB 生效时主键就是数字，转得出来。
+     *
+     * @param isActive 是否为该类型**当前启用**的那一条（前端据此打勾）
+     * @param capabilities 能力标记。⚠️ 本批只回显，**不做上下文校验** ——
+     *                     那个消费方（选模型时按 contextWindow 拦过长会话）属 `T-806`，
+     *                     而且种子里的 `contextWindow=128000` 是**保守初值不是实测值**（`#170`）
+     */
+    public record ModelOption(long id,
+                              String displayName,
+                              String modelName,
+                              boolean isActive,
+                              Capabilities capabilities) {
+    }
+
+    /** 模型选项列表（形状是 {@code {list}}，与 mock 逐字一致）。 */
+    public record OptionList(List<ModelOption> list) {
+    }
+
+    // ==================================================================
+    // T-905 —— 用量统计
+    // ==================================================================
+
+    /**
+     * 一个用途桶的用量（前端 {@code ModelUsage.byPurpose[]}）。
+     *
+     * @param name    中文桶名，取值见 {@code ModelUsageRecorder.Purpose#getLabel()}。
+     *                ⚠️ 是**已经算好的展示名**而不是枚举名 —— 前端直接渲染，不做映射
+     *                （同 {@code ChatDtos.TraceStage#name} 的口径）
+     * @param percent 占比（整数百分比）。⚠️ 各桶之和**可能不是 100**（四舍五入），
+     *                前端不要拿它做"加起来必须等于 100"的校验
+     */
+    public record PurposeUsage(String name, long tokens, int percent) {
+    }
+
+    /**
+     * 一个模型的用量（前端 {@code ModelUsage.byModel[]}）。
+     *
+     * @param cost **三态**（`G6-6` 的诚实口径，与 {@link ModelConfigItem} 的计价三态同源）：
+     *             <ul>
+     *               <li>{@code number} = 已配单价，可估算；</li>
+     *               <li>{@code 0} = {@code billingUnit = NONE}（本地部署 / 包月），
+     *                   **已知不计费**；</li>
+     *               <li>{@code null} = **未配单价，无法估算** —— 前端要显示成
+     *                   「未配置单价」而不是「¥0」。</li>
+     *             </ul>
+     *             ⚠️ 后两者都是"0 元"，但语义完全相反 —— 这正是 `T-900` 阶段
+     *             反复强调的那条区分（`mock/data.ts:1147` 的注释逐字写着它）。
+     */
+    public record ModelUsageItem(String modelName,
+                                 ModelType modelType,
+                                 long calls,
+                                 long tokens,
+                                 BigDecimal cost,
+                                 BillingUnit billingUnit) {
+    }
+
+    /**
+     * 用量统计（`GET /system/model/usage`，前端 {@code ModelUsage}）。
+     *
+     * <h3>措辞：是「费用估算」，不是账单</h3>
+     * <p>`09` §1.13.1 专门为此写了一节「费用估算的诚实口径」，`BillingUnit` 的类注释
+     * 也复述了一遍。单价是运维手填的，可能与供应商实际账单不一致 ——
+     * 页面上永远不能出现"实际费用"这类说法。
+     *
+     * @param cost          费用合计（{@code currency} 计价）。**只累加已计价的项**；
+     *                      全部模型都未配单价时为 {@code null}（"无法估算"），
+     *                      **不是 0** —— 0 会被读成"确认不花钱"
+     * @param unpricedCount 未配置单价的模型数（**不含 {@code NONE}**：本地部署不是"忘了配"）。
+     *                      它存在的意义就是给那个 {@code null} 一个交代：
+     *                      "这个合计里少了几个模型"
+     * @param avgLatencySec 平均单次耗时（秒）。⚠️ 没有耗时记录时为 {@code 0} ——
+     *                      这里用 0 是**如实**：本字段只有一个空态，"没测过"与"测到 0 秒"
+     *                      在页面上无法也不需区分（与 {@code cost} 的三态不同）
+     */
+    public record UsageResponse(long calls,
+                                long tokens,
+                                BigDecimal cost,
+                                String currency,
+                                int unpricedCount,
+                                double avgLatencySec,
+                                List<PurposeUsage> byPurpose,
+                                List<ModelUsageItem> byModel) {
+    }
+
     /**
      * 切换启用结果（前端 {@code activateModel} 的返回类型）。
      *

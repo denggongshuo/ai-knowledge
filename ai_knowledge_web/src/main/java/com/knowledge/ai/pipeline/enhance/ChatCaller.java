@@ -1,5 +1,7 @@
 package com.knowledge.ai.pipeline.enhance;
 
+import com.knowledge.ai.service.ModelUsageRecorder;
+
 /**
  * **一次对话调用**的抽象（`T-507`）。
  *
@@ -30,4 +32,27 @@ public interface ChatCaller {
      * @throws RuntimeException 模型不可用 / 网络失败 —— 调用方负责决定要不要让文档失败
      */
     String call(String prompt);
+
+    /**
+     * 带**用途**的一次调用（`T-905`）—— 让实现方能把它记进用量统计。
+     *
+     * <h3>为什么是 {@code default} 方法而不是改 {@link #call(String)} 的返回类型</h3>
+     * <p>本接口是 {@link FunctionalInterface}，改抽象方法签名会让**所有用 lambda 造的替身
+     * 当场编译不过**（`IndexEnhancerTest` / `IndexEnhanceFlowTest` / `RetrievalTestStubs` 里
+     * 有好几处）。这与 {@code EmbeddingClient#modelRef()} 当初选 {@code default} 是同一条理由
+     * ——`T-507` 的注释原话是「用一个 default 方法既拿回了信息，又保住了『假 client 可以用
+     * lambda 写』」。于是这里照同一形状加一个**重载**，默认实现直接委托给
+     * {@link #call(String)}。
+     *
+     * <p>⚠️ 默认实现**不记用量**（它什么都做不了）—— 所以只有生产实现
+     * （{@code RegistryChatCaller}）覆盖它才真的有数。这在用例侧是**有意**的：
+     * 替身不该往库里写行。但如果将来出现第二个生产实现而忘了覆盖，
+     * 表现是"这一路的用量永远是 0"而不是报错 —— 登记在计划 §9。
+     *
+     * @param purpose 这次调用属于哪个用途桶（摘要 / HyQ）。**必填** ——
+     *                归不了桶的用量没法进 `byPurpose`，而 `byPurpose` 正是本批要交的东西
+     */
+    default String call(String prompt, ModelUsageRecorder.Purpose purpose) {
+        return call(prompt);
+    }
 }

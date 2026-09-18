@@ -14,8 +14,9 @@ import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.dto.system.ModelConfigDtos;
 import com.knowledge.ai.entity.SysModelConfig;
+import com.knowledge.ai.entity.SysModelUsage;
 import com.knowledge.ai.repository.SysModelConfigRepository;
-import jakarta.persistence.EntityManager;
+import com.knowledge.ai.repository.SysModelUsageRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -23,9 +24,14 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * M09 模型配置（`T-900`~`T-903`）—— 列表 / 增改删 / 启用切换 / 连接测试。
@@ -69,7 +75,8 @@ public class ModelConfigService {
 
     private final ModelProperties modelProperties;
 
-    private final EntityManager entityManager;
+    /** `T-905` 的用量落点。见 {@link #usage()}。 */
+    private final SysModelUsageRepository usageRepository;
 
     // ==================================================================
     // T-900 —— 列表
@@ -101,27 +108,30 @@ public class ModelConfigService {
                 chat.size(), rerank.size(), vl.size(),
                 defaultChat == null ? "未配置" : defaultChat.displayName(),
                 defaultChat != null && defaultChat.lastTestOk(),
-                chatTokensThisMonthWan());
+                monthTokensWan());
     }
 
     /**
-     * 本月对话 token（单位：万）。
+     * 本月 token 合计（单位：万）—— **全链路**，不是只有对话。
      *
-     * <p>⚠️ **口径边界（务必知道）**：数据来自 {@code sys_chat_message} 的
+     * <h3>`T-905` 起口径变了（销 `#169`）</h3>
+     * <p>`S6-M09-A` 时这一格的来源是 {@code sys_chat_message} 的
      * {@code token_prompt + token_completion}，所以它**只覆盖对话链路** ——
-     * 嵌入 / 重排 / VL 的用量没有落点（完整的用量统计是 `T-905`，属 `S6-B`）。
-     * 它给的是**真数但是部分口径**；登记在 `S6-M09-A` §9。
+     * 嵌入 / 重排 / 摘要 / HyQ / VL 的用量当时一处落点都没有，给的是
+     * 「**真数但是部分口径**」（`#169`）。`T-905` 建了 {@code sys_model_usage}
+     * 并接上六个采集点之后，这一格改成读它，与 {@link #usage()} 的 {@code tokens}
+     * **同源**（两处显示不一致是最容易被发现的那种缺陷）。
      *
-     * <p>刻意**不返回 0**：0 会被读成"本月确实没有用量"，那是另一种撒谎。
+     * <p>⚠️ 由此有一条必须知道的后果：本表是新表，**历史对话的 token 不追溯** ——
+     * 第一次真实调用发生前这里显示 0。那是正确的空态（换了个落点，从今天起开始记），
+     * 历史值仍在 {@code sys_chat_message} 里。
      */
-    private double chatTokensThisMonthWan() {
+    private double monthTokensWan() {
         try {
-            Object raw = entityManager.createNativeQuery(
-                            "select coalesce(sum(coalesce(token_prompt, 0) + coalesce(token_completion, 0)), 0) "
-                                    + "from sys_chat_message where created_at >= :from")
-                    .setParameter("from", LocalDateTime.now().withDayOfMonth(1).toLocalDate().atStartOfDay())
-                    .getSingleResult();
-            double tokens = raw == null ? 0D : ((Number) raw).doubleValue();
+            LocalDate today = LocalDate.now();
+            long tokens = usageRepository.findByOccurredAtBetween(today.withDayOfMonth(1), today).stream()
+                    .mapToLong(ModelConfigService::tokensOf)
+                    .sum();
             return BigDecimal.valueOf(tokens / 10_000D).setScale(1, RoundingMode.HALF_UP).doubleValue();
         } catch (RuntimeException ex) {
             // 统计不是配置页的核心功能 —— 它坏了不该让整个页面打不开
@@ -132,6 +142,268 @@ public class ModelConfigService {
 
     private List<ModelConfigDtos.ModelConfigItem> itemsOf(List<SysModelConfig> all, ModelType type) {
         return all.stream().filter(row -> row.getModelType() == type).map(this::toItem).toList();
+    }
+
+    // ==================================================================
+    // T-904 —— 问答页模型选项
+    // ==================================================================
+
+    /**
+     * 某类型**可选用**的模型（`GET /system/model/options`）。
+     *
+     * <h3>过滤条件只有一条：{@code last_test_ok}</h3>
+     * <p>任务行的验收要点原文是「**仅已启用且测试通过**」。这里的两半要分开看：
+     * <ul>
+     *   <li>「测试通过」由 {@code last_test_ok} 直接表达 —— 一个从没测通过的模型
+     *       选上去只会让用户问一句话然后拿到一个连接错误；</li>
+     *   <li>「已启用」**不能**理解成 {@code is_active = 1} —— 那样同类型就只剩一条了，
+     *       而 mock 与前端把 {@code isActive} 放在**每一项**上（`isActive?: boolean`），
+     *       说明列表里本来就有多条、其中一条被标记为当前启用。</li>
+     * </ul>
+     * 所以口径是：**回该类型的全部行，用 {@code isActive} 标出当前启用那一条**。
+     *
+     * <h3>权限码为什么是 {@code qa:ask} 而不是 {@code system:model}</h3>
+     * <p>本接口的消费方是**问答页的切换器**（`ChatView.vue:29` 已在调），
+     * 而 {@code system:model} 在 `V2` 的授权矩阵里**只有 {@code SUPER_ADMIN} 有**
+     * （本批开工前逐行查过 `sys_role_permission`）—— 挂它等于**普通用户打不开切换器**。
+     * 与 `S5-M08-C` 的 {@code qa:feedback} 教训同族：**权限码名字像、语义不同，
+     * 挂错的表现是普通用户用不了**。见计划 §1.1 第 6 条。
+     */
+    @Transactional(readOnly = true)
+    public ModelConfigDtos.OptionList options(ModelType type) {
+        ModelType target = type == null ? ModelType.CHAT : type;
+        List<ModelConfigDtos.ModelOption> list = repository
+                .findAllByOrderByModelTypeAscSortOrderAscIdAsc().stream()
+                .filter(row -> row.getModelType() == target)
+                .filter(row -> Boolean.TRUE.equals(row.getLastTestOk()))
+                .map(row -> new ModelConfigDtos.ModelOption(row.getId(), row.getDisplayName(),
+                        row.getModelName(), Boolean.TRUE.equals(row.getIsActive()),
+                        readCapabilities(row.getCapabilities())))
+                .toList();
+        return new ModelConfigDtos.OptionList(list);
+    }
+
+    // ==================================================================
+    // T-905 —— 用量统计
+    // ==================================================================
+
+    /** 用途桶在页面上的**固定展示顺序** —— 与 mock 的 `byPurpose` 顺序一致。 */
+    private static final List<ModelUsageRecorder.Purpose> PURPOSE_ORDER = List.of(
+            ModelUsageRecorder.Purpose.SUMMARY,
+            ModelUsageRecorder.Purpose.CHAT,
+            ModelUsageRecorder.Purpose.HYQ,
+            ModelUsageRecorder.Purpose.EMBEDDING,
+            ModelUsageRecorder.Purpose.RERANK,
+            ModelUsageRecorder.Purpose.VL_DESC);
+
+    /**
+     * 本月用量统计（`GET /system/model/usage`）。
+     *
+     * <h3>数据来源：{@code sys_model_usage} 是**唯一**的用量事实源</h3>
+     * <p>`T-905` 之前，对话用量只能从 {@code sys_chat_message} 的
+     * {@code token_prompt / token_completion} 算，而嵌入 / 重排 / 摘要 / HyQ / VL
+     * **一处落点都没有** —— 这正是 `#169` 登记的"真数但是部分口径"。
+     * 本批起用量统一落 {@code sys_model_usage}，本方法**只读它**。
+     *
+     * <p>⚠️ 由此有一条**必须知道**的后果：本表是**新表**，历史对话的 token
+     * **不会**追溯进来 —— 本月的数字在第一次真实调用发生前是 0。
+     * 这是正确的空态（"换了个落点，从今天起开始记"），不是数据丢失：
+     * 历史值仍在 {@code sys_chat_message} 里，需要时可回算。
+     *
+     * <h3>费用：三态 + 只累加已计价项</h3>
+     * <p>见 {@link ModelConfigDtos.ModelUsageItem#cost}。汇总那个 {@code cost}
+     * **只累加可估算的**，并同时给出 {@code unpricedCount} —— 一个少了几个模型的合计，
+     * 必须自己说清少了几个。
+     */
+    @Transactional(readOnly = true)
+    public ModelConfigDtos.UsageResponse usage() {
+        LocalDate today = LocalDate.now();
+        LocalDate from = today.withDayOfMonth(1);
+        List<SysModelUsage> rows = usageRepository.findByOccurredAtBetween(from, today);
+        Map<String, SysModelConfig> pricing = pricingByModelName();
+
+        long calls = 0L;
+        long tokens = 0L;
+        long latencySum = 0L;
+        long latencyCount = 0L;
+        Map<ModelUsageRecorder.Purpose, Long> byPurpose = new LinkedHashMap<>();
+        Map<String, UsageBucket> byModel = new LinkedHashMap<>();
+
+        for (SysModelUsage row : rows) {
+            long rowTokens = tokensOf(row);
+            calls += row.getCalls();
+            tokens += rowTokens;
+            if (row.getLatencyMs() != null) {
+                latencySum += row.getLatencyMs();
+                latencyCount += row.getCalls();
+            }
+            ModelUsageRecorder.Purpose purpose = purposeOf(row.getPurpose());
+            if (purpose != null) {
+                byPurpose.merge(purpose, rowTokens, Long::sum);
+            }
+            byModel.computeIfAbsent(row.getModelName(),
+                            key -> new UsageBucket(row.getModelType(), key))
+                    .add(row.getCalls(), nz(row.getPromptTokens()), nz(row.getCompletionTokens()));
+        }
+
+        BigDecimal cost = null;
+        int unpriced = 0;
+        List<ModelConfigDtos.ModelUsageItem> modelItems = new ArrayList<>(byModel.size());
+        String currency = "CNY";
+        for (UsageBucket bucket : byModel.values()) {
+            SysModelConfig config = pricing.get(bucket.modelName);
+            BillingUnit unit = config == null || config.getBillingUnit() == null
+                    ? BillingUnit.PER_TOKEN : config.getBillingUnit();
+            BigDecimal itemCost = estimate(bucket, config, unit);
+            if (itemCost != null) {
+                cost = cost == null ? itemCost : cost.add(itemCost);
+            } else if (unit != BillingUnit.NONE) {
+                // `NONE`（本地部署）不算"忘了配单价" —— 它本来就是 0 元，且页面要把它
+                // 显示成「不计费」而不是「未配置」。两者都是"0"，语义相反
+                unpriced++;
+            }
+            if (config != null && config.getCurrency() != null && !config.getCurrency().isBlank()) {
+                currency = config.getCurrency();
+            }
+            modelItems.add(new ModelConfigDtos.ModelUsageItem(bucket.modelName,
+                    parseType(bucket.modelType), bucket.calls, bucket.tokens(), itemCost, unit));
+        }
+        modelItems.sort(Comparator.comparingLong(ModelConfigDtos.ModelUsageItem::tokens).reversed());
+
+        return new ModelConfigDtos.UsageResponse(calls, tokens, cost, currency, unpriced,
+                avgLatencySec(latencySum, latencyCount), purposeItems(byPurpose, tokens), modelItems);
+    }
+
+    private static long tokensOf(SysModelUsage row) {
+        return nz(row.getPromptTokens()) + nz(row.getCompletionTokens());
+    }
+
+    private static long nz(Long value) {
+        return value == null ? 0L : value;
+    }
+
+    /** 模型名 → 配置行（用于取计价）。同名多条时取**排序最前**的那条，与配置页的展示顺序一致。 */
+    private Map<String, SysModelConfig> pricingByModelName() {
+        Map<String, SysModelConfig> map = new LinkedHashMap<>();
+        for (SysModelConfig row : repository.findAllByOrderByModelTypeAscSortOrderAscIdAsc()) {
+            map.putIfAbsent(row.getModelName(), row);
+        }
+        return map;
+    }
+
+    /**
+     * 估算一个模型的费用。**返回 {@code null} = 无法估算**（不是 0）。
+     *
+     * <p>三种计价单位各走各的：
+     * <ul>
+     *   <li>{@code NONE} → {@code 0}（**已知不计费**，本地部署）；</li>
+     *   <li>{@code PER_CALL} → 用了 {@code per_call_price} 才算得出来；</li>
+     *   <li>{@code PER_TOKEN} → 用了 {@code input_price} / {@code output_price} 才算得出来。
+     *       ⚠️ **两者都没有时返回 {@code null}**，而不是拿其中一个去乘全部 token ——
+     *       那会让一个"没配单价"的模型显示成一个偏低的数，比"未配置"更误导。</li>
+     * </ul>
+     */
+    private static BigDecimal estimate(UsageBucket bucket, SysModelConfig config, BillingUnit unit) {
+        if (unit == BillingUnit.NONE) {
+            return BigDecimal.ZERO;
+        }
+        if (config == null) {
+            return null;
+        }
+        if (unit == BillingUnit.PER_CALL) {
+            return config.getPerCallPrice() == null
+                    ? null
+                    : config.getPerCallPrice().multiply(BigDecimal.valueOf(bucket.calls));
+        }
+        if (config.getInputPrice() == null && config.getOutputPrice() == null) {
+            return null;
+        }
+        BigDecimal perMillion = BigDecimal.valueOf(1_000_000L);
+        BigDecimal in = config.getInputPrice() == null ? BigDecimal.ZERO : config.getInputPrice();
+        BigDecimal out = config.getOutputPrice() == null ? BigDecimal.ZERO : config.getOutputPrice();
+        return in.multiply(BigDecimal.valueOf(nz(bucket.promptTokens))).add(
+                        out.multiply(BigDecimal.valueOf(nz(bucket.completionTokens))))
+                .divide(perMillion, 2, RoundingMode.HALF_UP);
+    }
+
+    private static ModelType parseType(String name) {
+        try {
+            return ModelType.valueOf(name);
+        } catch (IllegalArgumentException ex) {
+            // 库里存的是枚举名；出现认不出的值说明有人手工改过表 —— 按对话模型兜底
+            // 而不是让整个接口 500（用量页不该因为一行脏数据打不开）
+            log.warn("用量表里出现认不出的 model_type：{}", name);
+            return ModelType.CHAT;
+        }
+    }
+
+    private static ModelUsageRecorder.Purpose purposeOf(String name) {
+        try {
+            return ModelUsageRecorder.Purpose.valueOf(name);
+        } catch (IllegalArgumentException ex) {
+            log.warn("用量表里出现认不出的 purpose：{}", name);
+            return null;
+        }
+    }
+
+    /**
+     * 按固定顺序产出用途桶，**空桶也发**。
+     *
+     * <p>为什么发 0 而不是省略：前端是按桶名匹配渲染的（"索引侧占了 63%"这类判断
+     * 需要看到每一个桶）。省掉一个桶，界面上就是那一行凭空消失 —— 而
+     * 「这一项是 0」与「这一项不存在」在用量分析里是两件事。
+     */
+    private static List<ModelConfigDtos.PurposeUsage> purposeItems(
+            Map<ModelUsageRecorder.Purpose, Long> byPurpose, long total) {
+        List<ModelConfigDtos.PurposeUsage> items = new ArrayList<>(PURPOSE_ORDER.size());
+        for (ModelUsageRecorder.Purpose purpose : PURPOSE_ORDER) {
+            long value = byPurpose.getOrDefault(purpose, 0L);
+            items.add(new ModelConfigDtos.PurposeUsage(purpose.getLabel(), value, percent(value, total)));
+        }
+        return items;
+    }
+
+    private static int percent(long value, long total) {
+        return total <= 0L ? 0 : (int) Math.round(value * 100.0D / total);
+    }
+
+    private static double avgLatencySec(long latencySum, long latencyCount) {
+        if (latencyCount <= 0L) {
+            return 0D;
+        }
+        return BigDecimal.valueOf(latencySum / 1000.0D / latencyCount)
+                .setScale(1, RoundingMode.HALF_UP).doubleValue();
+    }
+
+    /**
+     * 按模型聚合的中间态（可变，便于一次遍历累加）。
+     *
+     * <p>⚠️ **只有这一处能算 {@link #tokens}** —— 它是 {@code prompt + completion}，
+     * 而库里**刻意没有**"合计"那一列（冗余列与明细列迟早漂移，见 `V27` 头注）。
+     * 让两个数各加各的、合计只在这一处派生，就不会出现"合计与明细对不上"。
+     */
+    private static final class UsageBucket {
+
+        private final String modelType;
+        private final String modelName;
+        private long calls;
+        private long promptTokens;
+        private long completionTokens;
+
+        UsageBucket(String modelType, String modelName) {
+            this.modelType = modelType;
+            this.modelName = modelName;
+        }
+
+        void add(int rowCalls, long prompt, long completion) {
+            this.calls += rowCalls;
+            this.promptTokens += prompt;
+            this.completionTokens += completion;
+        }
+
+        long tokens() {
+            return promptTokens + completionTokens;
+        }
     }
 
     // ==================================================================

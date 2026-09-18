@@ -4,12 +4,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.knowledge.ai.core.ai.RerankClient;
 import com.knowledge.ai.core.ai.SiliconFlowRerankClient;
 import com.knowledge.ai.core.ai.ModelClientRegistry;
+import com.knowledge.ai.core.enums.ModelType;
 import com.knowledge.ai.core.enums.RetrievalMode;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.setting.SystemSettingService;
 import com.knowledge.ai.core.setting.SystemSettings;
+import com.knowledge.ai.service.ModelUsageRecorder;
 import com.knowledge.ai.service.RebuildStateService;
 import com.knowledge.ai.dto.kb.KbDtos;
 import jakarta.persistence.EntityManager;
@@ -72,6 +74,9 @@ public class RetrievalService {
 
     /** `T-709`：重建索引期间降级为关键词检索。 */
     private final RebuildStateService rebuildStateService;
+
+    /** `T-905` 的用量落点。见 {@link #recordRerankUsage}。 */
+    private final ModelUsageRecorder usageRecorder;
 
     /**
      * 检索。
@@ -206,6 +211,7 @@ public class RetrievalService {
                     elapsed(start), "重排调用失败，已降级为不重排：" + ex.getMessage());
         }
         long millis = elapsed(start);
+        recordRerankUsage(millis);
 
         if (hits.isEmpty()) {
             // 服务通了但一条都没返回 —— 与"调用失败"是两回事，不要混为一谈
@@ -237,6 +243,27 @@ public class RetrievalService {
      * @param rerankScores 非 {@code null} 表示**真的重排过**（哪怕只有一部分分片拿到分）；
      *                     {@code null} 表示没重排，此时用融合分、不做阈值比较
      */
+    /**
+     * 记一次重排用量（`T-905`）。
+     *
+     * <p>⚠️ **只记次数与耗时，不记 token**：重排接口（`SiliconFlowRerankClient`）返回的是
+     * 「候选 + 相关度分数」，**没有 token 用量**。硬凑一个（比如拿候选字符数当 token）
+     * 会让 `byPurpose` 里出现一个与其它桶不同量纲的数 —— 那比留 0 更误导。
+     * 重排的计费口径本来也多为 {@code PER_CALL}（按次），计次就够算钱了。边界登记在计划 §9。
+     *
+     * <p>⚠️ 只在**真的调用了模型**的那条路上记：调用失败与"未配置"两条降级路径
+     * 都在上面提前 return 了，一次请求都没发出去 —— 记进去会让"这个模型这个月调了 N 次"变成假的。
+     */
+    private void recordRerankUsage(long millis) {
+        try {
+            usageRecorder.record(modelClientRegistry.activeSpec(ModelType.RERANK),
+                    ModelUsageRecorder.Purpose.RERANK, 1, 0L, 0L,
+                    (int) Math.min(millis, Integer.MAX_VALUE));
+        } catch (Exception ex) {
+            log.warn("[检索] 重排用量记录失败（不影响本次检索）：原因={}", ex.getMessage());
+        }
+    }
+
     private static List<RetrievedChunk> toChunks(List<RrfFusion.FusedHit> fused, int topK,
                                                  Map<String, Double> rerankScores,
                                                  RetrievalParams params) {

@@ -6,6 +6,7 @@ import com.knowledge.ai.core.audit.RiskLevel;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.security.RequiresPerm;
+import com.knowledge.ai.core.enums.ModelType;
 import com.knowledge.ai.dto.system.ModelConfigDtos;
 import com.knowledge.ai.service.ModelConfigService;
 import lombok.RequiredArgsConstructor;
@@ -17,6 +18,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -63,6 +65,43 @@ public class ModelConfigController {
     @RequiresPerm("system:model")
     public ApiResponse<ModelConfigDtos.ConfigResponse> config() {
         return ApiResponse.ok(modelConfigService.list());
+    }
+
+    /**
+     * 问答页模型选项（`T-904`）。
+     *
+     * <p>🔴 **权限码是 {@code qa:ask}，不是 {@code system:model}** —— 本类其余六个端点
+     * 都是后者，唯独这个不是，而且这个差别是**有意的、必须的**：
+     * 消费方是问答页的切换器（`ChatView.vue:29` 已在调），而 {@code system:model}
+     * 在 `V2` 的授权矩阵里只有 {@code SUPER_ADMIN} 有（本批开工前逐行查过
+     * {@code sys_role_permission}）。挂错的表现是**普通用户在问答页根本开不了切换器**
+     * —— 而它在用例层不会红（用例拿的是超管 token）。
+     * 与 `S5-M08-C` 的 {@code qa:feedback} 同族：权限码名字像、语义不同。
+     *
+     * <p>⚠️ 不写审计点：读接口，且 `AuditRiskPolicy` 里「模型配置」那一行的落点是
+     * **四个写动作**（新增/编辑/删除/启用）。用户看了一眼下拉框不需要进审计页。
+     */
+    @GetMapping("/options")
+    @RequiresPerm("qa:ask")
+    public ApiResponse<ModelConfigDtos.OptionList> options(
+            @RequestParam(required = false) ModelType type) {
+        return ApiResponse.ok(modelConfigService.options(type));
+    }
+
+    /**
+     * 用量统计（`T-905`），默认本月。
+     *
+     * <p>⚠️ 页面上展示的是**费用估算**，不是账单（`09` §1.13.1 的「诚实口径」）。
+     * 本接口返回的 {@code cost} 有**三态**（可估算 / 0 = 不计费 / null = 未配单价），
+     * 前端必须区分 —— 见 {@link ModelConfigDtos.ModelUsageItem#cost}。
+     *
+     * <p>权限 {@code system:model}：这确实是模型配置页的读接口，超管专属是对的
+     * （与上面的 {@code options} 恰好相反 —— 那条要给普通用户用）。
+     */
+    @GetMapping("/usage")
+    @RequiresPerm("system:model")
+    public ApiResponse<ModelConfigDtos.UsageResponse> usage() {
+        return ApiResponse.ok(modelConfigService.usage());
     }
 
     /**

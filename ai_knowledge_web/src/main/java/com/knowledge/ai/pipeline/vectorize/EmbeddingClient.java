@@ -3,8 +3,12 @@ package com.knowledge.ai.pipeline.vectorize;
 import com.knowledge.ai.core.ai.ModelClientRegistry;
 import com.knowledge.ai.core.ai.ModelConfigSpec;
 import com.knowledge.ai.core.enums.ModelType;
+import com.knowledge.ai.service.ModelUsageRecorder;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.embedding.Embedding;
 import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.embedding.EmbeddingResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -87,12 +91,17 @@ public interface EmbeddingClient {
 
         private final ModelClientRegistry registry;
 
+        /** `T-905` 的用量落点。见 {@link #recordUsage}。 */
+        private final ModelUsageRecorder usageRecorder;
+
         /** 每批文本数。小数据下 16 条一批，实测远在服务端限制内。 */
         private final int batchSize;
 
         RegistryEmbeddingClient(ModelClientRegistry registry,
+                                ModelUsageRecorder usageRecorder,
                                 @Value("${m05.vectorize.batch-size:16}") int batchSize) {
             this.registry = registry;
+            this.usageRecorder = usageRecorder;
             this.batchSize = Math.max(1, batchSize);
         }
 
@@ -105,7 +114,15 @@ public interface EmbeddingClient {
                 List<String> batch = texts.subList(from, to);
                 List<float[]> got;
                 try {
-                    got = model.embed(batch);
+                    // ⚠️ 用 `embedForResponse` 而不是 `embed(List)` —— 两者返回的向量**完全一样**
+                    // （后者就是前者的一个 default 包装），但只有前者带得出 token 用量。
+                    // `T-905` 的 `byPurpose` 里「文档向量化（嵌入）」那一桶要靠它，
+                    // 而用量在**这一层不带出来，上层再想补也补不回来**。
+                    EmbeddingResponse response = model.embedForResponse(batch);
+                    recordUsage(response, batch.size());
+                    got = response.getResults().stream().map(Embedding::getOutput).toList();
+                } catch (EmbeddingFailedException ex) {
+                    throw ex;
                 } catch (Exception ex) {
                     // 把"第几批、多少条"带上 —— 否则排查时只剩一个远端的 500
                     throw new EmbeddingFailedException(
@@ -122,6 +139,30 @@ public interface EmbeddingClient {
             }
             log.debug("嵌入完成：{} 批 / {} 条", (texts.size() + batchSize - 1) / batchSize, texts.size());
             return out;
+        }
+
+        /**
+         * 记一次嵌入用量（`T-905`）。
+         *
+         * <p>⚠️ 嵌入**只有输入没有输出**：把网关回报的 token 全记进 {@code promptTokens}，
+         * {@code completionTokens} 恒 0。若网关连总数都不报，则退回 {@code batch.size()}
+         * —— 那时至少"调了几次、处理了几条"是准的（比整条不记强）。
+         *
+         * <p>⚠️ 记用量**不能影响嵌入本身**：这里整段包在 try 里，任何异常只留 warn。
+         * 与 {@code ModelUsageRecorder} 内部那条取舍同源，但这里多包一层是因为
+         * **调用点在核心写入路径上** —— 用量失败绝不能让一批向量写不进去。
+         */
+        private void recordUsage(EmbeddingResponse response, int batchCount) {
+            try {
+                Usage usage = response == null || response.getMetadata() == null
+                        ? null : response.getMetadata().getUsage();
+                long prompt = usage == null || usage.getPromptTokens() == null
+                        ? batchCount : usage.getPromptTokens().longValue();
+                usageRecorder.record(registry.activeSpec(ModelType.EMBEDDING),
+                        ModelUsageRecorder.Purpose.EMBEDDING, batchCount, prompt, 0L, null);
+            } catch (Exception ex) {
+                log.warn("嵌入用量记录失败（不影响向量写入）：批={} 原因={}", batchCount, ex.getMessage());
+            }
         }
 
         /**
