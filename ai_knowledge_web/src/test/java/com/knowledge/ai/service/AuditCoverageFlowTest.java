@@ -86,7 +86,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     /**
-     * 裁定过的 31 个动作 → 风险等级。
+     * 裁定过的 35 个动作 → 风险等级。
      *
      * <p>写死而**不从 {@code AuditRiskPolicy} 读**：策略表自己就是被测对象，
      * 两边都"自证"等于没测 —— 策略表漏登记、注解也漏挂时，双向比对照样通过。
@@ -141,6 +141,16 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // 本批只落**导出**（反馈处置属 T-807）。⚠️ 「删除会话」**不在**这个清单里：
         // 需求用枚举的方式裁过了，没点名的不加（理由见 AuditRiskPolicy 的对应位置）
         expected.put(AuditModule.QA + " 导出会话", RiskLevel.HIGH);
+        // ---- 系统 · 模型配置（4）---- （S6-M09-A 新增：T-900~T-903 的四个写动作）
+        // 四条同属 `MODEL_CONFIG_CHANGE`：`AuditRiskPolicy` 的 Category javadoc 原话就是
+        // 「四类模型的**新增、编辑、删除、启用或切换**」。⚠️「连接测试」**不在**这里 ——
+        // 它是只读探测（只写 `last_test_*` 三个结论列），与「单文件浏览式下载不算高危」同一条取舍。
+        // ⚠️ 也没有单独的「切换重排模型」：重排/VL 的切换与「启用」是同一端点、同一段代码、
+        // 同一个后果，拆成两个动作名会让同一次操作在审计页上看起来像两件事。
+        expected.put(AuditModule.SYSTEM + " 新增模型配置", RiskLevel.HIGH);
+        expected.put(AuditModule.SYSTEM + " 编辑模型配置", RiskLevel.HIGH);
+        expected.put(AuditModule.SYSTEM + " 删除模型配置", RiskLevel.HIGH);
+        expected.put(AuditModule.SYSTEM + " 启用模型配置", RiskLevel.HIGH);
         return expected;
     }
 
@@ -275,7 +285,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 31 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 35 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
@@ -284,7 +294,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "25（S4-M05-A）→ 27（S4-D 的 T-407 两条）→ 30（S4-E2 的 T-O06 三条："
                         + "触发解析 / 解析完成 / 解析失败）→ **31**（S5-M08-B 的 T-802 导出半边："
                         + "导出会话。⚠️ 只加这一条 —— 「删除会话」按《05》§4.2 的枚举不在采集范围内）")
-                .hasSize(31);
+                .hasSize(35);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

@@ -176,9 +176,9 @@ const editForm = reactive({
   displayName: '',
   protocol: 'OpenAI 兼容',
   baseUrl: '',
-  apiKey: '',
+  // ⚠️ 没有 `apiKey` / `keyChanged`：本批密钥**不落库**，表单不收也不发它，
+  // 只读展示服务端现算的掩码（见弹窗里 API Key 字段的注释）
   apiKeyMasked: '',
-  keyChanged: false,
   modelName: '',
   stream: true,
   vision: false,
@@ -203,9 +203,7 @@ function openCreate(type: ModelType) {
     displayName: '',
     protocol: 'OpenAI 兼容',
     baseUrl: '',
-    apiKey: '',
     apiKeyMasked: '',
-    keyChanged: true,
     modelName: '',
     stream: type !== 'EMBEDDING' && type !== 'RERANK',
     vision: type === 'VL',
@@ -232,9 +230,7 @@ function openEdit(m: ModelConfigItem) {
     displayName: m.displayName,
     protocol: m.protocol,
     baseUrl: m.baseUrl,
-    apiKey: '',
     apiKeyMasked: m.apiKeyMasked,
-    keyChanged: false,
     modelName: m.modelName,
     stream: m.capabilities.stream,
     vision: m.capabilities.vision,
@@ -811,11 +807,20 @@ onMounted(async () => {
         <div class="field">
           <label>API Key</label>
           <div class="api-key-row">
-            <el-input v-if="editMode === 'edit' && !editForm.keyChanged" :model-value="editForm.apiKeyMasked" class="mono" disabled />
-            <el-input v-else v-model="editForm.apiKey" class="mono" type="password" show-password placeholder="粘贴明文，保存后不再回显" />
-            <el-button v-if="editMode === 'edit' && !editForm.keyChanged" @click="editForm.keyChanged = true">更换</el-button>
+            <!--
+              ⚠️ 本字段**只读**（S6-M09-A，用户 2026-09-18 裁定）。
+              密钥不落库，它始终来自运行环境的 `.env`（`CHAT_API_KEY` / `EMBEDDED_API_KEY` /
+              `RERANKER_API_KEY` / `VL_API_KEY`，按模型的类型取）。这里显示的是读取时从
+              环境变量**现算**的掩码 —— 不是库里的快照，所以换了 key 它立刻跟着变。
+              不提供「更换」入口是有意的：仓里没有通用加解密工具，做加密落库要连带解决
+              密钥轮换与历史密文兼容，而密钥最终还是放在 `.env` 里，安全性并未提高。
+            -->
+            <el-input :model-value="editForm.apiKeyMasked || '未配置'" class="mono" disabled />
           </div>
-          <div class="hint">加密存储，保存后不再明文回显，日志中脱敏</div>
+          <div class="hint">
+            密钥由运维在服务端 <code>.env</code> 中配置（按模型类型取，如 <code>CHAT_API_KEY</code>），
+            本页面只读展示掩码、不接受录入
+          </div>
         </div>
 
         <div class="field">

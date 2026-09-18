@@ -1,5 +1,6 @@
 package com.knowledge.ai.core.ai;
 
+import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.core.enums.ModelType;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
@@ -68,6 +69,11 @@ public class ModelClientRegistry {
      */
     public ChatClient chatClient(String modelId) {
         ModelConfigSpec spec = specById(ModelType.CHAT, modelId);
+        return chatClientOf(spec);
+    }
+
+    /** 按规格取对话客户端。**私有** —— 见 {@link #probeConnection} 的解释。 */
+    private ChatClient chatClientOf(ModelConfigSpec spec) {
         return getOrCreate(spec, () -> ChatClient.builder((ChatModel) clientFactory.createChat(spec)).build(),
                 ChatClient.class);
     }
@@ -112,7 +118,96 @@ public class ModelClientRegistry {
         if (specs == null || specs.isEmpty()) {
             return NoOpRerankClient.INSTANCE;
         }
-        ModelConfigSpec spec = activeSpec(ModelType.RERANK);
+        return rerankClientOf(activeSpec(ModelType.RERANK));
+    }
+
+    // ==================================================================
+    // 连接测试（`T-903`）—— **唯一的"按任意规格直接构造并调用"入口**
+    // ==================================================================
+
+    /**
+     * 对**任意一条**模型配置做一次连接探测（`T-903`）。
+     *
+     * <h3>为什么必须由注册中心提供，而不是让调用方自己拼</h3>
+     * <p>「客户端只由 {@link ModelClientFactory} 构造、只经本类取得」是本项目的结构纪律
+     * （`T-014`）。而连接测试要测的是**待测的那一行** —— 它可能还没启用，
+     * 于是 `activeSpec(type)` 够不着它。三条路可选：① 让配置服务直接碰 `ModelClientFactory`
+     * （破坏结构纪律）；② 给每种类型开一个"按规格取"的公开重载
+     * （等于把「按 id/库选模型」的口子重新打开 —— 而
+     * {@code ModelClientRegistryTest#embeddingIsSingleton} 正**刻意钉死**了这一点：
+     * 嵌入是全局单例，注册中心不得提供任何"选一个嵌入"的方法）；③ **把探测本身收进来**。
+     *
+     * <p>本类选③：调用方递一个规格，拿一个结论。它**不是一个"取客户端"的口子** ——
+     * 不返回任何客户端对象，调用方拿不到句柄、也就无法用它去跑业务流量。
+     * 那正是它和②的区别，也是 {@code embeddingIsSingleton} 那条断言要守的东西。
+     *
+     * <h3>四类各自的探测方式</h3>
+     * <ul>
+     *   <li>{@code CHAT} / {@code VL}：发一句极短的文本。VL 模型在协议上**本来就是**
+     *       OpenAI 兼容的多模态对话模型 —— 发纯文本足以探到"网络通不通、密钥对不对、
+     *       模型名认不认"，而真正的图片理解链路是 `T-907`，连接测试不该依赖它；</li>
+     *   <li>{@code EMBEDDING}：嵌一个短句，并**如实报出维度**（维度对不上是真问题，
+     *       但它不是"连不通"，所以不算失败）；</li>
+     *   <li>{@code RERANK}：给两句候选打分。⚠️ **不走 {@link #rerankClient()} 的降级** ——
+     *       降级是为了"检索不被配置抖动打断"，而连接测试恰恰要**看见失败**。</li>
+     * </ul>
+     *
+     * @return 结论；**失败不抛**，由调用方翻译成 `{ok:false, message:...}` 给人看
+     */
+    public ProbeOutcome probeConnection(ModelConfigSpec spec) {
+        long startNanos = System.nanoTime();
+        try {
+            String detail = switch (spec.type()) {
+                case CHAT, VL -> {
+                    String content = chatClientOf(spec).prompt().user(PROBE_TEXT).call().content();
+                    yield content == null || content.isBlank()
+                            ? "连接正常（模型返回为空，但链路是通的）" : "连接正常";
+                }
+                case EMBEDDING -> {
+                    float[] vector = getOrCreate(spec, () -> clientFactory.createEmbedding(spec),
+                            EmbeddingModel.class).embed(PROBE_TEXT);
+                    int dim = vector == null ? 0 : vector.length;
+                    yield dim == MilvusConstants.DIMENSION
+                            ? "连接正常 · 向量维度 " + dim
+                            : "连接成功，但向量维度是 " + dim + "（期望 " + MilvusConstants.DIMENSION
+                                    + "）—— 入库前请先确认嵌入模型";
+                }
+                case RERANK -> {
+                    RerankClient client = getOrCreate(spec, () -> clientFactory.createRerank(spec),
+                            RerankClient.class);
+                    var hits = client.rerank(PROBE_TEXT, List.of(PROBE_TEXT, "无关的一句"), 1);
+                    yield hits.isEmpty() ? "连接正常（未返回排序结果）" : "连接正常 · 返回 " + hits.size() + " 条排序";
+                }
+            };
+            return new ProbeOutcome(true, elapsedMillis(startNanos), detail);
+        } catch (RuntimeException ex) {
+            return new ProbeOutcome(false, -1L, rootMessage(ex));
+        }
+    }
+
+    /** 一次连接探测的结论。 */
+    public record ProbeOutcome(boolean ok, long latencyMs, String detail) {
+    }
+
+    /** 探测话术。极短：它只是一次连通性探针，不是一次问答。 */
+    private static final String PROBE_TEXT = "ping";
+
+    private static long elapsedMillis(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /** 取最内层原因的话术 —— 外层常见的是包装异常，打给用户看没有意义。 */
+    private static String rootMessage(Throwable ex) {
+        Throwable cursor = ex;
+        while (cursor.getCause() != null && cursor.getCause() != cursor) {
+            cursor = cursor.getCause();
+        }
+        String message = cursor.getMessage();
+        return message == null || message.isBlank() ? cursor.getClass().getSimpleName() : message;
+    }
+
+    /** 按规格取重排客户端（不走降级）。**私有** —— 见 {@link #probeConnection} 的解释。 */
+    private RerankClient rerankClientOf(ModelConfigSpec spec) {
         return getOrCreate(spec, () -> clientFactory.createRerank(spec), RerankClient.class);
     }
 

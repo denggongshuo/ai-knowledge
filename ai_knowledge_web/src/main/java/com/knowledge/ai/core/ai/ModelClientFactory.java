@@ -38,14 +38,23 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ModelClientFactory {
 
-    private final ModelProperties modelProperties;
-
     private final ObjectProvider<ObservationRegistry> observationRegistryProvider;
 
     private final MeterRegistry meterRegistry;
 
     /** 构造对话模型。 */
     public ChatModel createChat(ModelConfigSpec spec) {
+        OpenAiChatOptions.Builder options = OpenAiChatOptions.builder()
+                .model(spec.model())
+                // `S6-M09-A` 起 temperature 取自**该条模型自己的** params（`T-901` 可编辑），
+                // 不再是全局单值 —— 否则在配置页改温度会"保存成功但行为不变"。
+                // 引导路径的 spec 仍逐项照抄 ModelProperties，故行为没有变化。
+                .temperature(spec.params().temperatureOrDefault());
+        // ⚠️ maxTokens 为 null 时**不下发**这个字段（让网关用自己的默认值）——
+        // 这是 S6-M09-A 之前的既有行为。给一个非空默认值会悄悄改变所有模型的生成长度上限。
+        if (spec.params().maxTokens() != null) {
+            options.maxTokens(spec.params().maxTokens());
+        }
         return OpenAiChatModel.builder()
                 .openAiClient(buildSdkClient(spec))
                 // 同步、异步两个 client 都要给：OpenAiChatModel.build() 在缺异步 client 时
@@ -54,10 +63,7 @@ public class ModelClientFactory {
                 // "At least one credential source must be specified"。
                 // 官方自动配置同样是把两个都传进去的（见 OpenAiChatAutoConfiguration）。
                 .openAiClientAsync(buildSdkClientAsync(spec))
-                .options(OpenAiChatOptions.builder()
-                        .model(spec.model())
-                        .temperature(modelProperties.getChatTemperature())
-                        .build())
+                .options(options.build())
                 .observationRegistry(observationRegistry())
                 .meterRegistry(meterRegistry)
                 .build();
@@ -84,12 +90,13 @@ public class ModelClientFactory {
      * 这里返回的是自写的 {@link SiliconFlowRerankClient}，只用 {@code RestClient}——
      * 决策与理由见 `S5-M07-A` §5（不引依赖）。
      *
-     * <p>超时取 {@code app.model.timeout-seconds}（与对话/嵌入同一个值）：
-     * 另立一个旋钮的收益是零，而"改了超时却没生效"这类问题会多一处来源。
+     * <p>超时取**该条模型自己的** {@code params.timeoutSec}（`S6-M09-A` 起）。
+     * 引导路径的 spec 逐项照抄 {@code app.model.timeout-seconds}，故行为没有变化；
+     * 而 DB 路径改了超时是真生效的 —— 这正是本批要让 `params` 落到实处的理由之一。
      * 客户端内部对该值有下限保护（重排不该比生成还慢等）。
      */
     public RerankClient createRerank(ModelConfigSpec spec) {
-        return new SiliconFlowRerankClient(spec, modelProperties.getTimeoutSeconds());
+        return new SiliconFlowRerankClient(spec, spec.params().timeoutSecOrDefault());
     }
 
     private OpenAIClient buildSdkClient(ModelConfigSpec spec) {
@@ -103,8 +110,8 @@ public class ModelClientFactory {
                 false,            // isMicrosoftFoundry
                 false,            // isGitHubModels
                 spec.model(),     // model（供 SDK 侧默认值）
-                Duration.ofSeconds(modelProperties.getTimeoutSeconds()),
-                modelProperties.getMaxRetries(),
+                Duration.ofSeconds(spec.params().timeoutSecOrDefault()),
+                spec.params().retriesOrDefault(),
                 null,             // proxy
                 Map.of(),         // customHeaders
                 observationRegistry(),
@@ -124,8 +131,8 @@ public class ModelClientFactory {
                 false,
                 false,
                 spec.model(),
-                Duration.ofSeconds(modelProperties.getTimeoutSeconds()),
-                modelProperties.getMaxRetries(),
+                Duration.ofSeconds(spec.params().timeoutSecOrDefault()),
+                spec.params().retriesOrDefault(),
                 null,
                 Map.of(),
                 observationRegistry(),

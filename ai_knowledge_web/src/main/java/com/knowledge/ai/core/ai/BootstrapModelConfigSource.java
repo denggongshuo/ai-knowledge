@@ -34,12 +34,8 @@ public class BootstrapModelConfigSource implements ModelConfigSource {
 
     @Override
     public List<ModelConfigSpec> listEnabled(ModelType type) {
-        ModelProperties.Endpoint endpoint = switch (type) {
-            case CHAT -> modelProperties.getChat();
-            case EMBEDDING -> modelProperties.getEmbedding();
-            case RERANK -> modelProperties.getRerank();
-            case VL -> modelProperties.getVl();
-        };
+        // 类型的 switch 收在 `ModelProperties#endpointOf` 一处（原先这里与 DB 实现各一份）
+        ModelProperties.Endpoint endpoint = modelProperties.endpointOf(type);
 
         // 端点不全就不给出这条配置：让"没配 key"表现为"该类无可用模型"，
         // 由调用方给出明确的业务错误，而不是构造一个必然调用失败的客户端。
@@ -55,7 +51,17 @@ public class BootstrapModelConfigSource implements ModelConfigSource {
                 endpoint.getApiKey(),
                 endpoint.getModel(),
                 BOOTSTRAP_VERSION,
-                true));
+                true,
+                // 引导路径的生成参数**逐项照抄 `ModelProperties`**，与 `S6-M09-A` 之前的行为
+                // 完全一致（temperature 仍是 `app.model.chat-temperature`，默认 0.7；
+                // maxTokens 仍不传 —— 见 GenerationParams 的 javadoc）。
+                // ⚠️ 这一条是**刻意保持行为不变**：接 DB 的那一批不该顺手改掉引导路径的生成结果，
+                // 否则"模型配置页上线后答案风格变了"会被归因到错误的地方。
+                new ModelConfigSpec.GenerationParams(
+                        modelProperties.getChatTemperature(),
+                        null,
+                        modelProperties.getTimeoutSeconds(),
+                        modelProperties.getMaxRetries())));
         return specs;
     }
 

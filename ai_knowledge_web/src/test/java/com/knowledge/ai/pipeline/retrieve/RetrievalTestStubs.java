@@ -148,10 +148,12 @@ public class RetrievalTestStubs {
     @Bean
     @Primary
     ModelClientFactory rerankOverridingFactory(
-            com.knowledge.ai.core.ai.ModelProperties modelProperties,
             org.springframework.beans.factory.ObjectProvider<io.micrometer.observation.ObservationRegistry> observations,
             io.micrometer.core.instrument.MeterRegistry meterRegistry) {
-        return new ModelClientFactory(modelProperties, observations, meterRegistry) {
+        // `S6-M09-A` 起 `ModelClientFactory` 不再持有 `ModelProperties` —— 生成参数
+        // （temperature / maxTokens / timeoutSec / retries）改由 `ModelConfigSpec#params()`
+        // 随模型走，见那边的 javadoc
+        return new ModelClientFactory(observations, meterRegistry) {
             @Override
             public com.knowledge.ai.core.ai.RerankClient createRerank(
                     com.knowledge.ai.core.ai.ModelConfigSpec spec) {

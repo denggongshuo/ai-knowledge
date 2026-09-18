@@ -115,8 +115,11 @@ class ModelClientRegistryTest {
         var status = registry.status();
         String text = status.toString();
 
-        assertEquals("bootstrap(app.model.*)", status.get("source"),
-                "S0 的配置来源应当是引导配置；S6 接 DB 后这里会变成 db");
+        // `S6-M09-A`（2026-09-18）起来源**就是** DB 了 —— 本条断言当时写的
+        // 「S6 接 DB 后这里会变成 db」正是现在发生的事。改动只有这一处常量：
+        // 语义（"状态里要说清当前用的是哪个来源"）没变，它才是这条判据要守的东西
+        assertEquals("db(sys_model_config)", status.get("source"),
+                "S6 起模型口径的真相源是 sys_model_config；引导配置退化为种子与密钥来源");
         assertTrue(text.contains(ModelType.CHAT.name()), "状态里应能看到各类模型的解析结果");
         assertFalse(text.contains(modelProperties.getChat().getApiKey()),
                 "状态里出现了真实密钥 —— G0-8 要求一律只报「已配置」");
@@ -139,7 +142,8 @@ class ModelClientRegistryTest {
     @DisplayName("T-014：配置来源抛错 → 回退「最近一次有效配置」，不打断调用方")
     void fallsBackToLastKnownGoodWhenSourceFails() {
         ModelConfigSpec spec = new ModelConfigSpec(
-                "m1", ModelType.CHAT, "https://example.test/v1", "k", "some-model", "v1", true);
+                "m1", ModelType.CHAT, "https://example.test/v1", "k", "some-model", "v1", true,
+                ModelConfigSpec.GenerationParams.defaults());
 
         ModelConfigSource flaky = new ModelConfigSource() {
             private int calls = 0;
@@ -171,7 +175,8 @@ class ModelClientRegistryTest {
     @DisplayName("T-014：来源正常但返回空 → 显式报错，**不**拿旧配置顶（那是两回事）")
     void emptyConfigFailsInsteadOfFallingBack() {
         ModelConfigSpec spec = new ModelConfigSpec(
-                "m1", ModelType.CHAT, "https://example.test/v1", "k", "some-model", "v1", true);
+                "m1", ModelType.CHAT, "https://example.test/v1", "k", "some-model", "v1", true,
+                ModelConfigSpec.GenerationParams.defaults());
 
         ModelConfigSource disappearing = new ModelConfigSource() {
             private int calls = 0;

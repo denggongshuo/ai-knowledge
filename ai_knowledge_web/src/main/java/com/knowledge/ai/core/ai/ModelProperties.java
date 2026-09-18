@@ -1,5 +1,6 @@
 package com.knowledge.ai.core.ai;
 
+import com.knowledge.ai.core.enums.ModelType;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
@@ -52,6 +53,24 @@ public class ModelProperties {
 
     /** 对话温度。0.7 是问答场景的既有取值。 */
     private double chatTemperature = 0.7;
+
+    /**
+     * 按类型取端点。
+     *
+     * <p>这个 switch 原先**散在两处**（{@code BootstrapModelConfigSource} 里一份、
+     * 接 DB 后的 {@code DbModelConfigSource} 又要一份）。{@code ModelType} 的取值增加时，
+     * 只改一处的那份会**静默漏掉新类型**（编译期不报错，因为 switch 有 default 或只是少一个分支）。
+     * 收在这里只有一份，加类型时编译器会当场指出漏了谁 —— 除非这里也用 default。
+     * 所以本方法**刻意不写 default**：靠穷举让编译器兜底。
+     */
+    public Endpoint endpointOf(ModelType type) {
+        return switch (type) {
+            case CHAT -> chat;
+            case EMBEDDING -> embedding;
+            case RERANK -> rerank;
+            case VL -> vl;
+        };
+    }
 
     /**
      * 单个模型端点。

@@ -218,6 +218,29 @@ public final class AuditRiskPolicy {
                         + "失败原因走日志与 `sys_async_task.error_msg`，**不**写进审计的 `fail_reason` —— "
                         + "那里的语义是「被审计的方法抛了异常」，而解析失败是**正常返回的业务结果**"
                         + "（`DocParseService#parseDocument` 从不抛异常），两处职责不重叠");
+
+        // ---------- 系统 · 模型配置（2026-09-18 · S6-M09-A 的 T-900~T-903 落地） ----------
+        // 四条一起登记：它们**本来就是同一条裁定**（`MODEL_CONFIG_CHANGE` 的类注释原文是
+        // 「四类模型的**新增、编辑、删除、启用或切换**」），`PLANNED` 里那两条只预告了"启用"半边。
+        register(AuditModule.SYSTEM, "新增模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
+                "§4.3④模型配置变更。**为什么「新增」也算高危**：新增一条模型本身不改行为，"
+                        + "但它是「启用」的必经前置 —— 而启用会改变全站的检索与生成行为。"
+                        + "把新增记成 NORMAL 会让「谁在什么时候把这条配置放进来」查不到，"
+                        + "而启用那条日志只说明「谁按了开关」");
+        register(AuditModule.SYSTEM, "编辑模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
+                "同上。编辑能改的东西里，Base URL 与模型名会**直接改变系统的对外行为**"
+                        + "（把请求打到别的供应商去了），而 temperature 之类改的是生成风格。"
+                        + "**不细分档位**：编辑是一个动作，按字段分档会让审计页出现"
+                        + "「同一个人点了同一次保存，进了两条不同等级的日志」");
+        register(AuditModule.SYSTEM, "删除模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
+                "同上，且与 §4.3③ 有一条**交叉**：删除配置删的不是内容（不是文档/知识库），"
+                        + "故按④归类而不是③。⚠️ 当前启用的那条**删不掉**（服务层拒绝），"
+                        + "所以这条日志记的都是「删掉了一条没在用的」");
+        register(AuditModule.SYSTEM, "启用模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
+                "§4.3④原话「**含启用切换**」。⚠️ 本批把「启用」与「切换重排/VL」**收敛成同一个动作名** —— "
+                        + "它们走的是同一个端点、同一段代码、同一个后果（系统级行为变更）。"
+                        + "`PLANNED` 里原有的「切换重排模型」因此**已并入本条**并被移除："
+                        + "留一条永远不会兑现的预告，下一个人会以为「重排切换还没做」");
     }
 
     // ==================================================================
@@ -242,10 +265,10 @@ public final class AuditRiskPolicy {
                 "§4.3②数据导出：批量形态属数据外带风险（与单文件下载的分界就在「批量」）");
         register(PLANNED, AuditModule.DOC, "删除文档", Category.CONTENT_DELETE, RiskLevel.HIGH,
                 "§4.3③内容删除");
-        register(PLANNED, AuditModule.SYSTEM, "启用模型配置", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
-                "§4.3④模型配置变更，**含启用切换**");
-        register(PLANNED, AuditModule.SYSTEM, "切换重排模型", Category.MODEL_CONFIG_CHANGE, RiskLevel.HIGH,
-                "§4.3④：切换重排/VL 属系统级行为变更，必须留痕");
+        // ⚠️ 原有的两条模型配置预告（「启用模型配置」「切换重排模型」）已于 `S6-M09-A`（2026-09-18）
+        // **移入 IMPLEMENTED** —— 它们落地了。其中「切换重排模型」是**并入**「启用模型配置」的：
+        // 重排/VL 的切换与"启用"是同一个端点、同一段代码、同一个后果，拆成两个动作名
+        // 会让同一次操作在审计页上看起来像两件事。详见 IMPLEMENTED 里那条的登记理由。
     }
 
     private AuditRiskPolicy() {

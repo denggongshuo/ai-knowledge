@@ -30,8 +30,22 @@ public record ModelConfigSpec(
         String apiKey,
         String model,
         String version,
-        boolean enabled
+        boolean enabled,
+        GenerationParams params
 ) {
+
+    /**
+     * 紧凑构造器：`params` 为 `null` 时给兜底值。
+     *
+     * <p>不这样做的话，每个构造点都要记得传 —— 而"忘传"的表现是
+     * {@code NullPointerException} 落在一次真实的问答调用里，不是启动时。
+     */
+    public ModelConfigSpec {
+        if (params == null) {
+            params = GenerationParams.defaults();
+        }
+    }
+
 
     /** 缓存 key：{@code type|id|version}。三段都参与，任一变化即视为新客户端。 */
     public String cacheKey() {
@@ -65,5 +79,47 @@ public record ModelConfigSpec(
 
     private static boolean isNotBlank(String value) {
         return value != null && !value.isBlank();
+    }
+
+    /**
+     * 该模型的**生成参数**（`T-901` 起随模型走，不再只由 `ModelProperties` 全局供给）。
+     *
+     * <h3>为什么必须加这一层（`S6-M09-A` 施工首日引入）</h3>
+     * <p>立据时没预见：`params`（temperature / maxTokens / timeoutSec / retries）是
+     * **每条模型自己的**配置，而它此前在 {@code ModelClientFactory} 里读的是
+     * {@code modelProperties.getChatTemperature()} —— 全局单值。若只把 `params` 存进 DB
+     * 而工厂仍读全局值，那么**用户在配置页改了 temperature，界面显示保存成功、生成行为纹丝不动**
+     * —— 与摸底文档点名的「页面显示已切换、实际仍打旧端点」是同一族：
+     * **看不见的失效**。
+     *
+     * <p>所以本批让 `params` 真的参与客户端构造。
+     *
+     * <h3>{@code maxTokens} 为什么可空</h3>
+     * <p>{@code null} = **不下发这个字段**，让网关用它自己的默认值 —— 这正是本批之前的既有行为
+     * （{@code OpenAiChatOptions} 里从来没设过 max_tokens）。
+     * 给一个非空默认值会**悄悄改变所有模型的生成长度上限**，那是比"少配置一项"严重得多的事。
+     */
+    public record GenerationParams(Double temperature, Integer maxTokens, Integer timeoutSec, Integer retries) {
+
+        /** 缺省值：见 {@code ModelConfigDefaults}。⚠️ 不叫 {@code default()} —— 那是保留字。 */
+        public static GenerationParams defaults() {
+            return new GenerationParams(ModelConfigDefaults.TEMPERATURE, null,
+                    ModelConfigDefaults.TIMEOUT_SEC, ModelConfigDefaults.RETRIES);
+        }
+
+        /** 温度；缺省时取兜底值（`0.3`，知识库问答建议 0.2~0.4）。 */
+        public double temperatureOrDefault() {
+            return temperature == null ? ModelConfigDefaults.TEMPERATURE : temperature;
+        }
+
+        /** 超时（秒）；缺省时取兜底值。 */
+        public int timeoutSecOrDefault() {
+            return timeoutSec == null ? ModelConfigDefaults.TIMEOUT_SEC : timeoutSec;
+        }
+
+        /** 重试次数；缺省时取兜底值。 */
+        public int retriesOrDefault() {
+            return retries == null ? ModelConfigDefaults.RETRIES : retries;
+        }
     }
 }
