@@ -161,6 +161,39 @@ public final class ProbeCleanup {
         return removed;
     }
 
+    /**
+     * **按日期**清模型用量（`T-905` · `S6-M09-B` 新增）—— 清**当天**那一格到今天为止。
+     *
+     * <h3>为什么是"按日期"而不是"按归属"</h3>
+     * <p>因为 {@code sys_model_usage} **一个归属列都没有**（没有 `kb_id` / `doc_id` /
+     * `user_id`，它是"哪个模型、干什么用、调了多少次"的聚合）。所以：
+     * <ul>
+     *   <li>上面的 {@link #sweepOrphanKbArtifacts} 那套"无主产物"问法**问不了它**
+     *       （它没有可以悬空的父）；</li>
+     *   <li>{@link ProbeArtifactCoverageTest} 的覆盖率闸**结构上也扫不到它**
+     *       —— 闸的输入是"带归属列的表"，而它不属于那一类。这是 `#130` 那个盲区的
+     *       <b>第三种形态</b>（前两种：`via: 'kb_id'` 认不出 `kb_id` 为 NULL 的行、
+     *       `sys_chat_message` 没有归属列只能靠两侧对账发现）。
+     *       台账记在 {@link ProbeArtifacts#NO_OWNERSHIP_COLUMN}。</li>
+     * </ul>
+     * <p>唯一可用且有意义的维度就是**日期**：它是按天聚合的，日期是它的天然主键维度。
+     *
+     * <h3>⚠️ 代价照实说</h3>
+     * <p>它**会把当天的真实用量一并清掉** —— 探针写的行与真实的行业务上无法区分
+     * （同一个模型名、同一个用途）。这与 `#148`（存量登录日志 4928 行，"无法与真实流量区分，
+     * 不修，记录"）是同一族取舍。之所以仍敢清，是因为本表是**聚合表**：
+     * 行数上界 = 天数 × 模型数 × 用途数（满打满算几十行），**不随调用次数增长** ——
+     * "清一次就干净"，不清也只是几十行，而清掉的代价是**当天**的统计数。
+     *
+     * <p>调用点：{@code ApiTestSupport} 的 `@AfterEach`（与无主产物兜底同一处）——
+     * 于是每个用例方法跑完都把当天的探针痕迹抹掉，一类跑完不会把灌水留给下一类。
+     *
+     * @return 删掉的行数
+     */
+    public static int sweepProbeUsage(JdbcTemplate jdbc) {
+        return jdbc.update("delete from sys_model_usage where occurred_at = curdate()");
+    }
+
     private static String placeholders(int count) {
         return java.util.stream.IntStream.range(0, count)
                 .mapToObj(i -> "?")

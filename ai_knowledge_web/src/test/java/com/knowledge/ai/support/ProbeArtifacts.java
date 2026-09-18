@@ -62,7 +62,34 @@ public final class ProbeArtifacts {
                             + "清理器其实一直在删它，但登记表里没有 —— 而它没有归属列，"
                             + "覆盖率闸**扫不到**，只有拿两份登记表取差集才看得出来"),
             Map.entry("sys_retrieval_trace", "检索打点。按 user_id 删（同上）"),
-            Map.entry("sys_retrieval_trace_chunk", "打点明细。它没有 user_id，按 trace_id 顺着父表删，**先于 sys_retrieval_trace**")
+            Map.entry("sys_retrieval_trace_chunk", "打点明细。它没有 user_id，按 trace_id 顺着父表删，**先于 sys_retrieval_trace**"),
+            Map.entry("sys_model_usage",
+                    "模型用量（T-905）。🔴 **一个归属列都没有**（无 kb_id/doc_id/user_id）—— "
+                            + "所以清理口径只能是**按日期清当天**（`ProbeCleanup#sweepProbeUsage`），"
+                            + "代价是当天的真实用量一并清掉（与 #148 同族）。"
+                            + "⚠️ 它**不入覆盖率闸的扫描集**：闸的输入是「带归属列的表」，"
+                            + "本表不属于那一类 —— 见 NO_OWNERSHIP_COLUMN 的台账")
+    );
+
+    /**
+     * 🔴 **闸的盲区台账**（`S6-M09-B` 新立）—— 「探针会写脏、但覆盖率闸**结构上看不见**」的表。
+     *
+     * <h3>为什么要单立一本台账</h3>
+     * <p>{@link ProbeArtifactCoverageTest} 的输入是「带 {@code kb_id/doc_id/user_id} 的表」——
+     * 对**没有归属列**的表它**恒看不见**。于是"漏登记"这件事在那种表上**无声无息**：
+     * 登记表没写、闸也不报。本仓已经撞过两次：
+     * <ul>
+     *   <li>`sys_chat_message` —— 两侧登记表取差集才发现（脚本侧登记了、Java 侧漏了）；</li>
+     *   <li>`sys_model_usage`（本批）—— 实测跑 7 个用例类就落 2 行 RERANK + 1 行 SUMMARY，
+     *       而**全量跑完看到的是 0**：因为 `ModelUsageFlowTest` 自己的整月清理把它盖住了。
+     *       这是「清理掩盖问题」的又一次现身。</li>
+     * </ul>
+     * <p>所以台账的**机器检查**是：本表的每一个 key **必须**在 {@link #REGISTERED} 里，
+     * 且登记值要写明怎么清 —— 否则"盲区"会变成"免检区"。
+     */
+    public static final Map<String, String> NO_OWNERSHIP_COLUMN = Map.of(
+            "sys_model_usage",
+            "无 kb_id/doc_id/user_id，按 occurred_at 清当天；见 ProbeCleanup#sweepProbeUsage"
     );
 
     /**

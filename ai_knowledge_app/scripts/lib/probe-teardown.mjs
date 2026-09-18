@@ -168,6 +168,19 @@ export const USER_ARTIFACTS = [
   },
 
   { id: 'sql:sys_user', kind: 'sql-user', table: 'sys_user', via: 'username', why: '用户主表' },
+  {
+    // 🔴 **既不是库族也不是用户族**：这张表**一个归属列都没有**（无 kb_id/doc_id/user_id），
+    // 所以上面两条路都够不着它 —— 只能按**日期**清当天。它是本仓第三种"归属维度不存在"的形态
+    // （前两种：`kb_id` 为 NULL 的导出任务、没有归属列只能靠两侧对账发现的 `sys_chat_message`）。
+    id: 'sql:sys_model_usage', kind: 'sql-date', table: 'sys_model_usage', via: 'date',
+    deleteSql: 'delete from sys_model_usage where occurred_at = curdate();',
+    countSql: 'select count(*) from sys_model_usage where occurred_at = curdate();',
+    why: '模型用量（T-905）。⚠️ 与 `#148` 同族：探针写的行与真实用量在业务上**无法区分**'
+      + '（同一个模型名、同一个用途），清当天会连同真实用量一起清掉。'
+      + '之所以仍敢清：本表是**聚合表**，行数上界 = 天数 × 模型数 × 用途数，**不随调用次数增长**。'
+      + '⚠️ 它同时是**覆盖率闸的盲区**（闸扫的是"带归属列的表"，本表不属于那一类）——'
+      + '台账记在 Java 侧 `ProbeArtifacts.NO_OWNERSHIP_COLUMN`，本条的登记正是那个台账逼出来的',
+  },
 ]
 
 /**
@@ -512,8 +525,12 @@ export function teardownUserProbe(prefix) {
   const userList = userIds.join(',')
 
   mysqlScalar(
-    USER_ARTIFACTS.filter((a) => a.kind === 'sql-user').map((a) => {
+    USER_ARTIFACTS.filter((a) => a.kind === 'sql-user' || a.kind === 'sql-date').map((a) => {
       if (a.via === 'username') return `delete from ${a.table} where username like '${prefix}%';`
+      // `via: 'date'` 与用户无关，**必须排在上面那条 `userList === ''` 之前** ——
+      // 否则"探针账号压根没建过"时会把它一起跳过，而当天的用量行照样留着
+      // （那种漏最隐蔽：清理函数看着跑了，日报里却是探针的数字）
+      if (a.via === 'date') return a.deleteSql
       // 探针账号压根没建过（幂等重入）—— 没有行可删，也不该拼出 `in ()`
       if (userList === '') return ''
       if (a.via === 'user') return `delete from ${a.table} where user_id in (${userList});`
@@ -619,6 +636,10 @@ export function findUserProbeResidue(prefix, snapshot = {}) {
     if (a.via === 'username') {
       // 按 username 删的那些**不依赖 sys_user**，所以它任何时候都是真的
       sql[a.table] = mysqlCount(`select count(*) from ${a.table} where username like '${prefix}%';`)
+    } else if (a.via === 'date') {
+      // `via: 'date'` 同样**不依赖 sys_user** —— 与 username 那一条同理，
+      // 任何时候查出来都是真的（而不是"账号没了所以查不到 ⇒ 记 0"）
+      sql[a.table] = mysqlCount(a.countSql)
     } else if (userList === '') {
       sql[a.table] = 0
     } else {

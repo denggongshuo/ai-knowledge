@@ -159,6 +159,11 @@ public abstract class ApiTestSupport {
     @AfterEach
     void sweepOrphanKbArtifacts() {
         ProbeCleanup.sweepOrphanKbArtifacts(jdbc);
+        // `T-905` 的用量表是**第三种形态的盲区**：它一个归属列都没有，
+        // 上面那套"无主产物"问法（扫 kb_id 悬空）与覆盖率闸（扫带归属列的表）**都够不着它**。
+        // 唯一可用且有意义的维度是**日期**（它是按天聚合的）。理由与代价写在
+        // `ProbeCleanup#sweepProbeUsage` 的 javadoc 里，台账在 `ProbeArtifacts.NO_OWNERSHIP_COLUMN`。
+        ProbeCleanup.sweepProbeUsage(jdbc);
     }
 
     /**

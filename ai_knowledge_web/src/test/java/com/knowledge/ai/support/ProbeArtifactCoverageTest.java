@@ -64,6 +64,22 @@ class ProbeArtifactCoverageTest extends ApiTestSupport {
     }
 
     @Test
+    @DisplayName("🔴 盲区台账非空，且台账里每一张都真的登记过（否则盲区=免检区）")
+    void blindSpotsAreStillAccountedFor() {
+        // 本闸的输入是"带归属列的表"，所以**没有归属列**的表它结构上看不见。
+        // 那类表只能靠一本**显式台账**兜住 —— 台账里的每一张都必须已在 REGISTERED 里
+        // 且写明怎么清。缺了这条，"闸看不见"就会悄悄退化成"没人管"。
+        assertThat(ProbeArtifacts.NO_OWNERSHIP_COLUMN)
+                .as("盲区台账不该为空 —— 空的台账意味着要么真的没有（那很好），"
+                        + "要么是有人把 `sys_model_usage` 这类表从台账里删掉了而没想清楚。"
+                        + "本仓已知至少有一张（sys_model_usage），故此处断言非空")
+                .isNotEmpty();
+        assertThat(ProbeArtifacts.REGISTERED.keySet())
+                .as("盲区台账里的每一张都必须同时出现在 REGISTERED 里 —— 否则它是个免检区")
+                .containsAll(ProbeArtifacts.NO_OWNERSHIP_COLUMN.keySet());
+    }
+
+    @Test
     @DisplayName("闸不能是空扫描：扫得到东西，且看得见已知的那几张")
     void scanIsNotEmptyAndSeesTheKnownTables() {
         Set<String> scanned = scannedTables();

@@ -130,9 +130,28 @@ class ModelConfigFlowTest extends ApiTestSupport {
         assertThat(first.get("isActive")).isEqualTo(true);
         assertThat(first.get("params")).as("params 是对象，不是 JSON 串").isInstanceOf(Map.class);
         assertThat(first.get("capabilities")).as("capabilities 是对象").isInstanceOf(Map.class);
-        // ⚠️ 前端 `{{ row.lastTestAt }}` 原样渲染 —— 种子从没测过，所以它是 null。
-        // 一旦测过就必须是**已格式化串**而不是时间戳，那一条由下面的 test() 判据覆盖
-        assertThat(first.get("lastTestAt")).as("从未测试过 → null（不是空串）").isNull();
+
+        // ⚠️ `lastTestAt` 的契约：从未测过 → `null`（**不是空串** —— 空串在页面上是一格空白，
+        // 分不出"没测过"与"测过但时间没记下来"）。测过时必须是**已格式化串**而不是时间戳
+        // （前端 `{{ row.lastTestAt }}` 原样渲染，发时间戳过去那一行就是空的），那半条由
+        // `testWritesResultBack` 覆盖。
+        //
+        // 🔴 **不能断言在种子那一行上** —— 它的 `last_test_at` 是**可变的环境状态**：
+        // 任何一次真实连接测试（开发时在页面上点一下「测试」，或上一批收尾时跑的真后端冒烟）
+        // 都会写它，于是一条"断言环境"的用例会在**与它无关的改动之后**变红。
+        // 实测：`S6-M09-A` 收尾的真冒烟把种子的 `last_test_at` 写成了当天时间，
+        // 下一次跑批这一行就红了 —— 而代码一行没改。
+        // 这与 `#129`「每批绿不绿是软的」是同一族，故改为**自造一条没测过的行**来验。
+        long freshId = createChat("从未测试的");
+        // 造完要**重新取一次列表** —— 上面那份 `data` 是造之前抓的，里面没有它
+        var after = get("/api/system/model/config", token).assertOk("模型配置列表");
+        List<Map<String, Object>> list = after.data("$.chat");
+        Map<String, Object> fresh = list.stream()
+                .filter(row -> row.get("id") != null && ((Number) row.get("id")).longValue() == freshId)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("新建的行应出现在 chat 列表里，实际：" + list));
+        assertThat(fresh.get("lastTestAt")).as("从未测试过 → null（不是空串）").isNull();
+        assertThat(fresh.get("lastTestOk")).as("从未测试过 → 结论为假").isEqualTo(false);
     }
 
     @Test
