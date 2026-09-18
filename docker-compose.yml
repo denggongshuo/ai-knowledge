@@ -208,6 +208,40 @@ services:
     networks:
       - kb-network
 
+  # ============================================================
+  # ClamAV（`T-O04` 步 3）—— 恶意内容扫描
+  #
+  # 🔴 **默认不启动**，必须显式带 profile 才起：
+  #     docker compose --profile av up -d clamav
+  #
+  # 为什么默认不启动（`O4` §6 自己写的风险）：
+  #   · 常驻内存约 **1 GB**，而本机的 docker 已经跑着 6 个服务；
+  #   · 它的病毒库要下载 + 常驻更新，首次启动要几分钟 ——
+  #     不能因为本地开发没装杀毒引擎就把**上传**堵死。
+  # 所以后端侧的口径是「未部署 → 降级为跳过 + 标记」（`ClamAvScanner` 的类注释），
+  # 列表上显示「未扫描」而**不是**假装扫过了（判据 6）。
+  #
+  # ⚠️ 与 `kb-` 前缀的其他服务不同，容器名保持上游的 `clamav`：
+  #     这个名字由镜像自身的文档与社区命令普遍引用（`docker exec clamav clamdscan`），
+  #     改成 `kb-clamav` 会让每次照文档敲命令的人多踩一次坑。
+  # ============================================================
+  clamav:
+    container_name: clamav
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    profiles: ["av"]
+    ports:
+      - "3310:3310"
+    # `clamd` 第一次启动要先下载病毒库（几百 MB），healthcheck 给足启动时间
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    networks:
+      - kb-network
+
 # ============================================================
 # 网络
 # ============================================================

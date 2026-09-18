@@ -192,6 +192,22 @@ app:
   #    依赖时序（"上传后等多久才 INDEXING"）。关掉之后由用例显式调 `ParseWorker#drainOnce()`
   #    驱动 —— **确定性且不丢覆盖**，比"关掉然后只断言 UPLOADED"诚实。
   # ------------------------------------------------------------
+  # ------------------------------------------------------------
+  # 恶意内容扫描（`T-O04` 步 3）—— ClamAV 的 clamd，走 TCP 的 INSTREAM 协议
+  #
+  # 🔴 `enabled` 默认 **false**：`O4` §6 的取舍是「未部署时降级为跳过 + 标记，不阻断」。
+  #    开它之前先确认 `clamav` 容器起来了（`docker compose --profile av up -d clamav`），
+  #    否则每篇文档都会走一遍"连不上 → 降级"，白等一次连接超时。
+  # ⚠️ 未部署时列表显示「未扫描」标记 —— **不是**静默当作已扫描（判据 6）。
+  # ------------------------------------------------------------
+  av:
+    clamav:
+      enabled: ${AV_CLAMAV_ENABLED:false}
+      host: ${AV_CLAMAV_HOST:127.0.0.1}
+      port: ${AV_CLAMAV_PORT:3310}
+      # 结论读取超时。一份 100MB 文档在低配机器上要几十秒，别调小
+      read-timeout-ms: ${AV_CLAMAV_READ_TIMEOUT_MS:120000}
+
   parse:
     worker:
       enabled: ${PARSE_WORKER_ENABLED:true}

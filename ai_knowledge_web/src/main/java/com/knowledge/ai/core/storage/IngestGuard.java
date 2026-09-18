@@ -277,6 +277,120 @@ public class IngestGuard {
         return new String(bytes, StandardCharsets.ISO_8859_1).contains("/Encrypt");
     }
 
+    // ==================================================================
+    // `T-O04` 步 4：宏检测（**放行 + 标记**，不是拒收）
+    // ==================================================================
+
+    /**
+     * OOXML 容器里的宏工程名（`docx` / `xlsx` / `pptx` 里的 VBA 存储）。
+     *
+     * <p>带宏的 Office 文档在 ZIP 里一定有一个 `vbaProject.bin` —— 这是格式层面的
+     * 硬事实，不是启发式。
+     */
+    private static final String VBA_PROJECT_ENTRY = "vbaproject.bin";
+
+    /** 宏的容器型扩展名（与 {@link #ZIP_CONTAINER_EXT} 同类，但这里按"可能带宏"取）。 */
+    private static final Set<String> MACRO_CAPABLE_EXT = Set.of("doc", "docx", "xls", "xlsx", "ppt", "pptx");
+
+    /**
+     * OLE2（老式 `.doc/.xls/.ppt`）里的宏存储名，**UTF-16LE** 编码。
+     *
+     * <p>为什么扫这个字节序列而不是用 POI 解 OLE 目录：准入阶段**不该解析**（同
+     * {@link #looksEncryptedPdf} 的取舍）—— OLE 的目录项名在文件里就是 UTF-16LE 存的，
+     * 一次字节查找足够回答"像不像带宏"。判错的代价是列表上多/少一个提示标记，
+     * 不是拦错文件。
+     */
+    private static final byte[] OLE_VBA_MARKER = "VBA".getBytes(StandardCharsets.UTF_16LE);
+
+    /**
+     * 检测文档里有没有宏（`O4` §3 流程图 `K -- 含宏 --> L`）。
+     *
+     * <h3>⚠️ 处置是「**放行 + 标记**」，不是拒收</h3>
+     * <p>宏在内部知识库里有正当用途（带宏的报表模板），一刀切拒收会误伤；
+     * 而"下载/预览页提示"需要这个结论才显示得出来。所以本方法的返回值**不参与准入决策**，
+     * 它只回答一个事实，由调用方落进 {@code sys_document.has_macro}。
+     *
+     * <h3>🔴 `O4` 文档说「Tika 可直接给出 `hasMacro`」—— 那是**错的**</h3>
+     * <p>本批开工时查过：Tika 3.2.2 的 `tika-core` / `tika-parsers-standard-package` 里
+     * **没有任何宏相关的类或元数据常量**（`Metadata` 也没有 `HAS_MACRO`）。
+     * 与该文档同族的偏差已经登记过三次（见计划 §1 的开工条件检查），这是第四次。
+     * 所以这里自己实现 —— 两条路，各自都是格式层面的硬事实：
+     * <ul>
+     *   <li>OOXML（zip）：找 `vbaProject.bin` 条目；</li>
+     *   <li>OLE2：扫 UTF-16LE 的 `VBA` 标记。</li>
+     * </ul>
+     *
+     * @return {@code true} 含宏 / {@code false} 不含 / {@code null} **判不了**
+     *         —— 第三个取值是刻意的：判不了与"不含"必须能区分，否则 {@code has_macro = 0}
+     *         会同时表示"检测过没有"与"没检测"（这正是 `V27` 那条三态纪律的同一条）
+     */
+    public Boolean hasMacro(org.springframework.web.multipart.MultipartFile file, String ext) {
+        String normalized = ext == null ? "" : ext.toLowerCase(Locale.ROOT);
+        if (!MACRO_CAPABLE_EXT.contains(normalized)) {
+            // 9 种格式里 txt/md/pdf 结构上不可能带宏 ⇒ "检测过，没有"而不是"判不了"
+            return Boolean.FALSE;
+        }
+        try {
+            if (ZIP_CONTAINER_EXT.contains(normalized)) {
+                return hasMacroInZip(file);
+            }
+            return hasMacroInOle(file);
+        } catch (Exception ex) {
+            // 探测失败不阻断上传（与 detect 的"判不了不是不合规"同一条取舍）
+            log.debug("宏探测失败（按判不了处理）：name={} 原因={}", file.getOriginalFilename(), ex.getMessage());
+            return null;
+        }
+    }
+
+    private Boolean hasMacroInZip(org.springframework.web.multipart.MultipartFile file) throws IOException {
+        Path temp = Files.createTempFile("macro-probe-", ".zip");
+        try {
+            try (InputStream in = file.getInputStream()) {
+                Files.copy(in, temp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            try (ZipFile zip = new ZipFile(temp.toFile())) {
+                Enumeration<? extends ZipEntry> entries = zip.entries();
+                boolean sawAnyEntry = false;
+                while (entries.hasMoreElements()) {
+                    sawAnyEntry = true;
+                    String name = entries.nextElement().getName().toLowerCase(Locale.ROOT);
+                    if (name.endsWith(VBA_PROJECT_ENTRY)) {
+                        return Boolean.TRUE;
+                    }
+                }
+                // 一个条目都读不到 ⇒ 这不是个能打开的 zip，判不了（放行，交给解析阶段）
+                return sawAnyEntry ? Boolean.FALSE : null;
+            }
+        } finally {
+            Files.deleteIfExists(temp);
+        }
+    }
+
+    private Boolean hasMacroInOle(org.springframework.web.multipart.MultipartFile file) throws IOException {
+        try (InputStream in = file.getInputStream()) {
+            // 流式滑窗匹配 `V\0B\0A\0`（UTF-16LE 的 "VBA"）。
+            // ⚠️ 不用 `readAllBytes`：老式 .doc 可能有几十 MB，而这里只回答"这 6 个字节在不在"。
+            // ⚠️ 窗口里**必须带上那三个 0x00** —— 只找 ASCII 的 "VBA" 会在压缩流、
+            //    随机字节里大量误报（每 16MB 就大约有一次），而带上 UTF-16 的零字节后
+            //    命中率降到可用。判错的代价只是列表上多一个提示标记，方向上仍是"宁可多提示"。
+            byte[] window = new byte[OLE_VBA_MARKER.length];
+            int filled = 0;
+            int b;
+            while ((b = in.read()) != -1) {
+                if (filled < window.length) {
+                    window[filled++] = (byte) b;
+                } else {
+                    System.arraycopy(window, 1, window, 0, window.length - 1);
+                    window[window.length - 1] = (byte) b;
+                }
+                if (filled == window.length && java.util.Arrays.equals(window, OLE_VBA_MARKER)) {
+                    return Boolean.TRUE;
+                }
+            }
+            return Boolean.FALSE;
+        }
+    }
+
     /** {@code InputStream#skip} 不保证跳满 —— 循环跳到目标为止（大文件只探尾部时要用）。 */
     private static void skipFully(InputStream in, long n) throws IOException {
         long remaining = n;

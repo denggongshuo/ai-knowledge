@@ -79,6 +79,12 @@ public class DocService {
 
     private final DocRecordWriter recordWriter;
 
+    /** `T-O04` 步 4：宏检测（**请求线程**做，见 {@code upload} 里的注释）。 */
+    private final com.knowledge.ai.core.storage.IngestGuard ingestGuard;
+
+    /** `T-O04` 步 3：恶意扫描的异步编排。 */
+    private final DocScanService docScanService;
+
     private final AsyncTaskService asyncTaskService;
 
     /**
@@ -177,6 +183,13 @@ public class DocService {
         long size = file.getSize();
         String md5 = md5Of(file);
 
+        // ---- `T-O04` 步 4：宏检测必须在**请求线程**做完 ----
+        // ⚠️ 与暂存同一个理由（见下面 `spillToTemp` 的注释）：`MultipartFile` 只在这次请求
+        // 的内存里活着，而异步任务体里已经读不到它了。宏检测要读字节，所以它**不能**
+        // 跟着扫描一起挪到异步里去 —— 挪过去只会拿到一个"文件已被容器清掉"的异常，
+        // 而那会被 `hasMacro` 的 catch 吞成 `null`（判不了），表现为 `has_macro` 永远是空。
+        Boolean hasMacro = ingestGuard.hasMacro(file, DocStorage.extensionOf(realName));
+
         long docId = recordWriter.insert(kbId, user.getUserId(), title, realName,
                 type.isEmpty() ? "UNKNOWN" : type, size, md5);
 
@@ -215,6 +228,13 @@ public class DocService {
                             context.stage("写入文档记录");
                             context.percent(90);
                             recordWriter.markStored(docId, objectKey);
+                            // 宏结论是**请求线程**测好的（见 upload 里的注释），这里只是落库
+                            recordWriter.markMacro(docId, hasMacro);
+
+                            // ---- `T-O04` 步 3：恶意扫描（异步，不阻塞上传响应）----
+                            // 它在 `markStored` **之后**投递：扫描要从 MinIO 读那个对象，
+                            // 而对象名是 store 成功才有的。与 `parseWorker.enqueue` 同一条时序纪律。
+                            String scanTaskId = docScanService.submit(kbId, docId, ownerId, objectKey, realName);
 
                             // ---- `S4-E1`：转存完成后**只投作业，不解析** ----
                             // 这次拆分不是设计偏好，是技术必然（计划 §3.4 假设 1）：
@@ -234,6 +254,7 @@ public class DocService {
                             payload.put("objectKey", objectKey);
                             payload.put("bytes", size);
                             payload.put("parseTaskId", parseTaskId);
+                            payload.put("scanTaskId", scanTaskId);
                             context.complete(payload);
                             log.info("文档转存完成，已投解析作业：kbId={} docId={} taskId={} parseTaskId={} name={} bytes={}",
                                     kbId, docId, context.taskId(), parseTaskId, realName, size);
@@ -323,7 +344,8 @@ public class DocService {
                         select d.id, d.title, d.type, d.size_bytes, d.chunk_count, d.status,
                                d.table_total, d.table_parsed, d.image_total, d.image_parsed,
                                d.pages_total, d.pages_with_text,
-                               u.real_name, d.created_at
+                               u.real_name, d.created_at,
+                               d.scan_status, d.has_macro
                         from sys_document d
                         left join sys_user u on u.id = d.owner_id
                         """ + where + " order by d.id desc limit :limit offset :offset");
@@ -349,7 +371,18 @@ public class DocService {
                     ((Number) r[10]).longValue(),
                     ((Number) r[11]).longValue(),
                     r[12] == null ? "—" : (String) r[12],
-                    formatTime(r[13])));
+                    formatTime(r[13]),
+                    // `T-O04`：扫描结论与宏标记。两者都可能为 null ——
+                    // scan_status 为 null = 该行早于扫描能力上线（**不是** SKIPPED）；
+                    // has_macro 为 null = 没检测过（**不是**"没有宏"）。
+                    // 前端据此决定显示「未扫描」标记与否，所以这个区分必须原样透传
+                    (String) r[14],
+                    // ⚠️ `has_macro` 是 `TINYINT(1)`，而 MySQL 驱动默认把
+                    // `tinyInt1isBit=true` ⇒ **原生查询回给我们的是 `Boolean` 而不是数字**。
+                    // 直接 `((Number) r[15])` 会抛 ClassCastException，而它的表现是
+                    // **整个文档列表接口 500**（实测踩到）—— 一个"列的类型"问题炸掉了一整页。
+                    // 两种都收下：驱动版本/连接参数一变就会在两个之间切，而这里没有理由挑边。
+                    boolOf(r[15])));
         }
         return new DocDtos.DocPage(list, total, list.size());
     }
@@ -431,6 +464,25 @@ public class DocService {
     }
 
     /** 时间列在 JDBC 侧可能是 {@code Timestamp} 也可能是 {@code LocalDateTime}，两者都接。 */
+    /**
+     * `TINYINT(1)` 列 → Boolean。**两种都收**。
+     *
+     * <p>MySQL 驱动默认 `tinyInt1isBit=true`，于是原生查询回的是 {@link Boolean}；
+     * 一旦有人调了那个连接参数、或换了驱动版本，回来的就是 {@link Number}。
+     * 只认一种的代价在 `T-O04` 实测过：**整个文档列表接口 500**，
+     * 报出来的是一句 `Boolean cannot be cast to Number` —— 与"列表"这个功能看起来
+     * 毫无关系，排查要从接口翻到 SQL 再翻到连接参数。
+     */
+    private static Boolean boolOf(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Boolean b) {
+            return b;
+        }
+        return ((Number) value).intValue() != 0;
+    }
+
     private static String formatTime(Object value) {
         if (value == null) {
             return "—";

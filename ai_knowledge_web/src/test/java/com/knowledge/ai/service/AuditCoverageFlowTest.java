@@ -127,6 +127,10 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         expected.put(AuditModule.DOC + " 触发解析", RiskLevel.NORMAL);
         expected.put(AuditModule.DOC + " 解析完成", RiskLevel.NORMAL);
         expected.put(AuditModule.DOC + " 解析失败", RiskLevel.NORMAL);
+        // `T-O04`（S6-M09-B 的 O 项）：本仓**第一条 SECURITY_EVENT 类**的高危记录。
+        // ⚠️ 它的操作人是「系统」（扫描跑在上传响应之后的后台线程上）——
+        // 这是唯一一条这样记的高危动作，不要因为"操作人是系统"就以为档次标错了。
+        expected.put(AuditModule.DOC + " 恶意内容拦截", RiskLevel.HIGH);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -285,7 +289,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 35 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 36 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
@@ -293,8 +297,11 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                 .as("总数变化必须是有意为之：新增审计点请同步改本用例与 AuditRiskPolicy。"
                         + "25（S4-M05-A）→ 27（S4-D 的 T-407 两条）→ 30（S4-E2 的 T-O06 三条："
                         + "触发解析 / 解析完成 / 解析失败）→ **31**（S5-M08-B 的 T-802 导出半边："
-                        + "导出会话。⚠️ 只加这一条 —— 「删除会话」按《05》§4.2 的枚举不在采集范围内）")
-                .hasSize(35);
+                        + "导出会话。⚠️ 只加这一条 —— 「删除会话」按《05》§4.2 的枚举不在采集范围内）"
+                        + "→ 35（S6-M09-A 的 T-900~T-903 四条模型配置）"
+                        + "→ **36**（S6-M09-B 的 T-O04：恶意内容拦截。⚠️ 它是本仓唯一一条"
+                        + "**操作人写「系统」**的高危记录 —— 扫描跑在上传响应之后的后台线程上）")
+                .hasSize(36);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

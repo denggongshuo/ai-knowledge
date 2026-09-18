@@ -142,6 +142,56 @@ public class DocRecordWriter {
      * @param chars        可检索文本量（`T-O05` 步 6 的「平均 chars/页」要用它，`V21`）
      * @param parseVersion 解析产物版本指纹（`T-O05` 步 4），由 {@code ParseFingerprint#version()} 算
      */
+    /**
+     * 回填恶意扫描结论（`T-O04` 步 3）。
+     *
+     * <p>⚠️ **不碰 `status`**：扫描与文档状态是两件正交的事 ——
+     * `SKIPPED` 不影响文档照常解析入库；`INFECTED` 的置 FAILED 由调用方**单独**调
+     * {@link #markFailed}（那一步会写原因）。把两者揉进一个方法，读的人会以为
+     * "扫描没扫成 ⇒ 文档失败"，而那是错的。
+     *
+     * @param verdict 扫描结论（`CLEAN` / `INFECTED` / `SKIPPED`）
+     * @param detail  一句话说明；`SKIPPED` 时写"为什么没扫成"
+     */
+    @Transactional
+    public void markScan(long docId, com.knowledge.ai.core.storage.ClamAvScanner.Verdict verdict,
+                         String detail) {
+        entityManager.createNativeQuery("""
+                        update sys_document
+                           set scan_status = :verdict, scan_note = :note, updated_at = :now
+                         where id = :id
+                        """)
+                .setParameter("verdict", verdict.name())
+                .setParameter("note", detail == null || detail.isBlank()
+                        ? null : clip(detail, 255))
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /**
+     * 回填宏检测结论（`T-O04` 步 4）—— **与扫描分开**，因为它们的时机不同：
+     * 宏检测在**请求线程**（要读 {@code MultipartFile}，请求一结束它就被容器清了），
+     * 扫描在**异步任务**里。合成一个方法就必须让其中一个跨越线程边界去带值。
+     *
+     * @param hasMacro **`null` = 判不了**（不是"没有"）——`NULL` 与 `0` 必须能区分，
+     *                 否则列表上"没检测过"会被显示成"确认没有宏"
+     */
+    @Transactional
+    public void markMacro(long docId, Boolean hasMacro) {
+        entityManager.createNativeQuery(
+                        "update sys_document set has_macro = :hasMacro, updated_at = :now where id = :id")
+                .setParameter("hasMacro", hasMacro)
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
+    }
+
+    /** 截断到列宽 —— 超长不该让一次扫描结论写不进去（`scan_note` 是 VARCHAR(255)）。 */
+    private static String clip(String value, int max) {
+        return value.length() <= max ? value : value.substring(0, max);
+    }
+
     @Transactional
     public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal,
                            int pagesTotal, int pagesWithText, int chars, String parseVersion) {

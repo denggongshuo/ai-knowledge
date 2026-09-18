@@ -32,7 +32,8 @@ public final class DocDtos {
                          String status, long tableTotal, long tableParsed,
                          long imageTotal, long imageParsed,
                          long pagesTotal, long pagesWithText,
-                         String owner, String uploadedAt) {
+                         String owner, String uploadedAt,
+                         String scanStatus, Boolean hasMacro) {
     }
 
     /**
