@@ -30,8 +30,8 @@
  *
  * 用法：`node scripts/e2e-chat-flow.mjs --base=http://127.0.0.1:5174`
  */
-import { spawn } from 'node:child_process'
-import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { spawn, execFileSync } from 'node:child_process'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -471,9 +471,12 @@ async function main() {
     // 改动前前端走 `http.post` 发 `{name,size,md5,mime}` —— 一个字节都没传，
     // 而接口照样能返回 200，**从接口层完全看不出来**。所以只能从页面把真文件塞进
     // `input[type=file]`，再看库里那行的 size 与真文件对不对得上。
-    const png = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-      'base64',
+    // ⚠️ 用**真图**而不是原来那张 1×1 的 base64 像素：`T-907` 起这张图会被送去 VL
+    // 生成描述，而 1×1 的透明像素**没有任何可描述的内容** —— VL 要么返回空、
+    // 要么胡说，两种都让下面「描述真的落库」的断言变成掷骰子。
+    // 借仓库里的一张真图表（44KB，有文字有结构），VL 能读出东西来。
+    const png = readFileSync(
+      'F:/work/code/ai-knowledge/docs/面试/图表/04-检索链路总览.png',
     )
     attachmentFixture = join(tmpdir(), `e2e-chat-att-${stamp}.png`)
     writeFileSync(attachmentFixture, png)
@@ -521,6 +524,120 @@ async function main() {
     return `附件 id=${attId} · ${png.length} 字节 · 对象 ${objectKey}`
   })
 
+  // ---------- ⑥.6 图片理解（T-907）----------
+  await step('图片理解（T-907 · 需求 09 §4.9/§4.12）：带图提问 → attachment 事件 → 描述落库', async () => {
+    // 上一步那张图还在**待发送区**（没发出去）—— 本步把它连同问题一起发出去。
+    // 这条链路才是 `T-907` 真正要证的：预上传只是把图放进桶里，**描述是发送时才生成的**。
+    await waitFor(`document.querySelectorAll('.pending-item').length > 0`, '待发送区仍有那张图')
+
+    // 🔴 **先清掉这张图的 VL 描述缓存**（需求 `09` §4.8 的 `md5:vlModelId:PROMPT_VERSION`）。
+    // 不清的话，上一步刚传的这张图若此前被理解过，描述会**秒回** —— 那本步就只验了"缓存命中"，
+    // 而真正要证的是**真调用**那条路（两产出、关键词切分、落库全是真模型给的）。
+    // 清掉之后走真调用（本机实测 40~60s），`as-done` 的等待上限也按它给。
+    const attMd5 = mysqlScalar(
+      `select md5 from sys_chat_attachment where user_id = ${loginUserId} order by id desc limit 1;`,
+    )
+    execFileSync('docker', ['exec', 'kb-valkey', 'sh', '-c',
+      `redis-cli --scan --pattern 'vision:desc:${attMd5}:*' | xargs -r redis-cli del`],
+    { encoding: 'utf8' })
+    const leftKeys = execFileSync('docker', ['exec', 'kb-valkey', 'sh', '-c',
+      `redis-cli --scan --pattern 'vision:desc:${attMd5}:*' | wc -l`], { encoding: 'utf8' }).trim()
+    check(leftKeys === '0', `缓存没清干净（还剩 ${leftKeys} 个键）—— 本步要的是**冷缓存**下的真调用`)
+
+    await evaluate(`(() => {
+      const ta = document.querySelector('.chat-input textarea')
+      const proto = HTMLTextAreaElement.prototype
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(ta, '这张图讲的是什么？请说明检索链路有哪几个阶段。')
+      ta.dispatchEvent(new Event('input', { bubbles: true }))
+      return true
+    })()`)
+    await sleep(300)
+    // ⚠️ **先等按钮可用**：`send()` 的第一行是 `if (... || sending.value) return`，
+    // 而上一轮流还没结束时按钮是 `loading`（等效 disabled）的 —— **点一个不能点的按钮
+    // 不报错也不发送**，表现是"脚本跑过了、请求根本没出去"（实测踩到：后端日志里
+    // 那次带图问答压根没有）。等它可点，把这类静默失败变成一条明确的等待。
+    await waitFor(`(() => {
+      const b = [...document.querySelectorAll('.chat-input button')]
+        .find((x) => (x.textContent || '').includes('发送'))
+      return !!b && !b.disabled
+    })()`, '发送按钮可用（上一轮流式已结束）', 120000)
+
+    await evaluate(`(() => {
+      const btn = [...document.querySelectorAll('.chat-input button')]
+        .find((b) => (b.textContent || '').includes('发送'))
+      if (!btn) throw new Error('找不到发送按钮')
+      btn.click()
+      return true
+    })()`)
+
+    // ① 页面把**描述**渲染出来了（`.as-done`，见 `ChatView` 的 attach-status 区块）。
+    //    ⚠️ 这里**不断言** `.as-line.describing`（「正在理解图片」）——
+    //    实测它渲染不出来，原因不在前端也不在 `T-907`：整条 SSE 是**攒完一次性发**的
+    //    （见本文件末尾的 §「已知缺陷」与计划 §9）。那一条挂起，等 buffering 修好再补。
+    //    真模型耗时以十秒计，给足 180s。
+    await waitFor(`!!document.querySelector('.as-done')`, '页面渲染出图片描述', 180000)
+
+    // ② 库里那行「真的被理解过」—— 三个字段必须同时非空
+    const row = mysqlScalar(
+      `select concat_ws('|', coalesce(prompt_version,''), coalesce(degraded,''), `
+        + `length(coalesce(description,'')), length(coalesce(search_summary,'')), `
+        + `coalesce(vl_model_name,'')) from sys_chat_attachment `
+        + `where user_id = ${loginUserId} order by id desc limit 1;`,
+    )
+    const [pv, degraded, descLen, sumLen, vlName] = row.split('|')
+    check(!!pv, 'prompt_version 没落库 —— 「改 prompt 缓存不失效」那条就无从回溯（需求 §4.8）')
+    check(!!vlName, 'vl_model_name 没落库 —— 换 VL 模型（T-908）时认不出这条是谁产的')
+    check(
+      degraded === '0',
+      `这张图**降级**了（degraded=${degraded}）—— 说明 VL 没跑成：要么未配置、要么调用失败。`
+      + '本步喂的是真图表，VL 可用时必须给出描述；降级在这里是**真失败**而不是可接受的结果',
+    )
+    check(
+      Number(descLen) > 0 && Number(sumLen) > 0,
+      `描述为空：desc=${descLen} 字 / searchSummary=${sumLen} 字 —— 一次调用两产出一件都没成`,
+    )
+
+    // ③ 检索真的用上了合成 query（§4.5 的 v1 拼接口径）
+    // ⚠️ 列名是 `query_text` 不是 `query` —— 实体的字段叫 query，但 `V15` 建表时
+    // 避开了 `query` 这个在各家 SQL 里含义微妙的词。按字段名写会 status=1，
+    // 而 `mysqlScalar` 把 stderr 吞了（`2>/dev/null`），报出来只有一句空原因。
+    const query = mysqlScalar(
+      `select query_text from sys_retrieval_trace where user_id = ${loginUserId} order by id desc limit 1;`,
+    )
+    check((query || '').includes('这张图讲的是什么'), `检索用的 query 丢了原问题：${query}`)
+    check(
+      (query || '').length > '这张图讲的是什么？请说明检索链路有哪几个阶段。'.length,
+      `检索用的 query 与问题等长，说明**没有拼上 searchSummary**：${query}`,
+    )
+
+    // ④ T-905 的采集点：VL 描述这次调用真的记了用量
+    const vlCalls = mysqlScalar(
+      `select coalesce(sum(calls), 0) from sys_model_usage `
+        + `where purpose = 'VL_DESC' and occurred_at = curdate();`,
+    )
+    check(Number(vlCalls) > 0, 'VL_DESC 用量一行都没记 —— T-905 的第六个采集点没接上')
+
+    // ⑤ 缓存真的落了键，且 key 是**三段**（md5 : vlModelId : PROMPT_VERSION，§4.8）。
+    //    这是「同图同模型不重复调用」的**机制证据** —— 没有它，"命中缓存"只是一句声明。
+    const md5 = mysqlScalar(
+      `select md5 from sys_chat_attachment where user_id = ${loginUserId} order by id desc limit 1;`,
+    )
+    const keys = execFileSync('docker', ['exec', 'kb-valkey', 'redis-cli', '--scan',
+      '--pattern', 'vision:desc:*'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean)
+    const mine = keys.filter((k) => k.startsWith(`vision:desc:${md5}:`) && !k.endsWith(':kw'))
+    // ⚠️ 同一个逻辑条目占了**两个物理 key**（正文用主 key、检索摘要用 `:kw` 后缀）——
+    // 理由见 `VisionDescriptionCache` 的类注释（拼分隔符会在描述里出现分隔符时错切）。
+    // 所以这里要先把 `:kw` 那条滤掉再判"三段"，否则拿到的是六段的那条。
+    check(mine.length > 0, `Redis 里没有该图的描述缓存：keys=${JSON.stringify(keys)} md5=${md5}`)
+    const segments = mine[0].split(':')
+    check(
+      segments.length === 5 && segments[4] === 'v1',
+      `缓存 key 不是「前缀:md5:vlModelId:PROMPT_VERSION」三段：${mine[0]}`,
+    )
+
+    await shot('chat-attachment-understood')
+    return `promptVersion=${pv} · 描述 ${descLen} 字 · 关键词 ${sumLen} 字 · VL=${vlName} · VL_DESC 调用 ${vlCalls} 次`
+  })
   await step('反馈落库（G5-14）：页面点「点赞」→「点踩+原因」，库里真的跟着变', async () => {
     // ⑥ 在页面上问过一次，取那条**回答**的 id（DOM 里没有 messageId）
     const messageId = Number(
