@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.trace.TraceContext;
 import com.knowledge.ai.pipeline.chat.ChatDtos;
@@ -11,6 +12,7 @@ import com.knowledge.ai.pipeline.retrieve.RetrievalService;
 import com.knowledge.ai.pipeline.retrieve.RetrievalTrace;
 import com.knowledge.ai.pipeline.retrieve.RetrievalTraceWriter;
 import com.knowledge.ai.pipeline.retrieve.RetrievedChunk;
+import com.knowledge.ai.pipeline.vision.VisionResult;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -69,6 +71,7 @@ public class ChatStreamService {
     private final StreamingChatCaller streamingChatCaller;
     private final ChatWireMapper wireMapper;
     private final RetrievalTraceWriter traceWriter;
+    private final ChatAttachmentService chatAttachmentService;
 
     /**
      * 跑一轮问答。
@@ -90,7 +93,20 @@ public class ChatStreamService {
         long sessionId = chatSessionService.resolve(user.getUserId(), request.sessionId(), request.modelId());
         chatSessionService.appendUser(sessionId, question);
 
-        RetrievalResult result = retrievalService.search(user, question, null);
+        // `T-907`：图片理解**串行阻塞在检索之前**（需求 `09` §4.9 的时序）。
+        // 它必须在 appendUser 之后 —— 用户消息落的是**原问题**，不是合成 query
+        String searchQuery;
+        try {
+            searchQuery = understandAttachments(user, request, sink, question);
+        } catch (BizException ex) {
+            // 附件不存在 / 不是你的：**不进链路**（§4.10 第 1 行的同一条处置），
+            // 而不是"跳过这张图继续答" —— 静默忽略图片是 §4.10 点名的最糟处理
+            log.warn("[问答] 附件校验未通过：userId={} 原因={}", user.getUserId(), ex.getMessage());
+            sink.error(ex.getMessage() + " —— 请重新上传该图片后再发送。");
+            return;
+        }
+
+        RetrievalResult result = retrievalService.search(user, searchQuery, null);
         Map<Long, String> docTitles = wireMapper.loadDocTitles(result.chunks());
 
         sink.retrieval(wireMapper.firstPacket(result, docTitles));
@@ -138,6 +154,64 @@ public class ChatStreamService {
     }
 
     /**
+     * 图片理解（`T-907` · 需求 `09` §4.9/§4.5）。
+     *
+     * <h3>事件顺序</h3>
+     * <pre>
+     *   attachment{DESCRIBING} × N   ← 逐张先报"正在理解"
+     *   …（VL 调用，1~3s，串行阻塞）…
+     *   attachment{DONE} × N         ← 逐张报结果（成功与降级都发，由 degraded 区分）
+     *   retrieval                    ← 此时 query 已含 searchSummary
+     * </pre>
+     * ⚠️ **带图时首包是 {@code attachment} 而不是 {@code retrieval}** ——
+     * 这与 `G5-7`「首包必须是 retrieval」不冲突：那条门禁成立于**不带图片**的问答
+     * （它要证的是"用户不必等生成就能看到引用角标"），而带图时描述在检索之前，
+     * 先发 {@code retrieval} 就必然要编一个还没算出来的 query。两句话的条件不同。
+     *
+     * <h3>query 合成（§4.5 的 v1 口径：拼接）</h3>
+     * <p>{@code searchQuery = 用户问题 + " " + searchSummary}。
+     * ⚠️ 这带来一处**必须登记的偏差**：{@code sys_retrieval_trace.query} 从此在带图时
+     * 存的是**合成 query**，而 `FR-SYS-03` §3.2 把那一列定义为「用户**原始**问法（不归一化）」。
+     * 原始问题**没有丢** —— 它在 {@code sys_chat_message.content} 里（{@link ChatSessionService#appendUser}
+     * 落的是原文）。§4.5 原本还要求「同时记录仅文字 query 与合成 query **两路**的召回结果」，
+     * 本批未做（做第二趟完整检索会让每次带图提问的检索耗时翻倍，见计划 §3.4 假设 3）。
+     *
+     * @return 实际送去检索的 query（无附件时**就是原问题**，逐字不变）
+     */
+    private String understandAttachments(LoginUser user, ChatDtos.ChatRequest request, ChatSink sink,
+                                         String question) {
+        List<String> ids = request.attachmentIds();
+        if (ids == null || ids.isEmpty()) {
+            return question;
+        }
+        for (String id : ids) {
+            sink.attachment(ChatDtos.AttachmentEvent.describing(id));
+        }
+
+        List<ChatAttachmentService.Described> described =
+                chatAttachmentService.describe(user.getUserId(), ids, question);
+
+        StringBuilder summary = new StringBuilder();
+        for (ChatAttachmentService.Described item : described) {
+            VisionResult result = item.result();
+            sink.attachment(ChatDtos.AttachmentEvent.done(item.attachmentId(),
+                    result.desc(), result.searchSummary(), result.vlModelName(), result.degraded()));
+            if (result.hasDescription() && result.searchSummary() != null
+                    && !result.searchSummary().isBlank()) {
+                if (!summary.isEmpty()) {
+                    summary.append(' ');
+                }
+                summary.append(result.searchSummary().strip());
+            }
+        }
+
+        // 降级 / 无描述时 summary 为空 ⇒ 检索仍按原问题走。
+        // 刻意不在那时拼一个空串：`"问题 "` 与 `"问题"` 对向量化是不同的输入，
+        // 而它换不来任何好处（多一个尾随空格只会让排查时分不清是哪种情形）
+        return summary.isEmpty() ? question : question + " " + summary;
+    }
+
+    /**
      * 收尾：终包 → 落 assistant 消息 → 落打点 → {@code done}。
      *
      * <p>顺序是有意的：**先发终包再落库**，用户看到的时间线不会因为写库而卡一下；
@@ -170,7 +244,9 @@ public class ChatStreamService {
                 outcome == null ? null : outcome.modelName(),
                 outcome == null ? null : outcome.tokenUsage(),
                 finishReason,
-                // `T-512`（S6）之前不发 `attachment` 事件、不传原图 —— 如实回 false
+                // `T-907` 已接图片理解（描述链路），但**「直接读原图」仍未做** ——
+                // 那是需求 §4.7 的独立入口，前置是「当前对话模型 capabilities.vision = true」
+                // 且只对该轮生效，属 `T-806`。本批如实回 false，不假装
                 false));
 
         log.info("[问答] 完成：traceId={} 会话={} 分片={} 生成={} 耗时={}ms（其中生成 {}ms）",

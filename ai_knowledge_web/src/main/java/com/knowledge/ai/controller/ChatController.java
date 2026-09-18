@@ -281,6 +281,20 @@ public class ChatController {
             send("retrieval", event);
         }
 
+        /**
+         * `event: attachment`（`T-907`）。
+         *
+         * <p>⚠️ **必须覆盖它** —— {@link com.knowledge.ai.pipeline.chat.ChatSink#attachment}
+         * 的默认实现是空操作（为了让既有替身不必改），不覆盖的话
+         * 用户在页面上**永远看不到「正在理解图片」**，而这条链路的其余部分全对：
+         * 描述生成了、检索也用了它、落库也落了。属于"用例绿而运行时缺一块"
+         * 那一族（`S5-M08-C` §9-1 登记的形态）。
+         */
+        @Override
+        public void attachment(ChatDtos.AttachmentEvent event) {
+            send("attachment", event);
+        }
+
         @Override
         public void delta(String content) {
             send("delta", new ChatDtos.DeltaEvent(content));

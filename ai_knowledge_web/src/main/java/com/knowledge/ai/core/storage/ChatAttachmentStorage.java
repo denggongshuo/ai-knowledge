@@ -191,6 +191,27 @@ public class ChatAttachmentStorage {
         }
     }
 
+    /**
+     * 读回对象字节（`T-907` 的 VL 描述要从它开始）。
+     *
+     * <p>与 {@code DocStorage#readAll} 同形：**读失败抛**（不像 {@link #presignedUrl}
+     * 那样返回 null）。理由是消费方不同 —— 预签名 URL 拿不到时前端退化成一个占位图标即可，
+     * 而这里的调用方（描述器）拿到 {@code null} 只能猜是"图不存在"还是"MinIO 挂了"，
+     * 然后两条路都走降级，用户看到的是"图片理解不可用"而实际原因完全不同。
+     *
+     * <p>⚠️ 但它**不返回 null 让调用方判**：抛出去由调用方决定降级还是失败。
+     * 上传上限 10 MB，整个读进内存是可接受的代价（与 {@link #store} 同一条理由）。
+     */
+    public byte[] readBytes(String objectKey) {
+        try (InputStream in = minioClient.getObject(io.minio.GetObjectArgs.builder()
+                .bucket(bucket).object(objectKey).build())) {
+            return in.readAllBytes();
+        } catch (Exception ex) {
+            log.warn("读取附件对象失败：object={} err={}", objectKey, ex.getMessage());
+            throw BizException.of(ErrorCode.SYSTEM_ERROR, "图片读取失败，请稍后重试或重新上传该图片");
+        }
+    }
+
     /** 取对象实际大小，用于核对"真的落进桶了"（对象不存在返回 {@code -1}，不抛）。 */
     public long sizeOf(String objectKey) {
         try {

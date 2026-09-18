@@ -112,6 +112,59 @@ public final class ChatDtos {
     public record DeltaEvent(String content) {
     }
 
+    // ==================================================================
+    // 图片理解进度（`T-907` · 需求 `09` §4.9）
+    // ==================================================================
+
+    /** {@code attachment} 事件的两个阶段（§4.9 的事件序列）。 */
+    public enum AttachmentStage {
+        /** 正在理解（VL 调用中）。用户看见「正在理解图片（VL 模型）…」+ 转圈。 */
+        DESCRIBING,
+        /** 理解完成（成功或降级）。 */
+        DONE,
+    }
+
+    /**
+     * §4.9 `event: attachment` —— 图片理解的进度。
+     *
+     * <h3>为什么这个事件必须在 {@code retrieval} 之前</h3>
+     * <p>§4.9 的时序是：图片上传 → **VL 描述（1~3s，串行阻塞）** → 合成 query → 检索 → 生成。
+     * 描述在检索**之前**，而合成 query 依赖它 —— 所以没有这条事件，用户会先盯着
+     * 一片空白等 1~3 秒，然后才看到首包。§4.9 的原话：「必须通过 SSE 提前给进度，
+     * 否则用户盯着空白等 3 秒会以为挂了」。
+     *
+     * <p>⚠️ 这条事件的存在**改变了 {@code G5-7} 的取证口径**：那条门禁说"首包必须是
+     * {@code retrieval}"，而它成立于**不带图片**的问答。带图时首包是 {@code attachment}
+     * —— 两句话都对，条件是"带不带图"。判据 8 就是按这个条件写的。
+     *
+     * @param stage         阶段
+     * @param attachmentId  附件 id（**字符串形式**，同 {@link AttachmentUploadResult#attachmentId}）
+     * @param desc          完整描述；{@code DESCRIBING} 阶段为 {@code null}
+     * @param searchSummary 检索摘要；同上
+     * @param vlModel      产出描述的 VL 模型名；{@code DESCRIBING} 阶段为 {@code null}
+     * @param degraded      是否降级产出。⚠️ `DESCRIBING` 阶段为 {@code null}
+     *                      （还没开始理解，谈不上降级），{@code DONE} 阶段才有真值
+     */
+    public record AttachmentEvent(AttachmentStage stage,
+                                  String attachmentId,
+                                  String desc,
+                                  String searchSummary,
+                                  String vlModel,
+                                  Boolean degraded) {
+
+        /** 「正在理解」—— 只有 id 有值，其余全是 {@code null}（**不填假值**）。 */
+        public static AttachmentEvent describing(String attachmentId) {
+            return new AttachmentEvent(AttachmentStage.DESCRIBING, attachmentId, null, null, null, null);
+        }
+
+        /** 「理解完成」—— 成功与降级都发它，由 {@code degraded} 区分。 */
+        public static AttachmentEvent done(String attachmentId, String desc, String searchSummary,
+                                           String vlModel, boolean degraded) {
+            return new AttachmentEvent(AttachmentStage.DONE, attachmentId, desc, searchSummary,
+                    vlModel, degraded);
+        }
+    }
+
     /**
      * token 用量（§9 `done.tokenUsage`）。
      *

@@ -26,6 +26,21 @@ public interface ChatSink {
      */
     void retrieval(ChatDtos.RetrievalEvent event);
 
+    /**
+     * `event: attachment` —— 图片理解的进度（`T-907` · 需求 `09` §4.9）。
+     *
+     * <p><b>带图提问时它比 {@link #retrieval} 更早发出</b>：VL 描述是串行阻塞在
+     * 检索之前的（1~3 秒），而合成 query 依赖它。不提前给进度，用户会盯着空白等。
+     *
+     * <p>默认实现是**空操作** —— 本接口有若干只关心"检索 → 生成"的既有替身
+     * （用例里的 `List<Object>` 收集器），逼它们全部实现一个新方法是纯负担。
+     * ⚠️ 但**生产实现必须覆盖它**（{@code ChatController.EmitterSink}），
+     * 否则用户在页面上永远看不到「正在理解图片」。
+     */
+    default void attachment(ChatDtos.AttachmentEvent event) {
+        // 默认空操作：见 javadoc
+    }
+
     /** `event: delta` —— 一小段增量正文。可发多次。 */
     void delta(String content);
 

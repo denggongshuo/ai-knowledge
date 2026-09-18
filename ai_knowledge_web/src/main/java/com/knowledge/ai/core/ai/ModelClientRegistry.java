@@ -121,6 +121,67 @@ public class ModelClientRegistry {
         return rerankClientOf(activeSpec(ModelType.RERANK));
     }
 
+    /**
+     * 取 **VL（视觉）客户端**（`T-907`）。**未配置时返回 {@link Optional#empty()}，不抛**。
+     *
+     * <h3>为什么返回 {@code Optional} 而不是像重排那样给个 NoOp</h3>
+     * <p>重排能造一个 {@code NoOpRerankClient}，因为"不重排"本身**就是一个合法的结果**
+     * （候选顺序不变而已）。图片理解没有这个性质 —— "没描述"不是一个可用的产出，
+     * 它必须**被上层看见并标成降级**（`degraded = true` + 提示「图片理解不可用」，
+     * 需求 `09` §4.10 第 3 行）。用 {@code Optional} 把"没配置"这件事**逼到调用方
+     * 必须写分支**，而不是让它拿到一个"看起来能用、其实什么都不做"的客户端。
+     *
+     * <h3>为什么口径跟 {@code chatClient()} / {@code embeddingModel()} 也不同</h3>
+     * <p>那两类没配置是**硬失败**（没对话模型就没有问答，没嵌入模型就建不了索引）。
+     * VL 不一样：它是**问答链路上的可选增强** —— `.env` 里 {@code VL_API_*}
+     * 允许为空，图片理解不了时**照常按文字问题回答**（§4.10）。所以这里降级不报错。
+     * ⚠️ 但配置来源**抛异常**时仍然要留 warn：静默降级会让"VL 悄悄失效了"永远没人发现
+     * （与 {@link #rerankClient()} 同一条取舍）。
+     *
+     * <h3>为什么可以"取一个 VL"而嵌入不行</h3>
+     * <p>{@code ModelClientRegistryTest#embeddingIsSingleton} 钉死的是**嵌入**：
+     * 索引期与查询期必须同一个模型，且 Milvus 的维度固定 —— 混用会让检索完全失效。
+     * VL 的性质不同：{@code ModelType#VL.allowsMultiple()} 为真（需求 `09` §1.2 与 `12` §1
+     * 两处一致），同一张图换个 VL 重算描述是**正常操作**（`T-908` 就是干这个的）。
+     * 所以这里取的是"当前启用的那一条"，与 {@link #rerankClient()} 同形。
+     *
+     * @return 当前启用 VL 模型的对话客户端；未配置 / 来源不可用时为空
+     */
+    public Optional<ChatClient> visionClient() {
+        List<ModelConfigSpec> specs;
+        try {
+            specs = configSource.listEnabled(ModelType.VL);
+        } catch (Exception ex) {
+            log.warn("模型配置来源不可用，本次不做图片理解：source={} 原因={}",
+                    configSource.sourceName(), ex.getMessage());
+            return Optional.empty();
+        }
+        if (specs == null || specs.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(chatClientOf(activeSpec(ModelType.VL)));
+    }
+
+    /**
+     * 当前启用 VL 模型的规格 —— 给描述落库用（`vlModelId` / `vlModelName` 两列）。
+     *
+     * <p>不配置时为空。⚠️ 与 {@link #visionClient()} 分开取是有意的：**降级路径上
+     * 也需要知道"本该是哪个模型"** —— 否则库里那行 `degraded = 1` 连"谁没干成"都记不下来，
+     * 而 `T-908` 换 VL 时要找的正是"哪些描述是哪个模型产的"。
+     */
+    public Optional<ModelConfigSpec> visionSpec() {
+        try {
+            List<ModelConfigSpec> specs = configSource.listEnabled(ModelType.VL);
+            if (specs == null || specs.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(activeSpec(ModelType.VL));
+        } catch (Exception ex) {
+            log.warn("读取 VL 模型规格失败：原因={}", ex.getMessage());
+            return Optional.empty();
+        }
+    }
+
     // ==================================================================
     // 连接测试（`T-903`）—— **唯一的"按任意规格直接构造并调用"入口**
     // ==================================================================

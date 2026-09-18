@@ -5,6 +5,8 @@ import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.storage.ChatAttachmentStorage;
 import com.knowledge.ai.entity.SysChatAttachment;
 import com.knowledge.ai.pipeline.chat.ChatDtos;
+import com.knowledge.ai.pipeline.vision.VisionDescriber;
+import com.knowledge.ai.pipeline.vision.VisionResult;
 import com.knowledge.ai.repository.SysChatAttachmentRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -13,18 +15,23 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * 问答图片附件（`T-805`）—— 预上传与回看。
+ * 问答图片附件（`T-805` 预上传 + `T-907` 图片理解 + 回看）。
  *
- * <h3>本批的边界：「只落 MinIO + 落库，不调 VL」</h3>
- * <p>这是 `T-805` 任务行括注写死的。所以本类**没有**：描述生成、进度事件、
- * 缓存、会话归属校验 —— 它们分别是 `T-806`（前三个的一部分）与 `T-512`（描述与缓存）。
+ * <h3>`T-805` 与 `T-907` 的分界</h3>
+ * <p>`T-805`（`S5-M08-C`）的边界是「**只落 MinIO + 落库，不调 VL**」——
+ * 所以那一批本类**没有**描述生成、进度事件、缓存。`T-907` 把这三件接上：
+ * 新增 {@link #describe}（编排入口）与描述字段的落库/回读。
+ * 二者的共同前提是同一条：**图片在用户点发送之前就传完了，而描述是发送时才生成的**
+ * （需求 `09` FR-SYS-04 的时序）。
  *
  * <h3>为什么"回看"的归属只到人，不到会话</h3>
- * <p>预上传时**会话还不存在**（会话是 {@code completions} 里才建的），而
- * {@code completions} 本批不消费 {@code attachmentIds}（`T-512` 才接）。
- * 需求 `09:661` 写的是"需校验**会话**归属"——那条口径要等附件真的绑上消息才谈得上。
+ * <p>预上传时**会话还不存在**（会话是 {@code completions} 里才建的）。
+ * 需求 `09:661` 写的是"需校验**会话**归属"——那条口径要等附件真的**绑上消息**
+ * 才谈得上（`T-806`/`T-512`：把 {@code attachmentId} 写进消息行）。
  * 本批把它落到**能做到的那一层**：属于当前用户。
  * 这是**弱一点的**保证，不是空保证：它挡住了"拿到别人的附件 id 就能看图"。
  *
@@ -41,6 +48,7 @@ public class ChatAttachmentService {
 
     private final ChatAttachmentStorage storage;
     private final SysChatAttachmentRepository repository;
+    private final VisionDescriber visionDescriber;
 
     /**
      * 预上传一张图片。
@@ -101,7 +109,7 @@ public class ChatAttachmentService {
 
         return new ChatDtos.AttachmentView(
                 String.valueOf(row.getId()),
-                // 本批只有 IMAGE 一种（`09` §4.6 的 attachments[] 形状里它就是常量）。
+                // 只有 IMAGE 一种（`09` §4.6 的 attachments[] 形状里它就是常量）。
                 // 写死而不是存列：没有第二种取值时，那个列只会是一个恒为同值的噪声列
                 "IMAGE",
                 row.getName(),
@@ -110,9 +118,121 @@ public class ChatAttachmentService {
                 row.getMime(),
                 // 每次读取现签 —— 库里存的是对象名，URL 有 TTL（PresignTtl#CHAT_ATTACHMENT_SECONDS）
                 storage.presignedUrl(row.getObjectKey()),
-                // 以下五个是 VL 描述（`09` §4.6），属 `T-512` —— **本批如实给 null，不填假值**。
-                // 填 "" 会被前端当成"模型确实没看出什么"，与"还没理解过"是两回事
-                null, null, null, null, null);
+                // 以下五个自 `T-907` 起是**真值**（此前恒 null）。仍然可能为 null ——
+                // 那表示「这张图还没有被理解过」，与"理解过但没看出东西"（degraded=true
+                // + 空描述）是两件事。`degraded` 用 Boolean 承载这个三态
+                row.getDescription(),
+                row.getSearchSummary(),
+                row.getVlModelName(),
+                row.getDegraded(),
+                row.getPromptVersion());
+    }
+
+    /**
+     * 理解一组图片（`T-907` · 需求 `09` FR-SYS-04）—— 问答链路的入口。
+     *
+     * <h3>为什么"附件不存在"直接报错，而不是跳过它</h3>
+     * <p>§4.10 的兜底表最后一行写着：「**最糟的处理是静默忽略图片** —— 用户以为模型看到了图，
+     * 实际没有，这类问题极难排查。」所以一个解析不出来的 {@code attachmentId}
+     * **不进链路**（与 §4.10 第 1 行「格式/大小不合规 → 直接返回业务错误码，不进链路」同形）。
+     * 它的表现是 {@code event: error} + 一句能照着做的提示 —— 而不是"答案看起来正常、
+     * 只是没看图"。
+     *
+     * <h3>为什么这里就把字节读出来</h3>
+     * <p>VL 的两条传输通路里有一条（base64 回退）必须要有字节，而**压缩也只作用于它**。
+     * 与其在调用器里再回一次对象存储（多一次往返、还要把 storage 依赖渗进 pipeline 层），
+     * 不如在这里一次读齐。上限 10 MB / 张、单次 ≤3 张（§4.5），
+     * 最坏 30 MB 瞬时内存，可接受。
+     *
+     * @param userId        提问人（归属校验到人 —— 会话在此刻还没建）
+     * @param attachmentIds 前端传来的附件 id（**字符串形式**）
+     * @param question      用户问题。问答期**带上**（§4.3：VL 会聚焦到相关区域）
+     * @return 与 {@code attachmentIds} **等长同序**的结果
+     * @throws BizException 任一 id 不存在 / 不属于当前用户（**同码 NOT_FOUND**，不区分）
+     */
+    @Transactional
+    public List<Described> describe(Long userId, List<String> attachmentIds, String question) {
+        if (attachmentIds == null || attachmentIds.isEmpty()) {
+            return List.of();
+        }
+        List<SysChatAttachment> rows = new ArrayList<>(attachmentIds.size());
+        for (String rawId : attachmentIds) {
+            Long id = parseId(rawId);
+            if (id == null) {
+                throw BizException.of(ErrorCode.NOT_FOUND);
+            }
+            rows.add(repository.findByIdAndUserId(id, userId)
+                    .orElseThrow(() -> BizException.of(ErrorCode.NOT_FOUND)));
+        }
+
+        List<VisionDescriber.VisionInput> inputs = new ArrayList<>(rows.size());
+        for (SysChatAttachment row : rows) {
+            inputs.add(new VisionDescriber.VisionInput(row.getMd5(),
+                    storage.readBytes(row.getObjectKey()),
+                    storage.presignedUrl(row.getObjectKey()),
+                    row.getMime(), question));
+        }
+
+        List<VisionResult> results = visionDescriber.describeAll(inputs);
+
+        List<Described> out = new ArrayList<>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            SysChatAttachment row = rows.get(i);
+            VisionResult result = results.get(i);
+            persistDescription(row, result);
+            out.add(new Described(String.valueOf(row.getId()), result));
+        }
+        return out;
+    }
+
+    /**
+     * 把描述写回附件行。
+     *
+     * <p>⚠️ **降级产出也写**（{@code degraded = 1} + 空描述）：库里那一列
+     * {@code NULL} 的语义是「**还没有被理解过**」，而降级是「**试过了、没成**」。
+     * 两者都要能读出来 —— 后者正是前端「重试理解图片」那个入口存在的理由（§4.10）。
+     * 把它们压成一个 {@code NULL}，用户就永远不知道自己那张图试过没有。
+     */
+    private void persistDescription(SysChatAttachment row, VisionResult result) {
+        if (result == null) {
+            return;
+        }
+        row.setDescription(result.desc() == null || result.desc().isBlank() ? null : result.desc());
+        row.setSearchSummary(result.searchSummary() == null || result.searchSummary().isBlank()
+                ? null : truncate(result.searchSummary(), 1000));
+        row.setVlModelName(blankToNull(result.vlModelName()));
+        row.setDegraded(result.degraded());
+        row.setPromptVersion(result.promptVersion());
+        repository.save(row);
+    }
+
+    /** {@code search_summary} 列是 VARCHAR(1000) —— 超长截断而不是让整次问答失败。 */
+    private static String truncate(String value, int max) {
+        return value.length() <= max ? value : value.substring(0, max);
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    /** 字符串 id → 数字；解析不出返回 {@code null}（调用方按 {@code NOT_FOUND} 处理）。 */
+    private static Long parseId(String rawId) {
+        if (rawId == null || rawId.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.valueOf(rawId.strip());
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * 一件附件的理解结果（回给编排用）。
+     *
+     * @param attachmentId 附件 id 的字符串形式（与请求里那个**同一个形状**）
+     */
+    public record Described(String attachmentId, VisionResult result) {
     }
 
     /** 浏览器没给文件名时给一个能显示的占位（`name` 列 NOT NULL）。 */
