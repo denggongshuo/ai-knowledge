@@ -46,6 +46,7 @@ import {
   teardownKbProbe,
   kbResidueClean,
   describeKbResidue,
+  minioKeysOfUserPrefix,
   minioRemove,
 } from './lib/probe-teardown.mjs'
 
@@ -244,12 +245,6 @@ function parseFrame(frame) {
  */
 let loginUserId = 0
 let sessionFloor = 0
-
-/**
- * `T-805` 那一步造的两样产物 —— **两者都不属于探针前缀**，必须自己收：
- * 库里那行走 `user_id`，桶里那个对象走 `object_key`。
- */
-let attachmentObjectKey = ''
 
 /** 喂给 `input[type=file]` 的临时 PNG 路径（跑完即删）。 */
 let attachmentFixture = ''
@@ -544,7 +539,8 @@ async function main() {
       `库里 size=${size}，真文件是 ${png.length} 字节 —— 落的不是同一份字节`,
     )
     check(objectKey.startsWith('chat-attachments/'), `对象名前缀不对：${objectKey}`)
-    attachmentObjectKey = objectKey
+    // ⚠️ 这里**不再把它存到模块级变量**去给收尾用（`#163`）：收尾改成了按
+    //    `userId` 前缀列全量 —— 存一份"我知道的那一个"正是漏的成因。
 
     // 回看接口也要真能读（本批页面上还没有消费方，但接口必须成立）
     const detail = bizOk(await api(`/api/chat/attachments/${attId}`), '回看附件')
@@ -842,8 +838,17 @@ async function cleanupProbe() {
     // ⚠️ 与上面几族不同 —— 它**不属于探针库**（`teardownKbProbe` 看不见它），
     // 而 `probe-teardown` 的 MinIO 清理只覆盖库族（要 join `sys_kb`）。
     // 问答附件是按**人**归属的前缀，与 `avatars/` 同一条取舍 ⇒ 脚本自己收。
-    if (attachmentObjectKey) {
-      minioRemove([attachmentObjectKey])
+    // 🔴 `#163`：**不能只删"自己那一个"**。
+    //    下一行删的是该用户**全部**附件行，若只删自己那一个对象，**更早几轮的对象
+    //    就永远成了无主孤儿** —— 实测桶里躺着 **10 个** `chat-attachments/689/…`
+    //    而对应的 DB 行**一个都没有**（全是历轮 E2E 漏下的）。
+    //    口径对齐：**行删多少，对象就收多少**。
+    //    ⚠️ 按 **userId 前缀**列全量，**不记"我知道的那一个"** —— 后者正是漏的成因：
+    //      脚本每轮都会删掉该用户**全部**行，于是上一轮的对象在下一次跑的时候就
+    //      没有任何行指向它了，而脚本只记得"自己造的那一个"。
+    const myAttachmentKeys = minioKeysOfUserPrefix([loginUserId])
+    if (myAttachmentKeys.length) {
+      minioRemove(myAttachmentKeys)
     }
     mysqlScalar(`delete from sys_chat_attachment where user_id = ${loginUserId};`)
   }

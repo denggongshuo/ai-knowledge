@@ -108,6 +108,18 @@ export const KB_ARTIFACTS = [
  * <p>⚠️ `sys_login_log` 是 2026-09-17 才补上的 —— 在那之前 `purgeProbeUsers` 只删用户，
  * 于是每次跑完都留下 `user_id` 指向已删用户的**孤儿行**（实测存量 3984 行）。
  * 该表**有 `username` 列**，本可按前缀删，纯粹是漏了。
+ *
+ * <h3>⚠️ 本表**只管数据库表** —— MinIO 对象在表外单独收（`#163`）</h3>
+ * <p>问答附件（`chat-attachments/{userId}/{uuid}.{ext}`）**不挂在任何探针库下**，
+ * 所以 {@link minioKeysOf}（要 join `sys_kb`）看不见它们。它们由
+ * {@link minioKeysOfUserPrefix} 按 **userId 前缀**单独快照并删除，
+ * 在 `teardownUserProbe` 里与这张表**并排**走。
+ *
+ * <p>**不加进本表**是有原因的：本表的每一项都会被
+ * {@link findUserProbeResidue} 当成"一张有 `via` 的表"去数（它无条件读 `a.table`），
+ * 混进一个非表条目会让那段计数逻辑拿到 `undefined` 去拼 SQL。
+ * 与其在计数循环里加一个 `if (a.kind === 'minio-...') continue`（那就又多了一处
+ * "新增产物时要同步改的地方"），不如让它走自己那条显式的路。
  */
 export const USER_ARTIFACTS = [
   {
@@ -260,6 +272,47 @@ export function minioStillPresent(rawObjectKeys) {
     `MSYS_NO_PATHCONV=1 docker exec kb-minio sh -c "ls ${paths} 2>/dev/null"`,
   ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
   return out.split('\n').map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * **按用户前缀**列出 MinIO 对象（`#163`）—— 问答附件那条路。
+ *
+ * <h3>为什么需要它</h3>
+ * <p>{@link minioKeysOf} 只能按**库**取（它从 `sys_document.storage_path` /
+ * `parse_path` 两列读），而问答附件**不属于任何探针库** —— 它的归属是
+ * `chat-attachments/{userId}/{uuid}.{ext}` 里的 **userId**（与 `avatars/` 同一条取舍）。
+ * 于是用户族的 teardown 删了**行**、却一直没删**对象**：每轮都在桶里多一个。
+ *
+ * <h3>为什么可以直接 `find`</h3>
+ * <p>MinIO 在这个部署里的数据目录是挂进容器的（{@link #MINIO_ROOT}），
+ * 所以"列一个前缀"就是列一个目录 —— 不需要 S3 客户端。
+ *
+ * <p>⚠️ **用 `ls -1` 而不是 `find`**：`kb-minio` 的镜像是极简的，**没有 `find`**
+ * （实测 `exit 127`）。而"没找到"与"这个命令不存在"在原实现里长得一模一样 ——
+ * 又一处恒真守卫。`ls` 则确实存在（{@link minioStillPresent} 一直用它）。
+ *
+ * <p>⚠️ 与 {@link minioRemove} 同一条坑：整串必须进 `sh -c` 并带
+ * `MSYS_NO_PATHCONV=1`，否则 MSYS 会把 `/data/…` 改写成 `C:/Program Files/Git/data/…`。
+ *
+ * <p>逐个 id 起一次调用（而不是把多个目录拼给一条命令）：探针账号每次只有一两个，
+ * 而拼串要处理 `ls` 的目录表头格式 —— 那正是 `minioStillPresent` 那个 javadoc
+ * 警告过的"外层 bash 先展开"的那类坑。
+ *
+ * @param userIds 用户 id 集合（**必须在删 `sys_user` 之前抓**，与其它归属 id 同理）
+ */
+export function minioKeysOfUserPrefix(userIds) {
+  const ids = normalizeKeys(userIds)
+  const keys = []
+  for (const id of ids) {
+    const out = spawnSync('bash', ['-c',
+      `MSYS_NO_PATHCONV=1 docker exec kb-minio sh -c `
+      + `"ls -1 '${MINIO_ROOT}/chat-attachments/${id}' 2>/dev/null"`,
+    ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
+    for (const name of out.split('\n').map((s) => s.trim()).filter(Boolean)) {
+      keys.push(`chat-attachments/${id}/${name}`)
+    }
+  }
+  return keys
 }
 
 /**
@@ -544,7 +597,17 @@ export function teardownUserProbe(prefix) {
       throw new Error(`USER_ARTIFACTS 里 ${a.table} 的 via 取值无法处理：${a.via}`)
     }).reduce((acc, s) => acc + s, ''),
   )
-  return { prefix, loginLogs, userIds, residue: findUserProbeResidue(prefix, { userIds }) }
+  // 🔴 `#163`：**桶里那批也要收** —— 它们不挂在任何探针库下面（`minioKeysOf` 要 join
+  //    `sys_kb`，看不见它们），归属是 `chat-attachments/{userId}/…` 里的 userId。
+  //    此前这里只删行不删对象 ⇒ 每轮在桶里多一个。
+  //    ⚠️ 快照要在**删对象之前**取，否则"还在吗"这个观察点永远为空（恒真守卫那一族）。
+  const minioKeys = minioKeysOfUserPrefix(userIds)
+  const minioRemoved = minioRemove(minioKeys)
+
+  return {
+    prefix, loginLogs, userIds, minioKeys, minioRemoved,
+    residue: findUserProbeResidue(prefix, { userIds, minioKeys }),
+  }
 }
 
 /**
@@ -670,6 +733,14 @@ export function findUserProbeResidue(prefix, snapshot = {}) {
     sqlTotal: Object.values(sql).reduce((a, b) => a + b, 0),
     /** 本轮抓到几个用户 id —— **0 表示上面那几格无从查起**（不是"干净"）。 */
     idsUsed: userIds.length,
+    /**
+     * 🔴 **桶里**还在的那批（`#163`）—— 观察点与上面那些 SQL 计数**独立性最高**：
+     * 它根本不经过 MySQL，所以"行删干净了"骗不过它。
+     *
+     * <p>⚠️ 与 kb 族的 `minioStillThere` 同一条限制：只有**清理前快照到的那些对象**
+     * 能这么查 —— 更早的轮次留下的孤儿对象这里查不到（要查得全前缀扫，那是另一件事）。
+     */
+    minioStillThere: snapshot.minioKeys ? minioStillPresent(snapshot.minioKeys) : [],
   }
 }
 
