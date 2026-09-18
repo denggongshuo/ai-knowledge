@@ -1,6 +1,8 @@
 package com.knowledge.ai.config;
 
 import lombok.extern.slf4j.Slf4j;
+import com.knowledge.ai.core.security.LoginUser;
+import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.trace.TraceContext;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -38,6 +40,12 @@ public class AsyncConfig {
     /** 检索召回执行器（`T-700` 的两路并行召回）。**与上面的池子分开**，理由见 {@link #retrievalExecutor()}。 */
     public static final String RETRIEVAL_EXECUTOR = "retrievalExecutor";
 
+    /**
+     * 问答 SSE 执行器（`S6-M05-C` 的 P0 修复）。
+     * **与上面两个池子都分开**，理由见 {@link #chatExecutor()}。
+     */
+    public static final String CHAT_EXECUTOR = "chatExecutor";
+
     @Value("${app.async.core-pool-size:4}")
     private int corePoolSize;
 
@@ -49,6 +57,17 @@ public class AsyncConfig {
 
     @Value("${app.async.keep-alive-seconds:120}")
     private int keepAliveSeconds;
+
+    /** 同时在线的提问数。4 是"两三个用户各问一轮 + 一轮重试"的折中。 */
+    @Value("${app.chat.core-pool-size:4}")
+    private int chatCorePoolSize;
+
+    @Value("${app.chat.max-pool-size:8}")
+    private int chatMaxPoolSize;
+
+    /** 队列**刻意小**（16）：问答是长任务，排长队不如早点拒绝并如实告诉用户。 */
+    @Value("${app.chat.queue-capacity:16}")
+    private int chatQueueCapacity;
 
     @Bean(name = TASK_EXECUTOR)
     public Executor taskExecutor() {
@@ -142,6 +161,93 @@ public class AsyncConfig {
         executor.setTaskDecorator(AsyncConfig::traceIdPropagating);
         executor.initialize();
         return executor;
+    }
+
+    /**
+     * 问答 SSE 执行器（`S6-M05-C` 的 P0 修复）—— 让 `SseEmitter` 能真的流式往外发。
+     *
+     * <h3>为什么必须新开一个池，而不是复用上面两个</h3>
+     * <p>这是本批最核心的一处取舍，**不是"顺手隔离一下"**：
+     *
+     * <ul>
+     *   <li><b>不能复用 {@link #TASK_EXECUTOR}</b>：它的拒绝策略是 {@code CallerRunsPolicy}。
+     *       队列一满，"让提交者自己跑"在这里等于**把整轮问答搬回请求线程同步跑完** ——
+     *       也就是把 {@code #174}（整条 SSE 攒完一次性发）**原地还原**，
+     *       而且只在有负载时才复现：本地跑一百次都是好的。这类"负载一变才集中爆"的
+     *       缺陷本仓登记过不止一次（见 `汇总.md` §5 那两条）。</li>
+     *   <li><b>不能复用 {@link #RETRIEVAL_EXECUTOR}</b>：它只有 4 个线程、且队列为 0。
+     *       问答任务会**长时间占着线程**（一次生成几分钟），而检索只是它内部的一小跳
+     *       （检索自己会往这个池里提交两路召回）—— 两者同一个池就是**自己等自己**：
+     *       8 个并发提问把线程占满后，每一次检索的召回都拿不到线程，
+     *       表现是"问答全部卡死"，而根因在池子大小上。</li>
+     * </ul>
+     *
+     * <p>所以：**线程数按"同时在线的提问数"给，拒绝策略用 {@code AbortPolicy}**
+     * —— 队列满时正确的反应是"尽早告诉用户"，而不是把压力偷偷转回请求线程。
+     * 被拒的那条由 {@code ChatController} 当场发一个 {@code error} 事件出去
+     * （见那里的注释：此时 emitter 还没 initialize，事件会堆进
+     * {@code earlySendAttempts}，初始化时重放）。
+     *
+     * <p>⚠️ 与另两个池同一条纪律：**必须**带上身份传播的装饰器 —— 但这里要传的是
+     * **两样**（traceId **和** {@code LoginUser}），所以不能用
+     * {@link #traceIdPropagating}，见 {@link #chatContextPropagating}。
+     */
+    @Bean(name = CHAT_EXECUTOR)
+    public Executor chatExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(chatCorePoolSize);
+        executor.setMaxPoolSize(chatMaxPoolSize);
+        executor.setQueueCapacity(chatQueueCapacity);
+        executor.setKeepAliveSeconds(keepAliveSeconds);
+        executor.setThreadNamePrefix("ak-chat-");
+        // 正在生成的回答不该因为一次优雅停机被拦腰砍断；给足排空时间
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.setTaskDecorator(AsyncConfig::chatContextPropagating);
+        executor.initialize();
+        log.info("问答线程池已就绪 core={} max={} queue={}", chatCorePoolSize, chatMaxPoolSize, chatQueueCapacity);
+        return executor;
+    }
+
+    /**
+     * 把提交线程的 {@code traceId} **与登录身份**传给问答工作线程。
+     *
+     * <h3>为什么不能复用 {@link #traceIdPropagating}</h3>
+     * <p>那个只传 traceId。问答编排比解析/索引多要一样东西：**`LoginUser`**。
+     * 它读 `LoginUserContext`（ThreadLocal）取用户 id、数据范围、密级上限与权限 ——
+     * 搬出请求线程后**一个都拿不到**，而且失效的样子是**安静**的：
+     * `LoginUserContext.require()` 抛的是 401（看着像"没登录"），
+     * `userIdOrNull()` 只是返回 null（数据范围静默退化）。
+     *
+     * <p>这与 `S4-E2` 补 {@code traceIdPropagating} 时踩的是同一个坑，
+     * 只是那次坑在 traceId 上、这次坑在身份上 —— `LoginUserContext` 的类注释
+     * 一直写着"**不跨线程**……异步任务必须自己把需要的字段在提交时取出来带过去"，
+     * 而在此之前**没有任何地方真的这么做**（原实现干脆同步跑在请求线程上，
+     * 所以那个坑一直被"同步"这件事掩盖着）。
+     *
+     * <p>⚠️ {@code finally} 里两样都要清：池化线程不清，下一条不相关的问答会
+     * **继承**上一个用户的身份 —— 那不只是日志串味，是**越权**。
+     */
+    private static Runnable chatContextPropagating(Runnable task) {
+        LoginUser user = LoginUserContext.get();
+        String traceId = TraceContext.get();
+        return () -> {
+            if (user != null) {
+                LoginUserContext.set(user);
+            }
+            if (traceId != null) {
+                // 与 traceIdPropagating 同一取舍：提交线程没有就**不造**一个再传
+                //（凭空生成的 id 与任何请求都对不上，会让"这次是谁触发的"永远查不出来）
+                TraceContext.set(traceId);
+            }
+            try {
+                task.run();
+            } finally {
+                LoginUserContext.clear();
+                TraceContext.clear();
+            }
+        };
     }
 
     /**

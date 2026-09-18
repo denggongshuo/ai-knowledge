@@ -27,7 +27,10 @@ import java.util.function.Consumer;
  * 不必为了凑元数据再发一次请求。
  *
  * <h3>为什么用 {@code toIterable()} 阻塞消费</h3>
- * <p>{@code SseEmitter} 是同步栈：请求线程负责边收边发。用 {@code subscribe()} 会让
+ * <p>⚠️ 本段原话是「{@code SseEmitter} 是同步栈：**请求线程**负责边收边发」——
+ * `S6-M05-C` 起那句里"请求线程"已经不成立（编排搬到了
+ * {@code AsyncConfig.CHAT_EXECUTOR} 上）。**但结论不变、而且更强**：
+ * 这是"同步阻塞式"的栈，所以用 {@code subscribe()} 依然会让
  * 回调落在别的线程上，{@code SseEmitter} 的并发 `send` 与"什么时候算结束"都会变得难说。
  * 阻塞消费让"循环走完 = 生成结束 = 可以发 done"成为一条直白的因果。
  */

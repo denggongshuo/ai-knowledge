@@ -96,6 +96,46 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         }
     }
 
+    /**
+     * **异步续跑时也要鉴权**（`S6-M05-C` 的 P0 修复）。
+     *
+     * <h3>为什么默认值在本仓是错的</h3>
+     * <p>{@code OncePerRequestFilter} 默认 {@code shouldNotFilterAsyncDispatch() == true}，
+     * 因为对绝大多数过滤器来说"一次请求跑一遍"是对的。**但本仓不成立**：
+     *
+     * <p>SSE（{@code SseEmitter}）会在**每一次正常完成**后触发容器的 <b>ASYNC 续跑</b>
+     * —— 同一个请求再走一遍过滤器链。而本仓是 {@code STATELESS} + 无
+     * {@code SecurityContextRepository}，**没有任何仓库能在第二次 dispatch 时把上下文
+     * 恢复回来**：{@link JwtAuthFilter} 是唯一的身份来源，而它被跳过了；更糟的是
+     * {@link #doFilterInternal} 的 {@code finally} 已经把上下文清掉了。
+     *
+     * <p>于是续跑时 {@code AuthorizationFilter} 拿到一个空上下文
+     * （{@code AnonymousAuthenticationFilter} 会按匿名填充），而
+     * {@code SecurityConfig} 写的是 {@code anyRequest().authenticated()} ⇒ **拒绝**。
+     * 表现见 `S6-M09-B` §9-2：每次问答都在日志里留两条
+     * {@code AuthorizationDeniedException} + {@code Unable to handle the Spring Security
+     * Exception because the response is already committed}，**并把已完成的流撕断**
+     * （{@code curl: (18) transfer closed with outstanding read data remaining}）。
+     *
+     * <h3>为什么不改成「把 ASYNC 移出安全链」</h3>
+     * <p>{@code spring.security.filter.dispatcher-types: request,error} 也能消掉这个异常，
+     * 而且更短。但那是在**全局过滤器注册**上打洞，治的是症状；真正的病因是
+     * 「本仓的鉴权上下文只能由本过滤器建立」—— 那就该让它在该跑的时候跑。
+     *
+     * <h3>代价（如实记录）</h3>
+     * <ul>
+     *   <li>每次问答多一次 JWT 解析（本地验签，无 IO）；</li>
+     *   <li><b>令牌在流中途过期时会重演同一个异常</b>：续跑时解析失败 ⇒ 上下文空 ⇒ 拒绝。
+     *       本仓 {@code jwt.access-ttl-minutes=120} 而 SSE 超时 5 分钟，实际不可达；
+     *       若将来把 access TTL 调到与 SSE 超时同量级，要回头重新判这条路。
+     *       （这也正是没有把 ASYNC 移出安全链的代价之一：那种做法对这条边界免疫。）</li>
+     * </ul>
+     */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
     private String resolveToken(HttpServletRequest request) {
         String header = request.getHeader(HttpHeaders.AUTHORIZATION);
         if (header == null || !header.regionMatches(true, 0, BEARER, 0, BEARER.length())) {

@@ -1,5 +1,6 @@
 package com.knowledge.ai.controller;
 
+import com.knowledge.ai.config.AsyncConfig;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
@@ -13,8 +14,9 @@ import com.knowledge.ai.service.ChatAttachmentService;
 import com.knowledge.ai.service.ChatFeedbackService;
 import com.knowledge.ai.service.ChatSessionService;
 import com.knowledge.ai.service.ChatStreamService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.TaskRejectedException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -33,6 +35,7 @@ import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.Executor;
 
 /**
  * 问答入口（`T-800`）—— `POST /api/chat/completions`，SSE 流式。
@@ -48,9 +51,14 @@ import java.util.Map;
  *       发问（本方法）仍只要求登录：它不写任何受控资源，收窄了会让普通用户问不出问题。
  *       ⚠️ 立据时这里写的是"没有 {@code chat:*} 所以只要求登录"，**漏了 {@code qa:*}** ——
  *       施工首日发现并订正（计划 §3 修订 1 / §9 遗留 1）。</li>
- *   <li><b>不发 {@code attachment} 事件</b>：`T-512`（S6）之前图片不进问答。
- *       请求里的 {@code attachmentIds} / {@code useVision} 收下但**不生效**，
- *       {@code done.usedVision} 如实回 {@code false} —— 不假装接受了。</li>
+ *   <li><b>{@code attachmentIds} 已生效，{@code useVision} 仍不生效</b>：
+ *       `T-907`（`S6-M09-B`）已接通图片理解，带图提问会先发
+ *       {@code event: attachment}（`DESCRIBING` → `DONE`）再做检索。
+ *       ⚠️ 本段此前写的是「`T-512`（S6）之前图片不进问答，两个字段收下但不生效」
+ *       —— `T-907` 交付后那句话就过期了，`S6-M05-C` 订正。
+ *       **仍然不生效的是 {@code useVision}**（「直接读原图」，需求 `09` §4.7）：
+ *       前置是「当前对话模型 {@code capabilities.vision = true}」且只对该轮生效，属 `T-806`；
+ *       {@code done.usedVision} 至今如实回 {@code false} —— 不假装接受了。</li>
  * </ol>
  *
  * <h3>为什么不在这里写审计点</h3>
@@ -60,7 +68,6 @@ import java.util.Map;
 @Slf4j
 @RestController
 @RequestMapping("/api/chat")
-@RequiredArgsConstructor
 public class ChatController {
 
     /**
@@ -80,12 +87,49 @@ public class ChatController {
 
     private final ChatFeedbackService chatFeedbackService;
 
+    /** 问答编排跑在这里，**不是**请求线程 —— 理由见 {@link #completions}。 */
+    private final Executor chatExecutor;
+
+    /**
+     * 显式构造器（**不用 `@RequiredArgsConstructor`**）：上面那个执行器有 3 个同类型的
+     * Bean，必须靠 {@code @Qualifier} 点名叫 {@link AsyncConfig#CHAT_EXECUTOR}。
+     * 与 {@code AsyncTaskService} / {@code HybridRetriever} 两处的既有做法一致 ——
+     * 字段级的 {@code @Qualifier} 能不能被 Lombok 抄到构造器参数上是另一回事，
+     * 不拿它赌。
+     */
+    public ChatController(ChatStreamService chatStreamService,
+                          ChatSessionService chatSessionService,
+                          ChatAttachmentService chatAttachmentService,
+                          ChatFeedbackService chatFeedbackService,
+                          @Qualifier(AsyncConfig.CHAT_EXECUTOR) Executor chatExecutor) {
+        this.chatStreamService = chatStreamService;
+        this.chatSessionService = chatSessionService;
+        this.chatAttachmentService = chatAttachmentService;
+        this.chatFeedbackService = chatFeedbackService;
+        this.chatExecutor = chatExecutor;
+    }
+
     /**
      * {@code POST /chat/completions} → {@code text/event-stream}。
      *
-     * <p>事件序列见 {@link ChatStreamService}。⚠️ 这里**同步跑完**再返回 emitter：
-     * {@code SseEmitter} 的每一帧在 {@code send} 时就已写出，所以"同步"不影响流式观感，
-     * 反而让"生成结束 = 可以发 done"成为一条直白的因果（不必处理跨线程的完成通知）。
+     * <h3>⚠️ 这里曾经是同步的，而那句解释是错的（`S6-M05-C` 的 P0 修复）</h3>
+     * <p>改前是「同步跑完 {@code chatStreamService.chat(...)} 才 {@code return emitter}」，
+     * 上面原先写着「{@code SseEmitter} 的每一帧在 {@code send} 时就已写出，所以"同步"
+     * 不影响流式观感」。**那句话是错的，而且它正是这个缺陷的成因**：
+     * Spring MVC 要等控制器方法**返回之后**才调 {@code emitter.initialize(handler)}，
+     * 在此之前每一次 {@code send()} 都被 {@code ResponseBodyEmitter} 收进
+     * {@code earlySendAttempts}，初始化时**一次性重放**。
+     *
+     * <p>实测（`S6-M09-B` §9-1）：一次带图问答的**全部帧**（含所有 {@code delta}）
+     * 都在 {@code +3778ms} 一次性到达，而请求总耗时也是 3778ms。后果是需求 `09` §4.9
+     * 「**必须**通过 SSE 提前给进度，否则用户盯着空白等」**从原理上没生效**，
+     * `G5-7` 的实际效果为零，「流式生成」是错觉。
+     *
+     * <p>所以现在：**先把 emitter 交给 Spring（方法立即返回），编排跑在
+     * {@link AsyncConfig#CHAT_EXECUTOR} 上**，每一帧在产生的那一刻就写出。
+     *
+     * <p>事件序列见 {@link ChatStreamService}。跨线程的身份与 traceId 由
+     * {@code AsyncConfig.chatContextPropagating} 带过去。
      */
     @PostMapping(value = "/completions", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter completions(@RequestBody ChatDtos.ChatRequest request) {
@@ -93,6 +137,28 @@ public class ChatController {
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MILLIS);
         EmitterSink sink = new EmitterSink(emitter);
 
+        try {
+            chatExecutor.execute(() -> runChat(user, request, sink));
+        } catch (TaskRejectedException ex) {
+            // 队列满（`AbortPolicy`）。⚠️ 此刻 emitter **还没 initialize**，
+            // 所以下面两个事件会堆进 `earlySendAttempts`、在 initialize 时重放 ——
+            // 用户看到的是一条 error 事件。
+            // 这正是要的效果：不处理的话，用户盯着空白等满 5 分钟才超时，
+            // 而"没人在处理你的请求"这件事从头到尾不可见
+            log.warn("[问答] 问答队列已满，当场拒绝：userId={}", user.getUserId());
+            sink.error("当前提问并发较多，请稍后重试。");
+            sink.complete();
+        }
+        return emitter;
+    }
+
+    /**
+     * 一轮问答的**全部编排**，跑在 {@link AsyncConfig#CHAT_EXECUTOR} 的工作线程上。
+     *
+     * <p>⚠️ 身份与 traceId 由 {@code AsyncConfig.chatContextPropagating} 带过来，
+     * 这里**不要**再自己 {@code set} 一遍 —— 两处都设，将来改一处就会漏一处。
+     */
+    private void runChat(LoginUser user, ChatDtos.ChatRequest request, EmitterSink sink) {
         try {
             chatStreamService.chat(user, request, sink);
         } catch (RuntimeException ex) {
@@ -103,7 +169,6 @@ public class ChatController {
         } finally {
             sink.complete();
         }
-        return emitter;
     }
 
     // ==================================================================
@@ -270,10 +335,34 @@ public class ChatController {
 
         private final SseEmitter emitter;
 
-        private boolean alive = true;
+        /**
+         * 连接是否还活着。
+         *
+         * <p>⚠️ **必须 `volatile`**：写它的是容器线程（超时/错误/完成回调），
+         * 读它的是编排线程（{@link ChatSink#alive()}）。
+         */
+        private volatile boolean alive = true;
 
         EmitterSink(SseEmitter emitter) {
             this.emitter = emitter;
+            // `S6-M05-C`：把"什么时候算死了"补齐。
+            // ⚠️ 改前 `alive` **只在 `send()` 抛异常时才翻** —— 于是"超时之后编排
+            // 还在往一条死连接上发"这条路径，要等到下一次 `send()` 才被发现；
+            // 而 SSE 超时是 5 分钟，中间完全可能一次 send 都没有。
+            // 事件本身不会丢（收尾落库照做，见 `complete()`），但"还在发"这件事
+            // 会一路假成功到下一次发送为止。
+            emitter.onTimeout(() -> markDead("已超时"));
+            emitter.onError(ex -> markDead("连接出错：" + ex.getMessage()));
+            // 正常完成也会回调它 —— 那时我们本来就说完了，所以只翻标志、不告警，
+            // 否则每一轮成功的问答都会留一条 WARN
+            emitter.onCompletion(() -> alive = false);
+        }
+
+        private void markDead(String why) {
+            if (alive) {
+                alive = false;
+                log.warn("[问答] SSE {}，后续事件不再发送（收尾落库仍会执行）", why);
+            }
         }
 
         @Override
@@ -324,8 +413,7 @@ public class ChatController {
                 emitter.send(SseEmitter.event().name(name)
                         .data(data, MediaType.APPLICATION_JSON));
             } catch (IOException | IllegalStateException ex) {
-                alive = false;
-                log.warn("[问答] SSE 连接已断开，后续事件不再发送（收尾落库仍会执行）：{}", ex.getMessage());
+                markDead("连接已断开：" + ex.getMessage());
             }
         }
 

@@ -27,7 +27,14 @@ public interface StreamingChatCaller {
     /**
      * 发一次提示词，逐段回调，返回本次调用的元数据。
      *
-     * <p>**阻塞**直到生成结束 —— 调用方跑在请求线程上（`SseEmitter` 的既有形态）。
+     * <p>**阻塞**直到生成结束。
+     *
+     * <p>⚠️ 这句话原先续着写「调用方跑在请求线程上（`SseEmitter` 的既有形态）」——
+     * `S6-M05-C` 起**不再成立**：`ChatController#completions` 把编排搬到了
+     * `AsyncConfig.CHAT_EXECUTOR` 上，正因如此 `SseEmitter` 才能真的边收边发
+     * （同步跑在请求线程上时，每一帧都会被 Spring 攒到方法返回后才一次性重放，
+     * 见 `SseEmitter` 那处缺陷的完整记录）。**调用方在工作线程上**，
+     * 且依赖 `chatContextPropagating` 把身份与 traceId 带过去。
      *
      * @param prompt  完整提示词
      * @param onDelta 每收到一段增量正文调用一次（**不做任何清洗**）

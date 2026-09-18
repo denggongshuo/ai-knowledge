@@ -13,7 +13,12 @@
  *   <li><b>图片附件</b>（`T-805`，`S5-M08-C`）：从页面喂一张**真文件**，验它走 multipart
  *       落桶 + 落库 —— 改前前端发的是 JSON 元数据，**一个字节都没传**，而接口照样返回 200；</li>
  *   <li><b>反馈</b>（`T-807`/`G5-14`）：页面点「点赞」再改成「点踩+原因」，回查 `sys_chat_message`
- *       的三列真的跟着变（覆盖语义）。</li>
+ *       的三列真的跟着变（覆盖语义）；</li>
+ *   <li>🆕 <b>流真的是流</b>（`S6-M05-C` 的 P0 修复 · `G6-11` 的页面半边）：带图提问时，
+ *       页面在**描述期间**要看得见「正在理解图片」（`.as-line.describing`）。
+ *       `S6-M09-B` 时这条**挂起**过 —— 整条 SSE 被攒到控制器方法返回后一次性重放，
+ *       `DESCRIBING` 与 `DONE` 之间只隔几毫秒，页面来不及渲染。修复后那两帧之间是
+ *       真的 40~60 秒（真模型），所以这条断言**必须**成立，且修复被回退时它会**超时转红**。</li>
  * </ol>
  *
  * <h3>⚠️ 探针账号用**种子超管**，不是 `e2e` 前缀的新账号</h3>
@@ -96,6 +101,32 @@ async function waitFor(expression, label, timeout = 30000) {
     await sleep(150)
   }
   throw new Error(`等待超时（${label}）：${expression}`)
+}
+
+/**
+ * 轮询一条 SQL 直到它给出**非空**值。
+ *
+ * <h3>⚠️ 为什么需要它 —— 一次被"假流式"掩盖了整整一批的竞态</h3>
+ * <p>`S6-M09-B` 时，本脚本在 `.as-done` 之后直接读 `sys_retrieval_trace` 的最新一行，
+ * 而 `.as-done` 只是**描述完成**（SSE 的 `attachment{DONE}` 帧）—— 那时检索、生成、
+ * 落库**一件都还没发生**。这个假设**碰巧成立**，因为当时整条 SSE 被攒到控制器方法
+ * 返回后一次性重放，`.as-done` 只在整轮跑完之后才出现。
+ *
+ * <p>`S6-M05-C` 的 P0 修复（编排搬出请求线程）让帧变成真的之后，这个假设当场就塌了：
+ * 实测 `order by id desc limit 1` 取回的是**上一轮**的 trace（脚本报
+ * 「检索用的 query 丢了原问题：A-100 的单价和交期分别是多少？」）。
+ *
+ * <p>所以改成**等事件发生，再断言值**（而不是"等到期望值出现"—— 那会把真失败
+ * 变成慢成功）。水位线在**发送之前**取，`id > 水位` 即本轮那一行。
+ */
+async function awaitSqlScalar(sql, label, timeout = 180000) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < timeout) {
+    const value = mysqlScalar(sql)
+    if (value) return value
+    await sleep(500)
+  }
+  throw new Error(`等待超时（${label}）：${sql}`)
 }
 
 async function shot(name) {
@@ -562,6 +593,13 @@ async function main() {
       return !!b && !b.disabled
     })()`, '发送按钮可用（上一轮流式已结束）', 120000)
 
+    // 🔴 **发送前记下 trace 水位线**：本轮的检索打点在整轮跑完（检索 + 生成 + 落库）
+    // 之后才写，而下面第 ① 条等到的是**描述完成**—— 两者之间隔着几十秒。
+    // 见 `awaitSqlScalar` 的 javadoc：这个竞态是"假流式"掩盖下来的，修复后才露出来。
+    const traceFloor = Number(
+      mysqlScalar(`select coalesce(max(id), 0) from sys_retrieval_trace where user_id = ${loginUserId};`) || '0',
+    )
+
     await evaluate(`(() => {
       const btn = [...document.querySelectorAll('.chat-input button')]
         .find((b) => (b.textContent || '').includes('发送'))
@@ -570,10 +608,17 @@ async function main() {
       return true
     })()`)
 
+    // ①-a 🔴 **描述期间页面看得到「正在理解图片」**（`G6-11` 的页面半边）。
+    //      `S6-M09-B` 时这一条**挂起**了，原因不在前端也不在 `T-907`：整条 SSE 被
+    //      攒到控制器方法返回后**一次性重放**，`DESCRIBING` 与 `DONE` 之间只隔几毫秒，
+    //      页面根本来不及渲染。`S6-M05-C` 的 P0 修复（编排搬出请求线程）之后，
+    //      这两帧之间是**真的 40~60 秒**（真模型实测），所以这条断言现在必须成立。
+    //      ⚠️ 它同时是那次修复**最有力的页面级证据**：修复若被回退，这里会**超时转红**
+    //      —— 而不是像以前那样只是"看不见"（那是没法判红的一种失败）。
+    await waitFor(`!!document.querySelector('.as-line.describing')`,
+      '页面在描述期间显示「正在理解图片」（G6-11）', 30000)
+
     // ① 页面把**描述**渲染出来了（`.as-done`，见 `ChatView` 的 attach-status 区块）。
-    //    ⚠️ 这里**不断言** `.as-line.describing`（「正在理解图片」）——
-    //    实测它渲染不出来，原因不在前端也不在 `T-907`：整条 SSE 是**攒完一次性发**的
-    //    （见本文件末尾的 §「已知缺陷」与计划 §9）。那一条挂起，等 buffering 修好再补。
     //    真模型耗时以十秒计，给足 180s。
     await waitFor(`!!document.querySelector('.as-done')`, '页面渲染出图片描述', 180000)
 
@@ -601,8 +646,12 @@ async function main() {
     // ⚠️ 列名是 `query_text` 不是 `query` —— 实体的字段叫 query，但 `V15` 建表时
     // 避开了 `query` 这个在各家 SQL 里含义微妙的词。按字段名写会 status=1，
     // 而 `mysqlScalar` 把 stderr 吞了（`2>/dev/null`），报出来只有一句空原因。
-    const query = mysqlScalar(
-      `select query_text from sys_retrieval_trace where user_id = ${loginUserId} order by id desc limit 1;`,
+    // 🔴 **必须等到本轮那一行出现**（`id > traceFloor`）—— 上面第 ① 条等到的
+    // `.as-done` 只是**描述完成**，这一轮的打点那时还没写（见 `awaitSqlScalar`）。
+    const query = await awaitSqlScalar(
+      `select query_text from sys_retrieval_trace where user_id = ${loginUserId} `
+        + `and id > ${traceFloor} order by id desc limit 1;`,
+      '本轮问答的检索打点落库（③ 的 query）',
     )
     check((query || '').includes('这张图讲的是什么'), `检索用的 query 丢了原问题：${query}`)
     check(
