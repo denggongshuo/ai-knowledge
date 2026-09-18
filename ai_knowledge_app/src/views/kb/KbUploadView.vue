@@ -426,6 +426,36 @@ function qualityText(d: KbDocRow) {
  * 旧行（`disposition` 为 null）按"未知"计 —— 它们落库时只有"内容缺失"一种语义
  * （那时没有 OCR/VL），所以计入是**还原当时的事实**，不是猜。
  */
+/**
+ * 「安全」列的标记（`T-O04` · `优化/O4` 步 3）。返回 `null` = **不显示任何标记**。
+ *
+ * 🔴 **三态，少一态就会误导**：
+ * - `'SKIPPED'` → 「未扫描」（黄色）—— ClamAV 未部署 / 连不上，**没扫成**；
+ * - `null` / `undefined` → **不显示**（返回 null）—— 该行早于扫描能力上线，**从没试过**；
+ * - `'CLEAN'` → 「已扫描」（绿色）；`'INFECTED'` → 「已拦截」（红色）。
+ *
+ * ⚠️ 前两者**绝不能合并**：把历史行也标成「未扫描」会让运维以为清理任务漏跑了，
+ * 而"这台机器本来就没装"与"这批老数据没扫过"是两件完全不同的事。
+ * 这条与后端 `V28` 把 `scan_status` 留成可空是**同一条纪律的两端**。
+ *
+ * ⚠️ 也**不显示** `has_macro`：宏是「放行 + 标记」，标记的落点是下载/预览页
+ * （见 `O4` §3 流程图），不在这个列表里 —— 列表上多一列会让它被淹没在
+ * 大多数文档都有的"无宏"里。真要做的话，等有消费方时再说。
+ */
+function scanTag(d: KbDocRow): { text: string; type: 'success' | 'danger' | 'warning' } | null {
+  switch (d.scanStatus) {
+    case 'CLEAN':
+      return { text: '已扫描', type: 'success' }
+    case 'INFECTED':
+      return { text: '已拦截', type: 'danger' }
+    case 'SKIPPED':
+      return { text: '未扫描', type: 'warning' }
+    default:
+      // `null` / `undefined` = 从没试过（本批之前的历史行）—— **不显示**，理由见上
+      return null
+  }
+}
+
 const actionableIssues = computed(() => issues.value.filter((i) => i.disposition !== 'EMPTY_PAGE'))
 const issueDocCount = computed(() => new Set(actionableIssues.value.map((i) => i.docId)).size)
 function sizeText(b: number) {
@@ -725,6 +755,20 @@ function gotoIssue() {
             <el-tag size="small" :type="qualityText(row).type" :effect="qualityText(row).type === 'danger' ? 'light' : 'plain'">
               {{ qualityText(row).text }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <!--
+          安全扫描（`T-O04` · `优化/O4` 步 3）。**独立一列而不是并进「解析质量」**：
+          扫描发生在解析**之前**，它的结论会决定这篇文档**能不能被解析** ——
+          把两件不同阶段的事塞进一列，读的人会以为"质量差的文档"与"有问题的文档"是一回事。
+          ⚠️ 三态必须分开显示（见 `scanTag` 的注释），其中 `null` **不显示标记**。
+        -->
+        <el-table-column label="安全" width="90">
+          <template #default="{ row }">
+            <el-tag v-if="scanTag(row)" size="small" :type="scanTag(row)!.type" effect="plain">
+              {{ scanTag(row)!.text }}
+            </el-tag>
+            <span v-else class="muted">—</span>
           </template>
         </el-table-column>
         <el-table-column prop="owner" label="上传人" width="90" />

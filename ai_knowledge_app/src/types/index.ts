@@ -578,6 +578,25 @@ export interface KbDocRow {
   pagesWithText?: number
   owner: string
   uploadedAt: string
+  /**
+   * 恶意扫描结论（`T-O04` · `优化/O4` 步 3）。
+   *
+   * 🔴 **三态，少一态就会误导**：
+   * - `'SKIPPED'` = **没扫成**（ClamAV 未部署 / 连不上）→ 列表上显示「未扫描」；
+   * - `null` / `undefined` = **该行早于扫描能力上线**（从没试过）→ **不显示**那个标记；
+   * - `'CLEAN'` / `'INFECTED'` = 扫过。
+   *
+   * ⚠️ 前两者绝不能合并显示：把历史行也标成「未扫描」会让运维以为清理任务漏跑了，
+   * 而那是两件完全不同的事（"这台机器本来就没装" vs "这批老数据没扫过"）。
+   */
+  scanStatus?: 'CLEAN' | 'INFECTED' | 'SKIPPED' | null
+  /**
+   * 是否含宏（`T-O04` 步 4）。
+   *
+   * ⚠️ `null` / `undefined` = **判不了或没检测过**，**不是**"没有宏" ——
+   * 所以不要用 `!hasMacro` 去判断"没有宏"，那会把"没检测过"也当成"干净"。
+   */
+  hasMacro?: boolean | null
 }
 
 /**
