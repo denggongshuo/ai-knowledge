@@ -67,6 +67,9 @@ public class RetrievalService {
     /** `T-705`：把命中的表格子块换成它所在的表（`G5-6`）。 */
     private final TableLookupService tableLookupService;
 
+    /** `T-507` 的 HyQ 半边：命中假设问句时换成源块正文（见该类的 javadoc）。 */
+    private final HyqSourceService hyqSourceService;
+
     /** `T-709`：重建索引期间降级为关键词检索。 */
     private final RebuildStateService rebuildStateService;
 
@@ -133,6 +136,12 @@ public class RetrievalService {
         // 它只换内容：命中子块（一行）→ 父块或其行窗口（`TableLookup`）。
         long tableStart = System.nanoTime();
         List<RetrievedChunk> chunks = tableLookupService.apply(rerank.chunks());
+        // ---------- ⑤.6 HyQ 回落（T-507 的挂起半边 · 汇总 §4-271）----------
+        // 与表格回表**同一类动作**（把"检索到的那条"换成"该喂给模型的那份"），
+        // 所以计在同一段耗时里。⚠️ 不为它单开一段：`G5-12` 要的是
+        // `totalMs ≈ 各段之和`，而"回表"这个词本来就覆盖这两种查找
+        // （区别只是触发它的块类型不同）。多开一段反而会让那个等式失衡
+        chunks = hyqSourceService.apply(chunks);
         long tableMillis = elapsed(tableStart);
 
         // ---------- ⑥ 契约 ----------

@@ -49,13 +49,28 @@ class IndexEnhanceFlowTest {
         static final String REPLY = """
                 {"summary": "本探针文档说明接口鉴权的令牌方式与错误码约定。",
                  "labels": ["接口设计", "鉴权"],
-                 "relations": [{"subject": "刷新令牌", "predicate": "换取", "object": "访问令牌"}]}
+                 "relations": [{"subject": "刷新令牌", "predicate": "换取", "object": "访问令牌"}],
+                 "chapters": [{"title": "3. 接口设计", "summary": "本章讲鉴权与令牌有效期。"}]}
                 """;
 
+        /** 分片级 HyQ 那一跳的回复。 */
+        static final String HYQ_REPLY = """
+                {"questions": ["令牌有效期是多久？", "鉴权用的是什么方式？"]}
+                """;
+
+        /** 与 {@code IndexEnhancerTest} 同一个标记：用来分辨两类提示词。 */
+        static final String HYQ_MARKER = "推测**用户可能怎样提问**";
+
+        /**
+         * ⚠️ 必须**按提示词分辨**该回哪一种：`T-507` 落地后一次 enhance 有
+         * 文档级 1 次 + 分片级 n 次两类调用。对所有提示词回同一个字符串的话，
+         * HyQ 那一跳拿到的是一份没有 {@code questions} 的 JSON，
+         * 于是"HyQ 解析失败"与"模型答不出问题"分不开，用例也就断言不到真行为。
+         */
         @Bean
         @Primary
         ChatCaller stubChatCaller() {
-            return prompt -> REPLY;
+            return prompt -> prompt.contains(HYQ_MARKER) ? HYQ_REPLY : REPLY;
         }
     }
 
@@ -85,9 +100,9 @@ class IndexEnhanceFlowTest {
     void summaryBlockIsProducedAndStored() {
         long docId = insertProbeDoc();
         List<Block> blocks = List.of(
-                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null),
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
                 new Block("接口鉴权采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
-                        "3. 接口设计", 2, 1, null));
+                        "3. 接口设计", 2, 1, null, null));
 
         IndexEnhancer.Result enhanced = indexEnhancer.enhance(doc(), blocks);
         assertThat(enhanced.status())
@@ -96,9 +111,11 @@ class IndexEnhanceFlowTest {
 
         int written = recordWriter.replaceChunks(docId, probeKbIdOf(docId), enhanced.blocks());
 
+        // 限定 `title_path is null` 取**文档级**那一条：章节级摘要带标题路径，
+// 两者现在都是 SUMMARY 类型（T-O09 步 6 之后）
         Map<String, Object> summary = jdbcTemplate.queryForMap(
                 "select chunk_type, parent_id, raw_content from sys_chunk "
-                        + "where doc_id = ? and chunk_type = 'SUMMARY'", docId);
+                        + "where doc_id = ? and chunk_type = 'SUMMARY' and title_path is null", docId);
         assertThat(summary.get("chunk_type")).isEqualTo("SUMMARY");
         assertThat(summary.get("parent_id"))
                 .as("`D-5` §1.6 明写摘要块 `parentId = null`。"
@@ -107,27 +124,79 @@ class IndexEnhanceFlowTest {
         assertThat((String) summary.get("raw_content")).contains("令牌方式");
 
         assertThat(count("select count(*) from sys_chunk where doc_id = ? and chunk_type = 'SUMMARY'", docId))
-                .as("`G4-9` 的判据原文：「存在 SUMMARY 类型分片」").isEqualTo(1);
+                .as("`G4-9` 的判据原文：「存在 SUMMARY 类型分片」。⚠️ 期望 2 而不是 1 —— "
+                        + "`T-O09` 步 6 的章节级摘要**复用同一次调用**产出，"
+                        + "所以同一篇里有一条文档级 + 一条章节级")
+                .isEqualTo(2);
 
         assertThat(count("select count(*) from sys_chunk where doc_id = ? and title_path = ?",
                 docId, "3. 接口设计"))
                 .as("`G4-9` 的另一半：「分片内容含标题路径」。⚠️ 本批之前**没人证过这一列** —— "
                         + "`ChunkingServiceTest` 只断言了 Block 上的 titlePath 算得对，"
                         + "而「算对了但没写进库」是两条独立的失败路径（写入侧是 blankToNull）。"
-                        + "期望 2 = 标题块自身 + 它下面的正文块")
-                .isEqualTo(2);
+                        + "期望 4 = 标题块自身 + 它下面的正文块 + **章节摘要**（继承章节标题）+ "
+                        + "**HyQ 块**（继承源块的标题路径，好让「这条问句属于哪一节」跟着它进检索）")
+                .isEqualTo(4);
         assertThat(count("select count(*) from sys_chunk where doc_id = ? and chunk_type = 'SUMMARY' "
                 + "and title_path is null", docId))
                 .as("摘要块是**文档级**的，不属于任何一节 —— 空标题路径落库为 NULL 而不是空串"
                         + "（空串与 NULL 在库里是两种值，见 DocRecordWriter#blankToNull）")
                 .isEqualTo(1);
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and parent_id is null", docId))
+                .as("库里真正落下的**顶层块** = 标题 + 正文 + 文档摘要 + 章节摘要 + HyQ = 5")
+                .isEqualTo(5);
         assertThat(written)
-                .as("顶层块 = 标题 + 正文 + 摘要 = 3")
-                .isEqualTo(3);
+                .as("⚠️ `replaceChunks` 返回的是**计入总数**的顶层块 = 4，**不含 HyQ** —— "
+                        + "`BlockType#countsInChunkTotal()` 只对它返回 false（D-5 §1.5）。"
+                        + "把「块写进去了」与「块算不算进总数」分成两个断言，"
+                        + "是因为混在一起时，少写一个 HyQ 与 HyQ 被误计入总数**都表现为同一个数字**")
+                .isEqualTo(4);
         assertThat(count("select chunk_count from sys_document where id = ?", docId))
-                .as("chunk_count 由 replaceChunks 回填，摘要块计入（`BlockType#countsInChunkTotal()` "
-                        + "只对 HYPOTHESIS_QA 返回 false）")
-                .isEqualTo(3);
+                .as("chunk_count 与 replaceChunks 的返回值同源（都用 countsInChunkTotal 过滤）")
+                .isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("判据9（G4-9 第三条）：HyQ 分片真的落库，且 source_chunk_id 指回源块")
+    void hyqBlockIsStoredWithItsSource() {
+        long docId = insertProbeDoc();
+        List<Block> blocks = List.of(
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
+                new Block("接口鉴权采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
+                        "3. 接口设计", 2, 1, null, null));
+
+        IndexEnhancer.Result enhanced = indexEnhancer.enhance(doc(), blocks);
+        recordWriter.replaceChunks(docId, probeKbIdOf(docId), enhanced.blocks());
+
+        Map<String, Object> hyq = jdbcTemplate.queryForMap(
+                "select parent_id, source_chunk_id, raw_content, chunk_type from sys_chunk "
+                        + "where doc_id = ? and chunk_type = 'HYPOTHESIS_QA'", docId);
+        assertThat(hyq.get("chunk_type")).isEqualTo("HYPOTHESIS_QA");
+        assertThat(hyq.get("parent_id"))
+                .as("HyQ 是顶层块 —— 挂父块会撞 G4-6 的全局断言")
+                .isNull();
+        assertThat((String) hyq.get("raw_content"))
+                .as("块内容是**问句**（召回用），不是源文")
+                .contains("令牌有效期是多久？");
+
+        Long sourceId = ((Number) hyq.get("source_chunk_id")).longValue();
+        Map<String, Object> source = jdbcTemplate.queryForMap(
+                "select chunk_type, raw_content from sys_chunk where id = ?", sourceId);
+        assertThat(source.get("chunk_type"))
+                .as("⚠️ 这一条就是 `汇总.md` §4-271 的答案：命中 HyQ 后按 source_chunk_id "
+                        + "取回的是**源块**（那段含参数的正文），而不是那条问句")
+                .isEqualTo("PARAGRAPH");
+        assertThat((String) source.get("raw_content")).contains("令牌有效期 2 小时");
+
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and chunk_type = 'HYPOTHESIS_QA' "
+                + "and source_chunk_id is null", docId))
+                .as("每一个 HyQ 块都必须挂上来源；悬空是**降级路径**，不该出现在正常流程里")
+                .isZero();
+
+        assertThat(count("select count(*) from sys_chunk where doc_id = ? and source_chunk_id is not null "
+                + "and chunk_type <> 'HYPOTHESIS_QA' and chunk_type <> 'SUMMARY'", docId))
+                .as("除 HyQ 与章节摘要外，没有别的块类型该有来源")
+                .isZero();
     }
 
     @Test
@@ -137,7 +206,7 @@ class IndexEnhanceFlowTest {
         // 空正文 → EMPTY_INPUT，等同于"这次增强没产出摘要"，走的是与关掉开关同一条落库路径
         IndexEnhancer.Result enhanced = indexEnhancer.enhance(
                 new ParsedDocument("PDF", 1, 0, "", List.of(), List.of(), 0, 0, List.of(), List.of()),
-                List.of(new Block("正文一段", BlockType.PARAGRAPH, "", 1, 1, null)));
+                List.of(new Block("正文一段", BlockType.PARAGRAPH, "", 1, 1, null, null)));
 
         assertThat(enhanced.status()).isEqualTo(IndexEnhancer.Status.EMPTY_INPUT);
         recordWriter.replaceChunks(docId, probeKbIdOf(docId), enhanced.blocks());

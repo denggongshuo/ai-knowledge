@@ -28,13 +28,25 @@ import java.util.List;
  * @param pageNo         所在页码，1-based；**非分页格式（TXT/MD）为 {@code null}**
  * @param parentOrderNo  **表格子块**指向其父块的 {@link #orderNo}；**顶层块为 {@code null}**。
  *                       ⚠️ 禁用 {@code 0} 当哨兵（D-5 §1.2 硬口径：{@code 0} 会与真实 id 混淆）
+ * @param sourceOrderNo  **HyQ 块**（`HYPOTHESIS_QA`）指向它由哪个块生成 —— 即"这条假设问句
+ *                       是从哪段正文推出来的"。其余块为 {@code null}。
+ *                       <p>⚠️ 它**不是** {@link #parentOrderNo}，两者不能合并：
+ *                       `G4-6` 的 SQL 断言（已收口）要求「凡有 {@code parent_id} 的块，
+ *                       父块必须是 {@code TABLE}`」—— 把 HyQ 挂到源块下面会让那条断言当场转红。
+ *                       而 `D-5` 原本**没给 HyQ 块任何回指源块的字段**，于是检索命中一个 HyQ 块时
+ *                       "拿什么给大模型"没有答案（`汇总.md` §4-271 挂了很久的判据）。
+ *                       本字段就是那个答案：命中后按它取**源块正文**喂给模型
+ *                       —— 问句只用于召回，不用于回答。
+ *                       <p>落库时它被解析成 `sys_chunk.source_chunk_id`（与 `parentOrderNo`
+ *                       解析成 `parent_id` 是同一跳：先插全部块拿到 id，再回填）。
  */
 public record Block(String rawContent,
                     BlockType blockType,
                     String titlePath,
                     int orderNo,
                     Integer pageNo,
-                    Integer parentOrderNo) {
+                    Integer parentOrderNo,
+                    Integer sourceOrderNo) {
 
     /** 紧凑构造器：内容为 null 与空串等价，下游不必两处判空。 */
     public Block {

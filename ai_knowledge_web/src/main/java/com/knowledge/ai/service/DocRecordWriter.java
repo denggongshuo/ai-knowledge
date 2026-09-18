@@ -283,8 +283,36 @@ public class DocRecordWriter {
                 if (!block.isTopLevel()) {
                     continue;
                 }
-                parentIds.put(block.orderNo(), insertChunk(docId, kbId, block, null, now));
+                // 第一趟先把顶层块落库拿 id。⚠️ 这里**不能**顺手解析 source：
+                // 源块在列表里的位置不保证在 HyQ 之前（本趟是顺序插的），
+                // 早解析会拿到 null —— 而"偶尔少一条来源"正是最难发现的那种缺陷
+                parentIds.put(block.orderNo(), insertChunk(docId, kbId, block, null, null, now));
             }
+
+            // 第二趟：回填 HyQ 的来源。此时**全部**顶层块的 id 都已就绪，与顺序无关
+            for (Block block : blocks) {
+                if (!block.isTopLevel() || block.sourceOrderNo() == null) {
+                    continue;
+                }
+                Long sourceId = parentIds.get(block.sourceOrderNo());
+                if (sourceId == null) {
+                    // 引用了不存在的源块 —— 内部不一致，但**不该让整篇解析失败**：
+                    // HyQ 块本身仍然有用（它照样能被检索命中），缺的只是"命中后喂什么"。
+                    // 写 NULL 并留痕，与检索侧的悬空降级是同一条口径
+                    log.warn("HyQ 块指向不存在的源块，来源记为 NULL（不影响该块的检索）："
+                                    + "docId={} hyqOrderNo={} sourceOrderNo={}",
+                            docId, block.orderNo(), block.sourceOrderNo());
+                    continue;
+                }
+                entityManager.createNativeQuery(
+                                "update sys_chunk set source_chunk_id = :sourceId "
+                                        + "where doc_id = :docId and order_no = :orderNo")
+                        .setParameter("sourceId", sourceId)
+                        .setParameter("docId", docId)
+                        .setParameter("orderNo", block.orderNo())
+                        .executeUpdate();
+            }
+
             for (Block block : blocks) {
                 if (block.isTopLevel()) {
                     continue;
@@ -298,7 +326,8 @@ public class DocRecordWriter {
                             "分片结果自相矛盾：第 " + block.orderNo() + " 块指向不存在的父块 #"
                                     + block.parentOrderNo() + "，本次解析未写入任何分片");
                 }
-                insertChunk(docId, kbId, block, parentId, now);
+                // 子块（表格行）永远是"行属于表"，不会同时是 HyQ 的来源 —— 传 null
+                insertChunk(docId, kbId, block, parentId, null, now);
             }
 
             topLevel = (int) blocks.stream()
@@ -337,17 +366,23 @@ public class DocRecordWriter {
      * 不返回自增键。{@code (doc_id, order_no)} 在本次写入内唯一（orderNo 是 1..N），
      * 且刚做过全删，所以这条回查是确定的。
      */
-    private Long insertChunk(long docId, long kbId, Block block, Long parentId, LocalDateTime now) {
+    private Long insertChunk(long docId, long kbId, Block block, Long parentId,
+                             Long sourceChunkId, LocalDateTime now) {
         entityManager.createNativeQuery("""
-                        insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, title_path,
-                                               raw_content, content_sha256, order_no, page_no, created_at)
-                        values (:docId, :kbId, :chunkType, :parentId, :titlePath,
-                                :rawContent, :contentSha256, :orderNo, :pageNo, :now)
+                        insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, source_chunk_id,
+                                               title_path, raw_content, content_sha256, order_no,
+                                               page_no, created_at)
+                        values (:docId, :kbId, :chunkType, :parentId, :sourceChunkId,
+                                :titlePath, :rawContent, :contentSha256, :orderNo, :pageNo, :now)
                         """)
                 .setParameter("docId", docId)
                 .setParameter("kbId", kbId)
                 .setParameter("chunkType", block.blockType().name())
                 .setParameter("parentId", parentId)
+                // `T-507` 的 HyQ 半边：只有 HYPOTHESIS_QA 有值，其余块为 null。
+                // 与 parent_id 同一跳解析（orderNo → 已落库的 id），只是语义不同：
+                // 那是**结构上的父子**，这是**生成上的来源**
+                .setParameter("sourceChunkId", sourceChunkId)
                 .setParameter("titlePath", blankToNull(block.titlePath()))
                 .setParameter("rawContent", block.rawContent())
                 // `O9` 步 1：**块的原始内容**的指纹，不是投影文本（含标题路径）的 ——

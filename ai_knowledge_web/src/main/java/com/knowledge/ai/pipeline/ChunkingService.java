@@ -86,7 +86,7 @@ public class ChunkingService {
                     pushToc(toc, el.level(), el.text());
                     // 标题自身也是原子块（《06》§1.5：「标题、代码块、完整列表同为结构边界切出的原子块」）
                     blocks.add(new Block(el.text(), BlockType.HEADING, titlePath(toc),
-                            nextOrderNo(blocks), el.pageNo(), null));
+                            nextOrderNo(blocks), el.pageNo(), null, null));
                 }
                 case PARAGRAPH -> pending.add(new PendingText(el.text(), el.pageNo()));
                 case TABLE -> {
@@ -125,7 +125,7 @@ public class ChunkingService {
 
         for (String piece : splitForFallback(text, options)) {
             blocks.add(new Block(piece, BlockType.PARAGRAPH, titlePath,
-                    nextOrderNo(blocks), pageNo, null));
+                    nextOrderNo(blocks), pageNo, null, null));
         }
     }
 
@@ -152,12 +152,12 @@ public class ChunkingService {
 
         int parentOrder = nextOrderNo(blocks);
         blocks.add(new Block(rendered.markdown(), BlockType.TABLE, titlePath,
-                parentOrder, el.pageNo(), null));
+                parentOrder, el.pageNo(), null, null));
         // I-4 的前提：父块整表封存、**不被切分**（所以这里不调用 splitForFallback）。
         // 子块逐行产出，每行 = 一条可独立检索的自然语言。
         for (String row : rendered.linearRows()) {
             blocks.add(new Block(row, BlockType.TABLE, titlePath,
-                    nextOrderNo(blocks), el.pageNo(), parentOrder));
+                    nextOrderNo(blocks), el.pageNo(), parentOrder, null));
         }
     }
 

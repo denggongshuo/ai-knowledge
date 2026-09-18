@@ -11,7 +11,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 索引增强（`T-507` · `D-5` §1.6 的**文档级**那一次调用）。
@@ -57,6 +59,18 @@ public class IndexEnhancer {
 
     /** 提示词里正文的 token 预算（`windowTokens` 口径）。 */
     private static final int INPUT_TOKEN_BUDGET = 3000;
+
+    /**
+     * 单个块送 HyQ 提示词时的字符上限。
+     *
+     * <p>取 2000：门控已经挡掉了长叙述段，走到这里的块本来就短；
+     * 剩下的超长块只有**表格父块**（整表 Markdown 可能上万字）。
+     * 截断它们是必须的（不能把一个 200 行的表整个塞进一次调用），
+     * 而这里截断**不告知模型**是可接受的 —— 与文档级摘要不同：
+     * 摘要缺了半篇还不说就是撒谎，而 HyQ 只要"能不能问出问题"，
+     * 不需要"是否看全了"这个元信息
+     */
+    private static final int HYQ_INPUT_MAX = 2000;
 
     private final ChatCaller chatCaller;
 
@@ -118,14 +132,27 @@ public class IndexEnhancer {
      * @param labels    内容标签；模型没给就是空列表（**不是 null**）
      * @param relations 实体关系；模型没给就是空列表。落点见类 javadoc（`T-C00`）
      */
-    public record Enhancement(String summary, List<String> labels, List<Relation> relations) {
+    public record Enhancement(String summary, List<String> labels, List<Relation> relations,
+                              List<Chapter> chapters) {
 
         public Enhancement {
             labels = labels == null ? List.of() : List.copyOf(labels);
             relations = relations == null ? List.of() : List.copyOf(relations);
+            chapters = chapters == null ? List.of() : List.copyOf(chapters);
         }
 
         public record Relation(String subject, String predicate, String object) {
+        }
+
+        /**
+         * 一章的摘要（`T-O09` 步 6）。
+         *
+         * <p>⚠️ {@code title} 用来**回挂到标题块**：模型被要求"与内容里的标题逐字一致"，
+         * 落库时按它找 {@code HEADING} 块，再把 {@code source_chunk_id} 指过去。
+         * 找不到就**跳过该章并留痕**（模型改写标题是常见的"不听话"形态）——
+         * 不硬凑一个 summary 块：一条挂不上任何章节的"章节摘要"比没有更误导。
+         */
+        public record Chapter(String title, String summary) {
         }
     }
 
@@ -173,13 +200,116 @@ public class IndexEnhancer {
 
         List<Block> withSummary = new ArrayList<>(blocks);
         withSummary.add(new Block(enhancement.summary(), BlockType.SUMMARY, "",
-                withSummary.size() + 1, null, null));
+                withSummary.size() + 1, null, null, null));
+
+        // `T-O09` 步 6：章节级摘要。**复用同一次调用**（`I-10`）——
+        // 这里只是把同一次返回里的 chapters 落成块，**没有第二次 LLM 调用**
+        int chapterBlocks = appendChapterSummaries(withSummary, blocks, enhancement);
+
+        // `T-507` 的 HyQ 半边 + `T-O09` 步 5 的门控
+        int hyqBlocks = appendHypotheticalQuestions(withSummary, blocks);
 
         return new Result(List.copyOf(withSummary), Status.OK,
                 "摘要 " + enhancement.summary().length() + " 字 · 标签 " + enhancement.labels().size()
-                        + " 个 · 关系 " + enhancement.relations().size() + " 条（提示词 "
+                        + " 个 · 关系 " + enhancement.relations().size() + " 条 · 章节摘要 "
+                        + chapterBlocks + " 条 · 假设问句 " + hyqBlocks + " 条（提示词 "
                         + EnhancePrompts.VERSION + "）",
                 enhancement);
+    }
+
+    /**
+     * 把模型给出的逐章摘要落成 `SUMMARY` 块（`T-O09` 步 6）。
+     *
+     * <h3>为什么按标题回挂，而不是按顺序</h3>
+     * <p>模型被要求"标题与内容里逐字一致"，但仍可能改写。**按顺序**回挂（第 1 条摘要
+     * 配第 1 个标题）在模型少给一章时会**整体错位** —— 那种错位不会报错，
+     * 只会让"第 3 章的摘要"挂在第 4 章上，且**没人看得出来**。
+     * 按标题精确匹配则最坏情况是"少一章摘要"，错误是**可发现**的（warn 日志）。
+     *
+     * <p>`source_chunk_id` 指向那个标题块：章节摘要的"来源"就是它所属的那一节标题，
+     * 与 HyQ 用的是同一个字段、同一套检索侧回落口径。
+     *
+     * @return 真正落成块的章节数（与模型给出条数的差额会体现在日志里）
+     */
+    private int appendChapterSummaries(List<Block> out, List<Block> sourceBlocks, Enhancement enhancement) {
+        if (enhancement.chapters().isEmpty()) {
+            return 0;
+        }
+        // 标题正文 → orderNo。同名标题（如两章都叫"概述"）取**第一个**：
+        // 按标题匹配本来就无法区分同名，取第一个至少是确定的（比随机好）
+        Map<String, Integer> headingByTitle = new HashMap<>();
+        for (Block block : sourceBlocks) {
+            if (block.blockType() == BlockType.HEADING) {
+                headingByTitle.putIfAbsent(block.rawContent().strip(), block.orderNo());
+            }
+        }
+
+        int produced = 0;
+        for (Enhancement.Chapter chapter : enhancement.chapters()) {
+            Integer headingOrder = headingByTitle.get(chapter.title().strip());
+            if (headingOrder == null) {
+                // 模型改写了标题 —— 跳过并留痕。硬凑一条会产出"挂不上任何章节"的摘要块，
+                // 那比少一条更糟：它在检索里会以"某章摘要"的形态出现，却查不到是哪章
+                log.warn("章节摘要的标题在块集里找不到对应标题块，已跳过：title={}", chapter.title());
+                continue;
+            }
+            out.add(new Block(chapter.summary(), BlockType.SUMMARY, chapter.title(),
+                    out.size() + 1, null, null, headingOrder));
+            produced++;
+        }
+        return produced;
+    }
+
+    /**
+     * 逐块生成 HyQ（`T-507` 的挂起半边），**先过 {@link HyqGate}**（`T-O09` 步 5）。
+     *
+     * <h3>成本形状</h3>
+     * <p>这是本方案里唯一**随文档规模线性增长**的 LLM 成本（`O9`：索引侧成本 63% 在此）。
+     * 门控的职责就是把"不值得问的块"挡在调用之前 —— 被挡掉的块**一次调用都不产生**。
+     *
+     * <h3>失败不牵连</h3>
+     * <p>单个块的调用失败 / 返回不可解析，都只让**那一个块**没有 HyQ，不影响文档级增强，
+     * 也不影响其它块。理由与文档级一致：增强是锦上添花，不该让一篇可用的文档失败。
+     *
+     * @return 真正落成块的 HyQ 条数（一个源块最多落**一条** HyQ 块，里面可含多句）
+     */
+    private int appendHypotheticalQuestions(List<Block> out, List<Block> sourceBlocks) {
+        int produced = 0;
+        int skipped = 0;
+        int attempted = 0;
+
+        for (Block block : sourceBlocks) {
+            String reason = HyqGate.reason(block);
+            if (reason == null) {
+                skipped++;
+                continue;
+            }
+            attempted++;
+            List<String> questions;
+            try {
+                questions = parseQuestions(chatCaller.call(
+                        EnhancePrompts.hypotheticalQuestions(clip(block.rawContent(), HYQ_INPUT_MAX),
+                                EnhancePrompts.MAX_HYQ_QUESTIONS)));
+            } catch (Exception ex) {
+                // 与文档级同一条纪律：模型侧异常不往上抛
+                log.warn("HyQ 生成失败（该块不出假设问句，不影响其它块）：orderNo={} err={}",
+                        block.orderNo(), readable(ex));
+                continue;
+            }
+            if (questions.isEmpty()) {
+                continue;
+            }
+            // 多条问句合成一个块、用换行分隔：**一个源块一条 HyQ 块**。
+            // 若一块一条问句，检索池里会出现同一段正文的多条近重复向量（互相挤占 top-k 名额），
+            // 而 `D-5` 的口径本来就是"分片级"（n 次调用 = n 个源块），不是"问句级"
+            out.add(new Block(String.join("\n", questions), BlockType.HYPOTHESIS_QA,
+                    block.titlePath(), out.size() + 1, block.pageNo(), null, block.orderNo()));
+            produced++;
+        }
+
+        log.info("[增强] HyQ：门控放行 {} 个块 / 跳过 {} 个块，产出 {} 条假设问句块（{}）",
+                attempted, skipped, produced, EnhancePrompts.VERSION);
+        return produced;
     }
 
     // ==================================================================
@@ -331,7 +461,56 @@ public class IndexEnhancer {
             }
         }
 
-        return new Enhancement(summary, labels, relations);
+        List<Enhancement.Chapter> chapters = new ArrayList<>();
+        for (JsonNode ch : root.path("chapters")) {
+            String title = ch.path("title").asText("").strip();
+            String text = clip(ch.path("summary").asText("").strip(), EnhancePrompts.MAX_SUMMARY_CHARS);
+            // 标题或摘要任一为空就丢：挂不上标题的章节摘要无处安放（见 Chapter 的 javadoc）
+            if (!title.isEmpty() && !text.isEmpty()
+                    && chapters.size() < EnhancePrompts.MAX_CHAPTERS) {
+                chapters.add(new Enhancement.Chapter(title, text));
+            }
+        }
+
+        return new Enhancement(summary, labels, relations, chapters);
+    }
+
+    /**
+     * 解析分片级 HyQ 的返回（`{"questions": [...]}`）。
+     *
+     * <p>与 {@link #parse} 分开而不是复用：两者的**必需字段不同**。
+     * 文档级没有 {@code summary} 就算整次调用白费（所以那里缺 summary 要抛）；
+     * 而 HyQ 给不出问题**是合法结果**（`O9` 的门控精神就是"不是每个块都值得问"），
+     * 所以这里返回空列表而不是抛异常 —— 抛异常会把"这个块没问题可问"
+     * 记成一次失败，污染增强成功率的统计。
+     *
+     * @return 问句列表；解析不出结构时也是空列表（调用方无需 try/catch）
+     */
+    static List<String> parseQuestions(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        try {
+            String json = stripFences(raw.strip());
+            int start = json.indexOf('{');
+            int end = json.lastIndexOf('}');
+            if (start < 0 || end <= start) {
+                return List.of();
+            }
+            JsonNode root = MAPPER.readTree(json.substring(start, end + 1));
+            List<String> questions = new ArrayList<>();
+            for (JsonNode q : root.path("questions")) {
+                String text = q.asText("").strip();
+                if (!text.isEmpty() && questions.size() < EnhancePrompts.MAX_HYQ_QUESTIONS) {
+                    questions.add(text);
+                }
+            }
+            return List.copyOf(questions);
+        } catch (Exception ex) {
+            // 与文档级不同：这里**不抛**。HyQ 是锦上添花，解析失败不该升级成"增强失败"
+            log.warn("HyQ 输出无法解析，本次该块不产出假设问句：{}", readable(ex));
+            return List.of();
+        }
     }
 
     /** 剥掉 ```json ... ``` 围栏（模型最常见的"不听话"形态，剥掉即可，不值得判失败）。 */

@@ -20,9 +20,16 @@ public final class CacheConstants {
     /**
      * 检索增强 prompt 的版本号。
      *
-     * <p>**改 `src/main/resources/prompts/` 下任何一个模板，都要把它 +1。**
+     * <p>**改任何一个增强提示词模板，都要把它 +1。**
+     *
+     * <p>⚠️ 2026-09-18（`S5-M08-B`）由 `v1` → `v2`：`EnhancePrompts` 的**文档级提示词**
+     * 改了输出契约（新增 `chapters` —— 章节级摘要复用同一次调用，`I-10`），
+     * 并新增了分片级 HyQ 提示词。虽然这些模板是**写在 Java 里的字符串**而不是
+     * `resources/prompts/` 下的文件，但本版本号的用途是"旧缓存语义失效"，
+     * 与模板存在哪儿无关 —— 不改它，`ak:enhance:v1:*` 的旧缓存会继续命中，
+     * 而它们**没有 chapters 字段**，表现为"改了提示词却没生效"。
      */
-    public static final String PROMPT_VERSION = "v1";
+    public static final String PROMPT_VERSION = "v2";
 
     /** 检索增强结果缓存前缀：{@code ak:enhance:{promptVersion}:{md5(内容)}}。 */
     public static final String ENHANCE = PREFIX + "enhance:";

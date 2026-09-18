@@ -170,4 +170,23 @@ public record RetrievedChunk(String chunkId,
                 score, scoreKind, rank, fusionRank, rerankScore, rankedScore, channelRanks, warn,
                 newTableContext);
     }
+
+    /**
+     * HyQ 回落结果（`T-507` 的挂起半边）：把**假设问句**换成它的**源块正文**。
+     *
+     * <p>命中一条 {@code HYPOTHESIS_QA} 分片时，它的内容是**问句**
+     * （"登录后多久需要重新认证？"）—— 把问句原样喂给大模型，模型只能看到一个
+     * 孤零零的提问，答不出任何东西。问句的作用是**召回**（匹配用户的另一种问法），
+     * 回答要靠它由之生成的**源块正文**（见 {@code sys_chunk.source_chunk_id}）。
+     *
+     * <p>与 {@link #withTableContext} 是同一类改写（把"检索到的那一条"换成
+     * "该喂给模型的那一份"），只是另一条触发路径。{@code chunkId}/{@code score}
+     * 一律不动 —— 引用角标与打点明细指的还是**真正被检索到的那条分片**，
+     * 换掉的只是内容。
+     */
+    public RetrievedChunk withHyqSource(String sourceText) {
+        return new RetrievedChunk(chunkId, docId, kbId, blockType, titlePath, sourceText,
+                score, scoreKind, rank, fusionRank, rerankScore, rankedScore, channelRanks, warn,
+                tableContext);
+    }
 }

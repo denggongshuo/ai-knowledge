@@ -107,7 +107,7 @@ class ChunkVectorizerTest {
     void projectionMatchesChunkViews() {
         // 同一份内容、两条路：Block（分片期）vs VectorChunk（已落库）——
         // 两者必须给出逐字节相同的文本，否则"重建索引"与"首次索引"会产出不同的向量
-        Block block = new Block("正文内容", BlockType.PARAGRAPH, "3. 接口 > 3.1 鉴权", 5, 2, null);
+        Block block = new Block("正文内容", BlockType.PARAGRAPH, "3. 接口 > 3.1 鉴权", 5, 2, null, null);
         VectorChunk row = chunk(7, "PARAGRAPH", "正文内容", "3. 接口 > 3.1 鉴权", null);
 
         assertThat(row.vectorText()).isEqualTo(ChunkViews.defaultVectorText(block));

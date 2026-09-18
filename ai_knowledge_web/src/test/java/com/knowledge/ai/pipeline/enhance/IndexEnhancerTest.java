@@ -26,11 +26,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class IndexEnhancerTest {
 
-    /** 假实现：记下提示词、返回预置文本。**不联网、毫秒级**。 */
+    /**
+     * 假实现：记下提示词、返回预置文本。**不联网、毫秒级**。
+     *
+     * <p>⚠️ `T-507` 落地后**一次 enhance 会产生两类调用**：文档级 1 次 + 分片级 HyQ n 次
+     * （`D-5` §1.6）。所以这个替身必须**按提示词分辨该回哪一种** ——
+     * 早期版本对所有提示词回同一个字符串，那在只有文档级调用时看不出问题，
+     * 而现在 HyQ 那一跳会拿到一份没有 `questions` 的 JSON，
+     * 于是"HyQ 解析失败"和"模型答不出问题"长得一模一样，用例断言不到真正的行为。
+     */
     private static final class FakeCaller implements ChatCaller {
         private final List<String> prompts = new ArrayList<>();
         private final String reply;
         private final RuntimeException failure;
+        private String hyqReply = QUESTIONS_JSON;
 
         FakeCaller(String reply) {
             this.reply = reply;
@@ -42,15 +51,40 @@ class IndexEnhancerTest {
             this.failure = failure;
         }
 
+        /** 换掉 HyQ 那一跳的返回（默认 {@link #QUESTIONS_JSON}）。 */
+        FakeCaller withHyqReply(String hyq) {
+            this.hyqReply = hyq;
+            return this;
+        }
+
         @Override
         public String call(String prompt) {
             prompts.add(prompt);
             if (failure != null) {
                 throw failure;
             }
-            return reply;
+            return prompt.contains(HYQ_MARKER) ? hyqReply : reply;
+        }
+
+        /** 只挑出**文档级**那一次（`I-10` 的判据要的是它，不是总调用数）。 */
+        List<String> documentLevelPrompts() {
+            return prompts.stream().filter(p -> !p.contains(HYQ_MARKER)).toList();
+        }
+
+        /** 只挑出**分片级 HyQ** 那些（`T-507` / `T-O09` 步 5 的计数对象）。 */
+        List<String> hyqPrompts() {
+            return prompts.stream().filter(p -> p.contains(HYQ_MARKER)).toList();
         }
     }
+
+    /** 区分两类提示词的稳定标记 —— 取 HyQ 提示词里的固定字样。 */
+    private static final String HYQ_MARKER = "推测**用户可能怎样提问**";
+
+    private static final String QUESTIONS_JSON = """
+            {
+              "questions": ["登录后多久需要重新认证？", "令牌有效期怎么配置？"]
+            }
+            """;
 
     private static final String GOOD_JSON = """
             {
@@ -75,9 +109,12 @@ class IndexEnhancerTest {
 
         IndexEnhancer.Result result = enhancer.enhance(doc(), blocks());
 
-        assertThat(caller.prompts)
-                .as("`D-5` §1.6 / I-10：文档级调用是 1 次/篇。"
-                        + "分三次调用是三重成本、三重失败点，而且三份「对文档的理解」还会互相不一致")
+        assertThat(caller.documentLevelPrompts())
+                .as("`D-5` §1.6 / I-10：**文档级**调用是 1 次/篇。"
+                        + "分三次调用是三重成本、三重失败点，而且三份「对文档的理解」还会互相不一致。"
+                        + "⚠️ 断言的是**文档级那一次**而不是 `prompts` 总数 —— "
+                        + "`T-507` 落地后 HyQ 是另一类分片级调用（n 次/篇），"
+                        + "拿总数断言会把两件事混成一件")
                 .hasSize(1);
         assertThat(result.status()).isEqualTo(IndexEnhancer.Status.OK);
         assertThat(result.enhancement().summary()).isNotBlank();
@@ -125,8 +162,12 @@ class IndexEnhancerTest {
         IndexEnhancer.Result result = enhancerWith(new FakeCaller(GOOD_JSON), true)
                 .enhance(doc(), blocks());
 
-        Block summary = result.blocks().getLast();
-        assertThat(summary.blockType()).isEqualTo(BlockType.SUMMARY);
+        // ⚠️ 不再用 getLast()：`T-507` 落地后摘要块后面还会追加 HyQ 块。
+        // "摘要是不是最后一个"从来不是这条判据要问的事 —— 它问的是"摘要块长什么样"
+        Block summary = result.blocks().stream()
+                .filter(b -> b.blockType() == BlockType.SUMMARY)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("没有产出 SUMMARY 块：" + result.status()));
         assertThat(summary.isTopLevel())
                 .as("`D-5` §1.6：「文档级摘要（blockType = SUMMARY，**parentId = null**）」。"
                         + "给它挂父块还会撞上 G4-6 的全局断言（有 parent_id 的块父块必须是 TABLE）")
@@ -135,7 +176,8 @@ class IndexEnhancerTest {
         assertThat(summary.orderNo())
                 .as("序号接在既有块之后，不能重号 —— (doc_id, order_no) 是写入后回查的唯一依据")
                 .isEqualTo(blocks().size() + 1);
-        assertThat(result.blocks()).hasSize(blocks().size() + 1);
+        assertThat(result.blocks()).as("原块 + 1 条文档摘要 + 1 条 HyQ（门控放行了那段含参数的短段落）")
+                .hasSize(blocks().size() + 2);
     }
 
     @Test
@@ -320,8 +362,114 @@ class IndexEnhancerTest {
 
     private static List<Block> blocks() {
         return List.of(
-                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null),
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
                 new Block("接口鉴权流程采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
-                        "3. 接口设计", 2, 1, null));
+                        "3. 接口设计", 2, 1, null, null));
+    }
+
+    // ==================================================================
+    // T-507 HyQ 半边 + T-O09 步 5/6
+    // ==================================================================
+
+    @Test
+    @DisplayName("T-507：生成的 HyQ 块是顶层块，且**回指源块**（sourceOrderNo）")
+    void hyqBlockPointsBackToItsSourceBlock() {
+        IndexEnhancer.Result result = enhancerWith(new FakeCaller(GOOD_JSON), true)
+                .enhance(doc(), blocks());
+
+        Block hyq = result.blocks().stream()
+                .filter(b -> b.blockType() == BlockType.HYPOTHESIS_QA)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("没有产出 HYPOTHESIS_QA 块"));
+
+        assertThat(hyq.rawContent())
+                .as("块内容是模型给的问句，多条用换行合成一条块")
+                .contains("登录后多久需要重新认证？");
+        assertThat(hyq.isTopLevel())
+                .as("HyQ 是顶层块 —— 挂父块会撞 G4-6（有 parent_id 的块父块必须是 TABLE）")
+                .isTrue();
+        assertThat(hyq.sourceOrderNo())
+                .as("⚠️ 这一列是 `汇总.md` §4-271 的答案：命中 HyQ 后按它取源块正文。"
+                        + "没有它，HyQ 块只能把「问句」原样喂给大模型")
+                .isEqualTo(2);
+        assertThat(hyq.parentOrderNo()).as("parent 与 source 是两件事，别混").isNull();
+    }
+
+    @Test
+    @DisplayName("T-O09 步 5：门控放行含参数的短段落，**跳过标题**（不会为标题花一次调用）")
+    void gateSkipsHeadingsAndKeepsShortParagraphs() {
+        FakeCaller caller = new FakeCaller(GOOD_JSON);
+        enhancerWith(caller, true).enhance(doc(), blocks());
+
+        assertThat(caller.hyqPrompts())
+                .as("固件里只有那段含「2 小时」的短段落该被放行；标题「3. 接口设计」是噪声，"
+                        + "为它生成问句纯属浪费 —— 这正是 T-O09 步 5 要省的那部分钱")
+                .hasSize(1);
+        assertThat(caller.hyqPrompts().getFirst()).contains("令牌有效期 2 小时");
+    }
+
+    @Test
+    @DisplayName("T-O09 步 5：长叙述段落被跳过 —— 门控省钱的主力")
+    void gateSkipsLongNarrativeParagraph() {
+        FakeCaller caller = new FakeCaller(GOOD_JSON);
+        List<Block> longNarrative = List.of(new Block(
+                "本章首先介绍了背景。".repeat(40), BlockType.PARAGRAPH, "1. 背景", 1, 1, null, null));
+
+        enhancerWith(caller, true).enhance(doc(), longNarrative);
+
+        assertThat(caller.hyqPrompts())
+                .as("长叙述段（%d 字）在门控这里就该被拦下 —— 一次 LLM 调用都不产生",
+                        longNarrative.getFirst().rawContent().length())
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("T-O09 步 6：章节摘要**复用同一次调用**（I-10），产出每章一条 SUMMARY 块")
+    void chapterSummariesReuseTheSingleCall() {
+        String withChapters = """
+                {
+                  "summary": "文档级摘要",
+                  "labels": [],
+                  "relations": [],
+                  "chapters": [{"title": "3. 接口设计", "summary": "本章讲鉴权流程与令牌有效期。"}]
+                }
+                """;
+        FakeCaller caller = new FakeCaller(withChapters);
+
+        IndexEnhancer.Result result = enhancerWith(caller, true).enhance(doc(), blocks());
+
+        assertThat(result.enhancement().chapters()).hasSize(1);
+        assertThat(caller.documentLevelPrompts())
+                .as("`I-10`：章节级摘要必须与文档级**共享同一次调用**（边际成本 ≈ 0）。"
+                        + "若实现成另开一次调用，这条断言当场转红")
+                .hasSize(1);
+
+        List<Block> summaries = result.blocks().stream()
+                .filter(b -> b.blockType() == BlockType.SUMMARY).toList();
+        assertThat(summaries).as("一条文档级 + 一条章节级").hasSize(2);
+        Block chapter = summaries.stream().filter(b -> b.sourceOrderNo() != null).findFirst()
+                .orElseThrow(() -> new AssertionError("没有挂到标题块上的章节摘要"));
+        assertThat(chapter.sourceOrderNo())
+                .as("章节摘要的来源是它所属那一节的**标题块**")
+                .isEqualTo(1);
+        assertThat(chapter.isTopLevel()).as("D-5 §1.2：parentId = null").isTrue();
+    }
+
+    @Test
+    @DisplayName("T-O09 步 6：模型改写标题时**跳过并留痕**，不硬凑一条挂不上的摘要")
+    void chapterWithUnknownTitleIsSkipped() {
+        String renamed = """
+                {
+                  "summary": "文档级摘要",
+                  "chapters": [{"title": "第三章 接口设计（模型改写过的标题）", "summary": "…"}]
+                }
+                """;
+
+        IndexEnhancer.Result result = enhancerWith(new FakeCaller(renamed), true)
+                .enhance(doc(), blocks());
+
+        assertThat(result.blocks().stream().filter(b -> b.blockType() == BlockType.SUMMARY))
+                .as("只剩文档级那一条 —— 挂不上标题的章节摘要比少一条更误导")
+                .hasSize(1);
     }
 }

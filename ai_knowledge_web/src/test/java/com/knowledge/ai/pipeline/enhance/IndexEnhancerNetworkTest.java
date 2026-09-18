@@ -65,7 +65,7 @@ class IndexEnhancerNetworkTest {
 
         IndexEnhancer.Result result = indexEnhancer.enhance(doc, List.of(
                 new Block("接口鉴权采用令牌方式…", com.knowledge.ai.core.enums.BlockType.PARAGRAPH,
-                        "3. 接口设计", 1, 1, null)));
+                        "3. 接口设计", 1, 1, null, null)));
 
         // 失败时把 detail 带出来：真实调用出错与"输出格式不合约定"是两回事，
         // 断言里不写清原因，下一次只能靠重跑猜
