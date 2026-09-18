@@ -287,12 +287,23 @@ export const mockDocs: DocInfo[] = [
   { id: 6, kbId: 6, kbName: '信息安全规范库', title: '数据安全管理制度', path: '/信息安全/制度规范/数据安全管理制度.pdf', type: 'PDF', size: 5_242_880, pageCount: 15, chunkCount: 98, status: 'READY', securityLevel: 'CONFIDENTIAL', owner: '系统管理员', uploadedAt: '2026-08-20 11:30', version: 'v2.0' },
 ]
 
-/** 文档生命周期状态机 */
+/**
+ * 文档生命周期状态机。
+ *
+ * <p>⚠️ **本常量当前没有任何引用**（全仓只有这一行定义，`mock/index.ts` 也没导入它）。
+ * 页面上的文档状态文案在 {@code KbUploadView.vue} 的本地映射里（那份还要带 `type` 给标签上色），
+ * 详情/预览页则是硬编码的「已就绪」。
+ *
+ * <p>🔴 `READY` 的文案 **2026-09-18 从「可检索」改成「已就绪」**：与 `READY` 字面一致，
+ * 也与另外两处对齐。改之前它是个**陷阱** —— 三处状态文案里只有这一处写「可检索」，
+ * 而它恰好没人引用，于是"看起来像两种说法、实际只有一种在跑"（`#85` 的前提在核实时被推翻：
+ * 那"两个页面"并不存在）。留着这个值的话，下一个人一导入就会把漂移**重新引回来**。
+ */
 export const DOC_STATUS_LABEL: Record<DocInfo['status'], string> = {
   UPLOADED: '已上传',
   PARSING: '解析中',
   INDEXING: '索引中',
-  READY: '可检索',
+  READY: '已就绪',
   FAILED: '解析失败',
 }
 
