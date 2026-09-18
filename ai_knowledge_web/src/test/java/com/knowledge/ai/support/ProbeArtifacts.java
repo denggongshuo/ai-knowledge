@@ -1,6 +1,7 @@
 package com.knowledge.ai.support;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * **探针产物的登记表**（`S5` 测试可靠性修复批）—— Java 用例侧的"单一登记表"。
@@ -102,6 +103,35 @@ public final class ProbeArtifacts {
      * 本来就进不了闸的扫描范围。留着这个 Map 是为了让"豁免"这件事**有地方写**，
      * 而不是某天有人在闸里加个 `if` 绕过。
      */
+    /**
+     * **非表产物**（MinIO 对象 / Milvus 向量与分区）—— 脚本侧登记了，而它**进不了表名对账**。
+     *
+     * <h3>为什么单列一张冻结列表（`#149`）</h3>
+     * <p>两侧对账用的是 `table: 'sys_xxx'` 那个正则 —— 于是这四项
+     * **结构上不在它的输入里**：谁都不管，而闸看起来是绿的。
+     * 这是 `#130` 那一族（**闸覆盖了一类产物、另一类不在它的输入里**）的第四次变形。
+     *
+     * <p>把它们冻在这儿，是为了让"新增一个非表产物"**必须过一次人的判断**：
+     * Java 侧谁来收它？收不了的话，为什么登记？——
+     * 而不是靠下一个人恰好想起来还有这么一类。
+     *
+     * <h3>这四项 Java 侧分别是什么处境（2026-09-18 实测）</h3>
+     * <ul>
+     *   <li>{@code milvus:vectors} / {@code milvus:partitions} —— ✅ Java 侧由
+     *       {@code RetrievalFlowSupport#cleanProbeData()} 按 {@code createdKbIds} drop
+     *       （脚本侧那两条是给 E2E 用的）。</li>
+     *   <li>{@code minio:storage_path} / {@code minio:parse_path} —— 🔴 **Java 侧没有兜底**：
+     *       目前是"每个用例各删各的"（{@code ParseWorkerFlowTest} / {@code DocParseFlowTest}
+     *       / {@code ChatAttachmentFlowTest} 各写一遍 `removeObject`）。
+     *       ⚠️ 这正是 `#130` 判定会漏的那个形状（"每个类自己清"已被证明漏过 76 行/轮）。
+     *       **本批只把它摆到明面上，没有补兜底** —— 补它要一个 Java 侧的 MinIO 列举能力，
+     *       而那是独立的一块（登记在计划 §9）。</li>
+     * </ul>
+     */
+    public static final Set<String> NON_TABLE = Set.of(
+            "minio:storage_path", "minio:parse_path",
+            "milvus:vectors", "milvus:partitions");
+
     public static final Map<String, String> EXEMPT = Map.of();
 
     private ProbeArtifacts() {

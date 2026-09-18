@@ -151,6 +151,26 @@ class ProbeArtifactCoverageTest extends ApiTestSupport {
         assertThat(reverse)
                 .as("这些表**Java 侧登记了、脚本侧没有** —— 同上，反过来也是漏")
                 .isEmpty();
+
+        // 🔴 `#149`：**上面那两条对账都看不见非表产物**。
+        //    它们用的是 `table: 'sys_xxx'` 那个正则，而 MinIO 对象 / Milvus 向量与分区
+        //    **结构上不在它的输入里** ⇒ 这一类谁都不管，而闸看起来是绿的。
+        //    这是 `#130` 那一族（**闸覆盖了一类产物、另一类不在它的输入里**）的第四次变形。
+        //
+        //    把它冻住，让"新增一个非表产物"**必须过一次人的判断**：
+        //    Java 侧谁来收它？收不了的话，为什么登记？
+        //    —— 而不是靠下一个人恰好想起来还有这么一类。
+        Set<String> scriptNonTables = new LinkedHashSet<>();
+        Matcher nonTable = Pattern.compile("id: '([^']+)', kind: '(?!sql)[^']+'")
+                .matcher(registryPart);
+        while (nonTable.find()) {
+            scriptNonTables.add(nonTable.group(1));
+        }
+        assertThat(scriptNonTables)
+                .as("脚本侧的**非表产物**与冻结列表不一致（解出 %s）。"
+                        + "新增或改名时要与 `ProbeArtifacts.NON_TABLE` 一起改，"
+                        + "并在那边写清「Java 侧谁来收它」", scriptNonTables)
+                .containsExactlyInAnyOrderElementsOf(ProbeArtifacts.NON_TABLE);
     }
 
     @Test
