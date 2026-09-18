@@ -219,8 +219,22 @@ public class DocParseService {
             //
             // ⚠️ 与增强相反，向量化失败**必须牵连文档** —— 「块都在、向量一个没有」
             // 却标着可检索，是这个项目最不能接受的静默故障形态。所以这里不 catch。
+            // 🔴 `S6-M05-C`：写向量之前复核「**还是当初那一代吗**」。
+            //    不加这道闸的**实测**后果：用户点「清空索引」、拿到 `{"cleared":true}`，
+            //    而这篇在途文档跑完后把**被 drop 的分区重建了出来**（分区名逐字相同、
+            //    4 条向量原样重现）—— 用户明确要求的操作被**静默撤销**。
+            //    ⚠️ 判据用 `row.generation()`（本轮开始时的快照）而不是再读一次：
+            //      再读一次就成了"和我自己比"，恒真。
             ChunkVectorizer.Result vectorized = chunkVectorizer.vectorize(
-                    docId, row.kbId(), row.generation(), chunkReader.readByDocId(docId));
+                    docId, row.kbId(), row.generation(), chunkReader.readByDocId(docId),
+                    () -> {
+                        int current = recordWriter.currentKbGeneration(row.kbId());
+                        if (current != row.generation()) {
+                            throw new ChunkVectorizer.GenerationChangedException(
+                                    "该知识库的索引代已变更（本作业持有第 " + row.generation()
+                                            + " 代，当前第 " + current + " 代）—— 本次放弃写入向量");
+                        }
+                    });
             if (vectorized.allowsReady()) {
                 // `O9` 步 7：只有在**确实写了东西**之后才盖模型归因的章。
                 // 开关关掉时一条向量都没写，这时盖章等于声称"这些是某模型产的"
@@ -244,6 +258,19 @@ public class DocParseService {
                     parsed != null ? TextLayerGuard.merge(parsed, pageContentRouter) : java.util.List.of());
             log.warn("文档解析失败：docId={} type={} 原因={}", docId, row.type(), ex.getMessage());
             return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", ex.getMessage());
+        } catch (ChunkVectorizer.GenerationChangedException ex) {
+            // 🔴 **这不是解析失败** —— 文档一点问题都没有，它是被「清空索引 / 重建索引」波及的。
+            //    所以**不标 FAILED**：状态保持 `markParsed` 设的 INDEXING（有块、不可检索），
+            //    与 `clearIndex` 对其它文档的处置一致。
+            //    ⚠️ 标 FAILED 的代价是双重的：① 用户以为文件有问题；
+            //    ② FAILED 是**终态**，而重建索引的筛选是 `status in ('READY','INDEXING')`
+            //    —— 标了就**再也捞不到它**，永远修不好（与 `ReindexService` 里那条
+            //    "刻意不改文档状态"的订正是同一条理由）。
+            //    返回非 FAILED 的 status ⇒ `ParseWorker:285` 把作业正常收尾，不是失败重试。
+            log.warn("向量写入放弃（索引代已变更，文档留在 INDEXING）：docId={} 原因={}",
+                    docId, ex.getMessage());
+            return Map.of("docId", docId, "status", "INDEXING", "retryable", false,
+                    "reason", ex.getMessage());
         } catch (Exception ex) {
             String reason = "解析失败：" + readable(ex);
             recordWriter.markFailed(docId, reason);

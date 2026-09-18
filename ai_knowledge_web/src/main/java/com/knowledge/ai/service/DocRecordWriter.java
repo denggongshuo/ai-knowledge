@@ -455,6 +455,33 @@ public class DocRecordWriter {
         return ids.getFirst().longValue();
     }
 
+    /**
+     * 该库**当前**的代（`sys_kb.index_generation`）—— 检索该查哪一代。
+     *
+     * <p>存在的理由是 `S6-M05-C` 那件已实测的缺陷（顺查 `#187` 时发现）：
+     * <pre>
+     *   ① 文档 B 正在解析/索引（它在 parseDocument 开头读到了当时的分区代 = 1）
+     *   ② 用户点「清空索引」→ 代 1 的分区被 drop、文档状态退回 INDEXING
+     *   ③ B 跑完 → MilvusChunkWriter#replaceDocument「已自带 ensure」→ **代 1 的分区被重建**
+     *   ④ 用户以为清空了，实际分区与向量又回来了（实测：`{"cleared":true}` 之后
+     *      分区 [kb1007378_g1] 与 4 条向量原样重现）
+     * </pre>
+     *
+     * <p>⇒ 写向量之前必须重问一次"**还是这一代吗**"。这个方法就是那个重问点。
+     *
+     * @return 当前代；**库行不存在时返回 {@code -1}** —— 与任何合法代都不相等，
+     *         所以"库没了"与"代变了"在下游走同一条拒绝路径（那是对的：两者都不该写）
+     */
+    @Transactional(readOnly = true)
+    public int currentKbGeneration(long kbId) {
+        List<?> rows = entityManager.createNativeQuery(
+                        "select index_generation from sys_kb where id = :id")
+                .setParameter("id", kbId)
+                .getResultList();
+        return rows.isEmpty() || rows.getFirst() == null
+                ? -1 : ((Number) rows.getFirst()).intValue();
+    }
+
     /** 空串与 {@code null} 在库里是两种值 —— 标题路径没有就是没有，不写空串进去。 */
     private static String blankToNull(String v) {
         return v == null || v.isBlank() ? null : v;

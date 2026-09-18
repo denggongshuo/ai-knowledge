@@ -232,9 +232,24 @@ class ReindexFlowTest {
             seedVectors(docA, 1, "本库正文");
             seedVectorsIn(otherKb, docB, 1, "别库正文");
 
+            int genBefore = generation();
             reindexService.clearIndex(kbId);
 
-            assertThat(partitionGenerations()).as("本库的分区应被清掉").isEmpty();
+            // ⚠️ **期望在 `S6-M05-C` 变了，这是有意的、不是放宽**：
+            //    清空**不再把分区删到一个不剩**，而是**切到新代**并留下新代的**空分区**。
+            //    理由是那条硬口径：检索侧按 `sys_kb.index_generation` 找分区，而
+            //    **「查一个不存在的分区是报错、不是返回空」**（探针实测报 65535）——
+            //    所以"推进一代"必须**连带**把新代建出来，否则清空之后整个库的检索会当场炸。
+            assertThat(generation())
+                    .as("清空要真的**推进一代** —— 这是它 javadoc 一直写着、而代码此前没做的事"
+                            + "（实测：不推进的话，在途作业会写回被 drop 的那一代、把分区重建出来）")
+                    .isEqualTo(genBefore + 1);
+            assertThat(partitionGenerations())
+                    .as("只剩**新代那一个空分区**：旧代全被 drop，而新代**必须存在**")
+                    .containsExactly(genBefore + 1);
+            assertThat(partitions.countIn(MilvusConstants.partitionName(kbId, genBefore + 1)))
+                    .as("新代分区是**空的** —— 清空的意义就是向量一条都不剩")
+                    .isZero();
             assertThat(docGeneration(docA)).as("本库文档的断点归 0（向量没了）").isZero();
             assertThat(partitions.countIn(MilvusConstants.partitionName(otherKb, 1)))
                     .as("**别的库一条都不能少** —— 这是清空索引最容易写错的地方")

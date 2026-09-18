@@ -60,9 +60,14 @@ public class ChunkVectorizer {
      *                   日常解析传 {@code sys_kb.index_generation}；重建索引传"新代"。
      * @param chunks     该文档的全部块（**含不进池的**：本方法自己挑，调用方不必先过滤 ——
      *                   让"哪些块进池"只有一个口径）
+     * @param guard      **写入前的最后一道复核**（`S6-M05-C`）：见 {@link GenerationGuard}。
+     *                   它在**真正写 Milvus 之前、嵌入之后**调用 —— 放在这个位置是有意的：
+     *                   调用方在更早处判一次能省下嵌入的钱，但**只有这里能挡住
+     *                   "判定通过之后、写入之前"那段窗口**，而重建分区这个动作就在写入里。
      * @return 实际写入的条数
      */
-    public Result vectorize(long docId, long kbId, int generation, List<VectorChunk> chunks) {
+    public Result vectorize(long docId, long kbId, int generation, List<VectorChunk> chunks,
+                            GenerationGuard guard) {
         if (!enabled) {
             log.info("向量化开关未开启（m05.vectorize.enabled=false），跳过：docId={}", docId);
             return new Result(0, 0, Status.DISABLED, "向量化开关未开启（m05.vectorize.enabled=false）",
@@ -81,6 +86,9 @@ public class ChunkVectorizer {
         if (candidates.isEmpty()) {
             // 空块集也要走一次删除：上一次解析若写过向量，不清掉就会留下"文档没有块、
             // 却检索得到"的幽灵 —— 与 DocRecordWriter 空块集也要回填 chunk_count = 0 同一条理由
+            // ⚠️ 这一步**同样要过复核**：`replaceDocument` 会 ensure 分区，
+            //    所以"删"这个动作也会把被清掉的分区重建出来（只是没有向量而已）
+            guard.verify();
             writer.replaceDocument(partition, docId, List.of());
             log.info("没有需要向量化的块（全部被跳过）：docId={} 跳过={}（表格父块 {} + 样板 {}）",
                     docId, skipped, skippedProjection, skippedBoilerplate);
@@ -112,6 +120,11 @@ public class ChunkVectorizer {
             records.add(new VectorRecord(candidates.get(i), kbId, docId, vectors.get(i),
                     modelRef.model(), modelRef.version()));
         }
+        // 🔴 **最后一道复核**：从"上面的判定"到这里，可能已经过去好几秒（嵌入是网络调用）。
+        //    在这期间「清空索引」/「重建」都可能把这一代切走 —— 而 `replaceDocument`
+        //    会 ensure 分区，也就是**把已经被 drop 的分区重建出来**。实测过一次：
+        //    用户拿到 `{"cleared":true}` 之后，分区与 4 条向量原样重现。
+        guard.verify();
         int written = writer.replaceDocument(partition, docId, records);
         log.info("文档向量化完成：docId={} 分区={} 写入={} 跳过={}（表格父块/未实现的图片块 {} + 样板 {}）模型={}",
                 docId, partition, written, skipped, skippedProjection, skippedBoilerplate,
@@ -120,6 +133,53 @@ public class ChunkVectorizer {
     }
 
     /** 向量化的三种结局。**只有 {@link #OK} 允许把文档标成可检索。** */
+    /**
+     * **写入前的最后一道复核**（`S6-M05-C`）—— 「我手里的这一代**还是**该库当前那一代吗」。
+     *
+     * <h3>它存在的理由是一件实测过的缺陷</h3>
+     * <pre>
+     *   ① 文档 B 正在解析/索引（它在 parseDocument 开头读到当时的分区代 = 1）
+     *   ② 用户点「清空索引」→ 代 1 的分区被 drop，文档状态退回 INDEXING
+     *   ③ B 跑完 → `MilvusChunkWriter#replaceDocument`「已自带 ensure」→ **代 1 的分区被重建**
+     *   ④ 用户拿到 `{"cleared":true}`，而分区与 4 条向量原样重现 —— **静默地撤销了他明确要求的操作**
+     * </pre>
+     *
+     * <h3>为什么是一个回调，而不是在这里直接查库</h3>
+     * <p>{@code ChunkVectorizer} 是**纯管线**（嵌入 + 写向量），不碰 MySQL ——
+     * 把 DB 依赖引进来会让它从"可单测的变换"变成"要起库的组件"。
+     * 而"当前是哪一代"的口径只有调用方知道（日常解析 = {@code sys_kb.index_generation}；
+     * 重建 = 那个**还没切过去**的新代），所以判断权交给调用方。
+     *
+     * <p>⚠️ {@code ReindexService} 传的是**空实现** —— 这是**有意的**：
+     * 重建本来就写"当前代 + 1"，那一刻它**还不是**当前代，用同一条判据会把它自己拦下来。
+     * 见那边的调用点注释。
+     */
+    @FunctionalInterface
+    public interface GenerationGuard {
+
+        /**
+         * 复核。**不通过就抛**（{@code BizException}）—— 用异常而不是返回布尔量，
+         * 是因为"不通过"必须**中断整条写入**，而返回布尔量会留出"忘了判返回值"的口子。
+         */
+        void verify();
+    }
+
+    /**
+     * 复核不通过 —— 该库的代已经变了，本次**放弃写入**。
+     *
+     * <p>⚠️ **调用方绝不能把它当成"这篇文档解析失败"**：文档本身一点问题都没有，
+     * 它是被"清空索引 / 重建索引"这件事波及的。标 `FAILED` 会：
+     * ① 让用户以为文件有问题；② 把状态推到终态，后续重建索引的筛选
+     * （`status in ('READY','INDEXING')`）**再也捞不到它** —— 于是它永远修不好。
+     * 正确的落点是**留在 `INDEXING`**（有块、不可检索），与 `clearIndex` 对其它文档的处置一致。
+     */
+    public static class GenerationChangedException extends RuntimeException {
+
+        public GenerationChangedException(String message) {
+            super(message);
+        }
+    }
+
     public enum Status {
         /** 正常写入。 */
         OK,

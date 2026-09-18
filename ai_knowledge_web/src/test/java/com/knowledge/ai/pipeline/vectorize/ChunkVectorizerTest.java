@@ -62,6 +62,62 @@ class ChunkVectorizerTest {
         }
     }
 
+    @Test
+    @DisplayName("S6-M05-C：复核不通过 ⇒ **一条向量都不写，连分区都不碰**")
+    void guardRejectionWritesNothing() {
+        FakeWriter writer = new FakeWriter();
+        ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
+
+        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1,
+                List.of(chunk(1, "PARAGRAPH", "正文", null, null)),
+                () -> {
+                    throw new ChunkVectorizer.GenerationChangedException("代已变（用例）");
+                }))
+                .isInstanceOf(ChunkVectorizer.GenerationChangedException.class);
+
+        assertThat(writer.calls)
+                .as("复核没过 ⇒ `replaceDocument` **一次都不能被调**。"
+                        + "这不是「少写几条向量」的问题：`replaceDocument` 会 ensure 分区，"
+                        + "而那正是**把已被 drop 的分区重建出来**的动作 —— "
+                        + "实测的后果是用户拿到 `{\"cleared\":true}` 之后向量原样重现")
+                .isZero();
+        assertThat(writer.lastPartition).as("连分区名都不该被用到").isNull();
+        assertThat(writer.lastRecords).as("一条记录都不该组装出来").isEmpty();
+    }
+
+    @Test
+    @DisplayName("S6-M05-C：**空块集**那条路也要过复核（它同样会 ensure 分区）")
+    void guardAlsoAppliesToEmptyChunkSet() {
+        FakeWriter writer = new FakeWriter();
+        ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
+
+        // 只有表格父块 ⇒ 进池 0 个 ⇒ 走"空块集也要删一次"那条分支
+        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1,
+                List.of(chunk(2, "TABLE", "| a |", null, null)),
+                () -> {
+                    throw new ChunkVectorizer.GenerationChangedException("代已变（用例）");
+                }))
+                .isInstanceOf(ChunkVectorizer.GenerationChangedException.class);
+
+        assertThat(writer.calls)
+                .as("空块集那条路走的是「删旧向量」，而复核若漏在那里，"
+                        + "被清掉的分区照样会被 ensure 回来（只是没有向量而已）")
+                .isZero();
+    }
+
+    /**
+     * 用例里的调用入口：**复核恒通过**（`S6-M05-C` 加的 {@link ChunkVectorizer.GenerationGuard}）。
+     *
+     * <p>用例不制造"清空索引 vs 在途作业"那种竞态；生产路径的复核由 `DocParseService` 给出。
+     * ⚠️ 这里**具名**而不是重载一个同名 `vectorize` —— 重载会让下一个人以为
+     * "这个方法本来就没有复核"，而那条复核恰恰是防一件实测过的静默撤销的。
+     */
+    private static ChunkVectorizer.Result vectorizeNoGuard(ChunkVectorizer vectorizer,
+                                                           long docId, long kbId, int generation,
+                                                           List<VectorChunk> chunks) {
+        return vectorizer.vectorize(docId, kbId, generation, chunks, () -> { });
+    }
+
     private static VectorChunk chunk(long id, String type, String raw, String titlePath, Long parentId) {
         return new VectorChunk(id, type, raw, titlePath, "INTERNAL", parentId);
     }
@@ -72,7 +128,7 @@ class ChunkVectorizerTest {
         FakeWriter writer = new FakeWriter();
         ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
 
-        vectorizer.vectorize(100L, 8L, 3, List.of(chunk(1, "PARAGRAPH", "正文", null, null)));
+        vectorizeNoGuard(vectorizer,100L, 8L, 3, List.of(chunk(1, "PARAGRAPH", "正文", null, null)));
 
         assertThat(writer.lastPartition)
                 .as("分区名由 MilvusConstants#partitionName 统一给出 —— 读取侧（T-406 切代后查哪个分区）"
@@ -92,7 +148,7 @@ class ChunkVectorizerTest {
                 chunk(3, "TABLE", "型号 A-100，单价 ￥1,200", null, 2L), // 子块 → 进
                 chunk(4, "SUMMARY", "摘要", null, null));
 
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1, chunks);
+        ChunkVectorizer.Result r = vectorizeNoGuard(vectorizer,100L, 1L, 1, chunks);
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.OK);
         assertThat(r.written()).isEqualTo(3);
@@ -133,7 +189,7 @@ class ChunkVectorizerTest {
         ChunkVectorizer vectorizer = new ChunkVectorizer(new FakeEmbedding(1024), writer, true);
 
         // 只有表格父块 → 进池的是 0 个
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1,
+        ChunkVectorizer.Result r = vectorizeNoGuard(vectorizer,100L, 1L, 1,
                 List.of(chunk(2, "TABLE", "| a |", null, null)));
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.EMPTY);
@@ -151,7 +207,7 @@ class ChunkVectorizerTest {
         FakeWriter writer = new FakeWriter();
         ChunkVectorizer vectorizer = new ChunkVectorizer(embedding, writer, false);
 
-        ChunkVectorizer.Result r = vectorizer.vectorize(100L, 1L, 1,
+        ChunkVectorizer.Result r = vectorizeNoGuard(vectorizer,100L, 1L, 1,
                 List.of(chunk(1, "PARAGRAPH", "正文", null, null)));
 
         assertThat(r.status()).isEqualTo(ChunkVectorizer.Status.DISABLED);
@@ -171,7 +227,7 @@ class ChunkVectorizerTest {
             chunks.add(chunk(i, "PARAGRAPH", "正文 " + i, null, null));
         }
 
-        vectorizer.vectorize(100L, 1L, 1, chunks);
+        vectorizeNoGuard(vectorizer,100L, 1L, 1, chunks);
 
         // ⚠️ 本用例**测的不是分批** —— 分批在 EmbeddingClient.RegistryEmbeddingClient 里
         // （那里才碰得到模型、才有 batchSize）。这一层要保证的是：
@@ -192,7 +248,7 @@ class ChunkVectorizerTest {
         };
         ChunkVectorizer vectorizer = new ChunkVectorizer(shortChanged, new FakeWriter(), true);
 
-        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1, List.of(
+        assertThatThrownBy(() -> vectorizeNoGuard(vectorizer,100L, 1L, 1, List.of(
                 chunk(1, "PARAGRAPH", "a", null, null),
                 chunk(2, "PARAGRAPH", "b", null, null))))
                 .isInstanceOf(BizException.class)
@@ -208,7 +264,7 @@ class ChunkVectorizerTest {
         };
         ChunkVectorizer vectorizer = new ChunkVectorizer(boom, new FakeWriter(), true);
 
-        assertThatThrownBy(() -> vectorizer.vectorize(100L, 1L, 1, List.of(
+        assertThatThrownBy(() -> vectorizeNoGuard(vectorizer,100L, 1L, 1, List.of(
                 chunk(1, "PARAGRAPH", "a", null, null),
                 chunk(2, "PARAGRAPH", "b", null, null))))
                 .isInstanceOf(BizException.class)

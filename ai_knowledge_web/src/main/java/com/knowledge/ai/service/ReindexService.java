@@ -146,7 +146,13 @@ public class ReindexService {
         for (DocRow doc : docs) {
             try {
                 ChunkVectorizer.Result r = chunkVectorizer.vectorize(
-                        doc.id(), kbId, to, chunkReader.readByDocId(doc.id()));
+                        doc.id(), kbId, to, chunkReader.readByDocId(doc.id()),
+                        // ⚠️ **空复核，这是有意的**（`S6-M05-C`）：重建本来就写"当前代 + 1"，
+                        //    而那一刻它**还不是**当前代 —— 用日常解析那条判据
+                        //    （"必须等于当前代"）会把重建自己拦下来，一条向量都写不进去。
+                        //    重建这条路的正确性靠另一条保证：`switchGeneration` 是**原子切换**，
+                        //    切之前检索仍指向旧代，切之后才指向新代（见类注释）。
+                        () -> { });
                 if (r.allowsReady()) {
                     // `O9` 步 7：换模型重建时，归因**必须跟着刷新** ——
                     // 否则这两列记的是"上一次是谁产的"，而它恰恰是这个字段要回答的问题。
@@ -266,20 +272,59 @@ public class ReindexService {
      * 清空一个库的索引（`DELETE /kb/{id}/index`，`T-407` 的清空半边）。
      *
      * <p>与"重建"的区别：清空是**真的把向量删掉**（用户明确要求），所以它不保留旧代。
-     * 删完后把代推进一代（而不是留在原地）—— 因为指向的分区已被删，留着就是一个
-     * **会报错的指针**（探针实测：查不存在的分区报 65535，不是返回空）。
+     * 四步顺序固定：**建新代分区 → 切代 → 删旧代 → 文档退回 `INDEXING`**。
+     *
+     * <h3>🔴 「删完后把代推进一代」此前只是**承诺**（`S6-M05-C` 实测订正）</h3>
+     * <p>本方法原来只做两件事：drop 掉现有分区、把 `index_generation > 0` 的文档重置 ——
+     * **它没有推进任何代**。而探针实测的后果是：
+     * <pre>
+     *   [清空前]     分区=[kb1007378_g1] 向量=4   10910:READY|代=1   10911:PARSING|代=0
+     *   DELETE → 200 {"cleared":true}
+     *   [清空后立刻]  分区=[—]            向量=0   10910:INDEXING|0   10911:PARSING|0
+     *   [B 终态后]   分区=[kb1007378_g1] 向量=4   10910:INDEXING|0   10911:READY|1
+     *                 └─ **分区名逐字相同**，被在途作业重建了出来
+     * </pre>
+     * 即：**用户拿到 `{"cleared":true}`，而清空被静默撤销**。
+     *
+     * <p>两条修法合起来才够（`S6-M05-C` 用户裁定）：
+     * <ol>
+     *   <li><b>本方法真的推进代</b>（原来那句承诺）—— 并把新代分区**先建出来**，
+     *       否则检索侧会指向一个不存在的分区，而那是**报错不是返回空**；</li>
+     *   <li><b>写路径复核代</b>（{@code ChunkVectorizer.GenerationGuard}）——
+     *       只做第 1 条挡不住**已经发出的**在途作业，它手里的代是清空前读的。</li>
+     * </ol>
      */
     @Transactional
     @AuditLog(module = AuditModule.KB, action = "清空索引", risk = RiskLevel.HIGH, target = "'知识库#' + #kbId")
     public int clearIndex(long kbId) {
-        requireActiveKb(kbId);
+        KbRow kb = requireActiveKb(kbId);
+        int from = kb.generation();
+        int to = from + 1;
+        String targetPartition = MilvusConstants.partitionName(kbId, to);
+
+        // ① **先把新代的分区建出来** —— 顺序不能反，这是本方法最容易写错的一处。
+        //    检索侧按 `sys_kb.index_generation` 找分区，而**「查一个不存在的分区是报错、
+        //    不是返回空」**（探针实测：报 65535）。所以"推进一代"必须**连带**把新代建出来，
+        //    否则清空之后整个库的检索会**当场炸**，而不是"少几条结果"。
+        partitionManager.ensure(targetPartition);
+
+        // ② **切代** —— 这一刻起检索查的是新代（空），清空的**效果**至此生效。
+        //    ⚠️ 必须是**先建后切**：先切后建的话，中间那段时间检索指向一个不存在的分区。
+        switchGeneration(kbId, to);
+
+        // ③ 再删旧代分区。与重建不同，这里**全部删掉**（不留 `KEEP_GENERATIONS` 窗口）——
+        //    "清空是**真的把向量删掉**（用户明确要求）"，留一代下来的话清空只清了一半。
         int dropped = 0;
         for (int generation : partitionManager.generationsOf(kbId)) {
-            if (partitionManager.dropQuietly(MilvusConstants.partitionName(kbId, generation))) {
+            if (generation < to
+                    && partitionManager.dropQuietly(MilvusConstants.partitionName(kbId, generation))) {
                 dropped++;
             }
         }
-        // 文档的向量没了，断点与状态都要跟上 —— 不然后续重建会误 skip
+
+        // ④ 文档的向量没了，断点与状态都要跟上 —— 不然后续重建会误 skip。
+        //    ⚠️ 这一步**必须排在 ② 之后**：`switchGeneration` 顺手把 `reindex_required` 置 0，
+        //       而"文档都停在 INDEXING、检索不到"这件事要求它是 1。
         entityManager.createNativeQuery(
                         "update sys_document set index_generation = 0, status = 'INDEXING', "
                                 + "updated_at = :now "
@@ -292,7 +337,11 @@ public class ReindexService {
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", kbId)
                 .executeUpdate();
-        log.info("[清空索引] kbId={} 删除分区数={}（保留代推进，避免指向已删分区）", kbId, dropped);
+
+        // ⑤ 🔴 **审计里要能看出"代被推进了"** —— 只报"删了几个分区"的话，
+        //    事后翻审计看不出新旧代，而"代"正是判断这次清空有没有被在途作业撤销的依据。
+        log.info("[清空索引] kbId={} 代 {} → {}（新代分区已建 · 删除旧代分区 {} 个 · 文档退回 INDEXING）",
+                kbId, from, to, dropped);
         return dropped;
     }
 
