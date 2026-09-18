@@ -148,13 +148,26 @@ class KbDeleteFlowTest extends ApiTestSupport {
     void clearIndexIsAudited() {
         // 先造一个该库的分区，让"清空"有东西可清
         partitions.ensure(MilvusConstants.partitionName(kbId, 1));
+        Integer genBefore = jdbc.queryForObject(
+                "select index_generation from sys_kb where id = ?", Integer.class, kbId);
 
         RawResponse response = call("DELETE", "/api/kb/" + kbId + "/index", null, token);
 
         assertThat(response.code()).isZero();
         Object cleared = response.data("$.cleared");
         assertThat(cleared).isEqualTo(Boolean.TRUE);
-        assertThat(partitions.generationsOf(kbId)).as("该库的分区应被清掉").isEmpty();
+        // ⚠️ **期望在 `S6-M05-C` 变了**（与 `ReindexFlowTest#clearIndexOnlyTouchesThatKb` **同因同改**）：
+        //    清空**不再删到一个不剩**，而是**切到新代**并留下新代的**空分区**。
+        //    理由：检索侧按 `sys_kb.index_generation` 找分区，而
+        //    **「查一个不存在的分区是报错，不是返回空」** ⇒ 先切后建会让整个库的检索当场炸。
+        //    ⚠️ 本批**先只改了一条**（那条），全量跑批才逮到本条 ——
+        //    这两处是**同一形状**，改一处必须搜全（记进计划 §9）。
+        assertThat(partitions.generationsOf(kbId))
+                .as("只剩**新代那一个空分区**：旧代全被 drop，而新代**必须存在**")
+                .containsExactly(genBefore + 1);
+        assertThat(partitions.countIn(MilvusConstants.partitionName(kbId, genBefore + 1)))
+                .as("新代分区是**空的** —— 清空的意义就是向量一条都不剩")
+                .isZero();
 
         List<String> risks = jdbc.queryForList(
                 "select risk_level from sys_audit_log where action = ? and target = ?",

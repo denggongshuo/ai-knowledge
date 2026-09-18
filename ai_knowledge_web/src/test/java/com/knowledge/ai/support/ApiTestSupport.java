@@ -4,6 +4,7 @@ import com.jayway.jsonpath.JsonPath;
 import com.knowledge.ai.core.security.CaptchaStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -51,8 +52,18 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * 这比让每个用例写 {@code finally { deleteUser(...) }} 更可靠：漏写一次就会留下
  * 一个占用用户名/手机号的垃圾账号，让下一次运行以"用户名已存在"这种莫名其妙的方式失败。
  */
+@Slf4j
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 public abstract class ApiTestSupport {
+
+    /** `T-O10` 的对象兜底用（`sweepOrphanMinioObjects`）。 */
+    @Autowired
+    protected io.minio.MinioClient minioClient;
+
+    /** 同上。从配置读，与生产同一个桶。 */
+    @org.springframework.beans.factory.annotation.Value("${minio.bucket:rag-documents}")
+    protected String minioBucket;
+
 
     /** 业务错误码：成功。所有断言都用它做基准，避免各处硬编码 0。 */
     protected static final int CODE_OK = 0;
@@ -164,6 +175,16 @@ public abstract class ApiTestSupport {
         // 唯一可用且有意义的维度是**日期**（它是按天聚合的）。理由与代价写在
         // `ProbeCleanup#sweepProbeUsage` 的 javadoc 里，台账在 `ProbeArtifacts.NO_OWNERSHIP_COLUMN`。
         ProbeCleanup.sweepProbeUsage(jdbc);
+        // `T-O10`：**对象那一侧的兜底**（此前只有"每个类各自删自己造的那些"）。
+        // 与上面两条**同一个问法**、同一处调用 —— 分开放会各自演化。
+        // ⚠️ 本调用用**默认时间下限**（盖过"先落桶、后落行"那个窗口），
+        //    否则它会把**正在上传的对象删掉** —— 用防残留的机制制造数据丢失。
+        int orphanObjects = ProbeCleanup.sweepOrphanMinioObjects(
+                minioClient, minioBucket, jdbc, ProbeCleanup.DEFAULT_MIN_AGE);
+        if (orphanObjects > 0) {
+            // **> 0 是信号，不是正常现象** —— 说明有类漏清了（与 kb 族那条同源）
+            log.warn("[探针兜底] 删掉 {} 个无主 MinIO 对象 —— 有类漏清了，请补它的收尾", orphanObjects);
+        }
     }
 
     /**

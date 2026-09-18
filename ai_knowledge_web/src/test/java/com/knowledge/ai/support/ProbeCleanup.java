@@ -1,5 +1,6 @@
 package com.knowledge.ai.support;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.Collection;
@@ -27,6 +28,7 @@ import java.util.stream.Collectors;
  * <p>⚠️ 本类**刻意不做**"清全库"式删除（如 `delete from sys_chunk`）—— 那会连**别人**的
  * 探针数据一起清掉，多个用例类并行/连续跑时会互相打架。只删调用方点名的那批 id。
  */
+@Slf4j
 public final class ProbeCleanup {
 
     /**
@@ -193,6 +195,108 @@ public final class ProbeCleanup {
     public static int sweepProbeUsage(JdbcTemplate jdbc) {
         return jdbc.update("delete from sys_model_usage where occurred_at = curdate()");
     }
+
+    /**
+     * **MinIO 对象的兜底**（`T-O10`，用户 2026-09-18 裁定收进 O 目录）——
+     * 扫四个前缀下的**无主对象**并删掉。
+     *
+     * <h3>为什么需要它：SQL 侧有兜底，MinIO 侧一直没有</h3>
+     * <p>{@link #sweepOrphanKbArtifacts} 早就把"不问'你清了没有'，只问'库里还剩不剩无主的东西'"
+     * 这条问法用在了**行**上；而**对象**那一侧**从来没有对等物** ——
+     * 只有"每个用例类各自删自己造的那些"（`ParseWorkerFlowTest` / `DocParseFlowTest` /
+     * `ChatAttachmentFlowTest` **各写一遍** `removeObject`）。
+     *
+     * <p>⚠️ **"每个类自己清"这条约定已被证明会漏**（`#130`：`DocUploadFlowTest` 那份删了 5 张表、
+     * 唯独漏 `sys_async_task`，一轮全量留 76 行）。**同一个形状**在对象侧原样存在，
+     * 代价是实测过的：桶里攒到 1030 个对象 ⇒ `storage-quota` 全桶递归列举 ⇒ 读超时 ⇒
+     * **把毫不相干的 `KbWriteFlowTest` 拖红**（现象离原因极远）。
+     *
+     * <h3>四个前缀**一次收口**，不一个一个补</h3>
+     * <p>只在 `documents/` 上做等于把同一个坑留给另外三个 —— 而本仓已为"一处一处补"付过四次学费。
+     *
+     * <h3>🔴 时间下限是**唯一**的防误删机制，不能省</h3>
+     * <p>**上传路径是先落桶、后落行**（`ChatAttachmentService#upload`：`storage.store(...)` →
+     * 再 `repository.save(row)`；`DocStorage` 同族）。所以"对象在、行不在"在上传进行中是**正常状态**。
+     * 没有时间下限的话，这个兜底会把**正在上传的对象删掉** ——
+     * 那是**用一个防残留的机制制造数据丢失**，与「闸必须放在建探针之前」是同一条纪律。
+     *
+     * <p>⚠️ 因此本方法**必须能被用例以 {@code Duration.ZERO} 调到**：
+     * 一个**没法被验证的兜底**与**没有兜底**在证据上是同一件事。
+     *
+     * <h3>🔴 量"桶里有几个对象"要用**客户端**，不要 `ls` 数容器里的行</h3>
+     * <p>MinIO 在对象被删掉之后**不会修剪空目录**，所以
+     * {@code ls -1R /data/rag-documents/documents} 会把那些**空目录壳**一起列出来。
+     * 实测踩到：按行数读出"905 个孤儿对象"，用客户端一量是 **0** —— 差了两个数量级，
+     * 而那个错数字差点促成一次**不可逆的批量删除决定**。
+     *
+     * <p>⇒ 判据是：**用与删除同一个工具去量**。`listObjects` 说什么才算什么。
+     * （与 `#136`「闸说干净与真的干净是两件事」是同一条纪律的又一次现身：
+     * 这一次是"观测工具与被观测对象不是同一个"。）
+     *
+     * <h3>边界（写下来，免得下一个人以为它管全桶）</h3>
+     * <p><b>只覆盖"有归属列的前缀"。</b>没有归属列的对象**结构上判不了无主** ——
+     * `audit-export/` 就是（`#78` 已登记：它没有归属列）。
+     *
+     * <p><b>调用点只在 {@code ApiTestSupport}</b>，`RetrievalFlowSupport` **刻意没加** ——
+     * 那个基座的用例全是**直接插库造数据**（`insertDocWithChunks` 之类），**不往桶里写对象**，
+     * 加了等于每个方法白花一次 `listObjects` 往返、零收益。
+     * ⚠️ **但那条前提会变**：哪天有人在那个基座上写了一个真上传的用例，**就要把调用补上**
+     * （否则那个用例的残留**结构上不在兜底的输入里** —— 正是 `#149` 记的那个形态）。
+     *
+     * @param minAge 只扫**比它更老**的对象；调用方传 {@code Duration.ZERO} 表示"不设下限"（用例用）
+     * @return 删掉的对象数。**> 0 是信号，不是正常现象** —— 说明有类漏清了
+     */
+    public static int sweepOrphanMinioObjects(io.minio.MinioClient minioClient, String bucket,
+                                             JdbcTemplate jdbc, java.time.Duration minAge) {
+        java.time.Instant cutoff = java.time.Instant.now().minus(minAge);
+        int removed = 0;
+        for (String[] prefix : MINIO_PREFIXES) {
+            String objectPrefix = prefix[0];
+            String table = prefix[1];
+            String column = prefix[2];
+            try {
+                for (io.minio.Result<io.minio.messages.Item> result : minioClient.listObjects(
+                        io.minio.ListObjectsArgs.builder()
+                                .bucket(bucket).prefix(objectPrefix).recursive(true).build())) {
+                    io.minio.messages.Item item = result.get();
+                    // 太新 ⇒ 可能正在上传（先落桶后落行）—— **跳过，不删**
+                    if (item.lastModified().toInstant().isAfter(cutoff)) {
+                        continue;
+                    }
+                    Integer rows = jdbc.queryForObject(
+                            "select count(*) from " + table + " where " + column + " = ?",
+                            Integer.class, item.objectName());
+                    if (rows != null && rows > 0) {
+                        continue;       // 有主，活着
+                    }
+                    minioClient.removeObject(io.minio.RemoveObjectArgs.builder()
+                            .bucket(bucket).object(item.objectName()).build());
+                    log.warn("兜底删掉无主对象（有类漏清了）：{}/{}", bucket, item.objectName());
+                    removed++;
+                }
+            } catch (Exception ex) {
+                // 兜底自己炸了不该让用例红 —— 但它**必须说出来**（否则"扫过了"与"扫失败了"分不清）
+                log.warn("无主对象扫描失败（前缀 {}）：{}", objectPrefix, ex.getMessage());
+            }
+        }
+        return removed;
+    }
+
+    /** 默认下限：10 分钟。取值理由见 {@link #sweepOrphanMinioObjects} —— 只要盖过"上传中"那一窗口即可。 */
+    public static final java.time.Duration DEFAULT_MIN_AGE = java.time.Duration.ofMinutes(10);
+
+    /**
+     * 四个前缀 → **归属列**。表名/列名都是**编译期常量**（不是用户输入），所以拼进 SQL 没有注入面。
+     *
+     * <p>⚠️ 新增一个"系统产出的对象前缀"时，**必须在这里加一行**，否则它**结构上不在兜底的输入里**
+     * —— 那正是 `#149` 记的"闸覆盖了一类产物、另一类不在输入里"那个形态。
+     */
+    private static final String[][] MINIO_PREFIXES = {
+            {"documents/", "sys_document", "storage_path"},
+            {"parsed/", "sys_document", "parse_path"},
+            {"chat-attachments/", "sys_chat_attachment", "object_key"},
+            {"avatars/", "sys_user", "avatar"},
+    };
 
     private static String placeholders(int count) {
         return java.util.stream.IntStream.range(0, count)
