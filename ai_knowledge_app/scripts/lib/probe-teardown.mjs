@@ -449,8 +449,9 @@ async function quiesceParseJobs(code) {
     }
     await sleep(2000)
   }
-  // 等不到就说出来（调用方的残留自检会把它变成一条红判据，而不是悄悄过去）
-  console.warn(`⚠️ 探针库 ${code} 仍有解析作业在跑（等了 60s）—— 它跑完可能留下块与分区，残留自检会报`)
+  // 等不到就说出来 —— 而且**不只是说出来**：这个 `timedOut` 会一路传到
+  // `kbResidueClean`，把调用方的收尾判据**变红**（`#187` 修的就是"只 warn 不红"）。
+  console.warn(`⚠️ 探针库 ${code} 仍有解析作业在跑（等了 60s）—— 明细见收尾判据（它会报红）`)
   return { cancelled, waitedMs: 60000, timedOut: true }
 }
 
@@ -476,7 +477,11 @@ function minioKeysOf(code) {
  */
 export async function teardownKbProbe(code) {
   // ⓪ `S4-E1` 起多了一步：**先让解析作业停下来**，否则它们是"删完之后还在写"的源头
-  await quiesceParseJobs(code)
+  // 🔴 `#187`：**必须接住它的返回值**。原写法是 `await quiesceParseJobs(code)` ——
+  //    返回值被整个丢掉，于是"等不到"这件事只留在一条 `console.warn` 里，
+  //    调用方的收尾判据**照样全绿**。这正是"没静默"那句承诺没兑现的地方：
+  //    信息**存在**，但在传递的路上被扔了。
+  const quiesce = await quiesceParseJobs(code)
 
   // ① 快照 —— 删行之后就取不到了
   const ids = kbIdsOf(code)
@@ -509,8 +514,8 @@ export async function teardownKbProbe(code) {
   )
 
   // ⑤ 残留自检 —— 独立观测点
-  const residue = await findKbProbeResidue(code, { ids, minioKeys })
-  return { code, ids, minioKeys, removed: { minio: minioRemoved, sql: '见 residue' }, residue }
+  const residue = await findKbProbeResidue(code, { ids, minioKeys, quiesceTimedOut: !!quiesce.timedOut })
+  return { code, ids, minioKeys, removed: { minio: minioRemoved, sql: '见 residue' }, residue, quiesce }
 }
 
 /** 用户族探针（`e2e-audit-backfill` 那类）。幂等。 */
@@ -573,7 +578,7 @@ export function userIdsOf(prefix) {
  * @param snapshot 清理**前**取的 `{ids, minioKeys}`；不给则 `ids` 类计数无意义（见 {@link #idsUsed}）
  */
 export async function findKbProbeResidue(code, snapshot = {}) {
-  const { ids = [], minioKeys = [] } = snapshot
+  const { ids = [], minioKeys = [], quiesceTimedOut = false } = snapshot
 
   // ① 按**清理前抓到的 ids** 数 —— 与 `teardownKbProbe` 的删除用的是同一份 ids，
   //    所以"删了什么"与"查了什么"是同一个集合（旧版差的就是这一点）
@@ -616,6 +621,18 @@ export async function findKbProbeResidue(code, snapshot = {}) {
     milvusPartitions: await milvusLeftoverPartitions(ids),
     /** ⚠️ 只有「清理前快照到的那些对象」能这么查 —— 更早的轮次留下的孤儿对象查不到。 */
     minioStillThere: minioStillPresent(minioKeys),
+    /**
+     * 🔴 **静默等待失败**（`#187`）：清理前没等到解析作业停下来。
+     *
+     * <p>它的含义**不是**"现在有残留"，而是**"这份残留报告不可信"**：
+     * 还在跑的 worker 会在删完之后**继续往已删的库写**，所以此刻数出来的 0
+     * 只说明"这一刻是 0"。实测后果是**几分钟后**多出 156 行孤儿分片 + 1 个空分区
+     * （`S6-M09-B` 收尾时逮到的那次）。
+     *
+     * <p>所以它**计入** {@link kbResidueClean} —— 见那里的注释：这条不是"多一个数"，
+     * 是把一个"沉默的不可知"变成一条**红判据**。
+     */
+    quiesceTimedOut,
   }
 }
 
@@ -665,6 +682,10 @@ export function describeKbResidue(r) {
     + `无主残留=${r.orphanTotal} · `
     + `Milvus 向量=${r.milvusVectors} 分区=[${r.milvusPartitions.join(',') || '—'}] `
     + `MinIO 对象=${r.minioStillThere.length}`
+    + (r.quiesceTimedOut
+      ? ' · 🔴 **解析作业没停下来（等了 60s）—— 这份报告不可信**：'
+        + '还在跑的 worker 会在删完之后继续往已删的库写（实测几分钟后多出 156 行孤儿分片 + 1 个空分区）'
+      : '')
     + (r.idsUsed === 0 ? ' · ⚠️ 本轮没抓到 kb ids，上述按归属的数**无从查起**（不是"干净"）' : '')
 }
 
@@ -676,4 +697,11 @@ export function describeKbResidue(r) {
  * 它由 `describeKbResidue` 打出来报警，并由 `selftest-residue.mjs` 的负向锚钉住"它数得出来"。
  */
 export const kbResidueClean = (r) =>
-  r.sqlTotal === 0 && r.milvusVectors === 0 && r.milvusPartitions.length === 0 && r.minioStillThere.length === 0
+  r.sqlTotal === 0 && r.milvusVectors === 0 && r.milvusPartitions.length === 0
+  && r.minioStillThere.length === 0
+  // 🔴 `#187`：**等不到解析作业停下来 ⇒ 清理不算干净**。
+  //    它的语义不是"现在有残留"（此刻多半真是 0），而是"这份报告不可信" ——
+  //    还在跑的 worker 会在删完之后继续写，实测几分钟后多出 156 行孤儿分片 + 1 个空分区。
+  //    之所以并进这个布尔量而不是另开一个：**所有调用方都在 check 它** ——
+  //    并进来等于让超时自动把每一处收尾判据变红，不必去改 6 个脚本。
+  && !r.quiesceTimedOut
