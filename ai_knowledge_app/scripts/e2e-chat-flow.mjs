@@ -785,10 +785,44 @@ async function main() {
   })
 
   // ---------- ⑦ 收尾 ----------
+  // 🔴 这一步**只负责报告结论**：真正的清理在 `cleanupProbe()`，而它由下面的
+  //    `finally` **无条件**调用（`#186`：`step()` 失败会 rethrow，所以"清理是一个 step"
+  //    等于"中途失败就不清理"）。这里再调一次是**有意的幂等重复** —— 见该函数的 javadoc。
   await step('收尾：清理探针库与会话行', async () => {
-    // 会话族：**先子后父**（明细按 trace_id 顺上去、消息按 session_id 顺上去）。
-    // ⚠️ 顺序反了会留下孤儿明细，而它们**不属于任何探针前缀**，没有别的机制能发现。
-    // 口径是「本账号 + id 大于水位」—— 页面级那一步自己开的会话也在这张网里
+    const { residue, left } = await cleanupProbe()
+    check(kbResidueClean(residue), `探针库仍有残留：${describeKbResidue(residue)}`)
+    check(left === 0, `仍残留 ${left} 行会话族数据（含问答附件）`)
+    return `探针库已清（${describeKbResidue(residue)}）· 会话族残留 ${left} 行`
+  })
+}
+
+// ---------------------------------------------------------------- 清理（幂等）
+
+/**
+ * 清理本脚本造的一切，并回报残留。
+ *
+ * <h3>🔴 为什么它必须能从 `finally` 里被调 —— `#186` 的根因</h3>
+ * <p>原先清理是**一个普通的 step**（⑦ 收尾），而 {@link step} 失败时**会 rethrow**
+ * ⇒ 任何一步没走通，收尾就**根本不会执行**。实测代价：`S6-M05-C` 期间两次中断
+ * 各留下一个 `kb_e2echat*` 探针库 + 它的文档/分片/作业 —— 而探针库会把 `sys_kb`
+ * 顶上去、同时**搞红 4 个 kb 用例类**（`#186` 原文）。本批两轮中断各手工清了一次。
+ *
+ * <p>所以：**清理从"一步"变成"一条必走的路径"**，⑦ 收尾那一步改为只**报告结论**。
+ *
+ * <p><b>幂等</b>：删除都是「水位」形状（`id > 水位` / `session_id > 水位`），跑两遍是
+ * no-op；`teardownKbProbe` 也自带"删不到就跳过"。所以正常路径上它会跑两次
+ * （⑦ 一次、`finally` 一次）—— 这是**有意的**：宁可多做一次无副作用的清理，
+ * 也不要把"这条路一定会走"当成前提。
+ *
+ * <p><b>半途状态安全</b>：登录之前就失败时 `loginUserId` / `sessionFloor` 还是 0 ——
+ * 那时会话族本来就没被造出来，跳过即可（kb 族与会话族**分开判**，不要用一个
+ * `if` 把两者绑在一起：它们的水位来源不同，绑起来将来一定漏一处）。
+ */
+async function cleanupProbe() {
+  // 会话族：**先子后父**（明细按 trace_id 顺上去、消息按 session_id 顺上去）。
+  // ⚠️ 顺序反了会留下孤儿明细，而它们**不属于任何探针前缀**，没有别的机制能发现。
+  // 口径是「本账号 + id 大于水位」—— 页面级那一步自己开的会话也在这张网里
+  if (loginUserId > 0) {
     mysqlScalar(
       `delete from sys_retrieval_trace_chunk where trace_id in (select trace_id from sys_retrieval_trace `
         + `where user_id = ${loginUserId} and session_id > ${sessionFloor});`,
@@ -812,30 +846,30 @@ async function main() {
       minioRemove([attachmentObjectKey])
     }
     mysqlScalar(`delete from sys_chat_attachment where user_id = ${loginUserId};`)
-    if (attachmentFixture && existsSync(attachmentFixture)) {
-      rmSync(attachmentFixture, { force: true })
-    }
+  }
+  if (attachmentFixture && existsSync(attachmentFixture)) {
+    rmSync(attachmentFixture, { force: true })
+  }
 
-    // ⚠️ `teardownKbProbe` 是 async（它要等 Milvus 那边确认）—— 漏了 await 拿到的是 Promise，
-    // 而 `residue` 是 undefined，报出来的是 "Cannot read properties of undefined"，
-    // 与"清理失败"看起来毫不相干（本脚本第一版正是如此）
-    const r = await teardownKbProbe(KB_CODE)
-    check(kbResidueClean(r.residue), `探针库仍有残留：${describeKbResidue(r.residue)}`)
+  // ⚠️ `teardownKbProbe` 是 async（它要等 Milvus 那边确认）—— 漏了 await 拿到的是 Promise，
+  // 而 `residue` 是 undefined，报出来的是 "Cannot read properties of undefined"，
+  // 与"清理失败"看起来毫不相干（本脚本第一版正是如此）
+  const r = await teardownKbProbe(KB_CODE)
 
-    // 独立观测点：不看清理命令的返回值，直接再查一次
-    const left = Number(
-      mysqlScalar(
-        `select (select count(*) from sys_chat_session where user_id = ${loginUserId} and id > ${sessionFloor}) `
-          + `+ (select count(*) from sys_chat_message where session_id > ${sessionFloor}) `
-          + `+ (select count(*) from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor}) `
-          + `+ (select count(*) from sys_retrieval_trace_chunk where trace_id in `
-          + `(select trace_id from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor})) `
-          + `+ (select count(*) from sys_chat_attachment where user_id = ${loginUserId});`,
-      ),
-    )
-    check(left === 0, `仍残留 ${left} 行会话族数据（含问答附件）`)
-    return `探针库已清（${describeKbResidue(r.residue)}）· 会话族残留 ${left} 行`
-  })
+  // 独立观测点：不看清理命令的返回值，直接再查一次
+  const left = loginUserId > 0
+    ? Number(
+        mysqlScalar(
+          `select (select count(*) from sys_chat_session where user_id = ${loginUserId} and id > ${sessionFloor}) `
+            + `+ (select count(*) from sys_chat_message where session_id > ${sessionFloor}) `
+            + `+ (select count(*) from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor}) `
+            + `+ (select count(*) from sys_retrieval_trace_chunk where trace_id in `
+            + `(select trace_id from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor})) `
+            + `+ (select count(*) from sys_chat_attachment where user_id = ${loginUserId});`,
+        ),
+      )
+    : 0
+  return { residue: r.residue, left }
 }
 
 // ---------------------------------------------------------------- 启动/收尾
@@ -945,6 +979,16 @@ try {
   console.error(`\n✗ 中断：${e.message}`)
   process.exitCode = 1
 } finally {
+  // 🔴 `#186`：清理是**必走路径**，不是"一步"。
+  //    `step()` 失败会 rethrow ⇒ 中途失败时 ⑦ 收尾根本不会执行，于是探针库留在库里，
+  //    把 `sys_kb` 顶上去、同时搞红 4 个 kb 用例类。实测本批两轮中断各手工清了一次。
+  //    ⚠️ 这里**不再 check**（那会掩盖真正的失败原因）：清理结果由 ⑦ 收尾那一步报告，
+  //    这里只在**兜底清理自己炸了**时说一声 —— 那时才需要人工去核残留。
+  try {
+    await cleanupProbe()
+  } catch (e) {
+    console.error(`  ⚠️ 兜底清理失败（正常路径的 ⑦ 收尾会报残留，这里只提示）：${e.message}`)
+  }
   try {
     ws?.close()
   } catch {}
