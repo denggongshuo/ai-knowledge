@@ -1,20 +1,35 @@
 package com.knowledge.ai.controller;
 
+import com.knowledge.ai.core.audit.AuditLog;
+import com.knowledge.ai.core.audit.AuditModule;
+import com.knowledge.ai.core.audit.RiskLevel;
+import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.security.LoginUserContext;
+import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.pipeline.chat.ChatDtos;
 import com.knowledge.ai.pipeline.chat.ChatSink;
+import com.knowledge.ai.service.ChatSessionService;
 import com.knowledge.ai.service.ChatStreamService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * 问答入口（`T-800`）—— `POST /api/chat/completions`，SSE 流式。
@@ -24,10 +39,12 @@ import java.io.IOException;
  *   <li><b>路径与请求字段是前端定死的</b>：{@code request.ts:245} 打的是
  *       {@code /api/chat/completions}，body 是 <b>{@code message}</b> 而不是 {@code query}，
  *       且**不带 {@code kbIds}**（检索范围由服务端的可见范围决定）。</li>
- *   <li><b>权限只要求登录</b>：{@code PermissionCode} 里没有 {@code chat:*}，
- *       而问答本身不写任何受控资源。与 {@code /system/thresholds} / {@code /kb/presets}
- *       同型 —— 不收窄到某个权限码，免得普通用户问不出问题。
- *       ⚠️ 将来引入问答侧的运营权限时**要重新判**（已登记 `#122` 的同族问题）。</li>
+ *   <li><b>发问只要求登录，但会话管理不是</b>：{@code PermissionCode} 里确实没有
+ *       {@code chat:*} —— 而问答侧的权限码在**另一个域名**下：7 个 {@code qa:*} 码
+ *       （`T-802` 的四个接口各挂一个，见下方方法注释）。
+ *       发问（本方法）仍只要求登录：它不写任何受控资源，收窄了会让普通用户问不出问题。
+ *       ⚠️ 立据时这里写的是"没有 {@code chat:*} 所以只要求登录"，**漏了 {@code qa:*}** ——
+ *       施工首日发现并订正（计划 §3 修订 1 / §9 遗留 1）。</li>
  *   <li><b>不发 {@code attachment} 事件</b>：`T-512`（S6）之前图片不进问答。
  *       请求里的 {@code attachmentIds} / {@code useVision} 收下但**不生效**，
  *       {@code done.usedVision} 如实回 {@code false} —— 不假装接受了。</li>
@@ -54,6 +71,8 @@ public class ChatController {
 
     private final ChatStreamService chatStreamService;
 
+    private final ChatSessionService chatSessionService;
+
     /**
      * {@code POST /chat/completions} → {@code text/event-stream}。
      *
@@ -78,6 +97,94 @@ public class ChatController {
             sink.complete();
         }
         return emitter;
+    }
+
+    // ==================================================================
+    // T-802 余下半边（S5-M08-B）：会话列表 / 消息列表 / 删除 / 导出
+    // ==================================================================
+
+    /**
+     * 会话列表（`T-802`），支持标题搜索。
+     *
+     * <p><b>权限码用的是 {@code qa:history:view} 而不是「只要求登录」</b>：
+     * {@link com.knowledge.ai.core.enums.PermissionCode} 里的 7 个 {@code qa:*} 码
+     * **早已存在、{@code V2} 已种子、且已按角色差异化授权**（`USER`/`AUDITOR` 有 view 没有 delete/export，
+     * `GUEST` 一个都没有）。此前没有端点去用它们 —— 不挂就等于**把这条已裁定的权限边界作废**。
+     *
+     * <p>⚠️ 它**只挂 {@code view}，不挂 {@code qa:history:search}**：搜索是列表的收窄，
+     * 能看全部即能筛，筛选不会放大可见面（详见计划 §9 的遗留登记）。
+     */
+    @GetMapping("/sessions")
+    @RequiresPerm("qa:history:view")
+    public ApiResponse<ChatDtos.SessionPage> sessions(
+            @RequestParam(required = false) String keyword,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(chatSessionService.list(userId, keyword, page, size));
+    }
+
+    /**
+     * 某会话的消息列表（含历史引用 `citations[]`）。
+     *
+     * <p>归属校验在服务层：不是本人的 / 不存在 / 已软删，三者一律 {@code NOT_FOUND}
+     * —— **不区分**它们是有意的，区分开就泄露了"这个 id 确实存在"。
+     */
+    @GetMapping("/sessions/{id}/messages")
+    @RequiresPerm("qa:history:view")
+    public ApiResponse<ChatDtos.MessagePage> messages(@PathVariable("id") Long sessionId) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(chatSessionService.messages(userId, sessionId));
+    }
+
+    /**
+     * 删除会话（**软删**，消息行保留）。
+     *
+     * <p>权限 {@code qa:history:delete} —— `USER` 与 `AUDITOR` **都没有**这个码，
+     * 即"能回看自己的历史"与"能抹掉自己的历史"是两件事。
+     */
+    @DeleteMapping("/sessions/{id}")
+    @RequiresPerm("qa:history:delete")
+    public ApiResponse<Map<String, Boolean>> deleteSession(@PathVariable("id") Long sessionId) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(Map.of("deleted", chatSessionService.softDelete(userId, sessionId)));
+    }
+
+    /**
+     * 导出会话为 Markdown —— 🚩 **数据导出（高危）**。
+     *
+     * <p><b>为什么审计点挂在这里而不是 Service 上</b>：`operator` 与 `apiPath` 取自
+     * **请求上下文**（{@code AuditAspect} 从 {@code LoginUserContext} / 请求里取），
+     * 直调 Service 会测成空值 —— 而"谁导出了哪个会话"正是这条日志唯一的价值。
+     *
+     * <p>《01》§487 把「导出会话记录」与批量下载归为同一类**数据外带**行为；
+     * 《05》§4.3② 把数据导出列为高危四类之一。
+     *
+     * <p>⚠️ 本注释**刻意不写那几个注解的字面形式**（连反例也不写）：
+     * {@code audit-api.mjs} 用正则从本目录源码里抓路由，**不区分注释与真注解** ——
+     * 在 javadoc 里写一遍就会多出一条幽灵路由（{@code DocController} 头注记录了这次踩坑）。
+     */
+    @GetMapping("/sessions/{id}/export")
+    @RequiresPerm("qa:session:export")
+    @AuditLog(module = AuditModule.QA, action = "导出会话", risk = RiskLevel.HIGH, target = "#sessionId")
+    public ResponseEntity<byte[]> exportSession(@PathVariable("id") Long sessionId,
+                                                @RequestParam(defaultValue = "md") String format) {
+        Long userId = LoginUserContext.requireUserId();
+        String markdown = chatSessionService.exportMarkdown(userId, sessionId);
+        byte[] body = markdown.getBytes(StandardCharsets.UTF_8);
+
+        // ⚠️ 文件名可能含中文（会话标题就是首个提问），http 头只能放 ASCII ——
+        // 用 RFC 5987 的 `filename*=UTF-8''…` 带上真名，同时给一个纯 ASCII 的
+        // `filename=` 兜底（老客户端只认前者时会拿到一个安全的默认名，而不是乱码）
+        String ascii = "chat-session-" + sessionId + ".md";
+        String encoded = URLEncoder.encode("会话-" + sessionId + ".md", StandardCharsets.UTF_8)
+                .replace("+", "%20");
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_TYPE, "text/markdown; charset=UTF-8")
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + encoded)
+                .body(body);
     }
 
     /**
