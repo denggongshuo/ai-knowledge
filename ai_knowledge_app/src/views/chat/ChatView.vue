@@ -175,6 +175,18 @@ async function uploadOne(att: ChatAttachment) {
     live.md5 = res.md5
     live.mime = res.mime
     live.url = live.url ?? res.presignedUrl
+    // 🔴 **上传成功必须把 stage 从 `UPLOADING` 摘掉** —— 否则**带图提问永远发不出去**：
+    // `send()` 的第二道闸是 `attachments.some(a => a.stage === 'UPLOADING')`，
+    // 它见 `UPLOADING` 就弹「图片仍在上传，请稍候」并 `return`，**一个请求都不发**。
+    // 而界面看起来一切正常：待发送区的文案判的是 `progress >= 100`（不是 stage），
+    // 所以它显示「待发送（发送后由 VL 生成描述）」，用户点「发送」只看到一句一闪而过的提示。
+    //
+    // ⚠️ 这个缺陷**此前不可能被发现**：`T-805` 之前带图问答这条链路的页面级用例
+    // 只验到"上传完成"（`S5-M08-C` 的步骤 ⑥.5），**从来没有真的点过发送**。
+    // `T-907` 接上图片理解之后，这条路径才第一次被端到端走通 —— 一走就撞上了。
+    // 与 `#159`（透传链路三个缺陷）、`#160`（选到不可见的孪生元素）同族：
+    // **凡是"界面上看着对"的地方，都要有一条真跑一次的判据**。
+    live.stage = undefined
     pendingFiles.delete(localId)
   } catch {
     live.stage = 'FAILED'
