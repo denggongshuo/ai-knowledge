@@ -79,6 +79,21 @@ public class SysChunk {
     private Long parentId;
 
     /**
+     * HyQ 块的**来源块** id（`T-507` 的挂起半边，`V24`；契约见 D-5 §1.1 / §1.8）。
+     *
+     * <p>⚠️ 与 {@link #parentId} 是**两件事**，不可合并：
+     * 那是**结构上的父子**（表格行属于表格），这是**生成上的来源**（这段正文推出过这条问句）。
+     * 合并会当场把 `G4-6` 的断言打成红的 —— 它要求「凡有 {@code parent_id} 的块，
+     * 父块必须是 {@code TABLE}」，而 HyQ 的源块是正文。
+     *
+     * <p>只有 {@code HYPOTHESIS_QA} 有值（章节级 {@code SUMMARY} 指向所属标题块，
+     * 是同一套回落口径）。检索侧按它把 HyQ 的内容换成源块正文 ——
+     * 问句只用于召回，不用于回答。
+     */
+    @Column(name = "source_chunk_id")
+    private Long sourceChunkId;
+
+    /**
      * 标题路径（D-5 §1.1 `titlePath`）。
      *
      * <p>它**既进 Milvus 标量**（`title_path`，供过滤）**又进索引期投影**（供语义）——

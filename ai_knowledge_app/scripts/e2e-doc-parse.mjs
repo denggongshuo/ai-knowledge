@@ -103,15 +103,23 @@ function docRowOf(title) {
 }
 
 /**
- * 探针库里某文档的分片统计（`chunk_count|顶层块数|全部块数`）。
+ * 探针库里某文档的分片统计（`chunk_count|计入总数的顶层块数|全部块数`）。
  *
  * 用于 `S4-M05-C1` 的判据 15：`chunk_count` 从「恒 0」变成真值，
  * 且口径必须是**顶层块数**（D-5 §1.5 —— 表格子块不计入）。
+ *
+ * ⚠️ `S5-M08-B` 订正：第二列由「顶层块数」改为「**计入总数的**顶层块数」
+ * （多一个 `chunk_type <> 'HYPOTHESIS_QA'`）。
+ * 原因：`T-507` 落地后 `sys_chunk` 里出现了 **HyQ 块，它是顶层块但不计入 `chunk_count`**
+ * （`BlockType#countsInChunkTotal()` 对 `HYPOTHESIS_QA` 返回 `false`，D-5 §1.5 明写）。
+ * 原式「chunk_count == 顶层块数」在 HyQ 出现之前恰好成立，**那不是口径，是巧合** ——
+ * 表现为 `chunk_count=4 顶层=5`，看着像 `chunk_count` 算错了，实际是这条断言问错了问题。
  */
 function chunkStatOf(title) {
   const raw = mysqlScalar(
     `select concat_ws('|', d.chunk_count, ` +
-      `(select count(*) from sys_chunk c where c.doc_id=d.id and c.parent_id is null), ` +
+      `(select count(*) from sys_chunk c where c.doc_id=d.id and c.parent_id is null ` +
+      ` and c.chunk_type <> 'HYPOTHESIS_QA'), ` +
       `(select count(*) from sys_chunk c where c.doc_id=d.id)) ` +
       `from sys_document d join sys_kb k on k.id=d.kb_id where k.code='${PROBE_CODE}' and d.title='${title}' order by d.id desc limit 1;`,
   )
@@ -453,8 +461,8 @@ async function main() {
     )
     check(
       mdChunks && Number(mdChunks[0]) > 0 && mdChunks[0] === mdChunks[1],
-      'T-503：chunk_count 口径 = 顶层块数（D-5 §1.5：表格子块不计入）—— 销 汇总.md §3 #54',
-      mdChunks ? `chunk_count=${mdChunks[0]} 顶层=${mdChunks[1]} 全部=${mdChunks[2]}` : '—',
+      'T-503：chunk_count 口径 = **计入总数的**顶层块数（D-5 §1.5：表格子块与 HyQ 块都不计入）—— 销 汇总.md §3 #54',
+      mdChunks ? `chunk_count=${mdChunks[0]} 计入总数的顶层=${mdChunks[1]} 全部=${mdChunks[2]}` : '—',
     )
 
     const mdDb = docRowOf('E2E解析探针')
