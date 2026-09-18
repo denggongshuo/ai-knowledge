@@ -299,8 +299,15 @@ public record ParsedDocument(String format,
      * @param tableIndex 仅 `TABLE` 有意义：{@link #tables()} 的**下标（0-based，0 是合法值）**；
      *                   **非表格为 {@code -1}** —— 这里必须用负数哨兵，
      *                   因为 0 是一个真实的表格下标（与 `parentId` 禁用 0 的理由同源：0 有真身）
+     * @param imageInfo  **仅 `IMAGE` 有意义**：这张图的身份与出处（{@link ImageInfo}）——
+     *                   题注配对的 id、包围盒、题注文本、MinIO 对象键、字节 md5。
+     *                   **其余 kind 恒为 {@code null}**。
+     *                   <p>⚠️ `IMAGE` 元素**可以**带着一个 `imageInfo` 却**没有字节**
+     *                   （{@link ImageInfo#hasBytes()} 为 false）——实测 75 张里 49 张如此。
+     *                   那是要**登记给人看**的事实，不是异常（`T-512` 步 6.5，用户裁定 B）。
      */
-    public record DocElement(Kind kind, String text, int pageNo, int level, int tableIndex) {
+    public record DocElement(Kind kind, String text, int pageNo, int level, int tableIndex,
+                             ImageInfo imageInfo) {
 
         /** 元素种类。与 {@link com.knowledge.ai.core.enums.BlockType} 不是一回事 ——
          * 那是**分片后**的块类型（8 种，含摘要与 HyQ），这是**解析产物**的元素形状。 */
@@ -310,19 +317,30 @@ public record ParsedDocument(String format,
 
         /** 排序恒为文档顺序 —— 分片靠的就是它，不该有第二种顺序。 */
         public static DocElement heading(int level, String text, int pageNo) {
-            return new DocElement(Kind.HEADING, text, pageNo, level, -1);
+            return new DocElement(Kind.HEADING, text, pageNo, level, -1, null);
         }
 
         public static DocElement paragraph(String text, int pageNo) {
-            return new DocElement(Kind.PARAGRAPH, text, pageNo, 0, -1);
+            return new DocElement(Kind.PARAGRAPH, text, pageNo, 0, -1, null);
         }
 
         public static DocElement table(int tableIndex, int pageNo) {
-            return new DocElement(Kind.TABLE, null, pageNo, 0, tableIndex);
+            return new DocElement(Kind.TABLE, null, pageNo, 0, tableIndex, null);
         }
 
+        /**
+         * 一个图片元素（`T-512` 起带上 {@code imageInfo}）。
+         *
+         * <p>⚠️ **保留无 `imageInfo` 的重载是有意的**，不是遗留：`TikaDocumentParser`
+         * （DOCX/XLSX/XHTML 那条路）**结构上拿不到图** —— 它只有 `<img>` 元素标记，
+         * 没有字节、没有包围盒、没有 id。给它一个 `imageInfo` 反而是编造。
+         */
         public static DocElement image(int pageNo) {
-            return new DocElement(Kind.IMAGE, null, pageNo, 0, -1);
+            return image(pageNo, null);
+        }
+
+        public static DocElement image(int pageNo, ImageInfo imageInfo) {
+            return new DocElement(Kind.IMAGE, null, pageNo, 0, -1, imageInfo);
         }
     }
 

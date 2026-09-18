@@ -13,7 +13,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
@@ -157,6 +159,12 @@ public class PdfDocumentParser {
         Scan scan = new Scan();
         int pages = intOr(root.get("number of pages"), 0);
 
+        // `T-512` 步 3：**先收题注、再走树** —— 题注节点可能出现在它描述的那张图**前后任意位置**
+        // （实测：`caption` 在第 5 页，它 `linked content id` 指向的 image 不一定同页）。
+        // 单趟边走边配的话，配对结果会取决于遍历顺序 —— 那是"这份样本看着对、换一份就错"
+        // 的一类缺陷，而需求 `06:158` 把题注定成了分片内容的**首选**，错配就直接污染检索。
+        collectCaptions(root.get("kids"), scan);
+
         walk(root.get("kids"), 0, title, scan);
 
         List<ParsedDocument.Heading> headings = scan.headings;
@@ -205,6 +213,13 @@ public class PdfDocumentParser {
         private final List<String> paragraphs = new ArrayList<>();
         private final List<ParsedDocument.DocElement> elements = new ArrayList<>();
         private int imageCount;
+        /**
+         * `T-512` 步 3：题注的 `linked content id` → 题注文本。
+         *
+         * <p>先于 `walk` 填好（见 {@link #collectCaptions}），因为题注与它描述的图
+         * **在元素树里没有固定的先后**。
+         */
+        private final Map<Integer, String> captionByLinkId = new HashMap<>();
     }
 
     /**
@@ -261,7 +276,7 @@ public class PdfDocumentParser {
                 }
                 case "image" -> {
                     scan.imageCount++;
-                    scan.elements.add(ParsedDocument.DocElement.image(pageNo));
+                    scan.elements.add(ParsedDocument.DocElement.image(pageNo, imageInfoOf(el, scan)));
                 }
                 case "paragraph" -> {
                     String text = textOr(el.get("content"), "").trim();
@@ -284,10 +299,71 @@ public class PdfDocumentParser {
                     // 这是步 0.5 修的那个缺陷 —— 此前这里什么都不做，于是 `text block`
                     // 的后代（段落、列表）整片消失。题注没有 kids，递归到它是空操作；
                     // "题注挂着表格"那一路仍由 table 侧的 "title" 承接，不进正文。
+                    //
+                    // ⚠️ `T-512` 起 `caption` **多了一个去处**：它已经被 collectCaptions
+                    //    收进 `captionByLinkId`，再由 imageInfoOf 挂到对应的图元素上。
+                    //    所以本分支"不产出元素"这一条**依然成立**（题注不单独成元素），
+                    //    但它不再是"被丢掉"—— 那是本批要修的那件事。
                     walk(el.get("kids"), pageNo, title, scan);
                 }
             }
         }
+    }
+
+    /**
+     * 收题注（`T-512` 步 3）：`caption` 的 `linked content id` → 题注文本。
+     *
+     * <p>实测（`T512ImageProbeTest`）：`caption` 节点的字段是
+     * {@code [type, pdfua_tag, id, page number, bounding box, linked content id, font, font size, text color, content]}，
+     * 11 条题注全部带 `linked content id` —— **这条链是通的**，只是此前没人走。
+     *
+     * <p>⚠️ 同一张图有多条题注时取**第一条**（{@code putIfAbsent}），**不拼接**：
+     * 拼起来会让"作者写的那句话"变成一段混合物，而需求 `06:158` 要的恰恰是那一句
+     * （「题注优先级更高，它是作者写的，比 VL 描述更准」）。
+     */
+    private static void collectCaptions(JsonNode kids, Scan scan) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            if ("caption".equals(textOr(el.get("type"), ""))) {
+                JsonNode link = el.get("linked content id");
+                String content = textOr(el.get("content"), "").trim();
+                if (link != null && link.canConvertToInt() && !content.isEmpty()) {
+                    scan.captionByLinkId.putIfAbsent(link.asInt(), content);
+                }
+            }
+            collectCaptions(el.get("kids"), scan);
+        }
+    }
+
+    /**
+     * `image` 节点 → {@link ImageInfo}（`T-512` 步 1）。
+     *
+     * <p>⚠️ {@code objectKey} / {@code md5} 在这里**恒为 null** —— 它们要等字节真的落到 MinIO
+     * 之后才有，而那一步由 `DocParseService` 提供的 `ImageSink` 完成（步 2）。
+     * **这里不编造**：节点有 {@code source} 只说明解析器**打算**导出，
+     * 导出成功与否由那一步按字节判定（`ImageInfo#hasBytes`）。
+     */
+    private static ImageInfo imageInfoOf(JsonNode el, Scan scan) {
+        JsonNode idNode = el.get("id");
+        Integer id = idNode != null && idNode.canConvertToInt() ? idNode.asInt() : null;
+        return new ImageInfo(id, boxOf(el.get("bounding box")),
+                id == null ? null : scan.captionByLinkId.get(id), null, null);
+    }
+
+    /**
+     * `bounding box` = {@code [x0, y0, x1, y1]}（实测字段名**带空格**）。
+     *
+     * <p>形状不对时返回 {@code null} 而不是硬凑四个 0：0 包围盒是一个**看起来合法**的值，
+     * 会让下游的"面积过滤"把这张图当成小图标丢掉 —— 那是静默丢内容。
+     */
+    private static ImageInfo.Box boxOf(JsonNode node) {
+        if (node == null || !node.isArray() || node.size() < 4) {
+            return null;
+        }
+        return new ImageInfo.Box(node.get(0).asDouble(), node.get(1).asDouble(),
+                node.get(2).asDouble(), node.get(3).asDouble());
     }
 
     /** {@code table} 元素 → cell 矩阵。格子在 {@code cells[].kids[].content} 里逐段拼。 */

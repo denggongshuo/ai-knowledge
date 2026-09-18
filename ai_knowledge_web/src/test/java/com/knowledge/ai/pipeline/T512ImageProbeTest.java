@@ -150,6 +150,51 @@ class T512ImageProbeTest {
                 .isGreaterThanOrEqualTo(0L);
     }
 
+    @Test
+    @DisplayName("T-512 步 1/3：解析器真的把 id / 包围盒 / 题注挂到了 IMAGE 元素上")
+    void parserCarriesImageIdentityAndCaption() throws Exception {
+        Assumptions.assumeTrue(Files.isRegularFile(SAMPLE), "缺样本 " + SAMPLE);
+
+        ParsedDocument doc = PdfDocumentParser.parse(SAMPLE);
+        List<ParsedDocument.DocElement> images = doc.elements().stream()
+                .filter(e -> e.kind() == ParsedDocument.DocElement.Kind.IMAGE)
+                .toList();
+
+        long withInfo = images.stream().filter(e -> e.imageInfo() != null).count();
+        long withId = images.stream()
+                .filter(e -> e.imageInfo() != null && e.imageInfo().sourceId() != null).count();
+        long withBox = images.stream()
+                .filter(e -> e.imageInfo() != null && e.imageInfo().box() != null).count();
+        long withCaption = images.stream()
+                .filter(e -> e.imageInfo() != null && e.imageInfo().hasCaption()).count();
+
+        System.out.println("======== T-512 步 1/3：解析器侧取证 ========");
+        System.out.println("IMAGE 元素 = " + images.size());
+        System.out.println("带 imageInfo = " + withInfo);
+        System.out.println("带 sourceId  = " + withId);
+        System.out.println("带 bounding box = " + withBox);
+        System.out.println("带题注        = " + withCaption);
+        System.out.println("==========================================");
+
+        assertThat(images).as("样本必须真的有图元素，否则本用例什么都没验").isNotEmpty();
+        assertThat(withInfo)
+                .as("每个 IMAGE 元素都要带 imageInfo（内容可以为空，但对象本身要定义）")
+                .isEqualTo(images.size());
+        assertThat(withId)
+                .as("**每个** IMAGE 元素都必须带 sourceId —— 它是题注配对的唯一钥匙，"
+                        + "实测 75/75 都有值；缺了就意味着配对整体失效")
+                .isEqualTo(images.size());
+        assertThat(withBox)
+                .as("包围盒是 `T-O03` ②「尺寸/位置固定」与 `T-512` 的小图标过滤的**唯一输入**，"
+                        + "实测每张都有")
+                .isEqualTo(images.size());
+        assertThat(withCaption)
+                .as("⚠️ 题注**本来就稀有**（实测 11 条题注 / 75 张图、能配上对 8 条 ≈11%%）。"
+                        + "所以这里断言的是 **> 0**（配对链真的通了），**不是**'大多数都有' —— "
+                        + "把后者写成断言等于要求样本去迎合实现")
+                .isGreaterThan(0);
+    }
+
     // ==================================================================
     // 探针本体
     // ==================================================================
