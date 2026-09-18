@@ -232,7 +232,8 @@ public final class ChatDtos {
      * 别因为都在聊天域就统一成一种写法。
      *
      * @param id          消息 id（**字符串形式**，同 {@code ChatSessionItem#id}）
-     * @param attachments 图片附件。`T-805`（图片附件）未落地 ⇒ **恒为空列表** ——
+     * @param attachments 图片附件。⚠️ `S5-M08-C` 已交付 `T-805`（上传/落库/回看），
+     *                    但**附件与消息的绑定**属 `T-806`/`T-512` ⇒ 本批仍**恒为空列表**。
      *                    发空数组而不是省掉这个字段：前端按数组遍历，缺字段要写判空
      */
     public record ChatMessageItem(String id, String role, String content, long createdAt,
@@ -242,5 +243,76 @@ public final class ChatDtos {
 
     /** 消息列表响应。形状同 {@link SessionPage}（{@code {list, total}}）。 */
     public record MessagePage(List<ChatMessageItem> list, long total) {
+    }
+
+    // ==================================================================
+    // 图片附件（`T-805`）与反馈（`T-807`）· `S5-M08-C`
+    // ==================================================================
+
+    /**
+     * 图片预上传的响应（{@code POST /chat/attachments}）。
+     *
+     * <p>字段与 mock（{@code mock/index.ts:669}）逐字一致 —— 同
+     * {@link ChatSessionItem} 那条「**字段形状以 mock 为准**」的规矩。
+     *
+     * @param attachmentId 附件 id 的**字符串形式**（前端类型是 {@code string}，
+     *                     后端主键是 {@code BIGINT}）。与 {@link DoneEvent#messageId}
+     *                     同一条口径：发字符串，别让两边各转一次
+     * @param presignedUrl 短 TTL 的预签名读地址，供前端直接当 {@code <img src>} 用。
+     *                     ⚠️ **不落库** —— 它必然过期，回看时重新签发
+     */
+    public record AttachmentUploadResult(String attachmentId, String presignedUrl,
+                                         String md5, long size, String mime) {
+    }
+
+    /**
+     * 回看附件（{@code GET /chat/attachments/{id}}）。
+     *
+     * <h3>后五个字段本批恒为 {@code null} —— 这是如实，不是遗漏</h3>
+     * <p>它们属于 **VL 描述**（需求 `09` §4.6），而描述生成是 `T-512`（S6）：
+     * 「`T-805` 只落 MinIO + 落库，**不调 VL**」是任务行写死的边界。
+     * 所以这里**不填假值**：`{@code desc = ""}` 会被前端当成"模型确实没看出什么"，
+     * 与"还没理解过"是两回事。
+     *
+     * <p>⚠️ {@link #degraded} 刻意用 **{@code Boolean}` 而不是 {@code boolean}`**：
+     * {@code null} = 「还没有描述」，{@code false} = 「有描述且没降级」。
+     * 用基本类型就必然要在"没有描述"时填一个 {@code false} —— 那是把两个事实压成一个。
+     *
+     * <p>⚠️ 本批 {@code ChatView} **没有消费方**（回看入口在 `T-806`），
+     * 但它必须真的能读 —— 否则 `T-512` 落地时才发现读侧不成立。
+     */
+    public record AttachmentView(String id,
+                                 String type,
+                                 String name,
+                                 long size,
+                                 String md5,
+                                 String mime,
+                                 String url,
+                                 String desc,
+                                 String searchSummary,
+                                 String vlModelName,
+                                 Boolean degraded,
+                                 String promptVersion) {
+    }
+
+    /**
+     * 反馈请求体（{@code POST /chat/feedback}，需求 `07` §6.8）。
+     *
+     * @param messageId 被反馈的消息 id，**字符串**（前端拿到的就是 {@code done.messageId} 那个串）。
+     *                  ⚠️ 解析不出数字时按 **{@code NOT_FOUND}** 处理而不是 `400` ——
+     *                  一个不存在的 id 与一个格式不对的 id，对调用方是同一件事
+     * @param type      {@code like} / {@code unlike}
+     * @param reason    点踩原因（{@code ChatFeedbackReason} 的 5 个中文标签之一）。
+     *                  **只在 {@code unlike} 时允许有值** —— 需求写的是「**点踩时**可选原因」
+     */
+    public record FeedbackRequest(String messageId, String type, String reason) {
+    }
+
+    /**
+     * 反馈的落库结果（回给前端，便于它把状态定在原地而不是自己猜）。
+     *
+     * @param feedback 落库后的当前值 —— **可能是覆盖后的结果**，前端别假定它等于刚提交的 type
+     */
+    public record FeedbackResult(String messageId, String feedback, String reason) {
     }
 }

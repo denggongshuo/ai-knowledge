@@ -296,15 +296,30 @@ export const recycleApi = {
   cleanup: () => http.post<{ cleaned: number; note: string }>('/recycle/cleanup'),
 }
 
-/** 问答（图片附件与会话；流式生成走 chatStream） */
+/** 问答（图片附件 / 会话 / 反馈；流式生成走 chatStream） */
 export const chatApi = {
-  /** 图片预上传：只落存储 + 落库，不调 VL（描述由后端在 completions 内部完成） */
-  uploadAttachment: (body: { name: string; size: number; md5: string; mime?: string }) =>
-    http.post<AttachmentUploadResult>('/chat/attachments', body),
-  /** 回看附件（含 VL 描述，只读展示） */
+  /**
+   * 图片预上传：只落存储 + 落库，不调 VL（描述由后端在 completions 内部完成）。
+   *
+   * <p>⚠️ 走 `http.upload` 而**不是** `http.post`：需求 `09` §FR-SYS-04 的接口表写的是
+   * `multipart/form-data`，而这里此前发的是一个只有 `{name,size,md5,mime}` 的 JSON ——
+   * **文件字节从来没有上传过**。改用 `upload` 后顺带拿到 XHR 的真实进度，
+   * 于是 `ChatView` 里那个"每 80ms 自己加 12%"的假进度定时器可以删掉。
+   */
+  uploadAttachment: (form: FormData, onProgress?: (percent: number) => void) =>
+    http.upload<AttachmentUploadResult>('/chat/attachments', form, onProgress),
+  /** 回看附件（含 VL 描述，只读展示）。⚠️ 描述字段在 T-512 之前为 null */
   attachment: (id: string) => http.get<Record<string, unknown>>(`/chat/attachments/${id}`),
   sessions: () => http.get<{ list: ChatSessionItem[]; total: number }>('/chat/sessions'),
   messages: (id: string) => http.get<{ list: unknown[]; total: number }>(`/chat/sessions/${id}/messages`),
+  /**
+   * 点赞 / 点踩（+ 点踩原因）—— 后端落库，运营页据此归因（`G5-14`）。
+   *
+   * <p>`reason` **只在点踩时**能带：点赞带原因后端会拒（`PARAM_INVALID`），
+   * 因为需求 `07` §6.8 写的是「点踩时可选原因」。
+   */
+  feedback: (body: { messageId: string; type: 'like' | 'unlike'; reason?: string }) =>
+    http.post<{ messageId: string; feedback: string; reason: string | null }>('/chat/feedback', body),
 }
 
 /** 系统配置 */

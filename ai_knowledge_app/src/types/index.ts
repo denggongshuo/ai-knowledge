@@ -152,7 +152,25 @@ export interface ChatMessage {
   attachments?: ChatAttachment[]
   /** 是否把原图直接传给了对话模型（「直接读原图」兜底，仅该轮生效） */
   usedVision?: boolean
+  /**
+   * 当前反馈：`like` / `unlike`；`null` = **从未反馈**（与会话列表里可空的 `modelId` 同一口径）。
+   *
+   * <p>⚠️ 与后端那三列一对一 —— 它表示的是**当前值**，不是"我这次点了什么"。
+   * 用户改主意时是覆盖，前端据此把高亮跟着换过去。
+   */
+  feedback?: 'like' | 'unlike' | null
+  /** 点踩原因（`ChatFeedbackReason` 的 5 个中文标签之一）；点赞或未反馈时为 `null` */
+  feedbackReason?: string | null
 }
+
+/** 点赞 / 点踩的原因选项（**必须与后端 `ChatFeedbackReason` 逐字一致**） */
+export const FEEDBACK_REASONS = [
+  '答案不准确',
+  '没找到相关内容',
+  '引用来源不对',
+  '回答太啰嗦',
+  '其他',
+] as const
 
 /** 图片附件（V2 新增：提问传图 → VL 生成描述） */
 export interface ChatAttachment {

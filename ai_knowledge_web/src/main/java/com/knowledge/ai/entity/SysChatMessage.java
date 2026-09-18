@@ -79,6 +79,32 @@ public class SysChatMessage {
     @Column(name = "finish_reason", length = 32)
     private String finishReason;
 
+    // ---------- 反馈（T-807 / G5-14）----------
+
+    /**
+     * 点赞 / 点踩：{@code like} / {@code unlike}。
+     *
+     * <p>🔴 {@code null} 的语义是「**从未反馈**」，与 {@code unlike} 是两件事。
+     * 运营统计**必须**用 {@code where feedback = 'unlike'}，**不能**用 {@code <> 'like'}——
+     * MySQL 里 {@code NULL <> 'like'} 求值为 {@code NULL}（非 true），
+     * 会把"从未反馈"整批滤掉，负反馈率的分母静默变小。
+     */
+    @Column(name = "feedback", length = 16)
+    private String feedback;
+
+    /**
+     * 点踩原因（{@code ChatFeedbackReason} 的中文标签，5 条枚举之一）。
+     *
+     * <p>只在 {@link #feedback} 为 {@code unlike} 时有值 —— {@code like} 不带原因，
+     * 需求 `07` §6.8 写的是「**点踩时**可选原因」。
+     */
+    @Column(name = "feedback_reason", length = 64)
+    private String feedbackReason;
+
+    /** 反馈时间。可被改写 —— **改主意是覆盖，不是追加**（不保留变更历史，见计划 §3.4 假设 3）。 */
+    @Column(name = "feedback_at")
+    private LocalDateTime feedbackAt;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 }

@@ -1,7 +1,7 @@
 /**
  * 页面级联调 —— 问答 SSE 全链路（`S5-M08-A` · `T-800`/`T-801`/`T-707`/`T-708`）。
  *
- * <h3>这个脚本验的四件事</h3>
+ * <h3>这个脚本验的六件事</h3>
  * <ol>
  *   <li><b>SSE 事件序列</b>（`G5-7`/`G5-8`）：首包必须是 `retrieval`，
  *       且 `done` 带 `modelId`/`modelName`/`tokenUsage`/`finishReason`/`usedVision`；</li>
@@ -9,7 +9,11 @@
  *       —— 前端用前者渲染引用角标、用后者渲染链路面板，漂移了就对不上；</li>
  *   <li><b>打点落库</b>（`G5-12`/`G5-13`/`I-13`/`I-14`）：`sys_retrieval_trace` 真有一行，
  *       6 阶段耗时齐全、Top1 相似度非空；</li>
- *   <li><b>页面级</b>（`G5-15`）：真后端模式下「提问 → 引用角标 → 检索详情面板」能走通。</li>
+ *   <li><b>页面级</b>（`G5-15`）：真后端模式下「提问 → 引用角标 → 检索详情面板」能走通；</li>
+ *   <li><b>图片附件</b>（`T-805`，`S5-M08-C`）：从页面喂一张**真文件**，验它走 multipart
+ *       落桶 + 落库 —— 改前前端发的是 JSON 元数据，**一个字节都没传**，而接口照样返回 200；</li>
+ *   <li><b>反馈</b>（`T-807`/`G5-14`）：页面点「点赞」再改成「点踩+原因」，回查 `sys_chat_message`
+ *       的三列真的跟着变（覆盖语义）。</li>
  * </ol>
  *
  * <h3>⚠️ 探针账号用**种子超管**，不是 `e2e` 前缀的新账号</h3>
@@ -29,9 +33,16 @@
 import { spawn } from 'node:child_process'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
-import { mysqlScalar, teardownKbProbe, kbResidueClean, describeKbResidue } from './lib/probe-teardown.mjs'
+import { dirname, resolve, join } from 'node:path'
+import {
+  mysqlScalar,
+  teardownKbProbe,
+  kbResidueClean,
+  describeKbResidue,
+  minioRemove,
+} from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
@@ -203,6 +214,15 @@ function parseFrame(frame) {
 let loginUserId = 0
 let sessionFloor = 0
 
+/**
+ * `T-805` 那一步造的两样产物 —— **两者都不属于探针前缀**，必须自己收：
+ * 库里那行走 `user_id`，桶里那个对象走 `object_key`。
+ */
+let attachmentObjectKey = ''
+
+/** 喂给 `input[type=file]` 的临时 PNG 路径（跑完即删）。 */
+let attachmentFixture = ''
+
 async function main() {
   console.log(`\n联调目标：${BASE}`)
   console.log(`探针账号：${ACCOUNT}（种子超管）· 探针知识库：${KB_CODE}\n`)
@@ -348,6 +368,29 @@ async function main() {
       `会话 id=${sessionId} 没超过水位 ${sessionFloor} —— 说明这次问答落进了别人的会话里`,
     )
 
+    // `T-808` 归因（判据 8）：这一列是「同一会话为何答案风格变了」的第一手线索，
+    // 而它在**用例里非空、在真实运行时可能是 NULL** —— 只能在这里查。
+    // ⚠️ 空召回不生成回答（`G5-11`），那条路上的 `outcome` 是 null，两个列本来就该是空；
+    // 所以本步先确认"这一轮真的生成了"，再断言 model_name。
+    const attribution = mysqlScalar(
+      `select concat_ws('|', coalesce(model_name,'NULL'), coalesce(model_id,'NULL'), finish_reason) `
+        + `from sys_chat_message where id = ${messageId};`,
+    )
+    const [usedModelName, usedModelId, finishReason] = attribution.split('|')
+    check(
+      finishReason !== 'empty_recall',
+      `这一轮走的是空召回（无回答），归因两列为空是正常的 —— 但本步需要一次真生成`,
+    )
+    check(usedModelName !== 'NULL', `T-808：真生成后 model_name 不该为空（finish=${finishReason}）`)
+    if (usedModelId === 'NULL') {
+      // 已知偏差（`#139`/`#15`）：模型配置尚未接进 DB，引导配置的 id 是 `bootstrap-chat`
+      // 这种字符串，`RegistryStreamingChatCaller#numericId` 解析不出数字就如实返回 null。
+      // **不是本步的失败**，但要留痕 —— 否则"归因列有值"会被误当成"归因可用"
+      observations.push(
+        `T-808：model_id 为 NULL（引导配置 id 非数字，S6 接 DB 后才恒非空）—— 已登记为 S6 T-900 遗留`,
+      )
+    }
+
     const row = mysqlScalar(
       `select concat_ws('|', embed_millis, vector_search_millis, bm25_recall_millis, rerank_millis, `
         + `coalesce(llm_generation_millis,'NULL'), total_millis, coalesce(top1_score,'NULL'), chunk_count) `
@@ -422,6 +465,159 @@ async function main() {
     return `角标 ${summary.tags} 个 · 面板引用 ${summary.cites} 条 · 分数样例 ${summary.scores[0]}`
   })
 
+  // ---------- ⑥.5 图片附件（T-805）与反馈（T-807 / G5-14） ----------
+  await step('图片附件上传（T-805）：真字节走 multipart，落桶 + 落库', async () => {
+    // ⚠️ 必须喂**真文件**：本步要证的恰恰是"文件字节真的上传了"。
+    // 改动前前端走 `http.post` 发 `{name,size,md5,mime}` —— 一个字节都没传，
+    // 而接口照样能返回 200，**从接口层完全看不出来**。所以只能从页面把真文件塞进
+    // `input[type=file]`，再看库里那行的 size 与真文件对不对得上。
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    attachmentFixture = join(tmpdir(), `e2e-chat-att-${stamp}.png`)
+    writeFileSync(attachmentFixture, png)
+
+    // ⚠️ **不重新导航**：上一步已经把页面停在 /chat 上，重载会丢掉那段会话
+    // （`ChatView` 挂载时只渲染欢迎语），而下一步的反馈要挂在**刚问出来的那条回答**上。
+    await waitFor(
+      `!!document.querySelector('.chat-input input[type="file"]')`,
+      '问答页仍挂载（沿用上一步的页面）',
+    )
+
+    // `DOM.setFileInputFiles` 要的是元素句柄（objectId），不是选择器
+    const handle = await send('Runtime.evaluate', {
+      expression: `document.querySelector('.chat-input input[type="file"]')`,
+    })
+    await send('DOM.setFileInputFiles', { files: [attachmentFixture], objectId: handle.result.objectId })
+
+    await waitFor(`document.querySelectorAll('.pending-item').length > 0`, '待发送区出现缩略图', 30000)
+    // 文案从「上传中 N%」变成「待发送」= 上传真的结束了（进度来自 XHR，不是假的定时器）
+    await waitFor(
+      `[...document.querySelectorAll('.pending-item')].some((e) => (e.textContent || '').includes('待发送'))`,
+      '附件上传完成',
+      30000,
+    )
+
+    const row = mysqlScalar(
+      `select concat_ws('|', id, object_key, size) from sys_chat_attachment `
+        + `where user_id = ${loginUserId} order by id desc limit 1;`,
+    )
+    check(!!row, '页面上传成功，但库里没有 sys_chat_attachment 行')
+    const [attId, objectKey, size] = row.split('|')
+    check(
+      Number(size) === png.length,
+      `库里 size=${size}，真文件是 ${png.length} 字节 —— 落的不是同一份字节`,
+    )
+    check(objectKey.startsWith('chat-attachments/'), `对象名前缀不对：${objectKey}`)
+    attachmentObjectKey = objectKey
+
+    // 回看接口也要真能读（本批页面上还没有消费方，但接口必须成立）
+    const detail = bizOk(await api(`/api/chat/attachments/${attId}`), '回看附件')
+    check(detail.name && detail.url, `回看响应缺字段：${JSON.stringify(detail)}`)
+    check(detail.desc === null, 'T-512 之前 desc 必须如实为 null（填 "" 会被当成「模型没看出什么」）')
+
+    await shot('chat-attachment-uploaded')
+    return `附件 id=${attId} · ${png.length} 字节 · 对象 ${objectKey}`
+  })
+
+  await step('反馈落库（G5-14）：页面点「点赞」→「点踩+原因」，库里真的跟着变', async () => {
+    // ⑥ 在页面上问过一次，取那条**回答**的 id（DOM 里没有 messageId）
+    const messageId = Number(
+      mysqlScalar(
+        `select id from sys_chat_message where role = 'assistant' and session_id in `
+          + `(select id from sys_chat_session where user_id = ${loginUserId} and id > ${sessionFloor}) `
+          + `order by id desc limit 1;`,
+      ),
+    )
+    check(Number.isFinite(messageId) && messageId > 0, '取不到页面上那条回答的 messageId')
+
+    // 取**最后一个可用**的动作区 —— 欢迎语那一条也有 `.mf-actions`，但它的按钮是禁用的
+    // （它不是真实消息，后端没有它的行）。按"最后一个"取会随页面状态漂移，按"可用的"取才稳
+    await evaluate(`(() => {
+      const rows = [...document.querySelectorAll('.msg.assistant .mf-actions')]
+      const usable = rows.filter((r) => {
+        const b = [...r.querySelectorAll('button')].find((x) => (x.textContent || '').includes('点赞'))
+        return b && !b.disabled
+      })
+      if (!usable.length) throw new Error('页面上没有一个可用的点赞按钮')
+      const btn = [...usable[usable.length - 1].querySelectorAll('button')]
+        .find((x) => (x.textContent || '').includes('点赞'))
+      btn.click()
+      return true
+    })()`)
+    await waitFor(
+      `[...document.querySelectorAll('.msg.assistant .mf-actions')].some((e) => e.textContent.includes('已点赞'))`,
+      '点赞生效',
+      15000,
+    )
+    const afterLike = mysqlScalar(
+      `select coalesce(feedback,'NULL') from sys_chat_message where id = ${messageId};`,
+    )
+    check(afterLike === 'like', `点赞后库里 feedback 应为 like，实际 ${afterLike}`)
+
+    // 改成点踩 + 选原因 → 覆盖语义（库里只留终态），且原因跟着换
+    await evaluate(`(() => {
+      const rows = [...document.querySelectorAll('.msg.assistant .mf-actions')]
+      const usable = rows.filter((r) => {
+        const b = [...r.querySelectorAll('button')].find((x) => (x.textContent || '').includes('点踩'))
+        return b && !b.disabled
+      })
+      if (!usable.length) throw new Error('页面上没有一个可用的点踩按钮')
+      const btn = [...usable[usable.length - 1].querySelectorAll('button')]
+        .find((x) => (x.textContent || '').includes('点踩'))
+      btn.click()
+      return true
+    })()`)
+    // ⚠️ **要挑"可见的"那一个**：`el-popover` 的内容会为**每条** assistant 消息都渲染一份
+    // （欢迎语那条也有，只是它的入口是禁用的），所以 `.fb-reason` 一次能查到 10 个（2×5）。
+    // 直接取 `[0]` 会点到欢迎语那一份 —— 它的 `canFeedback` 为 false，**静默返回、一个请求都不发**，
+    // 表现是"点了没反应"（实测：backend 日志里连一条 `/chat/feedback` 都没有）。
+    await waitFor(
+      `[...document.querySelectorAll('.fb-reason')].some((e) => e.getBoundingClientRect().width > 0)`,
+      '点踩原因弹层出现',
+      15000,
+    )
+    // 选中 + 读文案 + 点击放在**同一次 evaluate** 里：分两次调用之间有往返，
+    // 中间弹层一旦消失，第二次就会点到 null
+    const reason = await evaluate(`(() => {
+      const visible = [...document.querySelectorAll('.fb-reason')]
+        .filter((e) => e.getBoundingClientRect().width > 0)
+      if (!visible.length) throw new Error('没有可见的点踩原因项')
+      const label = visible[0].textContent.trim()
+      visible[0].click()
+      return label
+    })()`)
+    try {
+      await waitFor(
+        `[...document.querySelectorAll('.msg.assistant .mf-actions')].some((e) => e.textContent.includes('已点踩'))`,
+        '点踩生效',
+        15000,
+      )
+    } catch (e) {
+      // 失败时把**现场**带出来：只报"等待超时"等于没说 —— 是没发请求、
+      // 是请求被拒、还是点了没反应，三种原因的下一步完全不同
+      await shot('chat-feedback-timeout')
+      const diag = await evaluate(`(() => ({
+        rows: [...document.querySelectorAll('.msg.assistant .mf-actions')].map((r) => r.textContent.trim()),
+        reasons: document.querySelectorAll('.fb-reason').length,
+        toasts: [...document.querySelectorAll('.el-message')].map((t) => t.textContent.trim()),
+      }))()`)
+      throw new Error(`${e.message} · 现场=${JSON.stringify(diag)}`)
+    }
+
+    const picked = mysqlScalar(
+      `select concat_ws('|', feedback, coalesce(feedback_reason,'NULL')) `
+        + `from sys_chat_message where id = ${messageId};`,
+    )
+    const [fb, fbReason] = picked.split('|')
+    check(fb === 'unlike', `改成点踩后库里应为 unlike，实际 ${fb}`)
+    check(fbReason === reason, `库里原因「${fbReason}」与页面选的「${reason}」不一致`)
+
+    await shot('chat-feedback')
+    return `messageId=${messageId} · 点赞 → 点踩（${reason}），两次都落库`
+  })
+
   // ---------- ⑦ 收尾 ----------
   await step('收尾：清理探针库与会话行', async () => {
     // 会话族：**先子后父**（明细按 trace_id 顺上去、消息按 session_id 顺上去）。
@@ -442,6 +638,18 @@ async function main() {
       `delete from sys_chat_session where user_id = ${loginUserId} and id > ${sessionFloor};`,
     )
 
+    // `T-805` 的附件：**行 + 桶里那个对象都要收**。
+    // ⚠️ 与上面几族不同 —— 它**不属于探针库**（`teardownKbProbe` 看不见它），
+    // 而 `probe-teardown` 的 MinIO 清理只覆盖库族（要 join `sys_kb`）。
+    // 问答附件是按**人**归属的前缀，与 `avatars/` 同一条取舍 ⇒ 脚本自己收。
+    if (attachmentObjectKey) {
+      minioRemove([attachmentObjectKey])
+    }
+    mysqlScalar(`delete from sys_chat_attachment where user_id = ${loginUserId};`)
+    if (attachmentFixture && existsSync(attachmentFixture)) {
+      rmSync(attachmentFixture, { force: true })
+    }
+
     // ⚠️ `teardownKbProbe` 是 async（它要等 Milvus 那边确认）—— 漏了 await 拿到的是 Promise，
     // 而 `residue` 是 undefined，报出来的是 "Cannot read properties of undefined"，
     // 与"清理失败"看起来毫不相干（本脚本第一版正是如此）
@@ -455,10 +663,11 @@ async function main() {
           + `+ (select count(*) from sys_chat_message where session_id > ${sessionFloor}) `
           + `+ (select count(*) from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor}) `
           + `+ (select count(*) from sys_retrieval_trace_chunk where trace_id in `
-          + `(select trace_id from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor}));`,
+          + `(select trace_id from sys_retrieval_trace where user_id = ${loginUserId} and session_id > ${sessionFloor})) `
+          + `+ (select count(*) from sys_chat_attachment where user_id = ${loginUserId});`,
       ),
     )
-    check(left === 0, `仍残留 ${left} 行会话族数据`)
+    check(left === 0, `仍残留 ${left} 行会话族数据（含问答附件）`)
     return `探针库已清（${describeKbResidue(r.residue)}）· 会话族残留 ${left} 行`
   })
 }

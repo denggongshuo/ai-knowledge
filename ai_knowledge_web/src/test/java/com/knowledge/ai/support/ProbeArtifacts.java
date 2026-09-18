@@ -51,6 +51,11 @@ public final class ProbeArtifacts {
                             + "⚠️ 与生产口径不冲突：生产里「用户删了日志要留」是**合规要求**，"
                             + "而这里删的是**探针账号**的日志 —— 它从来不是真实风控证据"),
             Map.entry("sys_chat_session", "问答会话。按 user_id 删（探针账号的）；⚠️ 用例若用**种子超管**提问，走会话水位线，见 ChatStreamFlowTest"),
+            Map.entry("sys_chat_attachment",
+                    "问答图片附件（T-805）。按 user_id 删 —— **它有归属列**，不顺着会话删："
+                            + "预上传发生在会话之前，附件可以先于会话存在。"
+                            + "⚠️ 它同时是一个 MinIO 对象（chat-attachments/ 前缀）：本表只登记**行**，"
+                            + "桶里的对象不在两侧清理器的能力范围内（与 documents/ 同一条取舍，靠生命周期规则）"),
             Map.entry("sys_chat_message",
                     "问答消息。它**没有 user_id**，按 session_id 顺着父表删，**先于 sys_chat_session**。"
                             + "⚠️ 这一行是**两侧对账**逼出来的（脚本侧登记了它、Java 侧漏了）："

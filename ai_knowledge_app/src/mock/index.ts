@@ -105,6 +105,18 @@ function readBody(req: Req): Promise<Record<string, unknown>> {
   })
 }
 
+/**
+ * 排空请求体但**不解析** —— 用于 `multipart/form-data`（图片上传，可达 10MB）。
+ * `readBody` 会把字节拼成一个 JS 字符串再 `JSON.parse`，对二进制既浪费又必然失败。
+ */
+function drainBody(req: Req): Promise<void> {
+  return new Promise((resolve) => {
+    req.on('data', () => {})
+    req.on('end', () => resolve())
+    req.on('error', () => resolve())
+  })
+}
+
 // ---------------------------------------------------------------- 状态
 const captchaStore = new Map<string, { code: string; expireAt: number }>()
 const smsStore = new Map<string, { code: string; expireAt: number }>()
@@ -660,7 +672,10 @@ const MOCK_VL_SEARCH_SUMMARY = '报价单, A-100, A-1000, 单价, 1280, 2450, �
 const attachmentStore = new Map<string, { name: string; size: number; md5: string; mime: string; desc?: string }>()
 
 register('POST', '/api/chat/attachments', async (req, res) => {
-  void req
+  // ⚠️ **必须把 body 读掉**：本接口在真实后端是 `multipart/form-data`（可达 10MB），
+  // 而 Node 的 http server 不会替你丢弃未消费的请求体 —— 留着不读会让连接挂住/报错。
+  // 这里只排空不解析（`readBody` 会把二进制拼成一个巨大的 JS 字符串，没必要）
+  await drainBody(req)
   await delay(420)
   const id = `att_${Date.now().toString(36)}`
   const md5 = 'a3f8c1e2b47d9e02c8f1a5b3d7e94150'
@@ -672,6 +687,24 @@ register('POST', '/api/chat/attachments', async (req, res) => {
     size: 486_400,
     mime: 'image/png',
   })
+})
+
+/** 反馈（内存态；与后端 `sys_chat_message` 的三列一一对应） */
+const feedbackStore = new Map<string, { feedback: string; reason: string | null }>()
+
+register('POST', '/api/chat/feedback', async (req, res, ctx) => {
+  void req
+  await delay(180)
+  const messageId = String(ctx.body.messageId ?? '')
+  const type = String(ctx.body.type ?? '')
+  const reason = ctx.body.reason == null ? null : String(ctx.body.reason)
+  if (type !== 'like' && type !== 'unlike') {
+    json(res, 10030, null, '反馈类型只能是 like 或 unlike')
+    return
+  }
+  // 与后端一致：反馈是**覆盖**语义，返回的是落库后的当前值
+  feedbackStore.set(messageId, { feedback: type, reason: type === 'unlike' ? reason : null })
+  json(res, 0, { messageId, ...feedbackStore.get(messageId) })
 })
 
 register('GET', '/api/chat/attachments/:id', (_req, res, ctx) => {

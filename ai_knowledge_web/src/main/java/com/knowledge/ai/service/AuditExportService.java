@@ -6,6 +6,7 @@ import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.security.LoginUserContext;
+import com.knowledge.ai.core.storage.PresignTtl;
 import com.knowledge.ai.dto.audit.AuditDtos;
 import io.minio.GetPresignedObjectUrlArgs;
 import io.minio.MinioClient;
@@ -56,7 +57,15 @@ public class AuditExportService {
     private static final String PREFIX = "audit-export/";
 
     /** 预签名 URL 有效期（小时）。导出文件是敏感物，比头像（7 天）短得多。 */
-    private static final int URL_TTL_HOURS = 24;
+    /**
+     * 预签名读取有效期。
+     *
+     * <p>取值搬到 {@link PresignTtl#AUDIT_EXPORT_HOURS} 了（`T-O06` 步 4 的「口径集中」半边，
+     * `S5-M08-C`）。⚠️ 它是 🚩 数据导出、按 `O6` 的理由**够格收窄**，而**没有**收窄——
+     * 因为导出是异步的、用户常常第二天才点开通知。那条取舍写在那边的类注释里，
+     * 别只改这里的数字：要一起动的是通知中心的话术。
+     */
+    private static final int URL_TTL_HOURS = PresignTtl.AUDIT_EXPORT_HOURS;
 
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 

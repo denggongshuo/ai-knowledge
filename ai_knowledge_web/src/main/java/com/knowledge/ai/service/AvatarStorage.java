@@ -2,6 +2,7 @@ package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.storage.PresignTtl;
 import io.minio.GetPresignedObjectUrlArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
@@ -48,8 +49,14 @@ public class AvatarStorage {
     /** 对象名前缀。 */
     private static final String PREFIX = "avatars/";
 
-    /** 预签名读取有效期（天）。 */
-    private static final int URL_TTL_DAYS = 7;
+    /**
+     * 预签名读取有效期。
+     *
+     * <p>取值搬到 {@link PresignTtl#AVATAR_DAYS} 了（`T-O06` 步 4 的「口径集中」半边，
+     * `S5-M08-C`）—— 三处预签名的 TTL 散在三个类里时，改的人只看得见自己那一处，
+     * 而它们背后是**三种不同的取舍**。理由写在那边。
+     */
+    private static final int URL_TTL_DAYS = PresignTtl.AVATAR_DAYS;
 
     private final MinioClient minioClient;
 

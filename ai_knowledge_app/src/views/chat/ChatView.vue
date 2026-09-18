@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Promotion, Delete, FolderOpened, Timer, Connection, Picture, PictureFilled, InfoFilled, View } from '@element-plus/icons-vue'
+import { Promotion, Delete, FolderOpened, Timer, Connection, Picture, PictureFilled, InfoFilled, View, DocumentCopy, CaretTop, CaretBottom } from '@element-plus/icons-vue'
 import { chatStream, chatApi, sysApi } from '@/api'
+import { FEEDBACK_REASONS } from '@/types'
 import type { ChatAttachment, ChatMessage, ChatSessionItem, Citation, ModelOption, RetrievalTrace } from '@/types'
 
 const WELCOME: ChatMessage = {
@@ -80,12 +81,14 @@ const fileInput = ref<HTMLInputElement>()
 const MAX_IMAGES = 3
 const MAX_SIZE = 10 * 1024 * 1024
 
-function pseudoMd5(f: File) {
-  const s = `${f.name}:${f.size}:${f.lastModified}`
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
-  return h.toString(16).padStart(8, '0').repeat(4)
-}
+/**
+ * 待发送附件的**原始字节**，按本地 id 存。
+ *
+ * <p>为什么不放进 `ChatAttachment`：那个对象是响应式的（驱动缩略图与进度条），
+ * 把 `File` 塞进去会让 Vue 去代理它的全部属性；而且它**上传完就该被释放** ——
+ * 留在数组里等于每张图多占一份内存，直到用户离开页面。
+ */
+const pendingFiles = new Map<string, File>()
 
 function pickFiles() {
   fileInput.value?.click()
@@ -123,37 +126,65 @@ async function addFiles(files: File[]) {
       type: 'IMAGE',
       name: f.name,
       size: f.size,
-      md5: pseudoMd5(f),
+      // 空串 = 「还不知道」。⚠️ 不在这里自己拼一个伪 md5：服务端算完会回填（见 uploadOne）——
+      // 它将来是 VL 描述缓存的 key 前半段（需求 `09` §4.8），伪值会让两张不同的图撞进同一项
+      md5: '',
       mime: f.type,
       url: URL.createObjectURL(f),
       stage: 'UPLOADING',
       progress: 0,
     }
+    pendingFiles.set(att.id, f)
     attachments.value.push(att)
     void uploadOne(att)
   }
 }
 
-/** 预上传：只落存储 + 落库，不调 VL（描述在后端内部完成） */
+/**
+ * 预上传：只落存储 + 落库，不调 VL（描述在后端内部完成）。
+ *
+ * <p>🔴 **必须改"数组里那一个"，不能改传进来的 `att`**：`attachments` 是
+ * `ref<ChatAttachment[]>`，`push(att)` 进去的是原始对象，而**读回来的是它的响应式代理** ——
+ * 改原始对象**不会触发重渲染**。表现是缩略图永远停在「上传中 0%」：
+ * 上传其实成功了、库里也有行，而界面上看不出任何变化。
+ *
+ * <p>本文件里 `runStream` 的 `const current = () => messages.value.find(...)` 就是这条正解，
+ * 本处此前与它不一致 —— 而这条路径**从来没有被端到端跑过**（`T-805` 之前是 404），
+ * 所以它一直没被发现。`S5-M08-C` 加页面级用例时才露出来。
+ */
 async function uploadOne(att: ChatAttachment) {
-  const timer = window.setInterval(() => {
-    if ((att.progress ?? 0) < 88) att.progress = (att.progress ?? 0) + 12
-  }, 80)
+  const localId = att.id
+  const file = pendingFiles.get(localId)
+  // 取数组里的**响应式代理**再改；取不到（已经被移除）就退回原对象，改了也无害
+  const live = attachments.value.find((a) => a.id === localId) ?? att
+  if (!file) {
+    live.stage = 'FAILED'
+    return
+  }
+  const form = new FormData()
+  form.append('file', file)
   try {
-    const res = await chatApi.uploadAttachment({ name: att.name, size: att.size, md5: att.md5, mime: att.mime })
-    window.clearInterval(timer)
-    att.progress = 100
-    att.id = res.attachmentId
-    att.url = att.url ?? res.presignedUrl
+    // 进度来自 XHR 的 upload.onprogress（`http.upload` 的第三参）——
+    // 此前是 `http.post` 拿不到进度，只好用一个每 80ms 自增 12% 的定时器假装
+    const res = await chatApi.uploadAttachment(form, (percent) => {
+      live.progress = percent
+    })
+    live.progress = 100
+    live.id = res.attachmentId
+    // md5 / mime 以**服务端算的**为准：前端送出去的那两个是客户端说了算的
+    live.md5 = res.md5
+    live.mime = res.mime
+    live.url = live.url ?? res.presignedUrl
+    pendingFiles.delete(localId)
   } catch {
-    window.clearInterval(timer)
-    att.stage = 'FAILED'
-    ElMessage.error(`${att.name} 上传失败`)
+    live.stage = 'FAILED'
+    ElMessage.error(`${att.name} 上传失败，请重试`)
   }
 }
 
 function removeAttachment(id: string) {
   attachments.value = attachments.value.filter((a) => a.id !== id)
+  pendingFiles.delete(id)
 }
 
 function formatSize(n: number) {
@@ -232,6 +263,54 @@ function readOriginal(aiMsg: ChatMessage) {
   runStream(u.content, atts.map((a) => a.id), true, ai.id)
 }
 
+// ---------------- 反馈（T-807 / G5-14） ----------------
+
+/** 正在提交反馈的消息 id（挡住同一行的重复点击）。 */
+const feedbackBusy = ref('')
+
+/** 欢迎语不是真实消息，后端没有它的行 —— 对它点赞只会拿到一个 NOT_FOUND。 */
+function canFeedback(m: ChatMessage) {
+  return m.role === 'assistant' && !m.streaming && !!m.content && m.id !== WELCOME.id
+}
+
+/**
+ * 提交反馈。点赞直接提交；点踩由调用方带上用户选的原因。
+ *
+ * <p>⚠️ 后端返回的是**落库后的当前值**（反馈可改，是覆盖语义），所以这里用返回值
+ * 覆盖本地状态而不是用刚提交的 `type` —— 两者不一致就说明服务端做了别的决定，
+ * 以服务端为准，别让界面显示一个库里没有的状态。
+ */
+async function submitFeedback(m: ChatMessage, type: 'like' | 'unlike', reason?: string) {
+  if (!canFeedback(m) || feedbackBusy.value) return
+  feedbackBusy.value = m.id
+  try {
+    const res = await chatApi.feedback({ messageId: m.id, type, ...(reason ? { reason } : {}) })
+    m.feedback = res.feedback as 'like' | 'unlike'
+    m.feedbackReason = res.reason
+    ElMessage.success(type === 'like' ? '感谢反馈' : '已记录，我们会据此改进检索')
+  } catch {
+    ElMessage.error('反馈提交失败，请稍后重试')
+  } finally {
+    feedbackBusy.value = ''
+  }
+}
+
+/** 反馈按钮的高亮态：点赞=主色 / 点踩=危险色 / 未反馈=默认。 */
+function feedbackType(m: ChatMessage, which: 'like' | 'unlike'): 'primary' | 'danger' | 'default' {
+  if (m.feedback !== which) return 'default'
+  return which === 'like' ? 'primary' : 'danger'
+}
+
+/** 复制回答正文。失败时给下一步动作（`navigator.clipboard` 在非安全上下文下不可用）。 */
+async function copyAnswer(m: ChatMessage) {
+  try {
+    await navigator.clipboard.writeText(m.content)
+    ElMessage.success('已复制回答')
+  } catch {
+    ElMessage.error('复制失败（浏览器未授权剪贴板），请手动选中文本复制')
+  }
+}
+
 function runStream(text: string, attachmentIds: string[], useVision: boolean, aiId: string) {
   const current = () => messages.value.find((m) => m.id === aiId)
 
@@ -280,6 +359,14 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
         const m = current()
         if (m) {
           m.streaming = false
+          // 🔴 把本地临时 id 换成**服务端那条消息的真 id**。
+          // `done.messageId` 存在的唯一理由就是这个：`T-807` 的 `/chat/feedback`
+          // 要拿它去定位那一行。换掉之前，页面上发出去的永远是 `a_1789…` 这种本地串，
+          // 后端解析不出数字、一律 NOT_FOUND —— 而**界面看起来一切正常**
+          // （按钮点了、没报错提示之外没有任何异常），只是反馈一条也存不进来。
+          // 与 `V23` 头注释写的「事件的参与者不齐，数据就永久缺一块」是同一种形状。
+          if (data.messageId) m.id = String(data.messageId)
+          m.modelId = data.modelId ?? m.modelId
           m.modelName = data.modelName ?? m.modelName
           if (data.usedVision) m.usedVision = true
         }
@@ -464,17 +551,57 @@ onMounted(async () => {
               <div v-if="!m.streaming && m.content" class="msg-foot">
                 <span v-if="m.modelName" class="mf-model">由 {{ m.modelName }} 生成</span>
                 <span v-if="m.usedVision" class="mf-vision"><el-icon><View /></el-icon> 已读原图</span>
-                <el-button
-                  v-if="m.attachments?.length"
-                  size="small"
-                  text
-                  :icon="Picture"
-                  :disabled="!canReadOriginal(m)"
-                  :title="canReadOriginal(m) ? '' : '当前对话模型不支持视觉（vision）'"
-                  @click="readOriginal(m)"
-                >
-                  直接读原图
-                </el-button>
+                <!-- 右侧动作组：原图兜底 + 反馈（T-807，需求 07 §6.8 点名的四件里除「重新生成」）。
+                     ⚠️ 全部收进**一个** margin-left:auto 的容器 —— 曾经是给每个 el-button
+                     各加一条 margin-left:auto，那样两个按钮会被推到行的两端 -->
+                <span class="mf-actions">
+                  <el-button
+                    v-if="m.attachments?.length"
+                    size="small"
+                    text
+                    :icon="Picture"
+                    :disabled="!canReadOriginal(m)"
+                    :title="canReadOriginal(m) ? '' : '当前对话模型不支持视觉（vision）'"
+                    @click="readOriginal(m)"
+                  >
+                    直接读原图
+                  </el-button>
+                  <el-button size="small" text :icon="DocumentCopy" :disabled="!canFeedback(m)" @click="copyAnswer(m)">
+                    复制
+                  </el-button>
+                  <el-button
+                    size="small"
+                    text
+                    :icon="CaretTop"
+                    :type="feedbackType(m, 'like')"
+                    :disabled="!canFeedback(m) || feedbackBusy === m.id"
+                    @click="submitFeedback(m, 'like')"
+                  >
+                    {{ m.feedback === 'like' ? '已点赞' : '点赞' }}
+                  </el-button>
+                  <el-popover :width="188" trigger="click" :disabled="!canFeedback(m) || feedbackBusy === m.id">
+                    <template #reference>
+                      <el-button
+                        size="small"
+                        text
+                        :icon="CaretBottom"
+                        :type="feedbackType(m, 'unlike')"
+                        :disabled="!canFeedback(m) || feedbackBusy === m.id"
+                      >
+                        {{ m.feedback === 'unlike' ? '已点踩' : '点踩' }}
+                      </el-button>
+                    </template>
+                    <div class="fb-title">哪里不满意？（可不选直接关闭）</div>
+                    <div
+                      v-for="r in FEEDBACK_REASONS"
+                      :key="r"
+                      class="fb-reason"
+                      @click="submitFeedback(m, 'unlike', r)"
+                    >
+                      {{ r }}
+                    </div>
+                  </el-popover>
+                </span>
               </div>
             </div>
           </div>
@@ -827,8 +954,29 @@ onMounted(async () => {
   padding: 0 7px;
   border-radius: 3px;
 }
-.msg-foot .el-button {
+/* 右侧动作组。⚠️ margin-left:auto 只加在**容器**上 —— 逐个 el-button 都加会把
+   相邻两个按钮推到行的两端（本批加反馈按钮时踩到），这条替换掉了原来的做法 */
+.mf-actions {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+/* 点踩原因弹层 */
+.fb-title {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 6px;
+}
+.fb-reason {
+  padding: 5px 8px;
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.fb-reason:hover {
+  background: var(--el-fill-color-light);
+  color: var(--el-color-primary);
 }
 
 /* 引用 / 检索详情 */

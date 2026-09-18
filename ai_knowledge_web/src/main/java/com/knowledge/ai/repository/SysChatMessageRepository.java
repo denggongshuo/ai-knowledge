@@ -7,6 +7,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 问答消息仓储。
@@ -29,6 +30,27 @@ public interface SysChatMessageRepository extends JpaRepository<SysChatMessage, 
      * （"回答排在提问前面"）。自增 id 是严格单调的，与插入顺序同序。
      */
     List<SysChatMessage> findBySessionIdOrderByIdAsc(Long sessionId);
+
+    /**
+     * 按消息 id + 归属人取一行（`T-807` 反馈的归属校验）。
+     *
+     * <p>归属校验与取数是**同一条 SQL**，与
+     * {@code SysChatAttachmentRepository#findByIdAndUserId} 同一条纪律 ——
+     * 不留"先按 id 查出来再比 userId"的中间态，那种写法只要有一处分支写错
+     * （早返回、日志带上 id、异常带上实体）就泄露了"这个 id 存在"。
+     *
+     * <p>⚠️ 带上 {@code deletedAt is null}：已软删的会话里的消息**不该还能被反馈**——
+     * 用户已经删掉那段对话了，再往里写反馈就是把数据写进一个他自己看不到的地方。
+     *
+     * @return 查不到即"不存在 **或** 不是你的 **或** 所在会话已删"，调用方**不得**区分
+     */
+    @Query("""
+            select m from SysChatMessage m
+            where m.id = :messageId
+              and m.sessionId in (select s.id from SysChatSession s
+                                  where s.userId = :userId and s.deletedAt is null)
+            """)
+    Optional<SysChatMessage> findOwned(@Param("messageId") Long messageId, @Param("userId") Long userId);
 
     /**
      * 批量取各会话的消息条数。

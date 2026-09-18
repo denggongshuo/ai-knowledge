@@ -159,6 +159,13 @@ export const USER_ARTIFACTS = [
     id: 'sql:sys_chat_session', kind: 'sql-user', table: 'sys_chat_session', via: 'user',
     why: '问答会话（T-802 建表半边）',
   },
+  {
+    id: 'sql:sys_chat_attachment', kind: 'sql-user', table: 'sys_chat_attachment', via: 'user',
+    why: '问答图片附件（T-805）。⚠️ 它**自己有 user_id**，不顺着会话删 ——'
+      + '预上传发生在会话之前，附件可以先于会话存在。'
+      + '⚠️ 它同时是一个 MinIO 对象（chat-attachments/ 前缀）：本表只登记**行**，'
+      + '桶里的对象不在清理器的能力范围内（与 documents/ 同一条取舍，靠生命周期规则）',
+  },
 
   { id: 'sql:sys_user', kind: 'sql-user', table: 'sys_user', via: 'username', why: '用户主表' },
 ]

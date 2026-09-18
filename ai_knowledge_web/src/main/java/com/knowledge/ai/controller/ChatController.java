@@ -9,6 +9,8 @@ import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.pipeline.chat.ChatDtos;
 import com.knowledge.ai.pipeline.chat.ChatSink;
+import com.knowledge.ai.service.ChatAttachmentService;
+import com.knowledge.ai.service.ChatFeedbackService;
 import com.knowledge.ai.service.ChatSessionService;
 import com.knowledge.ai.service.ChatStreamService;
 import lombok.RequiredArgsConstructor;
@@ -24,6 +26,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -72,6 +75,10 @@ public class ChatController {
     private final ChatStreamService chatStreamService;
 
     private final ChatSessionService chatSessionService;
+
+    private final ChatAttachmentService chatAttachmentService;
+
+    private final ChatFeedbackService chatFeedbackService;
 
     /**
      * {@code POST /chat/completions} → {@code text/event-stream}。
@@ -185,6 +192,70 @@ public class ChatController {
                 .header(HttpHeaders.CONTENT_DISPOSITION,
                         "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + encoded)
                 .body(body);
+    }
+
+    // ==================================================================
+    // 图片附件（`T-805`）· `S5-M08-C`
+    // ==================================================================
+
+    /**
+     * 图片**预上传** —— 只落 MinIO + 落库，**不调 VL**。
+     *
+     * <p>「预」的含义是时序：图片在用户点发送之前就传完了，而 VL 描述是**发送时**
+     * 才生成的（需求 `09` FR-SYS-04）。所以本接口不产生任何描述字段，
+     * 也不用 `attachment` 事件往前端推进度 —— 那些是 `T-806`/`T-512`。
+     *
+     * <p><b>请求形状是 {@code multipart/form-data}，字段名 {@code file}</b>。
+     * 这与需求 `09` §FR-SYS-04 的接口表一致 —— 而本批开工前的实情是：前端走的是
+     * {@code http.post} 发一个 JSON 元数据对象，**文件字节从来没有上传过**。
+     * 两边核对后按需求实现，前端同步改用既有的 {@code http.upload}（顺带拿到真进度）。
+     *
+     * <p>权限 {@code qa:ask}：上传附件是"提问"的一部分，而 {@code qa:feedback}
+     * 是运营侧处置权（`USER` 角色没有它）。详见 {@code ChatFeedbackService} 的类注释。
+     */
+    @PostMapping(value = "/attachments", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @RequiresPerm("qa:ask")
+    public ApiResponse<ChatDtos.AttachmentUploadResult> uploadAttachment(
+            @RequestParam("file") MultipartFile file) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(chatAttachmentService.upload(userId, file));
+    }
+
+    /**
+     * 回看附件（含 VL 描述的位置）。
+     *
+     * <p>⚠️ 描述字段本批**如实为 {@code null}**（属 `T-512`），不是"没实现完"——
+     * 见 {@link ChatDtos.AttachmentView} 的注释。
+     *
+     * <p>归属校验在服务层：不是本人的 / 不存在，**同码 {@code NOT_FOUND}**。
+     */
+    @GetMapping("/attachments/{id}")
+    @RequiresPerm("qa:ask")
+    public ApiResponse<ChatDtos.AttachmentView> attachment(@PathVariable("id") Long id) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(chatAttachmentService.get(userId, id));
+    }
+
+    // ==================================================================
+    // 反馈（`T-807` / `G5-14`）· `S5-M08-C`
+    // ==================================================================
+
+    /**
+     * 点赞 / 点踩（+ 点踩原因）—— **务必落库**（需求 `07` §6.8 的标题原话）。
+     *
+     * <p>为什么这里**不写审计点**：反馈的**提交**不是 🚩 危险操作，
+     * 而 `AuditRiskPolicy` 里「问答」那一行的落点是问答侧的**管理动作**
+     * （反馈处置、会话导出）—— 用户自己点了个踩不需要进审计页。
+     * 挂在这里会让审计日志被普通用户的操作淹没，反而盖住真正的管理动作。
+     *
+     * <p>权限 {@code qa:ask}（理由同上传附件），作用域边界由**归属校验**提供：
+     * 只能反馈自己会话里的回答。
+     */
+    @PostMapping("/feedback")
+    @RequiresPerm("qa:ask")
+    public ApiResponse<ChatDtos.FeedbackResult> feedback(@RequestBody ChatDtos.FeedbackRequest request) {
+        Long userId = LoginUserContext.requireUserId();
+        return ApiResponse.ok(chatFeedbackService.submit(userId, request));
     }
 
     /**

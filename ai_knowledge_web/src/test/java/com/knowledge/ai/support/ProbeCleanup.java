@@ -110,6 +110,10 @@ public final class ProbeCleanup {
             jdbc.update("delete from sys_chat_message where session_id in "
                     + "(select s.id from sys_chat_session s where s.user_id in (" + idIn + "))", idArgs);
             jdbc.update("delete from sys_chat_session where user_id in (" + idIn + ")", idArgs);
+            // 问答附件（`T-805`）**自己有归属列**，不顺着会话删 —— 它本来就可以先于会话存在
+            // （预上传时还没有会话）。⚠️ 它同时是一个 **MinIO 对象**：这里只删行，
+            // 桶里的对象由生命周期规则兜底（与 `DocStorage#remove` 无调用方同一条取舍）
+            jdbc.update("delete from sys_chat_attachment where user_id in (" + idIn + ")", idArgs);
             // ⚠️ `sys_async_task` 的归属列是 **`owner_id`** 而不是 `user_id` —— 导出这类
             // **没有知识库维度**的任务（`kb_id` 为 NULL）只能靠它找到。
             // 本批实测：`AuditExportService` 此前压根没传业务坐标 ⇒ `owner_id` 是 NULL，
