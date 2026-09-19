@@ -390,14 +390,17 @@ async function main() {
     check(own404.length === 0, '模型配置页**自己的**接口无 404（`/api/system/*`）',
       own404.map((e) => `${e.method} ${e.url.replace(BASE, '')}`).join(' | ') || '—')
 
-    // ⚠️ 剩下的 404 里，`/notices/*` 是**已登记**的 `M11` 通知中心未开工缺口
-    //    （顶栏那个未读数轮询在**每一页**都 404）。把它登记成**观察项**而不是判据 ——
-    //    否则这条判据会一直红，而"一直红"等于没有判据（本仓「误报比漏报更伤」）。
+    // 🔴 `/notices/*` 这一族**曾经是豁免的**：顶栏那个未读数轮询在**每一页**都 404
+    //    （`M11` 通知中心未开工），当时登记为**观察项**而不是判据 ——
+    //    因为一条总在红的判据等于没有判据。
+    //    `2026-09-19-S6-M11` 批交付了通知中心，**这个缺口关了** ⇒ 现在它也是判据的一部分：
+    //    哪一天 `/notices/*` 又 404，本页会当场红，而不是被"已知缺口"四个字盖过去。
+    //    （这就是「把豁免收回来」——留着豁免比当初设豁免更危险。）
     const known404 = all404.filter((e) => e.url.includes('/notices/'))
     const other404 = all404.filter((e) => !e.url.includes('/notices/'))
-    observe('模型配置页 404 分布', `本页自己 ${own404.length} · /notices/ 已知缺口 ${known404.length} · 其它 ${other404.length}`)
-    check(other404.length === 0, '模型配置页无「非 /notices/」的意外 404',
-      other404.map((e) => `${e.method} ${e.url.replace(BASE, '')}`).join(' | ') || '—')
+    observe('模型配置页 404 分布', `本页自己 ${own404.length} · /notices/ ${known404.length} · 其它 ${other404.length}`)
+    check(all404.length === 0, '模型配置页**一个 404 都没有**（含曾豁免的 /notices/）',
+      all404.map((e) => `${e.method} ${e.url.replace(BASE, '')}`).join(' | ') || '—')
 
     const refusedCalls = pageLedger.filter((e) => /embedding-impact|change-embedding|vl-impact|rebuild-image-docs/.test(e.url))
     check(refusedCalls.length === 0, '页面不再调用「换 + 重建」四条接口', refusedCalls.map((e) => e.url.replace(BASE, '')).join(' | ') || '—')
