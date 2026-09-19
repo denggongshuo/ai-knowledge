@@ -45,7 +45,7 @@ public class ChunkReader {
     public List<VectorChunk> readByDocId(long docId) {
         List<?> rows = entityManager.createNativeQuery("""
                         select c.id, c.chunk_type, c.raw_content, c.title_path, c.parent_id,
-                               k.secret_level, c.is_boilerplate
+                               k.secret_level, c.is_boilerplate, c.is_decorative
                           from sys_chunk c
                           join sys_document d on d.id = c.doc_id
                           join sys_kb k on k.id = d.kb_id
@@ -67,7 +67,9 @@ public class ChunkReader {
                     c[4] == null ? null : ((Number) c[4]).longValue(),
                     // `O9` 步 4：样板块**读得到、但不进召回池**。判据在 VectorChunk#inRecallPool，
                     // 不在这里 —— 读取层的职责是"照实读出来"，不是"顺手筛掉"
-                    isTrue(c[6])));
+                    isTrue(c[6]),
+                    // `T-O03`：装饰图同理 —— 读取层照实读，筛的活在向量化层
+                    isTrue(c[7])));
         }
         log.debug("读取待向量化分片：docId={} 块数={}", docId, chunks.size());
         return chunks;

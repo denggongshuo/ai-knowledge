@@ -20,6 +20,10 @@ import java.util.List;
  * @param isBoilerplate 是否被判为**跨文档样板**（`O9` 步 3/4）。为 {@code true} 时
  *                      {@link #vectorText()} 照样有值（块本身是完整的），但它
  *                      **不进向量召回池** —— 见 {@link #inRecallPool()}
+ * @param isDecorative  是否被判为**装饰图**（跨文档重复的 logo / 图标，`T-O03`）。
+ *                      与 {@link #isBoilerplate} **同一条处置**（不进召回池），
+ *                      但理由与判据都不同 —— 这也是它们分成两列的原因：
+ *                      合成一个标志之后"这条为什么被排除"就答不出来了
  */
 public record VectorChunk(long chunkId,
                           String blockType,
@@ -27,30 +31,38 @@ public record VectorChunk(long chunkId,
                           String titlePath,
                           String secretLevel,
                           Long parentId,
-                          boolean isBoilerplate) {
+                          boolean isBoilerplate,
+                          boolean isDecorative) {
 
-    /** 旧形态（无样板标记）—— 样板判定是 `S5-M07-A` 才有的，本批之前的调用点与测试用它。 */
+    /** 旧形态（无装饰图标记）—— 装饰图判定是 `T-O03`（`S6-M05-E`）才有的。 */
+    public VectorChunk(long chunkId, String blockType, String rawContent, String titlePath,
+                       String secretLevel, Long parentId, boolean isBoilerplate) {
+        this(chunkId, blockType, rawContent, titlePath, secretLevel, parentId, isBoilerplate, false);
+    }
+
+    /** 更旧的形态（两个标记都没有）—— 样板判定是 `S5-M07-A` 才有的。 */
     public VectorChunk(long chunkId, String blockType, String rawContent, String titlePath,
                        String secretLevel, Long parentId) {
-        this(chunkId, blockType, rawContent, titlePath, secretLevel, parentId, false);
+        this(chunkId, blockType, rawContent, titlePath, secretLevel, parentId, false, false);
     }
 
     /**
      * 是否**进向量召回池**。
      *
-     * <p>两道门槛，缺一不可：
+     * <p>三道门槛，缺一不可：
      * <ol>
      *   <li>{@link #vectorText()} 非 {@code null}（表格父块不进池，`D-5` §1.4）；</li>
-     *   <li>不是样板（`O9` 步 4：跨文档样板占着 top-20 的名额却不含信息）。</li>
+     *   <li>不是样板（`O9` 步 4：跨文档样板占着 top-20 的名额却不含信息）；</li>
+     *   <li>不是装饰图（`T-O03`：跨文档重复的 logo 同样占名额，且它对任何提问都没有信息量）。</li>
      * </ol>
      *
-     * <p>⚠️ 为什么不把样板判定并进 {@link #vectorText()}：那个方法的返回值是
-     * **文本投影**（`O8` 的"视图"），而样板是**语料统计结论**。把统计塞进投影函数
+     * <p>⚠️ 为什么不把这些判定并进 {@link #vectorText()}：那个方法的返回值是
+     * **文本投影**（`O8` 的"视图"），而样板与装饰图都是**语料统计结论**。把统计塞进投影函数
      * 会让"这段文本是什么"依赖"库里有多少篇文档" —— 同一个块在不同时刻投影出不同结果，
      * 是那种"跑两次结果不一样"的最坏形态。
      */
     public boolean inRecallPool() {
-        return vectorText() != null && !isBoilerplate;
+        return vectorText() != null && !isBoilerplate && !isDecorative;
     }
 
     /**

@@ -42,13 +42,22 @@ package com.knowledge.ai.pipeline;
  *                  「只对 IMAGE 有意义的值收进这个类型」—— `Block` 的 8 个字段里已经有
  *                  三个是"只有某类块有意义"了，再拆一个出来，`Block` 就成了那张桌子。
  *                  <p>消费方：`T-908`（换 VL）要按它筛出"是旧模型产的那些图"重算。
+ * @param phash     图片的**感知哈希**（dHash 64 位十六进制，`T-O03`）。
+ *                  与 {@link #md5} 回答的**不是同一个问题**：md5 是字节级的（"同一个对象"），
+ *                  这个是"看起来是不是同一张图"（重编码后 md5 变、dHash 不变）。
+ *                  装饰图判定用后者。
+ *                  <p>⚠️ 由 {@code PdfDocumentParser} 在**解析期**算 —— 那一跳字节就在手上，
+ *                  不必让判定侧去 MinIO 读回来（那既多一次 IO，又会把判定从纯函数变成有 IO 的）。
+ *                  <p>{@code null} 当且仅当没有字节（与 {@link #objectKey} 同步），
+ *                  或者字节认不出格式（见 {@code ImageHash} 的类注释）。
  */
 public record ImageInfo(Integer sourceId,
                         Box box,
                         String caption,
                         String objectKey,
                         String md5,
-                        String vlModelId) {
+                        String vlModelId,
+                        String phash) {
 
     /**
      * 补上「谁描述的我」—— 锁外描述那一步（`T-512` 步 5）用。
@@ -56,7 +65,7 @@ public record ImageInfo(Integer sourceId,
      * <p>返回新实例而不是原地改：record 天然不可变，而这个值在解析期**确实还不存在**。
      */
     public ImageInfo withVlModel(String model) {
-        return new ImageInfo(sourceId, box, caption, objectKey, md5, model);
+        return new ImageInfo(sourceId, box, caption, objectKey, md5, model, phash);
     }
 
     /**

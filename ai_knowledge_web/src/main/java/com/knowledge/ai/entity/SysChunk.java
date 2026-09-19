@@ -162,6 +162,36 @@ public class SysChunk {
     private String vlModelId;
 
     /**
+     * 图片的**感知哈希**（dHash 64 位十六进制，`V30` · `T-O03`）。
+     *
+     * <p>与 {@link #imageMd5} 回答的**不是同一个问题**：md5 是字节级的（"同一个对象"），
+     * 这个是"看起来是不是同一张图" —— 同一张 logo 被重编码过之后 md5 变了而 dHash 不变。
+     * 装饰图判定要的是后者。
+     *
+     * <p>⚠️ **非图片块与 `V30` 之前的旧块恒为 {@code null}**。判定侧必须
+     * 「两侧都非空才比较」（照 {@code ContentFingerprint.same} 的口径）。
+     */
+    @Column(name = "image_phash", length = 16)
+    private String imagePhash;
+
+    /**
+     * 是否被判为**装饰图**（跨文档重复的 logo / 图标，`V30` · `T-O03`）。
+     *
+     * <p>为 {@code 1} 时**不进向量召回池**（与 {@link #isBoilerplate} 同一条处置）——
+     * 判定的全部意义就是"别让它在检索里占名额"。
+     *
+     * <p>⚠️ 它与 {@code is_boilerplate} **分开两列**而不是共用一个：两者的
+     * **判据、阈值、数据来源都不同**（文本按 sha256 与长度区间、图片按 dHash），
+     * 合成一个标志之后，"这条为什么被排除"就答不出来了 —— 而那正是
+     * `is_boilerplate` 当初要回答的那个问题。
+     *
+     * <p>⚠️ 列类型是 {@code TINYINT(1)} 而**不是裸 {@code TINYINT}** —— 后者 Hibernate
+     * 映射成 {@code byte}，`ddl-auto: validate` 会当场拒绝启动（`V30` 的注释里记了实测）。
+     */
+    @Column(name = "is_decorative", nullable = false)
+    private Boolean isDecorative;
+
+    /**
      * 写入时间。**没有 {@code updated_at}** —— 块是整批重写的
      * （重跑解析时按 {@code doc_id} 先删后插），从不单行更新。
      */

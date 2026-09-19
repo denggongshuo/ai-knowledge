@@ -1,5 +1,6 @@
 package com.knowledge.ai.pipeline;
 
+import com.knowledge.ai.pipeline.vision.ImageHash;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -83,6 +84,25 @@ class PdfImageExtractionTest {
                 .as("`ImageInfo.hasBytes()` 为真的元素数必须等于交给 sink 的张数 —— "
                         + "否则下游（步 4 的块 / 步 8 的落库）会按元素上的值走，与真实存储分叉")
                 .isEqualTo(sink.names.size());
+
+        // `T-O03`：感知哈希**在解析期就算好了**，且只在有字节的那些元素上。
+        // ⚠️ 这条不能只靠真上传的用例证 —— 那条路要真 VL（分钟级），而这里解析一次就够
+        List<String> phashes = doc.elements().stream()
+                .filter(e -> e.kind() == ParsedDocument.DocElement.Kind.IMAGE)
+                .map(ParsedDocument.DocElement::imageInfo)
+                .filter(java.util.Objects::nonNull)
+                .map(ImageInfo::phash)
+                .filter(java.util.Objects::nonNull)
+                .toList();
+        System.out.println("带 phash 的元素   = " + phashes.size());
+        assertThat(phashes)
+                .as("有字节的图必须在解析期就算出 phash —— 那一跳字节在手上，"
+                        + "搬去别处算要么重读文件、要么让判定侧去 MinIO 取（把纯函数变成有 IO 的）")
+                .isNotEmpty()
+                .allSatisfy(h -> assertThat(h)
+                        .as("dHash 是 64 位 ⇒ 16 位小写十六进制，与 CHAR(16) 同源")
+                        .hasSize(ImageHash.LENGTH)
+                        .matches("[0-9a-f]{16}"));
 
         // 环境前提：这份样本必须**两种都有**，否则本用例只在验一半的分支
         assertThat(sink.names).as("样本上必须有可导出的图，否则没验到抽取那半边").isNotEmpty();

@@ -3,6 +3,7 @@ package com.knowledge.ai.pipeline;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.knowledge.ai.pipeline.vision.ImageHash;
 import lombok.extern.slf4j.Slf4j;
 import org.opendataloader.pdf.api.Config;
 import org.opendataloader.pdf.api.OpenDataLoaderPDF;
@@ -439,16 +440,29 @@ public class PdfDocumentParser {
                             + "（可能是矢量图或纯版式元素），该图不会参与检索；"
                             + "若其内容重要，请补录文字后重建索引",
                     ParsedDocument.IssueKind.IMAGE_NOT_EXTRACTABLE));
-            return new ImageInfo(id, box, caption, null, null, null);
+            return new ImageInfo(id, box, caption, null, null, null, null);
         }
 
-        ImageSink.Stored stored = storeImage(scan, source, pageNo);
+        Extracted extracted = storeImage(scan, source, pageNo);
+        ImageSink.Stored stored = extracted == null ? null : extracted.stored();
         // `vlModelId` 在第 6 个位置留 null —— 它是**唯一**不在解析期产生的字段，
         // 由锁外描述那一步（步 5）经 `ImageInfo#withVlModel` 补上。见该字段的 javadoc。
+        // `phash`（第 7 个）反而**必须在解析期算** —— 字节只在 `storeImage` 那一跳手上。
         return new ImageInfo(id, box, caption,
                 stored == null ? null : stored.objectKey(),
                 stored == null ? null : stored.md5(),
-                null);
+                null,
+                extracted == null ? null : extracted.phash());
+    }
+
+    /**
+     * 抽一张图的两个产出：**存下来的东西** + **感知哈希**（`T-O03`）。
+     *
+     * <p>为什么 phash 在 `storeImage` 里算而不是回到 {@code imageInfoOf} 再算一次：
+     * **字节只在这一跳手上**。搬出去要么重读一次文件，要么让判定侧去 MinIO 取 ——
+     * 后者会把装饰图判定从纯函数变成有 IO 的。
+     */
+    private record Extracted(ImageSink.Stored stored, String phash) {
     }
 
     /**
@@ -470,7 +484,7 @@ public class PdfDocumentParser {
      * 所以这条路径目前**只有用例能覆盖** —— 那不是"写了没用的代码"，
      * 是给"更图多的大 PDF"留的兜底，而那一类**本仓样本里没有**。
      */
-    private static ImageSink.Stored storeImage(Scan scan, String source, int pageNo) {
+    private static Extracted storeImage(Scan scan, String source, int pageNo) {
         if (scan.outDir == null) {
             return null;
         }
@@ -501,12 +515,20 @@ public class PdfDocumentParser {
                             + "第 " + pageNo + " 页起的后续图片已跳过未抽取");
             return null;
         }
+
+        // `T-O03`：感知哈希**就在这一跳算** —— 字节只在手上这一次。
+        // ⚠️ 它算在存之前、且**不受存储成败影响**：哈希是"这张图长什么样"的事实，
+        //    而存储是"它放在哪"。存储失败时那个 block 不会成为图片块，多算一次不吃亏；
+        //    反过来把它塞进存储分支，就等于让"存不下"顺手抹掉一个与存储无关的事实。
+        // ⚠️ 认不出格式时返回 null（`ImageHash` 不抛）—— 那张图放弃装饰图判定，文档照常走。
+        String phash = ImageHash.dHash(bytes);
+
         try {
             ImageSink.Stored stored = scan.sink.store(bytes, pageNo, file.getFileName().toString());
             if (stored != null) {
                 scan.imageBytesStored += bytes.length;
             }
-            return stored;
+            return stored == null ? null : new Extracted(stored, phash);
         } catch (RuntimeException ex) {
             // 存不下就降级（该图不进索引），但**必须留痕** —— 静默丢图是"少了一点东西
             // 而没人发现"的形态，正是本仓最不能接受的那一类

@@ -361,8 +361,9 @@ class DocumentImageDescriberTest {
     private static Block imageBlock(String caption, double area, String md5, String objectKey) {
         // 正方形最省事：边长 = sqrt(area)
         double side = Math.sqrt(area);
+        // 第 7 位（phash）留 null：描述链不碰它，装饰图判定才碰（`T-O03`）
         ImageInfo info = new ImageInfo(1, new ImageInfo.Box(0, 0, side, side),
-                caption == null || caption.isBlank() ? null : caption, objectKey, md5, null);
+                caption == null || caption.isBlank() ? null : caption, objectKey, md5, null, null);
         return new Block(caption == null ? "" : caption, BlockType.IMAGE, "1. 总览",
                 1, 1, null, null, info);
     }

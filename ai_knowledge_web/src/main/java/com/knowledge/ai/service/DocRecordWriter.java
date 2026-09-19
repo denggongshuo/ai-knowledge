@@ -1,11 +1,15 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.enums.BlockType;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.text.BoilerplateRule;
 import com.knowledge.ai.core.text.ContentFingerprint;
 import com.knowledge.ai.pipeline.Block;
+import com.knowledge.ai.pipeline.ImageInfo;
 import com.knowledge.ai.pipeline.ParsedDocument;
+import com.knowledge.ai.pipeline.vision.DecorativeImageRule;
+import com.knowledge.ai.pipeline.vision.ImageHash;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,9 +20,12 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * {@code sys_document} 的**短事务写点**（`T-500` 的落库侧）。
@@ -405,6 +412,12 @@ public class DocRecordWriter {
             // ⚠️ 位置是硬约束：必须在**全部 insert 之后**（计数要看得见本文档自己的块），
             // 且必须在**向量化之前**（样板块不进召回池，判据在 ChunkVectorizer 那一跳）
             markBoilerplate(docId, kbId, blocks);
+
+            // `T-O03`：装饰图识别。**位置约束与样板完全相同**，且理由也一样 ——
+            // 它同样按"跨文档计数"判，同样靠"不进召回池"生效。
+            // 紧挨着放而不是另起一跳：两者是同一次落库之后的同一类动作，
+            // 分开放只会让人以为它们能有不同的时机
+            markDecorativeImages(docId, kbId, blocks);
         } else {
             // 空块集也要回填 0：上次解析若写过 chunk_count，不归零会留下
             // "文档没有块、却报告有 42 个分片"的假数
@@ -430,10 +443,11 @@ public class DocRecordWriter {
         entityManager.createNativeQuery("""
                         insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, source_chunk_id,
                                                title_path, raw_content, content_sha256, order_no,
-                                               page_no, object_key, image_md5, vl_model_id, created_at)
+                                               page_no, object_key, image_md5, vl_model_id,
+                                               image_phash, created_at)
                         values (:docId, :kbId, :chunkType, :parentId, :sourceChunkId,
                                 :titlePath, :rawContent, :contentSha256, :orderNo, :pageNo,
-                                :objectKey, :imageMd5, :vlModelId, :now)
+                                :objectKey, :imageMd5, :vlModelId, :imagePhash, :now)
                         """)
                 .setParameter("docId", docId)
                 .setParameter("kbId", kbId)
@@ -456,6 +470,10 @@ public class DocRecordWriter {
                 .setParameter("objectKey", imageObjectKeyOf(block))
                 .setParameter("imageMd5", imageMd5Of(block))
                 .setParameter("vlModelId", vlModelIdOf(block))
+                // `T-O03`：感知哈希同样只有 IMAGE 块有值。⚠️ 它**由解析期算好**
+                // （`PdfDocumentParser.storeImage`，那一跳字节在手上）—— 这里只负责搬运，
+                // 不在写入侧重算（重算要读 MinIO，把这条链从纯搬运变成有 IO 的）
+                .setParameter("imagePhash", imagePhashOf(block))
                 .setParameter("now", now)
                 .executeUpdate();
 
@@ -528,6 +546,11 @@ public class DocRecordWriter {
      */
     private static String vlModelIdOf(Block block) {
         return block.imageInfo() == null ? null : blankToNull(block.imageInfo().vlModelId());
+    }
+
+    /** 感知哈希（dHash）；非图片块、以及解析期没算出来的（认不出格式）都为 {@code null}。 */
+    private static String imagePhashOf(Block block) {
+        return block.imageInfo() == null ? null : blankToNull(block.imageInfo().phash());
     }
 
     // ==================== O9 步 3/4 · 跨文档样板识别 ====================
@@ -609,6 +632,130 @@ public class DocRecordWriter {
                         + "（含先前文档，阈值 = 出现在 ≥{} 个文档且长度 {}~{} 字符，**不进向量召回池**）",
                 docId, kbId, hit.size(), marked,
                 BoilerplateRule.MIN_DOCS, BoilerplateRule.MIN_LENGTH, BoilerplateRule.MAX_LENGTH);
+        return marked;
+    }
+
+    // ==================== T-O03 · 跨文档装饰图识别 ====================
+
+    /**
+     * 标记**跨文档重复的装饰图**（`T-O03`）—— 判为装饰图的图片块**不进向量召回池**。
+     *
+     * <h3>与 {@link #markBoilerplate} 是同一形状，但**匹配那一步不同**</h3>
+     * <p>样板按 {@code content_sha256} **精确**分组（同一段文本就是同一段）。
+     * 图片不能这样：同一张 logo 被重编码过之后 phash 会差几位
+     * —— 精确匹配等于退化成 md5（那正是 `image_phash` 这一列存在的理由）。
+     *
+     * <p>所以匹配分两步：
+     * <ol>
+     *   <li>**LSH 取候选**（SQL）：把每张图的 phash 按 4 段切开，任一**段**与它相同的
+     *       都算候选。这是"只比值相等"的 SQL 能做的最近似操作；</li>
+     *   <li>**算汉明距离**（Java）：候选里真正 ≤ {@link DecorativeImageRule#MAX_HAMMING}
+     *       的才算"同一张图"。</li>
+     * </ol>
+     * ⚠️ **LSH 有假阴性**：两张图汉明距离够近、但四段**恰好都不同**的对子会被漏掉。
+     * 段数（{@link ImageHash#BANDS} = 4）就是这个权衡的旋钮 —— 段越少漏得越少、候选越多。
+     * **本批只落机制，这个数要按真实语料量**（登记在计划 §9）。
+     *
+     * <h3>为什么候选查询没有走索引</h3>
+     * <p>`idx_chunk_iphash` 建在**整值**上，而这里要按**子串**比 —— 那个索引帮不上忙。
+     * 查询被 `kb_id` 圈住（本表的常规前缀），所以代价是"扫一个库的分片"而不是全表。
+     * ⚠️ 真要更快就得把分带落成**独立的列或表**，那是另一个量级的设计；
+     * 本批不做（见计划 §3.3）。
+     *
+     * @return 标记的行数
+     */
+    @Transactional
+    public int markDecorativeImages(long docId, long kbId, List<Block> blocks) {
+        // 本文档的候选：phash → 面积。同一个 phash 在一篇里出现多次时取**第一个** ——
+        // 它们本来就是同一张图，面积差异只说明文档里有缩放过的副本，而面积只用于"整页守卫"
+        Map<String, Double> candidates = new LinkedHashMap<>();
+        for (Block block : blocks) {
+            ImageInfo info = block.imageInfo();
+            if (info == null || block.blockType() != BlockType.IMAGE) {
+                continue;
+            }
+            String phash = info.phash();
+            if (phash == null || phash.isBlank()) {
+                continue;
+            }
+            candidates.putIfAbsent(phash, info.box() == null ? null : info.box().area());
+        }
+        if (candidates.isEmpty()) {
+            return 0;
+        }
+
+        // ① LSH：四条带各取一批值，拼成 `or ... in (...)`。段内取并集即可 ——
+        //    重复值让 SQL 多做一点功，但不会多给结果
+        List<String> band0 = new ArrayList<>();
+        List<String> band1 = new ArrayList<>();
+        List<String> band2 = new ArrayList<>();
+        List<String> band3 = new ArrayList<>();
+        for (String phash : candidates.keySet()) {
+            List<String> bands = ImageHash.bands(phash);
+            // 空列表 = 哈希不合法（`ImageHash#bands` 对非法输入给空、不抛）。
+            // 这张图因此**连候选都进不去** ⇒ 放弃它的判定。这是有意的（宁可漏报）：
+            // 拿一个半截哈希去拼 SQL，换来的不是"多标几个"而是"标错"
+            if (bands.isEmpty()) {
+                continue;
+            }
+            band0.add(bands.get(0));
+            band1.add(bands.get(1));
+            band2.add(bands.get(2));
+            band3.add(bands.get(3));
+        }
+        if (band0.isEmpty()) {
+            return 0;
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select distinct doc_id, image_phash from sys_chunk
+                         where kb_id = :kbId and doc_id <> :docId and image_phash is not null
+                           and (substring(image_phash, 1, 4) in (:b0)
+                             or substring(image_phash, 5, 4) in (:b1)
+                             or substring(image_phash, 9, 4) in (:b2)
+                             or substring(image_phash, 13, 4) in (:b3))
+                        """)
+                .setParameter("kbId", kbId)
+                .setParameter("docId", docId)
+                .setParameter("b0", band0)
+                .setParameter("b1", band1)
+                .setParameter("b2", band2)
+                .setParameter("b3", band3)
+                .getResultList();
+
+        // ② 汉明距离：候选 phash → 它出现在哪些**别的文档**里
+        Set<String> hit = new LinkedHashSet<>();
+        for (Map.Entry<String, Double> entry : candidates.entrySet()) {
+            String phash = entry.getKey();
+            Set<Long> otherDocs = new HashSet<>();
+            for (Object[] row : rows) {
+                if (ImageHash.hamming(phash, String.valueOf(row[1]))
+                        <= DecorativeImageRule.MAX_HAMMING) {
+                    otherDocs.add(((Number) row[0]).longValue());
+                }
+            }
+            // +1 = 本文档自己。口径与 `BoilerplateRule.MIN_DOCS` 一致：**含当前文档在内**
+            long docCount = otherDocs.size() + 1L;
+            if (DecorativeImageRule.shouldMark(docCount, entry.getValue())) {
+                hit.add(phash);
+            }
+        }
+        if (hit.isEmpty()) {
+            return 0;
+        }
+
+        int marked = entityManager.createNativeQuery("""
+                        update sys_chunk set is_decorative = 1
+                         where kb_id = :kbId and image_phash in (:hashes) and is_decorative = 0
+                        """)
+                .setParameter("kbId", kbId)
+                .setParameter("hashes", hit)
+                .executeUpdate();
+        log.info("识别出跨文档装饰图（`T-O03`）：docId={} kbId={} 命中图 {} 张 · 标记行数 {}"
+                        + "（阈值 = 出现在 ≥{} 篇且面积 < {} pt²，**不进向量召回池**）",
+                docId, kbId, hit.size(), marked,
+                DecorativeImageRule.MIN_DOCS, Math.round(DecorativeImageRule.MAX_AREA));
         return marked;
     }
 
