@@ -379,12 +379,23 @@ export const sysApi = {
   /** 问答页切换器选项：只返回已启用且测试通过的模型（不含密钥） */
   modelOptions: (type: ModelType = 'CHAT') => http.get<{ list: ModelOption[] }>('/system/model/options', { type }),
   modelUsage: () => http.get<ModelUsage>('/system/model/usage', { range: 'month' }),
+  /**
+   * ⛔ **以下四条本版本都不支持**（用户 2026-09-19 裁定：只开放对话模型的切换）。
+   *
+   * 后端四个映射**都在**，但一律如实回 `MODEL_SWITCH_UNSUPPORTED`（业务码 `10081`）
+   * + 「现象 + 下一步动作」。它们不是 404，是**有语义的拒绝**。
+   *
+   * ⚠️ **页面已不再调它们**（`ModelConfigView.vue` 的「更换嵌入模型」对话框与 VL 的
+   * 「切换并重建」按钮已删）。保留这四个封装是**故意的**：后端接口真的存在，
+   * `api/index.ts` 是它的镜像，删掉封装会让人以为接口没了。
+   * 谁调用都会拿到那句拒绝 —— 这是正确行为，不是 bug。
+   */
   embeddingImpact: () => http.get<EmbeddingImpact>('/system/model/embedding-impact'),
   changeEmbedding: (body: { model: string; dimension: number; rebuildMode: string }) =>
     http.post<{ taskId: string }>('/system/model/change-embedding', body),
-  /** 换 VL 模型影响量（仅含图文档，非全库） */
+  /** ⛔ 本版本不支持（见上方说明）。 */
   vlImpact: () => http.get<VlImpact>('/system/model/vl-impact'),
-  /** 重建含图片 / 扫描件的文档 🚩 */
+  /** ⛔ 本版本不支持（见上方说明）：重建含图片 / 扫描件的文档 🚩 */
   rebuildImageDocs: () =>
     http.post<{ taskId: string; imageDocCount: number; imageCount: number; status: string }>('/system/model/rebuild-image-docs'),
   /**

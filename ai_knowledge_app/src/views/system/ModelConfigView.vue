@@ -9,14 +9,15 @@ import {
   InfoFilled,
   Collection,
   TrendCharts,
-  Right,
   Plus,
   Connection,
   Delete,
   Edit,
 } from '@element-plus/icons-vue'
 import { sysApi } from '@/api'
-import type { ModelConfigItem, ModelConfigResponse, ModelType, ModelUsage, VlImpact } from '@/types'
+// ⚠️ `Right` / `VlImpact` 两个 import 已随「更换嵌入模型」与 VL 影响量那两块一起删
+// （本版本不支持换嵌入 / 重建含图文档，页面上不再有它们的元素）
+import type { ModelConfigItem, ModelConfigResponse, ModelType, ModelUsage } from '@/types'
 
 // ---------------- 四类模型数据 ----------------
 const loading = ref(false)
@@ -126,10 +127,10 @@ async function activate(m: ModelConfigItem) {
       return
     }
   }
-  // VL：仅新解析的文档生效
+  // VL：仅新解析的文档生效。对话框**只讲后果**，不再调 `vl-impact` ——
+  // 那条接口本版本如实回「不支持」（见下方 `confirmVlSwitch` 的注释）
   if (m.modelType === 'VL') {
     vlPending.value = m
-    await loadVlImpact()
     vlDialog.value = true
     return
   }
@@ -297,62 +298,32 @@ async function saveModel() {
   }
 }
 
-// ---------------- 图片理解：理解进度示例（与问答页同链路） ----------------
-const vlImpact = reactive<VlImpact>({ kbCount: 0, imageDocCount: 0, imageCount: 0, estimateMinutes: 0, extraTokens: 0 })
-const vlImpactLoading = ref(false)
-async function loadVlImpact() {
-  vlImpactLoading.value = true
-  try {
-    Object.assign(vlImpact, await sysApi.vlImpact())
-  } finally {
-    vlImpactLoading.value = false
-  }
-}
-
 // ---------------- VL 切换确认 ----------------
+// 🔴 本版本**只切换、不重建**（用户 2026-09-19 裁定，见 `plan/2026-09-19-S6-M09-C.md`）。
+// 原来的「切换并重建含图文档」按钮已去掉 —— 它调的 `rebuild-image-docs` 现在如实回「不支持」，
+// 留着按钮就是给用户一条**填得动、提交必失败**的路。对话框改为**先把后果说清楚**。
+//
+// ⚠️ 顺带销掉一处静默失败：原来这里调 `vlImpact()` 拉影响量，而那条接口后端**根本不存在**，
+// 撞 404 后 `vlImpact` 停在全 0 初值 ⇒ 页面显示「0 个 / 0 篇 / 约 0 分钟」——
+// **与「真的没有」长得一模一样**（本仓记过的形态：`#85` 死常量、`#161` 解析不出数字）。
 const vlDialog = ref(false)
 const vlPending = ref<ModelConfigItem | null>(null)
 
-async function confirmVlSwitch(rebuild: boolean) {
+async function confirmVlSwitch() {
   const m = vlPending.value
   if (!m) return
   await doActivate(m)
-  if (rebuild) {
-    const res = await sysApi.rebuildImageDocs()
-    ElMessage.success(
-      `已启动重建：${res.imageDocCount} 篇含图文档 / ${res.imageCount} 张图片。任务 ${res.taskId} 可到通知中心查看`,
-    )
-  }
   vlDialog.value = false
   vlPending.value = null
 }
 
 // ---------------- 嵌入模型（只读单例） ----------------
-const embedImpact = reactive({ kbCount: 8, docCount: 1246, chunkCount: 38502, estimateMinutes: 42, extraTokens: 11800000 })
-const pendingRebuild = ref(false)
-const changeDialog = ref(false)
-const rebuildForm = reactive({
-  newModel: 'text-embedding-3-large',
-  newDimension: 3072,
-  rebuildMode: 'DEGRADED' as 'DEGRADED' | 'PAUSE',
-  confirmed: false,
-})
-
-async function confirmChange() {
-  if (!rebuildForm.confirmed) {
-    ElMessage.warning('请先勾选「我已知晓影响范围」')
-    return
-  }
-  await sysApi.changeEmbedding({
-    model: rebuildForm.newModel,
-    dimension: rebuildForm.newDimension,
-    rebuildMode: rebuildForm.rebuildMode,
-  })
-  changeDialog.value = false
-  rebuildForm.confirmed = false
-  pendingRebuild.value = false
-  ElMessage.success('已启动全库索引重建，任务编号可到通知中心查看，重建期间可继续使用关键词检索')
-}
+// 🔴 本版本**不支持换嵌入模型**（用户 2026-09-19 裁定：跨维度换模型要重建整个向量集合、
+// 旧数据不保留，风险太大）。原「更换嵌入模型」对话框连同它那五个数一起删掉了 ——
+// 那五个数（8 库 / 1246 篇 / 38502 片 / 42 分钟 / 1180 万 tokens）是 **mock 里的数**
+// （`src/mock/index.ts:1429`），而它在**真后端**下也会渲染出来。
+// `embedding-impact` 那条接口本版本如实回「不支持」，**不返回真数字**：返回真数字
+// 会让「不支持」看着像「能换」，用户会一路填到勾选确认才撞墙。
 
 // ---------------- 用量统计 ----------------
 const usage = reactive({
@@ -380,8 +351,9 @@ function typeLabel(t: ModelType) {
 }
 
 onMounted(async () => {
-  const [usageRes, impactRes] = await Promise.all([sysApi.modelUsage(), sysApi.embeddingImpact()])
-  Object.assign(embedImpact, impactRes ?? {})
+  // ⚠️ 这里原来并发拉 `embeddingImpact()` 并把它塞进一个 mock 初值对象。本版本那条接口
+  // 如实回「不支持」，页面也不再展示它的数 —— **直接不调**，页面因此少一次注定失败的请求
+  const usageRes = await sysApi.modelUsage()
   usage.calls = usageRes.calls
   usage.tokens = usageRes.tokens
   usage.cost = usageRes.cost
@@ -409,12 +381,10 @@ onMounted(async () => {
       </div>
     </div>
 
-    <!-- 待重建提示 -->
-    <div v-if="pendingRebuild" class="rebuild-banner">
-      <el-icon><Warning /></el-icon>
-      <span>系统启动时检测到<b>服务端嵌入模型配置与库内索引不一致</b>，索引不重建将无法继续检索，请确认后执行全库重建。</span>
-      <el-button size="small" type="warning" @click="changeDialog = true">立即处理</el-button>
-    </div>
+    <!-- ⚠️ 原「待重建提示」横幅已删（本版本不支持换嵌入模型）。
+         它原本由 `pendingRebuild` 驱动，而那个标志**从来没有被置为 true** ——
+         也就是说这条横幅在页面上一次都不会出现。与它一起删掉的还有那个
+         「模拟『检测到配置变更』」按钮：它是一条**没有后端**的演示入口。 -->
 
     <!-- 顶部统计 -->
     <div class="stat-grid">
@@ -555,24 +525,23 @@ onMounted(async () => {
           <div class="impact-box embed-impact">
             <div class="impact-head">
               <el-icon><Warning /></el-icon>
-              <b>更换嵌入模型的影响（全库）</b>
+              <b>更换嵌入模型：本版本不支持</b>
             </div>
-            <div class="impact-row"><span>受影响知识库</span><span class="mono">{{ embedImpact.kbCount }} 个（全部）</span></div>
-            <div class="impact-row"><span>需重新向量化</span><span class="mono">{{ embedImpact.docCount.toLocaleString() }} 篇文档</span></div>
-            <div class="impact-row"><span>需重建分片</span><span class="mono">{{ embedImpact.chunkCount.toLocaleString() }} 个</span></div>
-            <div class="impact-row"><span>预估耗时</span><span class="mono">约 {{ embedImpact.estimateMinutes }} 分钟</span></div>
-            <div class="impact-row last"><span>预估额外 tokens</span><span class="mono warn-num">约 {{ (embedImpact.extraTokens / 10000).toFixed(0) }} 万</span></div>
+            <div class="tiny" style="padding: 4px 2px">
+              更换嵌入模型需要<b>重建整个向量集合</b>（跨维度时旧数据不会保留），本版本未开放该入口。
+              当前只开放<b>对话模型</b>的切换。
+            </div>
+            <div class="tiny muted" style="padding: 4px 2px">
+              如确需更换，请联系管理员按《11-M05-存储生命周期规则（O7）》走人工流程。
+            </div>
           </div>
         </div>
         <div class="info-box">
           <el-icon><InfoFilled /></el-icon>
           <span class="tiny">
-            嵌入模型<b>由服务端配置，前端不提供新增入口（单例）</b>。运维变更配置后，系统启动时检测到与库内索引不一致，会在本页顶部提示「需重建索引」。
+            嵌入模型<b>由服务端配置，前端不提供新增入口（单例）</b>，也<b>不提供更换入口</b>（本版本）。
           </span>
         </div>
-        <el-button type="warning" plain style="margin-top: 12px" @click="changeDialog = true">
-          <el-icon><Refresh /></el-icon> 模拟「检测到配置变更」
-        </el-button>
       </div>
     </div>
 
@@ -681,7 +650,7 @@ onMounted(async () => {
         <div class="info-box">
           <el-icon><InfoFilled /></el-icon>
           <span class="tiny">
-            VL 与嵌入的关键区别：换嵌入模型<b>必须全库重建（约 {{ embedImpact.estimateMinutes }} 分钟）</b>；换 VL 模型<b>只影响含图文档</b>，纯文本文档不受影响。
+            VL 与嵌入的关键区别：换嵌入模型<b>必须全库重建</b>（本版本不支持）；换 VL 模型<b>只影响含图文档</b>，纯文本文档不受影响。
           </span>
         </div>
       </div>
@@ -898,94 +867,30 @@ onMounted(async () => {
       </template>
     </el-dialog>
 
-    <!-- 切换 VL 模型确认 -->
+    <!-- 切换 VL 模型确认 —— **只切换，不重建**（本版本） -->
     <el-dialog v-model="vlDialog" title="切换 VL 视觉模型" width="620px" destroy-on-close>
-      <div v-loading="vlImpactLoading">
-        <div class="rebuild-warn">
-          <el-icon><Warning /></el-icon>
-          <span class="tiny">
-            <b>仅新解析的文档生效</b>：已入库文档的图片描述不会自动更新（仍是旧模型产出）。纯文本文档不受影响，无需全库重建。
-          </span>
-        </div>
-        <div class="field">
-          <label>影响范围（仅含图文档）</label>
-          <div class="impact-box solid">
-            <div class="impact-row"><span>涉及知识库</span><span class="mono">{{ vlImpact.kbCount }} 个</span></div>
-            <div class="impact-row"><span>含图片 / 扫描件的文档</span><span class="mono">{{ vlImpact.imageDocCount }} 篇</span></div>
-            <div class="impact-row"><span>需重新理解的图片</span><span class="mono">{{ vlImpact.imageCount }} 张</span></div>
-            <div class="impact-row"><span>预估耗时</span><span class="mono">约 {{ vlImpact.estimateMinutes }} 分钟</span></div>
-            <div class="impact-row last"><span>预估额外 tokens</span><span class="mono warn-num">约 {{ (vlImpact.extraTokens / 10000).toFixed(1) }} 万</span></div>
-          </div>
-        </div>
-        <div class="info-box">
-          <el-icon><InfoFilled /></el-icon>
-          <span class="tiny">对比：换嵌入模型需要<b>全库重建（约 {{ embedImpact.estimateMinutes }} 分钟 / 8 个库）</b>；换 VL 只影响上面这些含图文档。</span>
-        </div>
+      <div class="rebuild-warn">
+        <el-icon><Warning /></el-icon>
+        <span class="tiny">
+          <b>仅新解析的文档生效</b>：已入库文档的图片描述不会自动更新（仍是旧模型产出）。纯文本文档不受影响。
+        </span>
+      </div>
+      <div class="info-box" style="margin-top: 12px">
+        <el-icon><InfoFilled /></el-icon>
+        <span class="tiny">
+          <b>本版本不提供「重建含图文档」</b>：重建需要逐张重新调用 VL 模型（实测 40~60 秒 / 张），
+          本版本未开放该入口。如需让已入库文档跟上新模型，请<b>重新上传该文档</b>（会重新走一遍解析与图片理解）。
+        </span>
       </div>
       <template #footer>
         <el-button @click="vlDialog = false">取消</el-button>
-        <el-button @click="confirmVlSwitch(false)">仅切换（不重建）</el-button>
-        <el-button type="primary" @click="confirmVlSwitch(true)">切换并重建含图文档</el-button>
+        <el-button type="primary" @click="confirmVlSwitch()">仅切换（不重建）</el-button>
       </template>
     </el-dialog>
 
-    <!-- 更换嵌入模型确认弹窗 -->
-    <el-dialog v-model="changeDialog" title="检测到嵌入模型配置已变更" width="620px" destroy-on-close>
-      <div class="rebuild-body">
-        <div class="rebuild-warn">
-          <el-icon><Warning /></el-icon>
-          <span class="tiny">系统启动时检测到<b>服务端的嵌入模型配置与库内索引不一致</b>。索引不重建将无法继续检索，请确认后执行全库重建。</span>
-        </div>
-        <div class="model-compare">
-          <div class="mc-side">
-            <div class="tiny muted">库内索引（当前）</div>
-            <div class="mono mc-name">{{ config.embedding.modelName }}</div>
-            <div class="tiny muted">{{ config.embedding.dimension }} 维</div>
-          </div>
-          <el-icon class="mc-arrow"><Right /></el-icon>
-          <div class="mc-side new">
-            <div class="tiny muted">服务端配置（新）</div>
-            <div class="mono mc-name">{{ rebuildForm.newModel }}</div>
-            <div class="tiny muted">{{ rebuildForm.newDimension }} 维</div>
-          </div>
-        </div>
-        <div class="field">
-          <label>影响范围</label>
-          <div class="impact-box solid">
-            <div class="impact-row"><span>受影响的全部知识库</span><span class="mono">{{ embedImpact.kbCount }} 个</span></div>
-            <div class="impact-row"><span>需重新向量化的文档</span><span class="mono">{{ embedImpact.docCount.toLocaleString() }} 篇</span></div>
-            <div class="impact-row"><span>需重建的分片</span><span class="mono">{{ embedImpact.chunkCount.toLocaleString() }} 个</span></div>
-            <div class="impact-row"><span>预估耗时</span><span class="mono">约 {{ embedImpact.estimateMinutes }} 分钟</span></div>
-            <div class="impact-row last"><span>预估额外 tokens 消耗</span><span class="mono warn-num">约 {{ (embedImpact.extraTokens / 10000).toFixed(0) }} 万</span></div>
-          </div>
-        </div>
-        <div class="field">
-          <label>重建期间的服务状态</label>
-          <el-radio-group v-model="rebuildForm.rebuildMode" class="mode-list">
-            <el-radio value="DEGRADED" border class="mode-item">
-              <div class="mode-inner"><b>降级为关键词检索</b><span class="tiny muted">推荐，问答仍可用但精度下降</span></div>
-            </el-radio>
-            <el-radio value="PAUSE" border class="mode-item">
-              <div class="mode-inner"><b>暂停问答服务</b><span class="tiny muted">重建更快，但用户完全无法提问</span></div>
-            </el-radio>
-          </el-radio-group>
-        </div>
-        <div class="rebuild-warn">
-          <el-icon><Warning /></el-icon>
-          <span class="tiny">
-            向量维度从 {{ config.embedding.dimension }} 变为 {{ rebuildForm.newDimension }}，<b>Milvus collection 需要整体重建</b>，旧数据不会保留。
-            重建过程中若中断，需要重新开始。
-          </span>
-        </div>
-        <el-checkbox v-model="rebuildForm.confirmed" class="confirm-check">
-          <span class="tiny">我已知晓影响范围，确认更换并重建全部索引</span>
-        </el-checkbox>
-      </div>
-      <template #footer>
-        <el-button @click="changeDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmChange">确认重建全部索引</el-button>
-      </template>
-    </el-dialog>
+    <!-- ⚠️ 原「更换嵌入模型确认弹窗」已整块删除（本版本不支持换嵌入模型）。
+         它调的两个接口现在都如实回「不支持」，留着对话框就是给用户一条
+         **填得动、勾得动、提交必失败**的路。说明改由嵌入模型卡片内联承载。 -->
   </div>
 </template>
 
@@ -1004,23 +909,9 @@ onMounted(async () => {
   gap: 8px;
 }
 
-/* 待重建横幅 */
-.rebuild-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: var(--el-color-warning-light-9);
-  border: 1px solid #faecd8;
-  border-radius: 8px;
-  padding: 11px 14px;
-  margin-bottom: 14px;
-  font-size: 12.5px;
-  color: #8a6d3b;
-}
-.rebuild-banner .el-icon {
-  color: var(--el-color-warning);
-  flex: none;
-}
+/* ⚠️ `.rebuild-banner` 的样式随「待重建横幅」一起删（本版本不支持换嵌入模型）。
+   同批删掉的孤儿样式：`.model-compare` / `.mc-*` / `.mode-*` / `.confirm-check` /
+   `.rebuild-body`（它们的元素都在被删的两个对话框里）。 */
 
 /* 统计 */
 .stat-grid {
@@ -1426,9 +1317,6 @@ onMounted(async () => {
 .edit-body .field {
   margin-bottom: 14px;
 }
-.rebuild-body .field {
-  margin-bottom: 14px;
-}
 .rebuild-warn {
   display: flex;
   gap: 9px;
@@ -1445,52 +1333,5 @@ onMounted(async () => {
 }
 .rebuild-warn .tiny {
   line-height: 1.65;
-}
-.model-compare {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 14px;
-  background: #fafbfd;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  margin-bottom: 16px;
-}
-.mc-side {
-  flex: 1;
-  text-align: center;
-}
-.mc-name {
-  font-size: 13.5px;
-  font-weight: 500;
-  margin: 5px 0 3px;
-}
-.mc-side.new .mc-name {
-  color: var(--el-color-primary);
-}
-.mc-arrow {
-  color: var(--el-color-primary);
-  flex: none;
-}
-.mode-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 100%;
-}
-.mode-item {
-  width: 100%;
-  height: 46px;
-  margin-right: 0;
-}
-.mode-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-right: 6px;
-  width: 100%;
-}
-.confirm-check {
-  margin-top: 4px;
 }
 </style>
