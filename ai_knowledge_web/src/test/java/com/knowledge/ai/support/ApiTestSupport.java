@@ -195,6 +195,17 @@ public abstract class ApiTestSupport {
             log.warn("[探针兜底] 删掉 {} 行孤儿打点明细 —— 清理与异步写库的窗口撞上了（#210）",
                     orphanTraceChunks);
         }
+        // `T-B03`（本批）：**通知的兜底**。这一条是**本批新造出来的需求** ——
+        // `NoticePublisher` 接线之后，凡是跑完异步任务的用例都会产通知行（此前一行都不产），
+        // 所以"谁清通知"必须同批回答，否则就是`#130` 那个形状的第 N 次复现。
+        // ⚠️ 它**必须排在 kb 族兜底之后**：那条把任务行/用户行删掉，通知才**变成**无主。
+        //    顺序反了会漏一轮（这一轮的残留要等下一轮才被扫）。
+        int orphanNotices = ProbeCleanup.sweepOrphanNotices(jdbc);
+        if (orphanNotices > 0) {
+            // ⚠️ 这条**不是告警级** —— 它 >0 通常只是"任务行先被删了"，属于**预期顺序**。
+            //    与上面几条不同，别把它当成"有类漏清了"的信号（见 `sweepOrphanNotices` 的 javadoc）。
+            log.info("[探针兜底] 清掉 {} 行无主通知（所含已读/设置行同批清了）", orphanNotices);
+        }
     }
 
     /**

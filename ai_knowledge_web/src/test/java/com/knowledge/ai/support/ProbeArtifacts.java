@@ -64,6 +64,15 @@ public final class ProbeArtifacts {
                             + "覆盖率闸**扫不到**，只有拿两份登记表取差集才看得出来"),
             Map.entry("sys_retrieval_trace", "检索打点。按 user_id 删（同上）"),
             Map.entry("sys_retrieval_trace_chunk", "打点明细。它没有 user_id，按 trace_id 顺着父表删，**先于 sys_retrieval_trace**"),
+            Map.entry("sys_notice",
+                    "站内通知（T-B03）。按**无主**删 —— 它有两根归属线：`source_task_id` 指向的"
+                            + "任务行、`user_id` 指向的用户行，任一悬空即无主。"
+                            + "⚠️ 这三张表是本批**新造出来的产物**：`T-B03` 接线之后，**凡是跑完异步任务的用例"
+                            + "都会产通知行**（解析类走 doc-upload、导出类走 audit-export），此前一行都不产。"
+                            + "见 ProbeCleanup#sweepOrphanNotices"),
+            Map.entry("sys_notice_read",
+                    "通知已读状态（T-B02）。无主判据：通知没了、或人没了。**子表，先于 sys_notice 清**"),
+            Map.entry("sys_notice_setting", "通知设置（T-B02）。无主判据：人没了"),
             Map.entry("sys_model_usage",
                     "模型用量（T-905）。🔴 **一个归属列都没有**（无 kb_id/doc_id/user_id）—— "
                             + "所以清理口径只能是**按日期清当天**（`ProbeCleanup#sweepProbeUsage`），"

@@ -179,6 +179,23 @@ export const USER_ARTIFACTS = [
       + '桶里的对象不在清理器的能力范围内（与 documents/ 同一条取舍，靠生命周期规则）',
   },
 
+  // ---- S6-M11 新增（通知中心）：`T-B03` 的**外溢面** ----
+  // 🔴 这三张表是**本批新造出来的产物**：`NoticePublisher` 接线之后，
+  //    **凡是跑完一个异步任务的用例/E2E 都会产通知行** —— 它们此前一行都不产，
+  //    所以"谁清通知"这个问题在 `T-B03` 之前**不存在**。
+  // ⚠️ 它们的归属**不是 `kb_id`**（通知没有知识库维度）⇒ 进不了 `KB_ARTIFACTS`；
+  //    这里登记的是"探针账号名下那些"，**种子超管（admin）名下的那些靠
+  //    `teardownKbProbe` 里的无主兜底**（任务行被删 ⇒ 通知成孤儿）。两条合起来才叫覆盖。
+  { id: 'sql:sys_notice_read', kind: 'sql-user', table: 'sys_notice_read', via: 'user',
+    why: '通知已读状态。⚠️ 子表，**必须先于 sys_notice**（顺序即执行顺序）' },
+  { id: 'sql:sys_notice_setting', kind: 'sql-user', table: 'sys_notice_setting', via: 'user',
+    why: '通知设置。没有行 = 默认开启（四类都开）' },
+  { id: 'sql:sys_notice', kind: 'sql-user', table: 'sys_notice', via: 'user',
+    why: '站内通知（T-B03 产出）。⚠️ `user_id` **可空**（NULL = 广播），'
+      + '而本表按 `user_id in (...)` 删 ⇒ **广播行删不掉**。'
+      + '本批的唯一产出方是异步任务终态、总带 owner ⇒ 不产广播行；'
+      + '收尾判据里有一条「user_id is null 的行数为 0」盯着它' },
+
   { id: 'sql:sys_user', kind: 'sql-user', table: 'sys_user', via: 'username', why: '用户主表' },
   {
     // 🔴 **既不是库族也不是用户族**：这张表**一个归属列都没有**（无 kb_id/doc_id/user_id），
@@ -528,6 +545,36 @@ function minioKeysOf(code) {
  *
  * @returns {Promise<{code:string, ids:string[], minioKeys:string[], removed:object, residue:object}>}
  */
+/**
+ * **无主通知兜底**（`S6-M11` · `T-B03` 的外溢面）。
+ *
+ * <h3>为什么它进不了上面两张登记表的循环</h3>
+ * `sys_notice` 的归属**不是 `kb_id`**（通知没有知识库维度）⇒ 进不了 `KB_ARTIFACTS`；
+ * 而它按 `via: 'user'` 只能删到**探针账号**名下那些 —— E2E 脚本用的是**种子超管 `admin`**，
+ * 那些通知的 `owner_id` 永远有效，`user_id in (...)` 够不着。
+ * 于是只能问第三根线：**产出它的任务行还在不在**。
+ *
+ * <p>⚠️ 这与 Java 侧 `ProbeCleanup#sweepOrphanNotices` 是**同一件事的两份实现**
+ * （一个 JS 一个 Java，两侧刻意不合并，只对账 —— 见 `ProbeArtifacts` 的类注释）。
+ * 改判据时**两边都要改**。
+ *
+ * <p>⚠️ 顺序**固定**：先清"人没了"的读行 → 再删主表 → 再清"通知没了"的读行
+ * （上一句刚制造出来的那批）。顺序反了会漏一轮。
+ *
+ * @returns {number} 删掉的通知行数
+ */
+export function sweepOrphanNotices() {
+  const before = mysqlCount('select count(*) from sys_notice;')
+  mysqlScalar(
+    'delete from sys_notice_read where user_id not in (select id from sys_user);'
+    + 'delete from sys_notice where (source_task_id is not null and source_task_id not in (select task_id from sys_async_task))'
+    + ' or (user_id is not null and user_id not in (select id from sys_user));'
+    + 'delete from sys_notice_read where notice_id not in (select id from sys_notice);'
+    + 'delete from sys_notice_setting where user_id not in (select id from sys_user);',
+  )
+  return before - mysqlCount('select count(*) from sys_notice;')
+}
+
 export async function teardownKbProbe(code) {
   // ⓪ `S4-E1` 起多了一步：**先让解析作业停下来**，否则它们是"删完之后还在写"的源头
   // 🔴 `#187`：**必须接住它的返回值**。原写法是 `await quiesceParseJobs(code)` ——
@@ -566,9 +613,17 @@ export async function teardownKbProbe(code) {
       .reduce((acc, s) => acc + s, ''),
   )
 
+  // ④.5 无主通知（`T-B03` 的外溢面）—— **必须排在 ④ 之后**：
+  //    ④ 刚把任务行删掉，通知**在这一刻才变成**无主。顺序反了要等下一轮才扫得到。
+  const noticesRemoved = sweepOrphanNotices()
+
   // ⑤ 残留自检 —— 独立观测点
   const residue = await findKbProbeResidue(code, { ids, minioKeys, quiesceTimedOut: !!quiesce.timedOut })
-  return { code, ids, minioKeys, removed: { minio: minioRemoved, sql: '见 residue' }, residue, quiesce }
+  return {
+    code, ids, minioKeys,
+    removed: { minio: minioRemoved, sql: '见 residue', notices: noticesRemoved },
+    residue, quiesce,
+  }
 }
 
 /** 用户族探针（`e2e-audit-backfill` 那类）。幂等。 */

@@ -205,6 +205,62 @@ public final class ProbeCleanup {
     }
 
     /**
+     * **无主通知兜底**（`T-B03` · `2026-09-19-S6-M11` 批）。
+     *
+     * <h3>为什么本批必须加它 —— 这是 `T-B03` 的**外溢面**</h3>
+     * <p>接线之后，**凡是跑完一个异步任务的用例都会产出通知行**：解析类用例
+     * （`ParseWorkerFlowTest` / `DocParseFlowTest` / `DocUploadFlowTest` …）走 `doc-upload`，
+     * 导出类用例（`AuditQueryFlowTest`）走 `audit-export`。
+     * 它们**此前一行都不产** ⇒ 「谁清通知」这个问题在本批之前不存在，是本批**新造出来的**。
+     *
+     * <h3>问法：还是"库里还剩不剩无主的东西"</h3>
+     * <p>与 {@link #sweepOrphanKbArtifacts} 同一条思路，但 `sys_notice` 的归属**有两根线**，
+     * 两个方向都要问：
+     * <ul>
+     *   <li><b>任务线</b> —— {@code source_task_id} 指向的 `sys_async_task` 行已经没了。
+     *       这是**通知最主要的无主形态**：用例收尾会删任务行（kb 族兜底按 `kb_id` 删、
+     *       {@link #cleanUsers} 按 `owner_id` 删），任务一旦没了，它产出的通知就没人能认领。</li>
+     *   <li><b>人线</b> —— {@code user_id} 指向的用户行已经没了（探针账号被删）。</li>
+     * </ul>
+     * ⚠️ 顺带清两张子表：`sys_notice_read`（通知没了、或人没了，它就成了孤儿）与
+     * `sys_notice_setting`（人没了）。**子表在前** —— 与 {@link #ORPHAN_SWEEP} 同序。
+     *
+     * <h3>🔴 这条判据**不能直接搬到生产**</h3>
+     * <p>「任务行不在 ⇒ 通知作废」只在**测试**里成立（任务行与通知同批产生、同批清理）。
+     * 生产里若哪天引入任务行的归档/清理，而通知的留存期比它长，这条判据会把
+     * **用户还没读的通知**当成孤儿删掉。
+     * ⚠️ 真要搬到生产，判据必须补上**时间下限**（`T-O10`/`T-O11` 那两条兜底用的
+     * {@link #DEFAULT_MIN_AGE} 就是干这个的），或改成"按通知自己的保留策略"。
+     *
+     * <h3>⚠️ 它抓不到"归属还在的"残留（射程如实写明）</h3>
+     * <p>用**种子超管**（`admin`）跑出来的通知，它的 `owner_id` 与 `source_task_id`
+     * 可能都仍然有效 ⇒ **不属于无主**，这条兜底看不见它。那一半靠各用例自己清
+     * （`AuditQueryFlowTest` 就是这么做的）。这与 `T-O11` 的 `audit-export/` 兜底是
+     * **同一条限制** —— **两条合起来才叫覆盖**。
+     *
+     * @return 删掉的行数。**&gt; 0 是信号，但比 {@link #sweepOrphanTraceChunks} 那条弱** ——
+     *         这里 &gt;0 多半只是"任务行先被删了"，那是**预期顺序**，不是事故
+     */
+    public static int sweepOrphanNotices(JdbcTemplate jdbc) {
+        int removed = 0;
+        // 1) 子表：读状态里"人没了"的
+        removed += jdbc.update("delete from sys_notice_read "
+                + "where user_id not in (select id from sys_user)");
+        // 2) 主表：任务线 + 人线（两个 not in 的子查询读的都是**别的表** ⇒ 不会撞 1093）
+        removed += jdbc.update("delete from sys_notice "
+                + "where (source_task_id is not null "
+                + "       and source_task_id not in (select task_id from sys_async_task)) "
+                + "   or (user_id is not null and user_id not in (select id from sys_user))");
+        // 3) 子表：读状态里"通知没了"的 —— 第 2 步刚制造出来的那一批
+        removed += jdbc.update("delete from sys_notice_read "
+                + "where notice_id not in (select id from sys_notice)");
+        // 4) 设置里"人没了"的
+        removed += jdbc.update("delete from sys_notice_setting "
+                + "where user_id not in (select id from sys_user)");
+        return removed;
+    }
+
+    /**
      * **按日期**清模型用量（`T-905` · `S6-M09-B` 新增）—— 清**当天**那一格到今天为止。
      *
      * <h3>为什么是"按日期"而不是"按归属"</h3>
