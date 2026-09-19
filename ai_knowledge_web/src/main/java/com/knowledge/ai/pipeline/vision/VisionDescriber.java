@@ -110,8 +110,14 @@ public class VisionDescriber {
             // **不抛**：图片理解不了时照常按文字问题回答（§4.10 第 3 行）。
             // 抛出去就等于拿一次图片失败炸掉整个问答 —— 比"少一份描述"严重一个量级
             long millis = (System.nanoTime() - startNanos) / 1_000_000L;
+            // 🔴 **必须打整条 cause 链，而不是 `getMessage()`**。
+            //    `S6-M05-C2` 实测踩到：文档侧 26 张里有 4 张被端点**确定性拒绝**，
+            //    而日志里那 4 行全是 `原因=Request failed` —— 四个字，**查不下去**。
+            //    真正的原因（HTTP 状态 + 响应体，如 `20015 image_url provided is not a valid image`）
+            //    藏在 cause 里，而这里当时只印了最外层。
+            //    本仓对失败态的硬口径是「现象 + 下一步动作」—— `Request failed` 两者都没有。
             log.warn("[图片理解] VL 调用失败，本次降级：md5={} vl={} 原因={}",
-                    input.md5(), modelRef.name(), ex.getMessage());
+                    input.md5(), modelRef.name(), causeChain(ex));
             // 失败也记一次用量：走到这里说明 `modelRef` 是有值的（未配置的情况上面已经
             // return 了），即**请求真的发出去了** —— 供应商多半照计费。不记会让
             // "这个月花了多少"漏掉失败的那些。与 {@code RetrievalService#recordRerankUsage}
@@ -211,6 +217,32 @@ public class VisionDescriber {
                 raw == null || raw.promptTokens() == null ? 0L : raw.promptTokens(),
                 raw == null || raw.completionTokens() == null ? 0L : raw.completionTokens(),
                 toInt(millis));
+    }
+
+    /**
+     * 把异常摊成**一条能查下去的**原因 —— 逐层拼 cause，而不是只取最外层。
+     *
+     * <p>为什么非要这样：`S6-M05-C2` 实测中，文档侧 4 张图被 VL 端点确定性拒绝，
+     * 而日志里只有 `Request failed` —— 那是 Spring AI 的包装层消息，
+     * **真正的 HTTP 状态与响应体（如 `20015 image_url provided is not a valid image`）
+     * 在它的 cause 里**。只印最外层 = 把可行动的信息丢掉，留下一句查不下去的话。
+     *
+     * <p>⚠️ 上限 6 层：异常链偶尔会成环（`cause == this`）或极深，
+     * 不设限会让一条日志刷满整个文件。
+     */
+    static String causeChain(Throwable ex) {
+        StringBuilder sb = new StringBuilder();
+        Throwable cursor = ex;
+        int depth = 0;
+        while (cursor != null && depth++ < 6) {
+            if (!sb.isEmpty()) {
+                sb.append(" ← ");
+            }
+            sb.append(cursor.getClass().getSimpleName()).append(": ")
+                    .append(cursor.getMessage() == null ? "(无消息)" : cursor.getMessage().trim());
+            cursor = cursor.getCause() == cursor ? null : cursor.getCause();
+        }
+        return sb.toString();
     }
 
     private static Integer toInt(long millis) {
