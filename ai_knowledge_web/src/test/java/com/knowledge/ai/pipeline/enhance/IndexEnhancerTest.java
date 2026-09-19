@@ -362,9 +362,9 @@ class IndexEnhancerTest {
 
     private static List<Block> blocks() {
         return List.of(
-                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null, null),
                 new Block("接口鉴权流程采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
-                        "3. 接口设计", 2, 1, null, null));
+                        "3. 接口设计", 2, 1, null, null, null));
     }
 
     // ==================================================================
@@ -413,7 +413,7 @@ class IndexEnhancerTest {
     void gateSkipsLongNarrativeParagraph() {
         FakeCaller caller = new FakeCaller(GOOD_JSON);
         List<Block> longNarrative = List.of(new Block(
-                "本章首先介绍了背景。".repeat(40), BlockType.PARAGRAPH, "1. 背景", 1, 1, null, null));
+                "本章首先介绍了背景。".repeat(40), BlockType.PARAGRAPH, "1. 背景", 1, 1, null, null, null));
 
         enhancerWith(caller, true).enhance(doc(), longNarrative);
 

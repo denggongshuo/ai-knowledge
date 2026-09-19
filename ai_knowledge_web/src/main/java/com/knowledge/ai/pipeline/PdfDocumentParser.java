@@ -41,8 +41,18 @@ import java.util.stream.Stream;
  * <ol>
  *   <li><b>临时目录 {@code finally} 必删</b>：opendataloader 只吃路径，产物落在
  *       {@code outputFolder}；漏删会让并发上传时磁盘以"每篇文档一份产物"的速度漏；</li>
- *   <li><b>图片输出必须关</b>（{@code IMAGE_OUTPUT_OFF}）：21.8MB 那类图多的手册
- *       开了会把产物撑到几百 MB（`T-0S1` §二原话）；</li>
+ *   <li><b>图片输出的两个上限必须给</b>（{@link #MAX_IMAGE_BYTES} / {@link #MAX_TOTAL_IMAGE_BYTES}）
+ *       —— ⚠️ <b>这条纪律在 `T-512` 步 2b 被改写过，原话不是这样</b>。原来是
+ *       「<b>图片输出必须关</b>（{@code IMAGE_OUTPUT_OFF}）：21.8MB 那类图多的手册
+ *       开了会把产物撑到几百 MB」（`T-0S1` §二原话）。
+ *       <p>🔴 <b>那句理由在 4/4 份真样本上都不成立</b>（`T512ImageProbeTest` 实测）：
+ *       75 图那份 2.52 MB · 57 图 0.65 MB · 63 图 0.48 MB · 21.8MB 手册（15 图）17.50 MB
+ *       —— 离"几百 MB"差一个数量级。而需求 `06:158` 点名要「题注 + VL 描述」进索引，
+ *       不出图这条路根本走不通。
+ *       <p>⚠️ <b>但上限仍要给</b>：实测最坏只到 17.50 MB，而更图多的大型 PDF **没测过**
+ *       —— 所以纪律从"一律关掉"改成"开，但单图/单篇各有硬上限，超限不抽并登记"。
+ *       这正是本仓对"被探针削弱但没被推翻的老结论"的标准处置：**改写它、把实测数字
+ *       一并写进去，而不是删掉它**（删了，下一个人会重新踩一遍）。</li>
  *   <li><b>全局串行</b>（见 {@link #LOCK}）：API 是静态入口（含 {@code shutdown()}），
  *       线程安全性未验证 —— 宁可排队，不要"偶发跨文档串内容"这种没法复现的错。
  *       `S4-E1` 起**等锁带超时**（{@link #LOCK_WAIT_SECONDS}），排不上队的一方会拿到
@@ -81,11 +91,45 @@ public class PdfDocumentParser {
     private static final String JSON_SUFFIX = ".json";
 
     /**
-     * 解析一份 PDF。
+     * **单张图**的字节上限（`T-512` 步 2b，可配）。
      *
-     * @param pdfPath 源文件路径（**必须是磁盘上的真实文件** —— API 只吃路径不吃流）
+     * <p>取 **2 MB**：4/4 份样本实测单图最大 **1.79 MB**（`健康生活方式` 那份扫描件），
+     * 留一次余量。超限的图**不抽**并登记 parse issue —— 见类注释调用纪律第 2 条。
+     *
+     * <p>⚠️ 用系统属性而不是配置表：与 {@link #LOCK_WAIT_SECONDS} 同一条取舍 ——
+     * 它调的是**本进程的解析行为**，不是某个知识库的业务参数（那是 {@code split_policy_json} 管的）。
+     */
+    private static final long MAX_IMAGE_BYTES =
+            Long.getLong("m05.image.max-bytes", 2L * 1024 * 1024);
+
+    /**
+     * **单篇文档**所有图的字节上限（`T-512` 步 2b，可配）。
+     *
+     * <p>取 **50 MB**：4/4 份样本实测单篇最大 **17.50 MB**，留约三倍余量。
+     * 与 {@link #MAX_IMAGE_BYTES} 是**两道不同的闸**：单图那道拦"一张巨图"，
+     * 这道拦"一篇里图特别多"—— 探针实测 4 份样本的出图数最多才 26 张，
+     * 而**更图多的大型 PDF 没测过**，所以按篇给总量兜底。
+     */
+    private static final long MAX_TOTAL_IMAGE_BYTES =
+            Long.getLong("m05.image.max-total-bytes", 50L * 1024 * 1024);
+
+    /**
+     * 解析一份 PDF（**不落任何图**）。
+     *
+     * <p>等价于 {@code parse(pdfPath, ImageSink.NOOP)} —— 保留这个重载是给
+     * 解析基线 / 几何探针那类**只要解析结果、不要产物**的调用方用的。
      */
     public static ParsedDocument parse(Path pdfPath) throws IOException {
+        return parse(pdfPath, ImageSink.NOOP);
+    }
+
+    /**
+     * 解析一份 PDF，并把抽出的图交给 {@code sink}。
+     *
+     * @param pdfPath 源文件路径（**必须是磁盘上的真实文件** —— API 只吃路径不吃流）
+     * @param sink    图片字节的出口；{@link ImageSink#NOOP} 表示不落存储
+     */
+    public static ParsedDocument parse(Path pdfPath, ImageSink sink) throws IOException {
         Path outDir = Files.createTempDirectory("kb-parse-");
         try {
             Config config = new Config();
@@ -94,7 +138,13 @@ public class PdfDocumentParser {
             config.setGenerateJSON(true);
             config.setGenerateText(false);
             config.setGenerateHtml(false);
-            config.setImageOutput(Config.IMAGE_OUTPUT_OFF);
+            // `T-512` 步 2b：**掀掉**原来"一律关掉"的纪律（理由与实测见类注释调用纪律第 2 条）。
+            // 选 EXTERNAL 不选 EMBEDDED：后者把图塞进 JSON，产物会大一截（探针实测 JSON 297 KB
+            // 是纯结构的大小，塞图后会翻好几倍）。
+            config.setImageOutput(Config.IMAGE_OUTPUT_EXTERNAL);
+            // JPEG 而不是 PNG：PDF 内嵌的位图本来就多是 JPEG（实测 DCTDecode），
+            // 转 PNG 只会让体积变大而不带来任何信息。
+            config.setImageFormat(Config.IMAGE_FORMAT_JPEG);
             // 表格方法保持 DEFAULT（T-0S1 §一-3：DEFAULT 与 CLUSTER 输出逐字节一致，不为 cluster 加复杂度）
             config.setTableMethod(Config.TABLE_METHOD_DEFAULT);
             // 多行单元格压平会让行列错位（T-0S1 §三），所以必须保留换行
@@ -124,7 +174,8 @@ public class PdfDocumentParser {
                 // 连 JSON 都没产出：要么文件损坏要么被杀。给可读原因，不让下游猜
                 throw new ParseException("PDF 解析未产出任何结构化结果，文件可能已损坏；请确认文件能正常打开后重新上传");
             }
-            return fromJson(MAPPER.readTree(Files.readString(json, StandardCharsets.UTF_8)));
+            return fromJson(MAPPER.readTree(Files.readString(json, StandardCharsets.UTF_8)),
+                    outDir, sink);
         } catch (ParseException ex) {
             throw ex;
         } catch (Exception ex) {
@@ -154,9 +205,18 @@ public class PdfDocumentParser {
      * 所以页眉页脚得靠 `优化/O3` 的跨页重复检测自己判，不能指望解析器分类。
      */
     static ParsedDocument fromJson(JsonNode root) {
+        return fromJson(root, null, ImageSink.NOOP);
+    }
+
+    /**
+     * @param outDir 产物目录 —— 图片字节的相对路径（JSON 的 {@code source} 字段）按它解析。
+     *               {@code null} 表示"没有产物目录可读"（只有 JSON、没有出图文件的场合）
+     * @param sink   图片字节的出口
+     */
+    static ParsedDocument fromJson(JsonNode root, Path outDir, ImageSink sink) {
         String title = textOr(root.get("title"), "");
 
-        Scan scan = new Scan();
+        Scan scan = new Scan(outDir, sink);
         int pages = intOr(root.get("number of pages"), 0);
 
         // `T-512` 步 3：**先收题注、再走树** —— 题注节点可能出现在它描述的那张图**前后任意位置**
@@ -171,7 +231,9 @@ public class PdfDocumentParser {
         List<ParsedDocument.ParsedTable> tables = scan.tables;
         List<String> paragraphs = scan.paragraphs;
         List<ParsedDocument.DocElement> elements = scan.elements;
-        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
+        // `T-512` 步 6.5：图片那类 issue 在 walk 时逐张攒下，与表格类在这里合流 ——
+        // 两条路最后都进同一个 issues 列表，由 `TextLayerGuard#merge` 再并入页级问题
+        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>(scan.imageIssues);
         int imageCount = scan.imageCount;
 
         // ---- ⚠️ 「无文本层」的逐页问题**已移走**（`S4-E2`）----
@@ -220,6 +282,20 @@ public class PdfDocumentParser {
          * **在元素树里没有固定的先后**。
          */
         private final Map<Integer, String> captionByLinkId = new HashMap<>();
+
+        /** 图片字节的出口（`T-512` 步 2b）。 */
+        private final ImageSink sink;
+        /** 产物目录 —— JSON 的 {@code source} 是**相对路径**，按它解析。可为 {@code null}。 */
+        private final Path outDir;
+        /** 本篇已落存储的图片字节合计，对着 {@link #MAX_TOTAL_IMAGE_BYTES} 涨。 */
+        private long imageBytesStored;
+        /** 图片类 issue（`T-512` 步 6.5）—— 在 walk 时逐张攒，最后并进 {@code fromJson} 的 issues。 */
+        private final List<ParsedDocument.DocumentIssue> imageIssues = new ArrayList<>();
+
+        private Scan(Path outDir, ImageSink sink) {
+            this.outDir = outDir;
+            this.sink = sink == null ? ImageSink.NOOP : sink;
+        }
     }
 
     /**
@@ -276,7 +352,8 @@ public class PdfDocumentParser {
                 }
                 case "image" -> {
                     scan.imageCount++;
-                    scan.elements.add(ParsedDocument.DocElement.image(pageNo, imageInfoOf(el, scan)));
+                    scan.elements.add(ParsedDocument.DocElement.image(
+                            pageNo, imageInfoOf(el, pageNo, scan)));
                 }
                 case "paragraph" -> {
                     String text = textOr(el.get("content"), "").trim();
@@ -345,11 +422,104 @@ public class PdfDocumentParser {
      * **这里不编造**：节点有 {@code source} 只说明解析器**打算**导出，
      * 导出成功与否由那一步按字节判定（`ImageInfo#hasBytes`）。
      */
-    private static ImageInfo imageInfoOf(JsonNode el, Scan scan) {
+    private static ImageInfo imageInfoOf(JsonNode el, int pageNo, Scan scan) {
         JsonNode idNode = el.get("id");
         Integer id = idNode != null && idNode.canConvertToInt() ? idNode.asInt() : null;
-        return new ImageInfo(id, boxOf(el.get("bounding box")),
-                id == null ? null : scan.captionByLinkId.get(id), null, null);
+        ImageInfo.Box box = boxOf(el.get("bounding box"));
+        String caption = id == null ? null : scan.captionByLinkId.get(id);
+
+        // `T-512` 步 2b：**有 `source` 才有字节可抽**。没有的那部分是**常态，不是异常**
+        // —— 四份样本实测出图率 100% / 40% / 35% / 11%，一份比一份不一样。
+        // 所以它走"**登记 + 继续**"：不抛异常、不算文档失败（用户 2026-09-18 裁定 B）。
+        // 不登记的话，`image_parsed < image_total` 在页面上与"还没跑完"长得一模一样。
+        String source = textOr(el.get("source"), "").trim();
+        if (source.isEmpty()) {
+            scan.imageIssues.add(ParsedDocument.DocumentIssue.missing(pageNo,
+                    "第 " + pageNo + " 页有 1 张图片未能从文档中提取位图"
+                            + "（可能是矢量图或纯版式元素），该图不会参与检索；"
+                            + "若其内容重要，请补录文字后重建索引",
+                    ParsedDocument.IssueKind.IMAGE_NOT_EXTRACTABLE));
+            return new ImageInfo(id, box, caption, null, null, null);
+        }
+
+        ImageSink.Stored stored = storeImage(scan, source, pageNo);
+        // `vlModelId` 在第 6 个位置留 null —— 它是**唯一**不在解析期产生的字段，
+        // 由锁外描述那一步（步 5）经 `ImageInfo#withVlModel` 补上。见该字段的 javadoc。
+        return new ImageInfo(id, box, caption,
+                stored == null ? null : stored.objectKey(),
+                stored == null ? null : stored.md5(),
+                null);
+    }
+
+    /**
+     * 把一张抽出的图的字节交给 {@code sink}（`T-512` 步 2b）。
+     *
+     * <h3>四道闸，任一不过就返回 {@code null} 并**登记一条 issue**</h3>
+     * <ol>
+     *   <li>没有产物目录（{@code outDir == null}）—— 只有 JSON、没有出图文件的场合。
+     *       ⚠️ **不登记**：那是调用方（解析基线等）**主动**不要产物的形态，
+     *       记成"图片无法提取"会是一条**假的**告警。</li>
+     *   <li>文件读不到 —— 解析器说导出了、磁盘上却没有。这是**真出了问题**，要看得见。</li>
+     *   <li>超单图 / 单篇上限（{@link #MAX_IMAGE_BYTES} / {@link #MAX_TOTAL_IMAGE_BYTES}）
+     *       —— 主动放弃，报文里写清是**超限**而不是"提不出来"。</li>
+     *   <li>sink 抛异常（MinIO 抖动等）—— 捕获并降级：**一张图存不下不该让整篇文档失败**
+     *       （与 {@code IndexEnhancer} "增强失败不牵连文档"同一条取舍）。</li>
+     * </ol>
+     *
+     * <p>⚠️ 第 3 条的两个上限在 4 份真样本上**都没触发**（最大单图 1.79 MB / 单篇 17.50 MB），
+     * 所以这条路径目前**只有用例能覆盖** —— 那不是"写了没用的代码"，
+     * 是给"更图多的大 PDF"留的兜底，而那一类**本仓样本里没有**。
+     */
+    private static ImageSink.Stored storeImage(Scan scan, String source, int pageNo) {
+        if (scan.outDir == null) {
+            return null;
+        }
+        // `source` 来自我们自己解析的 JSON，理论上就是我们自己临时目录下的相对路径；
+        // 仍做一次归一化 + 前缀校验 —— 一个 `../` 就能让"读自己的产物"变成"读任意文件"
+        Path file = scan.outDir.resolve(source).normalize();
+        if (!file.startsWith(scan.outDir)) {
+            registerImageIssue(scan, pageNo,
+                    "图片路径越出产物目录，已拒绝读取（" + source + "）");
+            return null;
+        }
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(file);
+        } catch (IOException ex) {
+            registerImageIssue(scan, pageNo,
+                    "第 " + pageNo + " 页的图片文件读不到（" + source + "）：" + readableCause(ex));
+            return null;
+        }
+        if (bytes.length > MAX_IMAGE_BYTES) {
+            registerImageIssue(scan, pageNo, "第 " + pageNo + " 页的图片超过单图上限（"
+                    + kb(bytes.length) + " KB > " + kb(MAX_IMAGE_BYTES) + " KB），已跳过未抽取");
+            return null;
+        }
+        if (scan.imageBytesStored + bytes.length > MAX_TOTAL_IMAGE_BYTES) {
+            registerImageIssue(scan, pageNo,
+                    "本篇图片累计已达单篇上限（" + mb(MAX_TOTAL_IMAGE_BYTES) + " MB），"
+                            + "第 " + pageNo + " 页起的后续图片已跳过未抽取");
+            return null;
+        }
+        try {
+            ImageSink.Stored stored = scan.sink.store(bytes, pageNo, file.getFileName().toString());
+            if (stored != null) {
+                scan.imageBytesStored += bytes.length;
+            }
+            return stored;
+        } catch (RuntimeException ex) {
+            // 存不下就降级（该图不进索引），但**必须留痕** —— 静默丢图是"少了一点东西
+            // 而没人发现"的形态，正是本仓最不能接受的那一类
+            registerImageIssue(scan, pageNo, "第 " + pageNo + " 页的图片存储失败："
+                    + readableCause(ex) + "；该图不会参与检索，请重新上传该文档");
+            return null;
+        }
+    }
+
+    /** 记一条图片类 issue（`IMAGE_NOT_EXTRACTABLE` + 处置"未处理"）。 */
+    private static void registerImageIssue(Scan scan, int pageNo, String reason) {
+        scan.imageIssues.add(ParsedDocument.DocumentIssue.missing(
+                pageNo, reason, ParsedDocument.IssueKind.IMAGE_NOT_EXTRACTABLE));
     }
 
     /**
@@ -468,6 +638,16 @@ public class PdfDocumentParser {
             return ex.getClass().getSimpleName();
         }
         return m.length() > 200 ? m.substring(0, 200) : m;
+    }
+
+    /** 字节数 → 给人看的 KB（图片上限的 issue 文案用）。 */
+    private static String kb(long bytes) {
+        return String.format("%.1f", bytes / 1024.0);
+    }
+
+    /** 字节数 → 给人看的 MB。 */
+    private static String mb(long bytes) {
+        return String.format("%.1f", bytes / 1024.0 / 1024.0);
     }
 
     private static Path findFirst(Path dir, String suffix) throws IOException {

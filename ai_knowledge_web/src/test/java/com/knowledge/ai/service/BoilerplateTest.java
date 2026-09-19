@@ -55,7 +55,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         for (int i = 0; i < 25; i++) {
             long docId = insertEmptyDoc("制度文件 " + i);
             recordWriter.replaceChunks(docId, kbId,
-                    List.of(new Block(disclaimer, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(disclaimer, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
 
         String hash = ContentFingerprint.of(disclaimer);
@@ -92,7 +92,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         for (int i = 0; i < 25; i++) {
             long docId = insertEmptyDoc("短文本 " + i);
             recordWriter.replaceChunks(docId, kbId,
-                    List.of(new Block(shortText, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(shortText, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
 
         assertThat(markedCount(shortText)).as("频次够了但太短 → 不标").isZero();
@@ -107,7 +107,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         for (int i = 0; i < 25; i++) {
             long docId = insertEmptyDoc("长文本 " + i);
             recordWriter.replaceChunks(docId, kbId,
-                    List.of(new Block(longText, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(longText, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
 
         assertThat(markedCount(longText))
@@ -123,7 +123,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         for (int i = 0; i < BoilerplateRule.MIN_DOCS - 1; i++) {
             long docId = insertEmptyDoc("少数派 " + i);
             recordWriter.replaceChunks(docId, kbId,
-                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
 
         assertThat(markedCount(text)).as("冷启动期频次不够是**正确行为**，不是缺陷").isZero();
@@ -137,7 +137,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         for (int i = 1; i <= BoilerplateRule.MIN_DOCS; i++) {
             long docId = insertEmptyDoc("计数 " + i);
             recordWriter.replaceChunks(docId, kbId,
-                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
             if (triggeredAt < 0 && markedCount(text) > 0) {
                 triggeredAt = i;
             }
@@ -156,7 +156,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         int half = BoilerplateRule.MIN_DOCS - 5;
         for (int i = 0; i < half; i++) {
             recordWriter.replaceChunks(insertEmptyDoc("甲库 " + i), kbId,
-                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
 
         long otherKb = insertKb("boilerplate-probe-other");
@@ -164,7 +164,7 @@ class BoilerplateTest extends RetrievalFlowSupport {
         kbId = otherKb;
         for (int i = 0; i < half; i++) {
             recordWriter.replaceChunks(insertEmptyDoc("乙库 " + i), otherKb,
-                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null)));
+                    List.of(new Block(text, BlockType.PARAGRAPH, null, 1, 1, null, null, null)));
         }
         kbId = savedKb;
 

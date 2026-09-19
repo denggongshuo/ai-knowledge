@@ -277,9 +277,50 @@ public class DocStorage {
         return objectKey;
     }
 
+    /**
+     * 抽出的一张图的**对象名**（`T-512` 步 2b）。
+     *
+     * <p>{@code images/{kbId}/{docId}/{name}} —— 与源文件 {@code documents/}、
+     * 产物 {@code parsed/} **三个前缀平行**。
+     *
+     * <h3>为什么单开一个前缀，而不是塞进 {@code parsed/}</h3>
+     * <p>图片与解析产物的**生命周期不同**：`O7` 的规则表（{@code 11-M05-存储生命周期规则（O7）.md}）
+     * 要能单独定"删图留产物"或"重建索引时重抽图"这类规则 —— 混进 {@code parsed/} 之后，
+     * 按前缀删除就再也拆不开了。三个前缀 = 三条能各自定的规则。
+     *
+     * <p>🔴 <b>它是 {@code static} 且与 {@link #putImage} 分开，是为了让调用方
+     * "先知道对象名、后写字节"</b> —— 见 {@code DocParseService.ImageBuffer} 的 javadoc：
+     * 图必须在文档被判失败时**根本不要写**，而 {@code ImageInfo} 又要在解析期就拿到
+     * 真 objectKey（下游的块与落库都按它走）。两件事都要，只有把"起名"和"写入"拆开。
+     */
+    public static String imageObjectKey(long kbId, long docId, String name) {
+        return "images/" + kbId + "/" + docId + "/" + safeName(name);
+    }
+
+    /**
+     * 写一张图的字节（对象名由 {@link #imageObjectKey} 起好）。
+     *
+     * <p>⚠️ 与 {@code storeArtifact} 同一条取舍：**全量覆盖写**（同名对象覆盖），
+     * 重跑解析天然幂等。单图有上限（{@code PdfDocumentParser.MAX_IMAGE_BYTES}，默认 2MB），
+     * 远小于 multipart 的 5MB 下限，单次 PUT 足够。
+     */
+    public void putImage(String objectKey, byte[] bytes) {
+        try (InputStream in = new java.io.ByteArrayInputStream(bytes)) {
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .stream(in, bytes.length, -1)
+                    .contentType("image/jpeg")
+                    .build());
+        } catch (Exception ex) {
+            log.error("图片写入 MinIO 失败：object={} size={} err={}",
+                    objectKey, bytes.length, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "图片存储失败，请稍后重试");
+        }
+    }
+
     /** 删除对象（文档被彻底删除时用）。**当前无调用方** —— `T-616` 起接入。 */
-    public void remove(String objectKey) {
-        try {
+    public void remove(String objectKey) {        try {
             minioClient.removeObject(io.minio.RemoveObjectArgs.builder()
                     .bucket(bucket).object(objectKey).build());
         } catch (Exception ex) {

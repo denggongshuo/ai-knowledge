@@ -133,7 +133,7 @@ class VectorAttributionTest extends RetrievalFlowSupport {
         List<Block> blocks = new java.util.ArrayList<>();
         int order = 1;
         for (String text : texts) {
-            blocks.add(new Block(text, BlockType.PARAGRAPH, null, order++, 1, null, null));
+            blocks.add(new Block(text, BlockType.PARAGRAPH, null, order++, 1, null, null, null));
         }
         recordWriter.replaceChunks(docId, kbId, blocks);
         return docId;

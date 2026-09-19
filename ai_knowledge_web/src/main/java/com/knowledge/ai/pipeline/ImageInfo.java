@@ -32,12 +32,32 @@ package com.knowledge.ai.pipeline;
  *                  用途有二：缓存 key 的原料（与 `T-907` 的问答附件同一条）、
  *                  以及需求 `06:160` 的「按 `imageMd5` 去重」（**本批只落列、不做去重**）。
  *                  {@code null} 当且仅当 {@code objectKey} 为 {@code null}
+ * @param vlModelId 这条描述出自哪条 **VL 模型**（需求 `06:159` 点名的元数据，
+ *                  落 `sys_chunk.vl_model_id`）。
+ *                  <p>⚠️ <b>它是本类型里唯一**不是解析产物**的字段</b>：上面四个都由
+ *                  {@code PdfDocumentParser} 在解析期填好，而这个要在**锁外描述**那一步
+ *                  （`T-512` 步 5）才知道 ⇒ 在 {@code parse.json} 里它**恒为 {@code null}**，
+ *                  那不是缺陷，是"那一刻还没发生"。
+ *                  <p>为什么放这里而不往 {@link Block} 再加一个字段：见类注释那句
+ *                  「只对 IMAGE 有意义的值收进这个类型」—— `Block` 的 8 个字段里已经有
+ *                  三个是"只有某类块有意义"了，再拆一个出来，`Block` 就成了那张桌子。
+ *                  <p>消费方：`T-908`（换 VL）要按它筛出"是旧模型产的那些图"重算。
  */
 public record ImageInfo(Integer sourceId,
                         Box box,
                         String caption,
                         String objectKey,
-                        String md5) {
+                        String md5,
+                        String vlModelId) {
+
+    /**
+     * 补上「谁描述的我」—— 锁外描述那一步（`T-512` 步 5）用。
+     *
+     * <p>返回新实例而不是原地改：record 天然不可变，而这个值在解析期**确实还不存在**。
+     */
+    public ImageInfo withVlModel(String model) {
+        return new ImageInfo(sourceId, box, caption, objectKey, md5, model);
+    }
 
     /**
      * 有没有可描述的字节。

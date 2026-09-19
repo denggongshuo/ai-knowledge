@@ -39,7 +39,7 @@ public final class ChunkViews {
      * 本方法不做适用性校验，因为"给正文块要表格视图"是**调用方的逻辑错误**，
      * 不该被静默兜底成一个看似合理的值。
      *
-     * @throws UnsupportedOperationException 视图是预留的（当前只有 {@code IMAGE_DESC}）
+     * @throws UnsupportedOperationException 视图是预留的（**当前已无** —— 每个枚举值都有实现）
      */
     public static String project(Block block, ChunkView view) {
         return switch (view) {
@@ -49,9 +49,13 @@ public final class ChunkViews {
             // 这里"投影"就是取它本身 —— 之所以仍走投影，是为了让它与正文块**同一条路**，
             // 而不是在向量化那一层再长出一个 `if (blockType == TABLE)` 的分支。
             case TABLE_MARKDOWN, TABLE_LINEAR -> block.rawContent();
-            case IMAGE_DESC -> throw new UnsupportedOperationException(
-                    "IMAGE_DESC 是预留视图，尚未实现 —— 图片处理是 T-512（P1，依赖 T-907 的 VL 模型，S6）。"
-                            + "落地时只补本分支的实现，不改分片管线。");
+            // `T-512` 步 6：图片块的 rawContent 在**锁外描述**那一步（步 5）就已经拼好
+            // （题注 + 换行 + VL 描述），所以这里与表格同形 —— **取它本身**。
+            //
+            // 🔑 这一步兑现的是 `ChunkView` 类注释里那句承诺：「接 VL 时**只加实现、不改管线**」。
+            //    此前它只是一句**承诺**（本分支抛异常）；现在它是**事实** ——
+            //    `ChunkingService`、`ChunkVectorizer`、落库、前端一行都没为它改过。
+            case IMAGE_DESC -> block.rawContent();
         };
     }
 
@@ -81,7 +85,7 @@ public final class ChunkViews {
      *
      * <p>返回 {@code null} 而不是空串：调用方要能区分"这块不该进检索池"与"这块进了但文本是空的"。
      *
-     * @throws UnsupportedOperationException 图片块（`IMAGE_DESC` 未实现，`T-512`）
+     * @throws UnsupportedOperationException 已无（`T-512` 步 6 补齐了最后一个预留视图）
      */
     public static String defaultVectorText(Block block) {
         return switch (block.blockType()) {

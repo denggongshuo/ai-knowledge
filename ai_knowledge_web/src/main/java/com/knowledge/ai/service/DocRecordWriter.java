@@ -133,10 +133,17 @@ public class DocRecordWriter {
      *
      * <p>⚠️ {@code image_total} 是 {@code S4-M05-C2} 新接的（`O3` §4 步 4）：解析阶段
      * **早就知道**图片数（{@code ParsedDocument#imageCount}），只是一直没写进质量列
-     * —— "采了不用"。{@code image_parsed} 仍留 0，表示"未理解"（`T-512` 的 VL 才填）。
-     * 于是含图文档的 {@code image_parsed < image_total} 恒成立，它会被
-     * {@code DocService} 的"质量待改进"过滤命中 —— 这是**刻意的**：
-     * 图片确实还没被理解，页面上的"有 N 张图（未理解）"就是这个意思。
+     * —— "采了不用"。
+     *
+     * <p>✅ {@code image_parsed} 由 **`T-512` 步 7** 接上（此前恒 0）。
+     * <b>两个数的口径不同，别再混起来</b>：
+     * <ul>
+     *   <li>{@code image_total} = **解析出的图元素数**（语义一个字没改，用户裁定 B）；</li>
+     *   <li>{@code image_parsed} = **真描述成功的张数**。</li>
+     * </ul>
+     * 所以 {@code image_parsed < image_total} **不再等价于"还没理解"** —— 差额里混着三类：
+     * 抽不到位图的（{@code IMAGE_NOT_EXTRACTABLE}）、按策略跳过的（{@code IMAGE_SKIPPED}）、
+     * 真失败了的。它们**各有各的 issue 行**，页面要能点开分辨（这正是登记那三类的目的）。
      */
     /**
      * @param chars        可检索文本量（`T-O05` 步 6 的「平均 chars/页」要用它，`V21`）
@@ -194,12 +201,13 @@ public class DocRecordWriter {
 
     @Transactional
     public void markParsed(long docId, String parsePath, int tableTotal, int tableParsed, int imageTotal,
+                           int imageParsed,
                            int pagesTotal, int pagesWithText, int chars, String parseVersion) {
         entityManager.createNativeQuery("""
                         update sys_document
                            set status = 'INDEXING', parse_path = :path,
                                table_total = :tableTotal, table_parsed = :tableParsed,
-                               image_total = :imageTotal,
+                               image_total = :imageTotal, image_parsed = :imageParsed,
                                pages_total = :pagesTotal, pages_with_text = :pagesWithText,
                                chars = :chars, parse_version = :parseVersion,
                                error_msg = null, updated_at = :now
@@ -209,6 +217,7 @@ public class DocRecordWriter {
                 .setParameter("tableTotal", tableTotal)
                 .setParameter("tableParsed", tableParsed)
                 .setParameter("imageTotal", imageTotal)
+                .setParameter("imageParsed", imageParsed)
                 .setParameter("pagesTotal", pagesTotal)
                 .setParameter("pagesWithText", pagesWithText)
                 .setParameter("chars", chars)
@@ -421,9 +430,10 @@ public class DocRecordWriter {
         entityManager.createNativeQuery("""
                         insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, source_chunk_id,
                                                title_path, raw_content, content_sha256, order_no,
-                                               page_no, created_at)
+                                               page_no, object_key, image_md5, vl_model_id, created_at)
                         values (:docId, :kbId, :chunkType, :parentId, :sourceChunkId,
-                                :titlePath, :rawContent, :contentSha256, :orderNo, :pageNo, :now)
+                                :titlePath, :rawContent, :contentSha256, :orderNo, :pageNo,
+                                :objectKey, :imageMd5, :vlModelId, :now)
                         """)
                 .setParameter("docId", docId)
                 .setParameter("kbId", kbId)
@@ -440,6 +450,12 @@ public class DocRecordWriter {
                 .setParameter("contentSha256", ContentFingerprint.of(block.rawContent()))
                 .setParameter("orderNo", block.orderNo())
                 .setParameter("pageNo", block.pageNo())
+                // `T-512` 步 8：三列图片元数据，**只有 IMAGE 块有值**。
+                // 全部从 `block.imageInfo()` 取 —— 单一来源，不在写入侧重新拼。
+                // ⚠️ 非 IMAGE 块的 `imageInfo` 恒 null ⇒ 三列恒 null（迁移 V29 的口径）
+                .setParameter("objectKey", imageObjectKeyOf(block))
+                .setParameter("imageMd5", imageMd5Of(block))
+                .setParameter("vlModelId", vlModelIdOf(block))
                 .setParameter("now", now)
                 .executeUpdate();
 
@@ -485,6 +501,33 @@ public class DocRecordWriter {
     /** 空串与 {@code null} 在库里是两种值 —— 标题路径没有就是没有，不写空串进去。 */
     private static String blankToNull(String v) {
         return v == null || v.isBlank() ? null : v;
+    }
+
+    // ==================== `T-512` 步 8：图片块的三列元数据 ====================
+    //
+    // 三个取值器刻意长成同一个形状（从 `block.imageInfo()` 里取，无信息时给 null）。
+    // 不内联成三个 `block.imageInfo() == null ? null : ...` 的三元表达式，
+    // 是因为那串三元要在 SQL 参数位置重复三遍 —— 而"三处各写一遍判空"正是
+    // 本仓反复吃亏的形状（漏掉一处就是一个恒 null 的列，且不报错）。
+
+    /** 原图对象名；非图片块为 {@code null}。 */
+    private static String imageObjectKeyOf(Block block) {
+        return block.imageInfo() == null ? null : block.imageInfo().objectKey();
+    }
+
+    /** 图片字节 md5；非图片块为 {@code null}。 */
+    private static String imageMd5Of(Block block) {
+        return block.imageInfo() == null ? null : block.imageInfo().md5();
+    }
+
+    /**
+     * 描述的 VL 模型标识；非图片块、以及**没被成功描述过**的图片块都为 {@code null}。
+     *
+     * <p>⚠️ 后者是常态而非缺陷：图片被跳过 / 理解失败时，这一列就该是空的 ——
+     * 填一个"我们试过的模型名"会让 `T-908` 误以为这张图已有旧模型的描述。
+     */
+    private static String vlModelIdOf(Block block) {
+        return block.imageInfo() == null ? null : blankToNull(block.imageInfo().vlModelId());
     }
 
     // ==================== O9 步 3/4 · 跨文档样板识别 ====================

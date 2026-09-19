@@ -80,12 +80,17 @@ class ParseQualityFlowTest {
     void markParsedWritesCharsAndVersion() {
         long docId = insertDoc("回填探针", "READY", null);
 
-        recordWriter.markParsed(docId, "parsed/1/1/parse.json", 7, 5, 3, 20, 18, 12345,
+        recordWriter.markParsed(docId, "parsed/1/1/parse.json", 7, 5, 3, 2, 20, 18, 12345,
                 ParseFingerprint.version());
 
         assertThat(jdbc.queryForObject("select chars from sys_document where id = ?", Integer.class, docId))
                 .as("chars 是「平均 chars/页」的分子，落了它聚合才不必去读 MinIO")
                 .isEqualTo(12345);
+        // `T-512` 步 7 起 image_parsed 也走这里 —— 它此前恒 0，于是含图文档的
+        // 「质量待改进」过滤恒命中、页面上永远是「图片 0/M」
+        assertThat(jdbc.queryForObject("select image_parsed from sys_document where id = ?", Integer.class, docId))
+                .as("image_parsed 必须真的落库（不是只算不写）")
+                .isEqualTo(2);
         assertThat(jdbc.queryForObject("select parse_version from sys_document where id = ?", String.class, docId))
                 .as("指纹必须与当前代码算出的一致，否则这篇文档会被自己立刻判成「需要重解析」")
                 .isEqualTo(ParseFingerprint.version());

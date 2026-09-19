@@ -296,6 +296,13 @@ public final class ProbeCleanup {
             {"parsed/", "sys_document", "parse_path"},
             {"chat-attachments/", "sys_chat_attachment", "object_key"},
             {"avatars/", "sys_user", "avatar"},
+            // `T-512` 步 2b 新增的第五个前缀 —— 图片块的原图。
+            // ⚠️ 上面那句 javadoc 说的"新增前缀必须在这里加一行"，**本批真的被抓了一次**：
+            //    加 `images/` 时漏了这一行，于是那一轮全量跑批在桶里留了 **180 个孤儿**
+            //    （对照 `documents/` 是 0 —— 因为它在清单里）。
+            //    归属列取 `sys_chunk.object_key`（图片块那一行），不是 `sys_document`：
+            //    图是**块级**产物，一篇文档删了但块还在的情况是存在的。
+            {"images/", "sys_chunk", "object_key"},
     };
 
     private static String placeholders(int count) {

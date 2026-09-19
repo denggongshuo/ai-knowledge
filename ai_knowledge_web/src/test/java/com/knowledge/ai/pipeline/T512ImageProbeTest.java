@@ -62,6 +62,28 @@ class T512ImageProbeTest {
     /** 21.8MB 那份 —— 原纪律点名的那一类手册，用来核对"几百 MB"那个说法还成不成立。 */
     private static final Path HEAVY = DIR.resolve("健康生活方式（指导手册）.pdf");
 
+    /**
+     * 出图体积清册的**全样本**（`T-512` 步 2a，用户 2026-09-19 裁定"两份都量"）。
+     *
+     * <h3>为什么不能只看 `1-DeepSeek` 那份就定上限</h3>
+     * <p>步 0 只量了两份（75 图 / 15 图），于是「原纪律说的几百 MB 不成立」这个结论
+     * **只覆盖 2/5 份 PDF**。而 `parse-fixtures.json` 里有**两份更大的**从未量过出图体积
+     * ——`江西省…章程`（63 图）与 `2-提示词工程`（57 图）。**上限要按最坏情形给**，
+     * 不量它们等于让上限建立在一个没测过的形态上。
+     *
+     * <p>⚠️ 两份的图**类型不同**（`江西省…章程` 是扫描件型、`2-提示词工程` 是 PPT 导出型），
+     * 所以不能只挑一份量 —— 单一形态可能漏掉一整类（尺寸分布、压缩比都可能差很多）。
+     *
+     * <p>⚠️ `江西农商银行…需求说明书.docx`（`imageCount=120`）**故意不在列**：
+     * 它是 DOCX，走 Tika 路径，**结构性不触发** opendataloader 出图（`pages=1`）。
+     * 量它只能证明"不触发"，信息量为零。
+     */
+    private static final List<Path> IMAGE_COST_SAMPLES = List.of(
+            SAMPLE,                                                            // 75 图（步 0 已量）
+            DIR.resolve("2-提示词工程.pdf"),                                    // 57 图（本步新增）
+            DIR.resolve("江西省农村信用社联合社_业务中台整体规划项目_项目管理章程.pdf"),  // 63 图（本步新增）
+            HEAVY);                                                            // 15 图 · 21.8MB 源（步 0 已量）
+
     @Test
     @DisplayName("T-512 步 0：出图能力 / 图元素字段 / 题注配对 / 磁盘代价")
     void imageOutputInventory() throws Exception {
@@ -131,23 +153,52 @@ class T512ImageProbeTest {
     }
 
     @Test
-    @DisplayName("T-512 步 0：原纪律说的「几百 MB」现在还成不成立（21.8MB 手册）")
-    void heavySampleDiskCost() throws Exception {
-        Assumptions.assumeTrue(Files.isRegularFile(HEAVY), "缺样本 " + HEAVY);
+    @DisplayName("T-512 步 2a：出图体积清册（4 份 PDF，含两份从未量过的更大样本）")
+    void imageOutputCostAcrossSamples() throws Exception {
+        List<Path> present = IMAGE_COST_SAMPLES.stream().filter(Files::isRegularFile).toList();
+        Assumptions.assumeTrue(!present.isEmpty(), "缺全部样本，跳过（样本在 docs/测试文件/ 已 gitignore）");
 
-        Probe probe = runWithImages(HEAVY);
-        System.out.println("======== T-512 步 0：重样本磁盘代价 ========");
-        System.out.println("样本 = " + HEAVY.getFileName());
-        System.out.println("image 元素 = " + probe.imageNodes.size());
-        System.out.println("出图合计 = " + mb(probe.imageBytes) + " MB · 单图 max = " + kb(probe.maxBytes) + " KB");
-        System.out.println("JSON = " + kb(probe.jsonBytes) + " KB");
-        System.out.println("=========================================");
+        System.out.println("======== T-512 步 2a：出图体积清册 ========");
+        System.out.printf("%-46s %8s %8s %12s %12s%n",
+                "样本", "图元素", "出图数", "出图合计(MB)", "单图max(KB)");
+        long worstTotal = 0L;
+        long worstSingle = 0L;
+        String worstTotalSample = "";
+        String worstSingleSample = "";
+        List<Probe> probes = new ArrayList<>();
+        for (Path sample : present) {
+            // ⚠️ 每份只跑一次（21.8MB 那份单跑就要几十秒）—— 结果存下来，两轮观察共用
+            Probe probe = runWithImages(sample);
+            probes.add(probe);
+            System.out.printf("%-46s %8d %8d %12s %12s%n",
+                    truncate(sample.getFileName().toString(), 44),
+                    probe.imageNodes.size(), probe.imageFiles.size(),
+                    mb(probe.imageBytes), kb(probe.maxBytes));
+            if (probe.imageBytes > worstTotal) {
+                worstTotal = probe.imageBytes;
+                worstTotalSample = sample.getFileName().toString();
+            }
+            if (probe.maxBytes > worstSingle) {
+                worstSingle = probe.maxBytes;
+                worstSingleSample = sample.getFileName().toString();
+            }
+        }
+        System.out.println("---------- 定上限要用的两个极值 ----------");
+        System.out.println("单篇合计最大 = " + mb(worstTotal) + " MB（" + worstTotalSample + "）");
+        System.out.println("单图字节最大 = " + kb(worstSingle) + " KB（" + worstSingleSample + "）");
+        System.out.println("==========================================");
 
-        assertThat(probe.imageBytes)
-                .as("量与结论都要留痕：原纪律的理由是「会把产物撑到几百 MB」。"
-                        + "本断言只保证**量到了**，不预设它一定超标 —— "
-                        + "**探针的产出允许是否掉那句老话**")
-                .isGreaterThanOrEqualTo(0L);
+        // ⚠️ 这里**故意不写死上限断言**：本用例的作用是**产出数字**，
+        //    由人对着数字决定 `2MB/单图 · 50MB/单篇` 还成不成立（`T-512` 计划 §1.2）。
+        //    写死一个"必须 < 50MB"的断言，就等于把还没定的阈值偷偷变成既成事实。
+        //    真正要钉的是**能力**：每一份样本都必须真的落出图文件来（下面这条）。
+        for (int i = 0; i < present.size(); i++) {
+            assertThat(probes.get(i).imageFiles)
+                    .as("`IMAGE_OUTPUT_EXTERNAL` 必须在**每一份**样本上都落出文件来 —— "
+                            + "若只有 1-DeepSeek 那份能出，抽图这条路对大类样本就不成立。样本=%s",
+                            present.get(i).getFileName())
+                    .isNotEmpty();
+        }
     }
 
     @Test

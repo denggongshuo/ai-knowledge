@@ -456,7 +456,17 @@ function scanTag(d: KbDocRow): { text: string; type: 'success' | 'danger' | 'war
   }
 }
 
-const actionableIssues = computed(() => issues.value.filter((i) => i.disposition !== 'EMPTY_PAGE'))
+// ⚠️ 排除**两种"无需处理"**的处置，它们的共同点是"用户对它没有任何可采取的动作"：
+//   · `EMPTY_PAGE` —— 空白页 / 纯版式页（S4-E2）；
+//   · `SKIPPED`    —— 图片按策略跳过（T-512 步 5.1）：尺寸过小（图标/分隔线）或
+//                     同图重复（公司 logo）—— 这两种**几乎每份带图文档都有**，
+//                     计进来会让告警条常态化变红，把真正该看的「图片理解失败」淹掉。
+//                     本仓为这条纪律返工过：`O2` 的页级阈值 10 就是被探针否掉的。
+//   两者的 `kind` 不同（`EMPTY_PAGE` vs `IMAGE_SKIPPED`），详情里仍分得开 ——
+//   这里排除的只是"要不要报警"，不是"要不要记录"。
+const actionableIssues = computed(() =>
+  issues.value.filter((i) => i.disposition !== 'EMPTY_PAGE' && i.disposition !== 'SKIPPED')
+)
 const issueDocCount = computed(() => new Set(actionableIssues.value.map((i) => i.docId)).size)
 function sizeText(b: number) {
   const mb = b / 1024 / 1024

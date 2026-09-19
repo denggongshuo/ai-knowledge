@@ -36,7 +36,7 @@ class HyqGateTest {
     @DisplayName("表格**子块**跳过 —— 一行是一条记录，为它单独花一次调用不划算")
     void tableChildIsGatedOut() {
         // 子块 = parentOrderNo 非 null（TABLE 类型靠父子区分，见 Block#isTopLevel）
-        Block row = new Block("型号 A-100，单价 1800", BlockType.TABLE, "1. 报价", 5, 1, 3, null);
+        Block row = new Block("型号 A-100，单价 1800", BlockType.TABLE, "1. 报价", 5, 1, 3, null, null);
 
         assertThat(HyqGate.shouldGenerate(row)).isFalse();
     }
@@ -118,6 +118,6 @@ class HyqGateTest {
     }
 
     private static Block block(BlockType type, String text, Integer parentOrderNo) {
-        return new Block(text, type, "3. 接口设计", 1, 1, parentOrderNo, null);
+        return new Block(text, type, "3. 接口设计", 1, 1, parentOrderNo, null, null);
     }
 }

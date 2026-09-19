@@ -30,21 +30,21 @@ class ChunkViewsTest {
     /** 一个典型的正文块：有标题路径。 */
     private static final Block TEXT_WITH_PATH =
             new Block("接口鉴权走 JWT，有效期 2 小时。", BlockType.PARAGRAPH,
-                    "3. 接口设计 > 3.1 鉴权流程", 7, 12, null, null);
+                    "3. 接口设计 > 3.1 鉴权流程", 7, 12, null, null, null);
 
     /** 封面段那种：标题之前的块，**没有**标题路径。 */
     private static final Block TEXT_WITHOUT_PATH =
-            new Block("某公司内部技术规范 v2。", BlockType.PARAGRAPH, null, 1, 1, null, null);
+            new Block("某公司内部技术规范 v2。", BlockType.PARAGRAPH, null, 1, 1, null, null, null);
 
     /** 表格父块：rawContent 就是 Markdown 管道表。 */
     private static final Block TABLE_PARENT =
             new Block("| 型号 | 产品名称 | 单价 |\n| A-100 | 智能网关 | ￥1,200 |\n",
-                    BlockType.TABLE, "2. 报价", 20, 5, null, null);
+                    BlockType.TABLE, "2. 报价", 20, 5, null, null, null);
 
     /** 表格子块：rawContent 就是行式文本。 */
     private static final Block TABLE_CHILD =
             new Block("型号 A-100，产品名称 智能网关，单价 ￥1,200",
-                    BlockType.TABLE, "2. 报价", 21, 5, 20, null);
+                    BlockType.TABLE, "2. 报价", 21, 5, 20, null, null);
 
     // ==================================================================
     // O8 判据 2 · 块内容不因注入而改变
@@ -150,23 +150,28 @@ class ChunkViewsTest {
     }
 
     // ==================================================================
-    // O8 判据 6 · 图片视图预留可插
+    // O8 判据 6 · 图片视图（`T-512` 步 6 起已实装）
     // ==================================================================
 
     @Test
-    @DisplayName("O8 判据 6：IMAGE_DESC 存在但无实现 —— T-512 落地时只加实现，不改管线")
-    void imageViewIsReservedNotImplemented() {
-        Block image = new Block("（图片：架构图.png）", BlockType.IMAGE, "1. 总览", 3, 2, null, null);
+    @DisplayName("O8 判据 6（T-512 步 6 订正）：IMAGE_DESC 有实现 —— 返回块内容，不再抛")
+    void imageViewIsImplemented() {
+        Block image = new Block("（图片：架构图.png）", BlockType.IMAGE, "1. 总览", 3, 2, null, null, null);
 
         assertThat(image.views())
-                .as("图片块已能声明自己的视图 —— 声明是现在就位的，实现留给 T-512")
+                .as("图片块声明 IMAGE_DESC 一条视图")
                 .containsExactly(ChunkView.IMAGE_DESC);
 
-        assertThatThrownBy(() -> ChunkViews.project(image, ChunkView.IMAGE_DESC))
-                .as("未实现的视图必须**显式炸**，不能静默返回空串 —— "
-                        + "空串会被嵌进向量，让'这张图没有语义'伪装成'已经处理过了'")
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("T-512");
+        // ⚠️ 这条断言**前身是它的反面**（`assertThatThrownBy(...UnsupportedOperationException)`，
+        //    方法名 `imageViewIsReservedNotImplemented`）。`T-512` 步 6 落地后**改成正向**，
+        //    而**不是删掉** —— 删了就没有任何东西守着"落地后确实不抛了"，
+        //    而那正是这条断言当初存在的理由（本仓 `O5` 判据 2 吃过一次"基线抓不到自己要抓的退化"）。
+        assertThat(ChunkViews.project(image, ChunkView.IMAGE_DESC))
+                .as("图片块的 rawContent 就是它的检索文本（题注 + VL 描述在步 5 拼好）")
+                .isEqualTo("（图片：架构图.png）");
+        assertThat(ChunkViews.defaultVectorText(image))
+                .as("图片块**进检索池** —— 需求 06:168「描述文本进文本向量」")
+                .isEqualTo("（图片：架构图.png）");
     }
 
     // ==================================================================
@@ -177,14 +182,14 @@ class ChunkViewsTest {
     @DisplayName("O8 §4 步 3：视图声明覆盖全部 8 种块类型，无遗漏")
     void everyBlockTypeDeclaresViews() {
         for (BlockType type : BlockType.values()) {
-            Block top = new Block("x", type, null, 1, 1, null, null);
+            Block top = new Block("x", type, null, 1, 1, null, null, null);
             assertThat(top.views())
                     .as("%s 的顶层块必须声明至少一个视图（漏了会让它在向量化那一层被静默跳过）", type)
                     .isNotEmpty();
         }
 
         // 表格的父子分叉是这个泛化点最容易被写错的地方：两者 blockType 相同
-        assertThat(new Block("x", BlockType.TABLE, null, 1, 1, 20, null).views())
+        assertThat(new Block("x", BlockType.TABLE, null, 1, 1, 20, null, null).views())
                 .as("同属 TABLE，靠 parentOrderNo 分叉 —— 这正是原先硬编码在表格分支里的那条规则")
                 .containsExactly(ChunkView.TABLE_LINEAR);
 

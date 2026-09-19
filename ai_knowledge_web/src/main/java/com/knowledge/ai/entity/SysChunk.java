@@ -129,6 +129,39 @@ public class SysChunk {
     private Integer pageNo;
 
     /**
+     * 图片块的**原图对象名**（`V29` · `T-512` 步 8；契约见 D-5 §1.1）。
+     *
+     * <p>MinIO 上的 {@code images/{kbId}/{docId}/{name}}。需求 `06:167`「原图存 MinIO
+     * 供人看」—— 检索命中一个图片块时，按它取回原图渲染给用户。
+     *
+     * <p>⚠️ **非图片块恒 {@code null}**（本表绝大多数行）。判"是不是图片块"用
+     * {@code object_key is not null} 或 {@link #chunkType} 均可，两者在本批同义。
+     */
+    @Column(name = "object_key", length = 255)
+    private String objectKey;
+
+    /**
+     * 图片字节的 md5（`V29` · `T-512` 步 8）。
+     *
+     * <p>需求 `06:160` 的「按 {@code imageMd5} 去重」用，也是 VL 描述缓存 key 的原料。
+     * ⚠️ **本批只落列、不做跨文档去重** —— 那个去重是语料级的，与清洗层的纯函数设计冲突，
+     * 待单独裁定（迁移 `V29` 的头注释里写清了这段取舍）。
+     */
+    @Column(name = "image_md5", length = 32)
+    private String imageMd5;
+
+    /**
+     * 产出该图片描述的 **VL 模型标识**（`V29` · `T-512` 步 8）。
+     *
+     * <p>消费方是 `T-908`（换 VL）：按这一列筛出"旧模型产的那些图"重算 ——
+     * 没有它，换模型就只能**全库重建**。
+     *
+     * <p>⚠️ 它由**锁外描述**那一步写入（`DocumentImageDescriber`），所以解析期是空的。
+     */
+    @Column(name = "vl_model_id", length = 64)
+    private String vlModelId;
+
+    /**
      * 写入时间。**没有 {@code updated_at}** —— 块是整批重写的
      * （重跑解析时按 {@code doc_id} 先删后插），从不单行更新。
      */

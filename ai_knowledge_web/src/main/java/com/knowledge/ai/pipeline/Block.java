@@ -39,6 +39,17 @@ import java.util.List;
  *                       —— 问句只用于召回，不用于回答。
  *                       <p>落库时它被解析成 `sys_chunk.source_chunk_id`（与 `parentOrderNo`
  *                       解析成 `parent_id` 是同一跳：先插全部块拿到 id，再回填）。
+ * @param imageInfo      **图片块**（`IMAGE`）携带的图片身份与出处；其余块恒 {@code null}
+ *                       （`T-512` 步 4，与 {@code DocElement} 的第 6 字段**同族**）。
+ *                       <p>为什么要它挂在块上：`IMAGE` 块的 {@code rawContent} 只有题注，
+ *                       而下游三处都要 `objectKey` —— 步 5 要按它**取字节去调 VL**、
+ *                       步 8 要把它落进 {@code sys_chunk.object_key}、
+ *                       检索回表要按它取原图。这三处若各自去 {@code ParsedDocument} 里找，
+ *                       就得靠"第几个图元素"这种位置匹配 —— 而块与元素**不是一一对应**的
+ *                       （`ChunkingService` 会合并、会跳过），位置匹配迟早错位。
+ *                       <p>⚠️ 非 IMAGE 恒 {@code null}，**不是**空对象：空 {@code ImageInfo}
+ *                       与"没有图片信息"是两件事，前者会让 {@code hasBytes()} 恒 false
+ *                       而看起来像"这张图抽不出来"。
  */
 public record Block(String rawContent,
                     BlockType blockType,
@@ -46,7 +57,8 @@ public record Block(String rawContent,
                     int orderNo,
                     Integer pageNo,
                     Integer parentOrderNo,
-                    Integer sourceOrderNo) {
+                    Integer sourceOrderNo,
+                    ImageInfo imageInfo) {
 
     /** 紧凑构造器：内容为 null 与空串等价，下游不必两处判空。 */
     public Block {

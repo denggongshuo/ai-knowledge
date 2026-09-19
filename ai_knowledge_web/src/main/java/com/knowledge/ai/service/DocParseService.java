@@ -7,6 +7,7 @@ import com.knowledge.ai.core.storage.DocStorage;
 import com.knowledge.ai.core.text.ContentFingerprint;
 import com.knowledge.ai.pipeline.ChunkingOptions;
 import com.knowledge.ai.pipeline.ChunkingService;
+import com.knowledge.ai.pipeline.ImageSink;
 import com.knowledge.ai.pipeline.ParseException;
 import com.knowledge.ai.pipeline.ParseFingerprint;
 import com.knowledge.ai.pipeline.ParsedDocument;
@@ -20,6 +21,7 @@ import com.knowledge.ai.pipeline.cleaning.DocumentCleaner;
 import com.knowledge.ai.pipeline.enhance.IndexEnhancer;
 import com.knowledge.ai.pipeline.routing.PageContentRouter;
 import com.knowledge.ai.pipeline.vectorize.ChunkVectorizer;
+import com.knowledge.ai.pipeline.vision.DocumentImageDescriber;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -88,6 +90,14 @@ public class DocParseService {
     /** 索引增强（`T-507`）—— 分片之后的文档级摘要调用，见 {@link IndexEnhancer}。 */
     private final IndexEnhancer indexEnhancer;
 
+    /**
+     * 图片描述（`T-512` 步 5）—— **分片之后、落库之前**的锁外 VL 调用。
+     *
+     * <p>⚠️ 它排在这里而不是解析器里，是本批**唯一"想错了就要重做"**的结构决定
+     * （解析有全局串行锁，而 VL 是 40~60 秒/张）。详见 {@link DocumentImageDescriber} 的类注释。
+     */
+    private final DocumentImageDescriber documentImageDescriber;
+
     /** 向量化（`T-508`）—— 分片之后的嵌入 + Milvus 写入，见 {@link ChunkVectorizer}。 */
     private final ChunkVectorizer chunkVectorizer;
 
@@ -129,6 +139,9 @@ public class DocParseService {
         // 同一种写法：`O9` 步 1/2 的近重复提示要在成功路径上报出去（进 task 结果），
         // 而它的取值点在 try 里面
         ContentDuplicateDetector.Hint duplicateHint = ContentDuplicateDetector.Hint.NONE;
+        // `T-512` 步 5：图片描述期新增的 issue（跳过 / 失败）—— 成功路径末尾那一次
+        // `replaceIssues` 才落库，而它在 try 外，所以在这里先声明
+        List<ParsedDocument.DocumentIssue> imageIssues = List.of();
         try {
             byte[] source;
             try {
@@ -143,7 +156,9 @@ public class DocParseService {
                 log.error("读取源文件失败（基础设施类，可重试）：docId={}", docId, ex);
                 return Map.of("docId", docId, "status", "FAILED", "retryable", true, "reason", why);
             }
-            parsed = dispatch(row.type(), source, row.fileName());
+            // `T-512` 步 2b：图先攒在内存里，等体检放行再落 MinIO（见 ImageBuffer 的 javadoc）
+            ImageBuffer images = new ImageBuffer(row.kbId(), docId);
+            parsed = dispatch(row.type(), source, row.fileName(), images);
             // ⚠️ 体检在清洗**之前**：TextLayerGuard 的判据吃 chars，而清洗只减不增。
             // 反过来排的话，一篇正常文档会因为"剥掉了页眉"而掉到扫描件的阈值以下 —— 误报。
             //
@@ -152,6 +167,10 @@ public class DocParseService {
             //   · merge() 是**页级登记**：哪几页丢了内容（混合文档的 2 页扫描件就靠它）。
             // 页级那半边**不在这里抛** —— 部分页缺失是"登记 + 路由"，不是"整篇失败"。
             TextLayerGuard.check(parsed);
+            // 🔴 位置是**硬约束**（`T-512` 步 2b）：必须在 `check` **之后**。
+            //    放在它之前，被拒掉的扫描件就会把十几 MB 的图留成 MinIO 孤儿 ——
+            //    而"整篇被拒"恰恰是**最常见**的失败路径。详见 ImageBuffer 的 javadoc。
+            images.flush();
 
             // `优化/O3` 逐文档清洗：页眉页脚剥离。位置有两条约束，缺一不可 ——
             //   ① 在 **storeArtifact 之后**（产物存的是**原始解析结果**）：清洗是"判定噪音"，
@@ -176,11 +195,21 @@ public class DocParseService {
             List<com.knowledge.ai.pipeline.Block> blocks =
                     chunkingService.chunk(cleaned.document(), chunkingOptions(row.kbId()));
 
+            // `T-512` 步 5：🔓 **锁外**图片描述。位置两条硬约束 ——
+            //   ① 在 `chunk` **之后**：要知道哪些是 IMAGE 块、要拿它们的 orderNo；
+            //   ② 在 `replaceChunks` **之前**：块落库后 rawContent 不再改写（O8「块存事实」）。
+            // ⚠️ 它**慢**（真 VL 40~60 秒/张）且**绝不能进解析锁** —— 见 DocumentImageDescriber。
+            // ⚠️ 任何一张图失败都不牵连文档（与下面的 enhance 同一条取舍）。
+            DocumentImageDescriber.Result imageDesc = documentImageDescriber.describe(blocks);
+            // 描述期新增的 issue 要在**成功路径末尾**那一次 replaceIssues 里并进去 ——
+            // 在这里先存下来（那个调用点在本方法最末，中间隔着向量化）
+            imageIssues = imageDesc.issues();
+
             // T-507 索引增强：文档级 1 次调用 → SUMMARY 块（parentId = null）。
             // 放在分片**之后**：摘要要基于"实际进了索引的那些块"所覆盖的正文。
             // ⚠️ 增强失败**不牵连文档** —— 正文已经切好能检索了，因为摘要没生成就把整篇判失败，
             // 等于用一件增强功能的故障否掉一篇可用文档。失败原因照实记日志。
-            IndexEnhancer.Result enhanced = indexEnhancer.enhance(cleaned.document(), blocks);
+            IndexEnhancer.Result enhanced = indexEnhancer.enhance(cleaned.document(), imageDesc.blocks());
             logEnhancement(docId, enhanced);
 
             chunkCount = recordWriter.replaceChunks(docId, row.kbId(), enhanced.blocks());
@@ -204,8 +233,15 @@ public class DocParseService {
             // `chars` 取**原始产物**的（`parsed`），不是清洗后的 `cleaned`：
             // 这一列要回答的是"解析器抽到了多少内容"，而清洗是**我们**减掉的量。
             // 取清洗后的值会让"某天改严了页眉剥离规则"表现为"解析质量下降" —— 两件事混在一起。
+            // `T-512` 步 7：`image_parsed` 回填 —— `image_total` 早已有真值，
+            // 而这一列在 `G4-4` 的页面上读作「图片 N/M **已理解**」。
+            // 不填它，含图文档的 `image_parsed(0) < image_total` 恒成立 ⇒
+            // ① `DocService` 的「质量待改进」过滤恒命中；
+            // ② 页面上那一列永远是 0/M，与"还没跑完"长得一样；
+            // ③ `T-908` 仍是无对象状态（它拿"已理解数"当重建基数）。
+            // ⚠️ `described` 只数**真描述成功**的 —— 跳过与失败都不算（它们有各自的 issue）。
             recordWriter.markParsed(docId, parsePath, parsed.tableTotal(), parsed.tableParsed(),
-                    cleaned.document().imageCount(),
+                    cleaned.document().imageCount(), imageDesc.described(),
                     cleaned.document().pages(), cleaned.document().pagesWithText(),
                     parsed.chars(), ParseFingerprint.version());
 
@@ -281,8 +317,13 @@ public class DocParseService {
             return Map.of("docId", docId, "status", "FAILED", "retryable", false, "reason", reason);
         }
 
-        // 成功路径：解析器自己的 issue（表格类 / 清洗类）+ **页级新增的**（混合文档的扫描页）
-        recordWriter.replaceIssues(docId, row.kbId(), TextLayerGuard.merge(parsed, pageContentRouter));
+        // 成功路径：解析器自己的 issue（表格类 / 图片不可提取）+ 清洗类 + **页级新增的**
+        //（混合文档的扫描页）+ **图片描述期新增的**（跳过 / 理解失败）。
+        // 🔊 四类都落同一张表：用户点开「图片 N/M」旁边那个差额，看到的就是这里的行。
+        List<ParsedDocument.DocumentIssue> allIssues =
+                new java.util.ArrayList<>(TextLayerGuard.merge(parsed, pageContentRouter));
+        allIssues.addAll(imageIssues);
+        recordWriter.replaceIssues(docId, row.kbId(), allIssues);
         log.info("文档解析完成：docId={} type={} pages={} chars={}(原始 {}) tables={}/{} images={} chunks={}",
                 docId, row.type(), parsed.pages(), cleaned.document().chars(), parsed.chars(),
                 parsed.tableParsed(), parsed.tableTotal(), parsed.imageCount(), chunkCount);
@@ -453,11 +494,23 @@ public class DocParseService {
      * 而基线的价值恰恰是"改了解析链路能被发现"：分派抄错一条，基线就永远看不见那条路径的退化。
      */
     static ParsedDocument dispatch(String type, byte[] source, String fileName) {
+        return dispatch(type, source, fileName, ImageSink.NOOP);
+    }
+
+    /**
+     * 同 {@link #dispatch(String, byte[], String)}，但把抽出的图交给 {@code sink}。
+     *
+     * <p>⚠️ 保留上面那个三参重载给**解析基线**（{@code ParseBaselineTest}）用 ——
+     * 它只要解析结果（chars / tables / headings / imageCount），不要任何产物。
+     * ⚠️ 两条路**走同一段分派**是本方法存在的理由（见上面的 javadoc）：测试里抄一份
+     * 分派逻辑，就有两处会在"新增支持一种格式"时各自演化。
+     */
+    static ParsedDocument dispatch(String type, byte[] source, String fileName, ImageSink sink) {
         if (PLAIN_TEXT.contains(type)) {
             return PlainTextParser.parse(source, fileName);
         }
         if ("PDF".equals(type)) {
-            return parsePdf(source);
+            return parsePdf(source, sink);
         }
         // 其余（DOC/DOCX/PPT/PPTX/XLS/XLSX）走 Tika —— 按文件头自动识别，
         // 扩展名只当提示（浏览器对 .docx 常标 application/octet-stream）
@@ -467,11 +520,16 @@ public class DocParseService {
 
     /** PDF 必须落临时文件（opendataloader 只吃路径），用完即删。 */
     static ParsedDocument parsePdf(byte[] source) {
+        return parsePdf(source, ImageSink.NOOP);
+    }
+
+    /** 同 {@link #parsePdf(byte[])}，但把抽出的图交给 {@code sink}（`T-512` 步 2b）。 */
+    static ParsedDocument parsePdf(byte[] source, ImageSink sink) {
         Path tmp = null;
         try {
             tmp = Files.createTempFile("kb-parse-", ".pdf");
             Files.write(tmp, source);
-            return PdfDocumentParser.parse(tmp);
+            return PdfDocumentParser.parse(tmp, sink);
         } catch (IOException ex) {
             throw new ParseException("文档暂存失败，无法开始解析，请重试", ex);
         } finally {
@@ -502,6 +560,83 @@ public class DocParseService {
         int nl = msg.indexOf('\n');
         String oneLine = nl > 0 ? msg.substring(0, nl) : msg;
         return oneLine.length() > 160 ? oneLine.substring(0, 160) : oneLine;
+    }
+
+    /**
+     * 一次解析期间攒下的图片字节 —— **等 {@code TextLayerGuard.check} 放行之后才真正落 MinIO**。
+     *
+     * <h3>为什么不抽一张存一张</h3>
+     * <p>图的字节**只**存在于 opendataloader 的临时目录里，而那个目录在
+     * {@link PdfDocumentParser} 的 {@code finally} 就被删 —— 所以存储**只能**发生在解析期内。
+     * 但 {@code TextLayerGuard.check} 在解析**之后**才跑，而它会**拒掉整篇**
+     * （实测：21.8MB 的全扫描件，0 字符 → 文档 {@code FAILED}）。
+     *
+     * <p>两者一夹就出现这个窗口：🔴 <b>图已经传上去了，文档却被判失败</b>。
+     * 不管它，每上传一份扫描件就在 MinIO 里留一份孤儿 —— 那份实测 **17.50 MB**，
+     * 而扫描件在这个业务域里是**常见**输入（验收语料 5 份 PDF 里就有 1 份）。
+     * 这与 `T-O10`（探针产物兜底）要治的是同一类东西，只不过这次在**生产路径**上。
+     *
+     * <h3>代价，照实写</h3>
+     * <p>峰值多占一份图的内存 —— 被单篇 50 MB 上限（{@code PdfDocumentParser.MAX_TOTAL_IMAGE_BYTES}）
+     * 框住；而解析有**全局串行锁**（{@code PdfDocumentParser.LOCK}），同刻只有一篇在跑，
+     * 所以是 50 MB 而**不是** 50 MB × N。
+     *
+     * <p>⚠️ 它只堵住了**主路径**上的那一类失败（整篇被拒）。解析之后还有别的失败点
+     * （清洗 / 分片 / 落库炸），那些是**代码缺陷**而不是预期结果，其孤儿登记为遗留（见本批 §9）。
+     *
+     * <h3>为什么攒着的时候就能给出 objectKey</h3>
+     * <p>它是**确定性**的（`images/{kbId}/{docId}/{name}`），不依赖写入结果 ——
+     * 所以 {@link com.knowledge.ai.pipeline.ImageInfo} 在解析期就拿到真 key，
+     * 下游（步 4 的块、步 8 的落库）不必等一个"稍后回填"。
+     */
+    final class ImageBuffer implements ImageSink {
+
+        private final long kbId;
+        private final long docId;
+        /** 对象名 → 字节。LinkedHashMap 只为日志顺序稳定，语义上无序。 */
+        private final java.util.Map<String, byte[]> pending = new java.util.LinkedHashMap<>();
+
+        ImageBuffer(long kbId, long docId) {
+            this.kbId = kbId;
+            this.docId = docId;
+        }
+
+        @Override
+        public Stored store(byte[] bytes, int pageNo, String sourceName) {
+            String objectKey = DocStorage.imageObjectKey(kbId, docId, sourceName);
+            pending.put(objectKey, bytes);
+            return new Stored(objectKey, md5Of(bytes));
+        }
+
+        /**
+         * 把攒下的图真正写进 MinIO。**只在文档通过校验之后调**。
+         *
+         * <p>失败会抛（{@code putImage} 抛 {@code BizException}）—— 那是基础设施问题，
+         * 让文档失败是对的：块还没落库，此时失败**不会**产生孤儿。
+         */
+        void flush() {
+            if (pending.isEmpty()) {
+                return;
+            }
+            pending.forEach(docStorage::putImage);
+            log.info("图片已落 MinIO：docId={} 张数={} 合计={} KB",
+                    docId, pending.size(),
+                    pending.values().stream().mapToLong(b -> b.length).sum() / 1024);
+            pending.clear();
+        }
+    }
+
+    /** 服务端算的 md5（小写十六进制）。与 {@code ChatAttachmentStorage#md5Of} 同一口径。 */
+    private static String md5Of(byte[] bytes) {
+        try {
+            return java.util.HexFormat.of()
+                    .formatHex(java.security.MessageDigest.getInstance("MD5").digest(bytes));
+        } catch (Exception ex) {
+            // MD5 是 JDK 必备算法，走不到这里。真走到了也不该让整篇文档失败 ——
+            // 缺 md5 只影响"同图去重"与"缓存命中"，不影响这篇文档能不能检索
+            log.warn("图片 md5 计算失败（留空，该图仍会入库）：err={}", ex.getMessage());
+            return null;
+        }
     }
 
     /** 文档行必须存在，否则解析无从谈起（正常流程不会走到，防御并发清理）。 */

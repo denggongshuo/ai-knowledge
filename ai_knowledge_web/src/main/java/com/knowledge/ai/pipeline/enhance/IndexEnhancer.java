@@ -201,7 +201,7 @@ public class IndexEnhancer {
 
         List<Block> withSummary = new ArrayList<>(blocks);
         withSummary.add(new Block(enhancement.summary(), BlockType.SUMMARY, "",
-                withSummary.size() + 1, null, null, null));
+                withSummary.size() + 1, null, null, null, null));
 
         // `T-O09` 步 6：章节级摘要。**复用同一次调用**（`I-10`）——
         // 这里只是把同一次返回里的 chapters 落成块，**没有第二次 LLM 调用**
@@ -255,7 +255,7 @@ public class IndexEnhancer {
                 continue;
             }
             out.add(new Block(chapter.summary(), BlockType.SUMMARY, chapter.title(),
-                    out.size() + 1, null, null, headingOrder));
+                    out.size() + 1, null, null, headingOrder, null));
             produced++;
         }
         return produced;
@@ -305,7 +305,7 @@ public class IndexEnhancer {
             // 若一块一条问句，检索池里会出现同一段正文的多条近重复向量（互相挤占 top-k 名额），
             // 而 `D-5` 的口径本来就是"分片级"（n 次调用 = n 个源块），不是"问句级"
             out.add(new Block(String.join("\n", questions), BlockType.HYPOTHESIS_QA,
-                    block.titlePath(), out.size() + 1, block.pageNo(), null, block.orderNo()));
+                    block.titlePath(), out.size() + 1, block.pageNo(), null, block.orderNo(), null));
             produced++;
         }
 

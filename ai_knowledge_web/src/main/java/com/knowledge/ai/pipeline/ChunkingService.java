@@ -86,17 +86,20 @@ public class ChunkingService {
                     pushToc(toc, el.level(), el.text());
                     // 标题自身也是原子块（《06》§1.5：「标题、代码块、完整列表同为结构边界切出的原子块」）
                     blocks.add(new Block(el.text(), BlockType.HEADING, titlePath(toc),
-                            nextOrderNo(blocks), el.pageNo(), null, null));
+                            nextOrderNo(blocks), el.pageNo(), null, null, null));
                 }
                 case PARAGRAPH -> pending.add(new PendingText(el.text(), el.pageNo()));
                 case TABLE -> {
                     flushParagraphs(blocks, pending, titlePath(toc), options);
                     appendTable(blocks, doc, el, titlePath(toc));
                 }
-                // 图片：T-512（P1，依赖 T-907 的 VL 模型）之前**不产出块** ——
-                // 与 ParsedDocument.pendingBlockTypes() 声明的"尚未产出"一致。
-                // 数量仍由 imageCount 统计（`G4-4` 的质量列），不静默丢。
+                // `T-512` 步 4：图片开始产出块。
+                // ⚠️ **先冲刷**攒下的正文 —— 与 TABLE 同一个理由：`orderNo` 是按**产出顺序**
+                // 递增的（`nextOrderNo`），不先冲刷的话，图前面那段的 orderNo 会排到图后面，
+                // 回表与详情页的阅读顺序就错位了。
                 case IMAGE -> {
+                    flushParagraphs(blocks, pending, titlePath(toc), options);
+                    appendImage(blocks, el, titlePath(toc));
                 }
             }
         }
@@ -125,8 +128,37 @@ public class ChunkingService {
 
         for (String piece : splitForFallback(text, options)) {
             blocks.add(new Block(piece, BlockType.PARAGRAPH, titlePath,
-                    nextOrderNo(blocks), pageNo, null, null));
+                    nextOrderNo(blocks), pageNo, null, null, null));
         }
+    }
+
+    /**
+     * 一张图 → **恰好一个** `IMAGE` 块（`T-512` 步 4）。
+     *
+     * <h3>需求 `06:166` 的「原子单元」怎么落</h3>
+     * <p>「图片**整体**作为一个原子单元（**不做图像切分**）」⇒ 这里**不调用**
+     * {@link #splitForFallback}，块数恒为 1，**不随 {@code chunkSize} 变**。
+     * 一张图的题注 + 描述远够不上一条分片，为它跑切分是纯粹的机器噪音。
+     *
+     * <h3>`rawContent` 此刻只有题注</h3>
+     * <p>VL 描述要等**锁外**那一步（步 5）才有 —— 这里若先塞个占位，
+     * 步 5 就得区分"占位"与"真描述"，而那个区分迟早会错。空着更诚实。
+     *
+     * <h3>没字节又没题注的图**不产出块**</h3>
+     * <p>它们已经在解析期登记为 {@code IMAGE_NOT_EXTRACTABLE}（步 6.5），**已经可见**。
+     * 再给它们各发一个空块，等于往索引里灌一批嵌入为空的向量 ——
+     * 检索命中它只会浪费一次召回（`rawContent` 是空串，既是"块"又没有任何东西可检索）。
+     * 「看得见」与「进索引」是两件事，这里刻意只做前者。
+     */
+    private void appendImage(List<Block> blocks, ParsedDocument.DocElement el, String titlePath) {
+        ImageInfo info = el.imageInfo();
+        String caption = info == null || !info.hasCaption() ? "" : info.caption();
+        boolean hasBytes = info != null && info.hasBytes();
+        if (!hasBytes && caption.isEmpty()) {
+            return;
+        }
+        blocks.add(new Block(caption, BlockType.IMAGE, titlePath,
+                nextOrderNo(blocks), el.pageNo(), null, null, info));
     }
 
     /** 一张表 → 父块（Markdown，不进检索）+ N 个子块（行式文本，进检索）。 */
@@ -152,12 +184,12 @@ public class ChunkingService {
 
         int parentOrder = nextOrderNo(blocks);
         blocks.add(new Block(rendered.markdown(), BlockType.TABLE, titlePath,
-                parentOrder, el.pageNo(), null, null));
+                parentOrder, el.pageNo(), null, null, null));
         // I-4 的前提：父块整表封存、**不被切分**（所以这里不调用 splitForFallback）。
         // 子块逐行产出，每行 = 一条可独立检索的自然语言。
         for (String row : rendered.linearRows()) {
             blocks.add(new Block(row, BlockType.TABLE, titlePath,
-                    nextOrderNo(blocks), el.pageNo(), parentOrder, null));
+                    nextOrderNo(blocks), el.pageNo(), parentOrder, null, null));
         }
     }
 

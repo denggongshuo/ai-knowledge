@@ -54,8 +54,17 @@ public final class ParseFingerprint {
      * 第三段来自代码常量，只有这一段没有机器可读的身份。
      * 忘了改的后果是"清洗规则变了，但所有文档都被判定为'产物仍是最新'"——
      * 于是重解析永远不会被触发，而这正是本机制要防的那件事。
+     *
+     * <h3>变更史（每次加一都要在这里留一行，否则下一个人不知道 v2 是什么）</h3>
+     * <ul>
+     *   <li>{@code v1} —— `O3`（页眉页脚剥离）/ `O8`（视图投影）落地时的初值；</li>
+     *   <li>{@code v2} —— **`T-512` 步 6**：{@code ChunkViews.IMAGE_DESC} 从"抛异常"
+     *       改成"返回 {@code rawContent}"。正是上面那句的**字面情形**：
+     *       投影口径变了（图片块从此有内容进向量池），不加这就是"规则变了、
+     *       而所有文档仍被判产物最新"。</li>
+     * </ul>
      */
-    static final String CLEANING_VERSION = "v1";
+    static final String CLEANING_VERSION = "v2";
 
     /** 指纹里的哈希取前 16 个十六进制字符：足够区分、又能在 JSON 里一眼读出来。 */
     private static final int SHORT_HASH_LENGTH = 16;
@@ -66,12 +75,20 @@ public final class ParseFingerprint {
      * <p>为什么不用反射遍历整个 {@code Config} 对象：那样会把**我们用都没用的字段**
      * 也算进指纹 —— 升级库时新增一个默认字段就会让全库文档被判为"需要重解析"，
      * 而那是一次纯粹的误报。指纹要回答的是"**我们的解析行为**变没变"。
+     *
+     * <p>⚠️ 清单收录的是「**会影响产物**的那些开关」，不是"调用过 setter 的那些"。
+     * 反例：{@code generateMarkdown} 被设成 {@code true}，但本仓**不读那个 .md**
+     * （markdown 由 {@code buildMarkdown} 从元素树重建）—— 所以它不进清单。
+     * 而 {@code imageFormat} 从 `T-512` 步 2b 起**真的进入产物**（决定落盘图的字节），
+     * 所以它必须进 —— 否则哪天把 JPEG 改成 PNG，全库文档不会被判"需重解析"，
+     * 而"同一张图换了格式"正是一次真实的解析行为变更。
      */
     private static final Map<String, String> PARSER_CONFIG = Map.of(
             "generateJSON", "true",
             "generateText", "false",
             "generateHtml", "false",
-            "imageOutput", "OFF",
+            "imageOutput", "EXTERNAL",
+            "imageFormat", "JPEG",
             "tableMethod", "DEFAULT",
             "keepLineBreaks", "true");
 

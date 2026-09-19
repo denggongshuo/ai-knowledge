@@ -613,9 +613,21 @@ export interface ParseIssue {
   docTitle: string
   pageNo: number
   reason: string
-  /** 问题种类：`NO_TEXT_LAYER` / `TABLE_NOT_PARSED` / `HEADER_FOOTER_STRIPPED` / `EMPTY_PAGE` / `OTHER` */
+  /**
+   * 问题种类。
+   *
+   * 文本侧：`NO_TEXT_LAYER` / `TABLE_NOT_PARSED` / `HEADER_FOOTER_STRIPPED` / `EMPTY_PAGE` / `OTHER`
+   * 图片侧（`T-512` 起）：`IMAGE_NOT_EXTRACTABLE`（抽不到位图）/ `IMAGE_SKIPPED`（按策略跳过）/
+   * `IMAGE_DESC_FAILED`（VL 理解失败）
+   */
   kind?: string | null
-  /** 处置结果：`MISSING`（未处理）/ `OCR_FILLED`（已补全）/ `EMPTY_PAGE`（空白页，不算问题） */
+  /**
+   * 处置结果。
+   *
+   * `MISSING`（未处理，**计入告警**）/ `OCR_FILLED`（已补全）/ `EMPTY_PAGE`（空白页，不算问题）/
+   * `SKIPPED`（按策略跳过，不算问题 —— `T-512` 步 5.1 新增；图标与重复 logo 几乎每份
+   * 带图文档都有，计入会让告警条常态化变红）
+   */
   disposition?: string | null
 }
 

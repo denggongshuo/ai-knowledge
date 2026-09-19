@@ -100,9 +100,9 @@ class IndexEnhanceFlowTest {
     void summaryBlockIsProducedAndStored() {
         long docId = insertProbeDoc();
         List<Block> blocks = List.of(
-                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null, null),
                 new Block("接口鉴权采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
-                        "3. 接口设计", 2, 1, null, null));
+                        "3. 接口设计", 2, 1, null, null, null));
 
         IndexEnhancer.Result enhanced = indexEnhancer.enhance(doc(), blocks);
         assertThat(enhanced.status())
@@ -161,9 +161,9 @@ class IndexEnhanceFlowTest {
     void hyqBlockIsStoredWithItsSource() {
         long docId = insertProbeDoc();
         List<Block> blocks = List.of(
-                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null),
+                new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null, null),
                 new Block("接口鉴权采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
-                        "3. 接口设计", 2, 1, null, null));
+                        "3. 接口设计", 2, 1, null, null, null));
 
         IndexEnhancer.Result enhanced = indexEnhancer.enhance(doc(), blocks);
         recordWriter.replaceChunks(docId, probeKbIdOf(docId), enhanced.blocks());
@@ -206,7 +206,7 @@ class IndexEnhanceFlowTest {
         // 空正文 → EMPTY_INPUT，等同于"这次增强没产出摘要"，走的是与关掉开关同一条落库路径
         IndexEnhancer.Result enhanced = indexEnhancer.enhance(
                 new ParsedDocument("PDF", 1, 0, "", List.of(), List.of(), 0, 0, List.of(), List.of()),
-                List.of(new Block("正文一段", BlockType.PARAGRAPH, "", 1, 1, null, null)));
+                List.of(new Block("正文一段", BlockType.PARAGRAPH, "", 1, 1, null, null, null)));
 
         assertThat(enhanced.status()).isEqualTo(IndexEnhancer.Status.EMPTY_INPUT);
         recordWriter.replaceChunks(docId, probeKbIdOf(docId), enhanced.blocks());
