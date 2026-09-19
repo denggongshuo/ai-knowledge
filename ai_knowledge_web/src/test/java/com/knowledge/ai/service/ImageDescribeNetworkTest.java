@@ -1,9 +1,14 @@
 package com.knowledge.ai.service;
 
 import com.knowledge.ai.core.async.ParseWorker;
+import com.knowledge.ai.core.enums.DataScope;
+import com.knowledge.ai.core.enums.SecretLevel;
+import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.pipeline.ImageInfo;
 import com.knowledge.ai.pipeline.ParsedDocument;
 import com.knowledge.ai.pipeline.PdfDocumentParser;
+import com.knowledge.ai.pipeline.chat.ChatDtos;
+import com.knowledge.ai.pipeline.chat.ChatSink;
 import com.knowledge.ai.support.ApiTestSupport;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
@@ -16,6 +21,7 @@ import org.springframework.test.context.TestPropertySource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +46,23 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   mvn -B test -Dtest=ImageDescribeNetworkTest -Dvision.probe.run=true
  * </pre>
  *
+ * <h3>判据 9（描述进得了召回）为什么挂在**同一条**用例上</h3>
+ * <p>它要的证据 —— "IMAGE 块带着真描述进了 Milvus、拿描述里的词问得回来" ——
+ * 正是上面那次真跑攒出来的产物。另起一条用例等于**再花一遍这 5 分钟的真 VL** 去造同一批
+ * IMAGE 块，而两次跑出来的描述还是不同的文本。
+ *
+ * <p>所以本类同时开 {@code m05.vectorize.enabled=true}：测试配置默认关着向量化
+ * （同一条"真调外部模型"的理由），关着的话描述只是躺在 {@code sys_chunk.raw_content} 里，
+ * **根本没进 Milvus**，"能不能召回"就无从谈起。
+ *
+ * <p>而且提问走的是**真问答链路**（`ChatStreamService#chat`）而不是直接调
+ * `RetrievalService#search`：判据原文要的证据落点是 `sys_retrieval_trace`，
+ * 那张表只由 `RetrievalTraceWriter` 在问答收尾时写。直接调检索服务的话那个 trace
+ * 对象只存在于返回值里，库里一行都没有 —— 等于**只验了一半**。
+ *
+ * <p>⚠️ 提问用的词是**从落库的真实描述里现取**的（那条最长行），不硬编码任何词语 ——
+ * 描述是模型现生成的，写死一个词会让下一次跑批变成"库里根本没有这个词"。
+ *
  * <h3>顺带：它是 `images/` 前缀兜底的**真对象**验证</h3>
  * <p>本用例会往 MinIO 写**真实的图片对象**（不是替身），而收尾走
  * {@code ApiTestSupport} 那套扫描（`ProbeCleanup.MINIO_PREFIXES` 的 `images/` 一行是
@@ -51,6 +74,11 @@ import static org.assertj.core.api.Assertions.assertThat;
         "m05.image.describe.enabled=true",
         // 用生产默认值（4）而不是调大 —— 这条用例要验的是**生产形态**会怎样
         "m05.image.describe.concurrency=4",
+        // 判据 9（描述进得了召回）**必须**开它：测试配置默认关着向量化
+        // （同一条理由 —— 真调嵌入模型），关着的话 IMAGE 块的描述只是躺在
+        // `sys_chunk.raw_content` 里，**根本没进 Milvus**，
+        // 于是"能不能被召回"这件事无从谈起（`ChunkVectorizer` 会直接返回 DISABLED）。
+        "m05.vectorize.enabled=true",
 })
 @DisplayName("真 VL：文档图片描述整条链（判据 4/5/8/9/13/14）")
 class ImageDescribeNetworkTest extends ApiTestSupport {
@@ -67,8 +95,27 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
     @Autowired
     private com.knowledge.ai.core.storage.DocStorage docStorage;
 
+    @Autowired
+    private ChatStreamService chatStreamService;
+
     /** 本用例建的探针库 —— 收尾要按它清。 */
     private final List<Long> probeKbIds = new ArrayList<>();
+
+    /**
+     * 判据 9 那条提问之前 `sys_chat_session` 的最大 id —— 之后新增的全是本轮造的。
+     *
+     * <p>⚠️ 会话与打点**没有 `kb_id` / `doc_id` 坐标**，{@code ProbeCleanup} 认不出它们
+     * （`#130`：产物认识、归属维度不认识）。所以只能用水位线兜住自己这一批。
+     * ⚠️ 收尾必须在**提问之前**就抓到它 —— 提问之后抓就是问完之后的水位，
+     * 自己造的行一条也删不掉。
+     *
+     * <p>🔴 **初值是 {@code -1} 而不是 {@code 0}，而且判空用的是 {@code >= 0}** ——
+     * 第一版写成 {@code 0} + {@code > 0}，当场漏了：基线是**空表**时
+     * {@code coalesce(max(id), 0)} 本来就返回 0，于是"合法水位"与"还没抓"撞成同一个值，
+     * 整段清理被静默跳过。实测留下一整个会话族：`session=1 · message=2 · trace=1 ·
+     * trace_chunk=5`。**哨兵值不要用一个合法值去当** —— 这是那条的第二次踩。
+     */
+    private long chatWatermark = -1;
 
     /**
      * 收尾：删探针库那一族的行与对象。
@@ -82,12 +129,20 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
      * 第二次重演 —— 所以这里照搬 `DocParseFlowTest` 那份**已经跑过很多轮**的版本，
      * 而不是自己另写一套。
      *
-     * <h3>为什么不用删图片对象</h3>
-     * <p>图片对象由 {@code sys_chunk.object_key} 引用。这里把 `sys_chunk` 行删掉之后，
-     * 它们就**成了无主对象** —— 而 `ApiTestSupport` 的收尾扫描（`T-O10`）会扫
-     * `images/` 前缀（那一行是 `S6-M05-C2` 补的）。
-     * ⚠️ 但扫描有 **10 分钟的年龄下限**（那窗口是为"上传中"留的）⇒
-     * **本轮刚写的图这一轮扫不掉**，要等下一轮。这是**设计如此**，不是遗漏。
+     * <h3>🔴 图片对象为什么必须**显式**删，不能指望兜底扫描</h3>
+     * <p>曾经这里是这么写的：「图片对象由 `sys_chunk.object_key` 引用，把行删掉就成了无主对象，
+     * `ApiTestSupport` 的收尾扫描（`T-O10`）会扫 `images/` 前缀 —— 只是它有 **10 分钟的年龄下限**
+     * （那窗口是为"上传中"留的），所以本轮刚写的图要等下一轮。这是设计如此。」
+     *
+     * <p>**那句话是错的，而且错得很隐蔽** —— 它把一条**兜底机制**说成了**主路径**。
+     * 兜底的那个窗口本来就是给"上传中"留的，它天然管不了"本轮刚写完就删行"这种情形；
+     * 而本条用例**每一次都**是这个情形 ⇒ 每一轮都必然留一批，**永远**要等下一轮，
+     * 而"下一轮"可能就是别人几小时后的全量跑批。实测：漏加这段的一版留 34 个，
+     * 加上收尾但没加这段的一版留 26 个。
+     *
+     * <p>⇒ **兜底机制不能拿来当主路径的收尾**。判据是：这笔产物**这一轮就该清掉**的话，
+     * 收尾就必须直接删它，而不是"它会在某轮之后被扫走"。
+     * 复验：本段加上之后跑完，桶里 `images/` 目录**直接不存在**。
      */
     @org.junit.jupiter.api.AfterEach
     void cleanProbeData() {
@@ -96,6 +151,17 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
                     "select storage_path, parse_path from sys_document where kb_id = ?", kbId)) {
                 removeObject(row.get("storage_path"));
                 removeObject(row.get("parse_path"));
+            }
+            // 🔴 **图片对象要显式删，不能靠兜底扫描**。
+            //    兜底扫描（`T-O10`）有一条 **10 分钟的年龄下限**（那窗口是给"上传中"留的）
+            //    ⇒ 本轮刚写的图**这一轮必然扫不掉**，要靠下一个含图跑批顺手带走。
+            //    实测：第一版没写这段，一轮跑批后桶里留 26 个；写之前的那一版留了 34 个。
+            //    ⚠️ 顺序不能反 —— 必须**在**删 `sys_chunk` 行之前取 object_key，
+            //    行没了就再也查不到这批对象叫什么（`#136` 那个形状）。
+            for (String objectKey : jdbcTemplate.queryForList(
+                    "select object_key from sys_chunk where kb_id = ? and object_key is not null",
+                    String.class, kbId)) {
+                removeObject(objectKey);
             }
             // 按 kb_id 直删而不是 join sys_document：文档行可能已经不在了，
             // join 一条也匹配不到、孤儿照样留下
@@ -106,6 +172,17 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
             jdbcTemplate.update("delete from sys_kb where id = ?", kbId);
         }
         probeKbIds.clear();
+
+        // 判据 9 那条提问造的**问答族四张表** —— `ProbeCleanup` 按 kb_id/doc_id 认产物，
+        // 而它们两个坐标都没有，只能按水位线兜。⚠️ 顺序不能反：明细按 trace_id 挂，
+        // 主表先删就再也找不到那些明细了（`ChatStreamFlowTest` 记的同一条）
+        if (chatWatermark >= 0) {
+            jdbcTemplate.update("delete from sys_retrieval_trace_chunk where trace_id in "
+                    + "(select trace_id from sys_retrieval_trace where session_id > ?)", chatWatermark);
+            jdbcTemplate.update("delete from sys_retrieval_trace where session_id > ?", chatWatermark);
+            jdbcTemplate.update("delete from sys_chat_message where session_id > ?", chatWatermark);
+            jdbcTemplate.update("delete from sys_chat_session where id > ?", chatWatermark);
+        }
     }
 
     /** 删对象存储里的文件。**静默**：删不掉不该让用例红（`DocStorage#remove` 自己吞并留 warn）。 */
@@ -171,7 +248,7 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
         //    它是用来区分"库里的计数是 0"与"桶里的字节不对"的 —— 若它排在后面，
         //    `image_parsed > 0` 一红就再也走不到，而**恰恰是那种时候最需要它**。
         List<Map<String, Object>> imageChunks = jdbcTemplate.queryForList(
-                "select order_no, raw_content, object_key, image_md5, vl_model_id "
+                "select id, order_no, raw_content, object_key, image_md5, vl_model_id "
                         + "from sys_chunk where doc_id = ? and chunk_type = 'IMAGE' order by order_no",
                 docId);
         System.out.println("IMAGE 块 = " + imageChunks.size() + " 个");
@@ -239,7 +316,123 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
                         + "在页面上与「还没跑完」长得一模一样")
                 .isNotNull().isGreaterThan(0);
 
+        // ---------- 判据 9：图片描述进得了召回 ----------
+        // 本批**最后一个未验判据**。它要的证据（IMAGE 块带着真描述进了 Milvus、且被搜得回来）
+        // 正是上面那次真跑攒出来的，所以接在这里而不是另起一条用例 —— 另起就等于
+        // 再花一遍约 5 分钟的真 VL 去造同一批 IMAGE 块。
+        //
+        // 走**真问答链路**（`ChatStreamService#chat`）而不是直接调 `RetrievalService#search`：
+        // 判据原文要的证据落点是 `sys_retrieval_trace`，而那张表只由 `RetrievalTraceWriter`
+        // 在问答收尾时写 —— 直接调检索服务的话那个对象只存在于返回值里，库里一行都没有，
+        // 等于**只验了一半**。走问答链路还会顺带真跑一次生成，但那不影响本判据：
+        // 打点写在 `finally` 里，模型挂了它也照落。
+        //
+        // ⚠️ 水位线必须在**提问之前**抓（见字段注释）。
+        Long floor = jdbcTemplate.queryForObject(
+                "select coalesce(max(id), 0) from sys_chat_session", Long.class);
+        chatWatermark = floor == null ? 0L : floor;
+
+        // 提问用**真实描述里的最长那一行**，不硬编码词语 ——
+        // 描述是模型现生成的，写死任何一个词都会在下一次跑批里变成"库里没有这个词"。
+        // 取"全局最长行"是为了尽量避开与正文重合的短句：命中的必须是描述本身带来的那部分信息
+        String searchQuery = imageChunks.stream()
+                .filter(c -> c.get("vl_model_id") != null)
+                .map(c -> String.valueOf(c.get("raw_content")))
+                .flatMap(content -> content.lines())
+                .map(String::strip)
+                .filter(line -> !line.isBlank())
+                .max(Comparator.comparingInt(String::length))
+                .orElseThrow(() -> new AssertionError(
+                        "一张都没被描述成功，判据 9 无从谈起（先看上面那 4 张为什么失败）"));
+        if (searchQuery.length() > 80) {
+            searchQuery = searchQuery.substring(0, 80);
+        }
+        System.out.println("======== 判据 9：拿描述里的词提问 ========");
+        System.out.println("query = " + searchQuery);
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), new ChatDtos.ChatRequest(searchQuery, null, null, null, null), sink);
+        System.out.println("问答事件序列 = " + sink.eventNames + " · 错误 = " + sink.lastError);
+
+        Map<String, Object> trace = jdbcTemplate.queryForMap(
+                "select trace_id, chunk_count, vector_hits, bm25_hits, rerank_applied "
+                        + "from sys_retrieval_trace where session_id > ? order by id desc limit 1",
+                chatWatermark);
+        System.out.println("trace = " + trace);
+
+        List<Map<String, Object>> hits = jdbcTemplate.queryForList(
+                "select tc.rank_no, tc.chunk_id, c.chunk_type, c.doc_id "
+                        + "from sys_retrieval_trace_chunk tc join sys_chunk c on c.id = tc.chunk_id "
+                        + "where tc.trace_id = ? order by tc.rank_no", trace.get("trace_id"));
+        System.out.println("打点明细 = " + hits);
+
+        assertThat(hits)
+                .as("🔴 判据 9：按描述里的词提问，必须命中那个 IMAGE 块 —— "
+                        + "一条都是空的说明描述压根没进召回池")
+                .isNotEmpty();
+        assertThat(hits)
+                .as("🔴 判据 9：命中里必须**有 IMAGE 块** —— 描述进了索引但排不上来，"
+                        + "等于用户拿图里的内容问不出东西")
+                .anySatisfy(h -> assertThat(h.get("chunk_type")).isEqualTo("IMAGE"));
+        assertThat(hits)
+                .as("命中必须是**本篇**的块（召回到了别人的文档说明可见性范围不对）")
+                .allSatisfy(h -> assertThat(((Number) h.get("doc_id")).longValue()).isEqualTo(docId));
+
         System.out.println("=========================================");
+    }
+
+    /**
+     * 只收事件、不回话的 {@link ChatSink}。
+     *
+     * <p>⚠️ 不共用 `ChatStreamFlowTest` 里那个 `RecordingSink`：它在那个用例类内部，
+     * 且带着那边特有的断言辅助。本类只要三样东西 —— 事件名、错误文案、以及
+     * "链路走到了 `done`"。重复的那点代码比引入一条跨用例类的依赖便宜。
+     */
+    private static final class RecordingSink implements ChatSink {
+
+        private final List<String> eventNames = new ArrayList<>();
+        private String lastError;
+
+        @Override
+        public void retrieval(ChatDtos.RetrievalEvent event) {
+            eventNames.add("retrieval");
+        }
+
+        @Override
+        public void delta(String content) {
+            eventNames.add("delta");
+        }
+
+        @Override
+        public void done(ChatDtos.DoneEvent event) {
+            eventNames.add("done");
+        }
+
+        @Override
+        public void error(String message) {
+            eventNames.add("error");
+            lastError = message;
+        }
+    }
+
+    /**
+     * 一个"看得见全部"的用户 —— 与 `RetrievalFlowSupport#reader` 同形。
+     *
+     * <p>⚠️ 这里**不能**只传 `LoginUser` 就完事：`DataScopeService#kbVisibility` 认的是
+     * `sys_kb_grant` 授权行（它按 `user_id` 现查 `sys_user_role`），**不认 `superAdmin`**
+     * 也不看 {@code roleCodes}。所以 userId=1 这个账号在库里真的持有 SUPER_ADMIN 角色，
+     * 才是这条提问能看见探针库的原因。
+     */
+    private static LoginUser reader() {
+        return LoginUser.builder()
+                .userId(1L)
+                .username("admin")
+                .realName("探针")
+                .deptId(1L)
+                .superAdmin(true)
+                .dataScope(DataScope.ALL)
+                .secretLevelUpper(SecretLevel.SECRET)
+                .build();
     }
 
     /** 从解析产物里取「能配上对的题注」文本集合（不花 VL）。 */
