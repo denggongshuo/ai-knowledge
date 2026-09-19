@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, type Component } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useTabsStore } from '@/stores/tabs'
@@ -47,7 +47,10 @@ const NAV_GROUPS: NavGroup[] = [
     name: '工作台',
     items: [
       { path: '/chat', title: '知识问答', icon: ChatDotRound, badge: 'AI' },
-      { path: '/notice', title: '消息通知', icon: Bell, badge: '5' },
+      // ⚠️ `badge: '5'` 已销（`S6-M11`）—— 那是原型里的演示值，被硬编码进了导航配置：
+      // 它**恒显示 5**，与真实未读数无关，看着像真数据。现在由 `navBadge()` 取
+      // `GET /notices/unread-count` 的真数（为 0 时不显示角标）。
+      { path: '/notice', title: '消息通知', icon: Bell },
     ],
   },
   {
@@ -62,7 +65,12 @@ const NAV_GROUPS: NavGroup[] = [
   {
     name: '运营分析',
     items: [
-      { path: '/ops/qa', title: '问答运营', icon: DataAnalysis, badge: '23' },
+      // ⚠️ `badge: '23'` 已销（`S6-M11`）—— 与上面 `'5'` 同形，是原型演示值。
+      // 它的真数 = 未命中清单的待处理数，而**那张清单属 `T-A00`（S8）**：
+      // 库里没有那张表（只有 `sys_retrieval_trace.miss_flag` 这个原始标记）。
+      // ⇒ 本批**不假装** —— 不显示角标（不显示 ≠ 显示 0：0 会被读成"确实没有待处理"）。
+      // 待 `T-A00` 落地后接回来。
+      { path: '/ops/qa', title: '问答运营', icon: DataAnalysis },
       { path: '/ops/retrieval', title: '检索质量分析', icon: Filter },
       { path: '/ops/usage', title: '使用统计', icon: Grid },
     ],
@@ -113,6 +121,16 @@ watch(
 // 刷新后 token 已恢复，但 user 在内存中丢失 → 拉取 profile 补全
 const unreadCount = ref(0)
 
+/** 未读角标的轮询间隔（需求 `09` §2.6：「建议 30s 轮询**或** SSE 推送」，二选一取前者）。 */
+const UNREAD_POLL_MS = 30_000
+let unreadTimer: ReturnType<typeof setInterval> | undefined
+
+function refreshUnread() {
+  noticeApi.unreadCount().then((r) => (unreadCount.value = r.count)).catch(() => {
+    /* 角标拉取失败不阻塞渲染（保持上一次的值比归零更诚实） */
+  })
+}
+
 onMounted(() => {
   if (!auth.user && auth.isLoggedIn) {
     userApi.profile().then((data) => {
@@ -121,11 +139,28 @@ onMounted(() => {
       /* profile 拉取失败不阻塞渲染 */
     })
   }
-  // 顶栏铃铛未读角标（建议后端 30s 轮询或 SSE 推送）
-  noticeApi.unreadCount().then((r) => (unreadCount.value = r.count)).catch(() => {
-    /* 忽略 */
-  })
+  // 顶栏铃铛未读角标。⚠️ 必须**清定时器** —— 不清的话每次进出布局都会叠一个，
+  // 页面开着越久请求越密（这是"看着一切正常"的泄漏，与 `#159` 那一族同形）。
+  refreshUnread()
+  unreadTimer = setInterval(refreshUnread, UNREAD_POLL_MS)
 })
+
+onUnmounted(() => {
+  if (unreadTimer) clearInterval(unreadTimer)
+})
+
+/**
+ * 导航项右侧的角标。
+ *
+ * <p>静态角标（`'AI'`）照旧由配置给；**消息通知**那个取真实未读数，
+ * 为 0 时返回 `undefined`（`v-if` 随之不渲染）—— 与"角标恒亮着"是两回事。
+ */
+function navBadge(item: NavItem): string | number | undefined {
+  if (item.path === '/notice') {
+    return unreadCount.value > 0 ? unreadCount.value : undefined
+  }
+  return item.badge
+}
 
 const activePath = computed(() => {
   const p = route.path
@@ -182,7 +217,7 @@ const keyword = ref('')
             >
               <el-icon><component :is="item.icon" /></el-icon>
               <span>{{ item.title }}</span>
-              <span v-if="item.badge" class="nav-badge" :class="{ warn: g.name !== '工作台' }">{{ item.badge }}</span>
+              <span v-if="navBadge(item) !== undefined" class="nav-badge" :class="{ warn: g.name !== '工作台' }">{{ navBadge(item) }}</span>
             </el-menu-item>
           </template>
         </el-menu>
