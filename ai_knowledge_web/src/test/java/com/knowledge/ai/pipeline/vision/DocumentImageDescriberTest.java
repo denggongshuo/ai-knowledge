@@ -44,8 +44,10 @@ class DocumentImageDescriberTest {
         VisionDescriber vision = new VisionDescriber(
                 caller, new FakeCache(), new ImageCompressor(), new FakeRecorder());
         // 阈值取 12000（与生产默认一致），这样用例里的面积值可以直接对着它读；
-        // 并发取 4（生产默认）—— 下面的去重用例要求"派发前就去重"，与并发数无关
-        describer = new DocumentImageDescriber(storage, vision, 12_000d, true, 4);
+        // 并发取 4（生产默认）—— 下面的去重用例要求"派发前就去重"，与并发数无关。
+        // 重试取 1（生产默认）：**它会让"失败"用例的调用次数变成 2 次** ——
+        // 凡是断言调用次数的用例都要把这一点算进去（下面有专门的用例钉它）
+        describer = new DocumentImageDescriber(storage, vision, 12_000d, true, 4, 1);
     }
 
     // ==================================================================
@@ -160,6 +162,87 @@ class DocumentImageDescriberTest {
     }
 
     // ==================================================================
+    // `#209` 重试
+    // ==================================================================
+
+    @Test
+    @DisplayName("#209：偶发失败后**重试一次就成功** → 那张图不会永久只剩题注")
+    void transientFailureIsRescuedByRetry() {
+        caller.failFirst = 1;                       // 第一次偶发失败，第二次成功
+        caller.raw = "重试之后拿到的描述。";
+        Block block = imageBlock("图 4", 200_000, "md5-r", "images/1/1/r.jpg");
+
+        DocumentImageDescriber.Result result = describer.describe(List.of(block));
+
+        assertThat(caller.callCount)
+                .as("必须真的调了两次 —— 只调一次说明重试没接上")
+                .isEqualTo(2);
+        assertThat(result.failed())
+                .as("🔴 这次要是一，说明重试白加了 —— 而生产里那 4 张图正是这个形态"
+                        + "（S6-M05-C2 §8.12：前两轮失败、第三轮全过）")
+                .isZero();
+        assertThat(result.described()).isEqualTo(1);
+        assertThat(result.blocks().getFirst().rawContent())
+                .as("救回来之后内容与一次就成功的**完全一样**（题注在前、描述在后）")
+                .isEqualTo("图 4\n重试之后拿到的描述。");
+        assertThat(result.issues()).as("救回来了就不该留失败 issue").isEmpty();
+    }
+
+    @Test
+    @DisplayName("#209：重试上限用尽仍失败 → 照旧降级，且 reason 里写明**试了几次**")
+    void retriesExhaustedStillDegradesWithVisibleAttemptCount() {
+        caller.failWith = new IllegalStateException("VL 服务不可达");
+        Block block = imageBlock("图 5", 200_000, "md5-x", "images/1/1/x.jpg");
+
+        DocumentImageDescriber.Result result = describer.describe(List.of(block));
+
+        assertThat(caller.callCount)
+                .as("重试上限 1 ⇒ 总共 2 次").isEqualTo(2);
+        assertThat(result.failed()).isEqualTo(1);
+        assertThat(result.issues()).singleElement()
+                .satisfies(i -> assertThat(i.reason())
+                        .as("🔴 必须写明**试了几次** —— 「试过 2 次仍失败」与「一次就失败」"
+                                + "对排查的含义完全不同（前者是端点持续不可用，后者可能只是抖动）")
+                        .contains("已尝试 2 次"));
+    }
+
+    @Test
+    @DisplayName("🔴 #209 负向锚：**成功的那些一次都不多调** —— 重试不许变成「每次都调两遍」")
+    void successfulOnesAreNeverCalledTwice() {
+        caller.raw = "一次就好。";
+        List<Block> blocks = List.of(
+                imageBlock("甲", 200_000, "m-1", "images/1/1/1.jpg"),
+                imageBlock("乙", 200_000, "m-2", "images/1/1/2.jpg"),
+                imageBlock("丙", 200_000, "m-3", "images/1/1/3.jpg"));
+
+        DocumentImageDescriber.Result result = describer.describe(blocks);
+
+        assertThat(result.described()).isEqualTo(3);
+        assertThat(caller.callCount)
+                .as("🔴 这张锚值是必需的：把重试写成「每张都先试两次」照样能让上面那条用例绿，"
+                        + "而它会让**正常路径的调用次数翻倍** —— 那是每分钟都在烧的钱")
+                .isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("🔴 #209：重试上限配 0 ⇒ 退回不重试（一次性杀掉这个行为的能力）")
+    void retryZeroFallsBackToNoRetry() {
+        caller.failFirst = 1;
+        caller.raw = "本来能拿到的描述。";
+        DocumentImageDescriber noRetry = new DocumentImageDescriber(
+                storage, new VisionDescriber(caller, new FakeCache(), new ImageCompressor(),
+                new FakeRecorder()), 12_000d, true, 4, 0);
+        Block block = imageBlock("图 6", 200_000, "md5-z", "images/1/1/z.jpg");
+
+        DocumentImageDescriber.Result result = noRetry.describe(List.of(block));
+
+        assertThat(caller.callCount).isEqualTo(1);
+        assertThat(result.failed())
+                .as("关掉重试之后行为与 `S6-M05-C2` 之前**逐字一致** —— 这是回退开关")
+                .isEqualTo(1);
+    }
+
+    // ==================================================================
     // 恒等式与开关
     // ==================================================================
 
@@ -186,7 +269,7 @@ class DocumentImageDescriberTest {
     void disabledReturnsBlocksUntouched() {
         DocumentImageDescriber off = new DocumentImageDescriber(
                 storage, new VisionDescriber(caller, new FakeCache(),
-                new ImageCompressor(), new FakeRecorder()), 12_000d, false, 4);
+                new ImageCompressor(), new FakeRecorder()), 12_000d, false, 4, 1);
         List<Block> blocks = List.of(imageBlock("图 3", 200_000, "md5-e", "images/1/1/e.jpg"));
 
         DocumentImageDescriber.Result result = off.describe(blocks);
@@ -253,7 +336,7 @@ class DocumentImageDescriberTest {
         int n = 4;
         DocumentImageDescriber parallel = new DocumentImageDescriber(
                 storage, new VisionDescriber(new RendezvousCaller(n), new FakeCache(),
-                new ImageCompressor(), new FakeRecorder()), 12_000d, true, n);
+                new ImageCompressor(), new FakeRecorder()), 12_000d, true, n, 1);
         List<Block> blocks = List.of(
                 imageBlock("一", 200_000, "p-1", "images/1/1/1.jpg"),
                 imageBlock("二", 200_000, "p-2", "images/1/1/2.jpg"),
@@ -365,6 +448,14 @@ class DocumentImageDescriberTest {
 
         String raw = "";
         RuntimeException failWith;
+        /**
+         * 前几次调用**偶发失败**（`#209` 的重试用例），之后成功。
+         *
+         * <p>与 {@link #failWith} 的分工：后者是"一直失败"（测降级），
+         * 这个是"失败一阵就好了"（测重试真的能救回来）——
+         * 而后者才是生产里的实际形态（`S6-M05-C2` §8.12：同一批图第一轮全失败、第三轮全过）。
+         */
+        int failFirst;
         int callCount;
         final VisionModelRef model = new VisionModelRef("4", "Qwen/Qwen3-VL-8B-Instruct");
 
@@ -373,6 +464,9 @@ class DocumentImageDescriberTest {
             callCount++;
             if (failWith != null) {
                 throw failWith;
+            }
+            if (callCount <= failFirst) {
+                throw new IllegalStateException("偶发失败（第 " + callCount + " 次调用）");
             }
             return VisionRaw.of(raw);
         }

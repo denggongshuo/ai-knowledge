@@ -108,16 +108,42 @@ public class DocumentImageDescriber {
      */
     private final int concurrency;
 
+    /**
+     * 失败后**额外再试几次**（`#209`）。{@code 0} = 不重试（退回本批之前的行为）。
+     *
+     * <h3>为什么需要它 —— 一次偶发失败会让那张图"永久"没有描述</h3>
+     * <p>`S6-M05-C2` §8.12 实测：26 张里有 4 张连续两轮被端点拒绝，而**第三轮全过了**
+     * （真调的 4 张 md5 与前两轮失败的那 4 张**逐字相同**）。
+     * ⇒ 那不是"这张图端点就是不收"，是**偶发**；而原来的实现里，偶发一次就等于
+     * 那张图**永久**退化成只有题注，用户唯一的补救是**重传整篇文档**。
+     *
+     * <h3>⚠️ 默认值 1 的采样边界（如实写，别当成标定过的数）</h3>
+     * <p>依据是 `C2` §8.12 那 **4 张**的观察（"第 2 次重试成功 4/4"），**n=4**。
+     * 它足以支持"加一次重试"，**不足以支持"一次就够了"** —— 所以它是可配的，
+     * 且真 VL 那条用例（`ImageDescribeNetworkTest`）会把"重试救回几张"打出来。
+     * 若那个数长期 > 0，该调的是这个值，不是再加一层重试。
+     *
+     * <h3>为什么不做退避</h3>
+     * <p>刻意**不加**：退避的长度同样要有依据，而手上没有"隔多久重试才有效"的数据。
+     * 先做**立即重试**并把它跑出数字 —— 若量出立即重试无效而隔几秒有效，那时再加。
+     * （凭感觉写一个 500ms，是把一个没有依据的数藏进代码里。）
+     */
+    private final int retry;
+
     public DocumentImageDescriber(DocStorage docStorage,
                                   VisionDescriber visionDescriber,
                                   @Value("${m05.image.min-area:12000}") double minArea,
                                   @Value("${m05.image.describe.enabled:true}") boolean enabled,
-                                  @Value("${m05.image.describe.concurrency:4}") int concurrency) {
+                                  @Value("${m05.image.describe.concurrency:4}") int concurrency,
+                                  @Value("${m05.image.describe.retry:1}") int retry) {
         this.docStorage = docStorage;
         this.visionDescriber = visionDescriber;
         this.minArea = minArea;
         this.enabled = enabled;
         this.concurrency = concurrency;
+        // 负数当 0：配置写错时**退回不重试**而不是抛 —— 这条链上代价是"少一份描述"，
+        // 为它让整篇文档的解析失败，量级不对（与 `compressor` 那几处的取舍同源）
+        this.retry = Math.max(0, retry);
     }
 
     /**
@@ -190,6 +216,7 @@ public class DocumentImageDescriber {
         // ==================== 阶段 3 · 组装（串行，按下标保序）====================
         int described = 0;
         int failed = 0;
+        int rescuedByRetry = 0;
         for (int i = 0; i < attempts.length; i++) {
             Attempt attempt = attempts[i];
             if (attempt == null) {
@@ -213,14 +240,19 @@ public class DocumentImageDescriber {
                 out.set(attempt.slot(), withContentOrNull(attempt.block()));
             } else {
                 described++;
+                if (attempt.attempts() > 1) {
+                    rescuedByRetry++;
+                }
                 out.set(attempt.slot(),
                         withDescription(attempt.block(), attempt.info(), attempt.result()));
             }
         }
 
         List<Block> kept = out.stream().filter(java.util.Objects::nonNull).toList();
-        log.info("图片描述完成：考虑={} 成功={} 跳过={} 失败={} 并发上限={}",
-                described + skipped + failed, described, skipped, failed, concurrency);
+        // ⚠️ `重试救回` 与 `重试上限` 必须出现在这一行里：它是"retry 该取多少"的证据来源。
+        //    只有"成功 N 张"的话，看不出这 N 张里有多少是本可以不花的钱
+        log.info("图片描述完成：考虑={} 成功={}（其中重试救回 {}）跳过={} 失败={} 并发上限={} 重试上限={}",
+                described + skipped + failed, described, rescuedByRetry, skipped, failed, concurrency, retry);
         return new Result(kept, described, skipped, failed, List.copyOf(issues));
     }
 
@@ -271,7 +303,7 @@ public class DocumentImageDescriber {
                         // 中断 = 服务在停。补一个"失败"而不是留 null ——
                         // null 会在阶段 3 走"任务炸了"那条路，而那描述的**不是**这里发生的事
                         Thread.currentThread().interrupt();
-                        attempts[slot] = Attempt.failed(candidate, "描述被中断（服务正在停止）");
+                        attempts[slot] = Attempt.failed(candidate, "描述被中断（服务正在停止）", 0);
                     }
                     return null;
                 }));
@@ -295,24 +327,52 @@ public class DocumentImageDescriber {
         }
     }
 
-    /** 描述一张图。**绝不抛** —— 任何失败都折成 {@link Attempt#failure()}。 */
+    /**
+     * 描述一张图，**失败就再试**（`#209`）。**绝不抛** —— 任何失败都折成 {@link Attempt#failure()}。
+     *
+     * <h3>为什么重试写在这里，而不是外面再包一轮</h3>
+     * <p>因为"重试"要的粒度是**一张图**，而外面那一层拿到的是"这一批的下标数组"
+     * （重试就得把那批里失败的下标挑出来再编一次并发）—— 那是把并发编排写两遍。
+     * 收在这里之后，并发上限仍然只由 {@link #concurrency} 管：重试发生在**同一个任务内**，
+     * 不会因为重试把在途请求数顶上去。
+     *
+     * <h3>为什么读字节**不**在重试范围内</h3>
+     * <p>对象读不到 = 那个 key 指向的东西没了，**不是瞬时故障** —— 重试只是把同一个失败
+     * 再问一遍，白等一轮。而 VL 的失败才是这次要接住的偶发。
+     */
     private Attempt describeOne(Candidate candidate) {
         ImageInfo info = candidate.info();
+        byte[] bytes;
         try {
-            byte[] bytes = docStorage.open(info.objectKey());
-            VisionResult result = visionDescriber.describe(new VisionDescriber.VisionInput(
-                    info.md5(), bytes, null, "image/jpeg",
-                    // ⚠️ **文档解析期传 null** —— 这里没有"用户的问题"。
-                    //    本行此前是 VisionDescriber 里那句"文档解析期传 null"的**唯一落点**，
-                    //    `T-512` 步 5 起它真的被传了（此前那条 javadoc 是承诺，不是事实）
-                    null));
-            return result.hasDescription()
-                    ? new Attempt(candidate.slot(), candidate.block(), info, result, null)
-                    : Attempt.failed(candidate, "VL 返回空或调用失败");
+            bytes = docStorage.open(info.objectKey());
         } catch (RuntimeException ex) {
-            // 读字节失败（对象丢了）/ VL 抛了 —— 都**不牵连文档**，但必须留痕
-            return Attempt.failed(candidate, ex.getMessage());
+            return Attempt.failed(candidate, "读取图片对象失败：" + ex.getMessage(), 0);
         }
+
+        int maxAttempts = retry + 1;
+        String lastFailure = "VL 返回空或调用失败";
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                VisionResult result = visionDescriber.describe(new VisionDescriber.VisionInput(
+                        info.md5(), bytes, null, "image/jpeg",
+                        // ⚠️ **文档解析期传 null** —— 这里没有"用户的问题"。
+                        //    本行此前是 VisionDescriber 里那句"文档解析期传 null"的**唯一落点**，
+                        //    `T-512` 步 5 起它真的被传了（此前那条 javadoc 是承诺，不是事实）
+                        null));
+                if (result.hasDescription()) {
+                    if (attempt > 1) {
+                        // 这条日志是 `retry` 该取多少的**唯一数据来源** —— 别把它降成 debug
+                        log.info("图片描述重试成功：第 {} 次尝试（md5={}）", attempt, info.md5());
+                    }
+                    return new Attempt(candidate.slot(), candidate.block(), info, result, null, attempt);
+                }
+            } catch (RuntimeException ex) {
+                // VL 抛了 —— **不牵连文档**，但要把原因带下去（fail 的 reason 会进 parse issue）
+                lastFailure = ex.getMessage();
+            }
+        }
+        return Attempt.failed(candidate,
+                lastFailure + (maxAttempts > 1 ? "（已尝试 " + maxAttempts + " 次）" : ""), maxAttempts);
     }
 
     /**
@@ -344,11 +404,19 @@ public class DocumentImageDescriber {
     private record Candidate(int slot, Block block, ImageInfo info) {
     }
 
-    /** 一次描述尝试。{@code failure != null} ⇒ 失败（`result` 为 {@code null}）。 */
-    private record Attempt(int slot, Block block, ImageInfo info, VisionResult result, String failure) {
+    /**
+     * 一次描述尝试。{@code failure != null} ⇒ 失败（`result` 为 {@code null}）。
+     *
+     * @param attempts 这件事**实际发生了几次调用**（`#209` 起）。
+     *                 ⚠️ 它不参与判定，只用于把"重试救回来的"与"一次就成了的"分开计数 ——
+     *                 而那个数正是 {@code m05.image.describe.retry} 该取多少的依据。
+     *                 没有它，日志里只能看到"成功了 N 张"，看不出重试值不值
+     */
+    private record Attempt(int slot, Block block, ImageInfo info, VisionResult result, String failure,
+                           int attempts) {
 
-        static Attempt failed(Candidate candidate, String reason) {
-            return new Attempt(candidate.slot(), candidate.block(), candidate.info(), null, reason);
+        static Attempt failed(Candidate candidate, String reason, int attempts) {
+            return new Attempt(candidate.slot(), candidate.block(), candidate.info(), null, reason, attempts);
         }
     }
 
