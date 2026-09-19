@@ -6,6 +6,8 @@ import com.knowledge.ai.core.async.AsyncTaskInfo;
 import com.knowledge.ai.core.async.AsyncTaskService;
 import com.knowledge.ai.core.async.AsyncTaskStatus;
 import com.knowledge.ai.support.ApiTestSupport;
+import com.knowledge.ai.support.ProbeCleanup;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -50,6 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       动种子权限行的话，用例中途挂掉就会留下权限漂移。</li>
  * </ol>
  */
+@Slf4j
 class AuditQueryFlowTest extends ApiTestSupport {
 
     /** 留存的真实超期天数（>180 才会被清）。 */
@@ -82,18 +85,88 @@ class AuditQueryFlowTest extends ApiTestSupport {
      */
     private final List<String> exportTaskIds = new ArrayList<>();
 
+    /**
+     * 本类开跑的时刻 —— 收尾的安全网据此认定"本轮产生的对象"。
+     *
+     * <p>⚠️ 它是**安全网的参数，不是主判据**：主判据是任务体里那个 `objectKey`
+     * （见 {@link #cleanExportTasks}）。
+     */
+    private java.time.Instant runStart;
+
     @BeforeEach
     void loginAdmin() {
+        runStart = java.time.Instant.now();
         token = loginAsAdmin().data("$.accessToken");
     }
 
-    /** 收尾：删掉本类造出来的导出任务行（不做的话它们会一轮轮攒在 `sys_async_task` 里）。 */
+    /**
+     * 收尾：**删导出任务行 + 删它们写出来的对象**。
+     *
+     * <h3>🔴 `T-O11` 之前这里只删行、不删对象</h3>
+     * <p>于是 `sys_async_task` 的基线永远是 0（看着很干净），而桶里的 `audit-export/`
+     * **单调上涨** —— 实测 Sep 15~19 每天都有、攒到 **137 个**。
+     * 闸只看库、不看桶，所以这件事**结构上不可见**。
+     *
+     * <h3>为什么归属必须"在删行之前抓"</h3>
+     * <p>与 {@code ProbeCleanup} 的第一条硬规矩同源：`objectKey` **只活在任务体的 result 里**
+     * （`SysAsyncTaskRepository#find` 明写「{@code result}` **不持久化**」）——
+     * 行一删，"这份导出写到哪个对象"就**再也没有地方可查**。
+     * 所以顺序固定：**先按 taskId 取回 objectKey → 删对象 → 才删行**。
+     *
+     * <h3>安全网（以及它的前提，别搬走）</h3>
+     * <p>万一某条任务的结果读不到（用例中途挂、任务被清过），再按
+     * "`audit-export/` 前缀 + **比本轮开始还新**"扫一遍。
+     * ⚠️ 它成立的前提是"**本类跑的时候，桶里新出现的导出都是本类造的**"。
+     * **不要**把它搬到基座里 —— 那会变成"按时间删真实用户的导出"，
+     * 正是 `ProbeCleanup` 边界段写明**不该有**的那种判据。
+     */
     @AfterEach
     void cleanExportTasks() {
         for (String taskId : exportTaskIds) {
+            String objectKey = objectKeyOf(taskId);
+            if (objectKey != null) {
+                removeObject(objectKey);
+            }
             jdbc.update("delete from sys_async_task where task_id = ?", taskId);
         }
         exportTaskIds.clear();
+        sweepObjectsCreatedThisRun();
+    }
+
+    /** 从任务结果里取 `objectKey` —— **必须赶在删行之前**。取不到返回 {@code null}。 */
+    private String objectKeyOf(String taskId) {
+        Object result = asyncTaskService.find(taskId).map(info -> info.getResult()).orElse(null);
+        if (!(result instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Object key = map.get("objectKey");
+        return key == null ? null : String.valueOf(key);
+    }
+
+    /** 安全网：删掉 `audit-export/` 下**本轮开始之后**产生的对象。 */
+    private void sweepObjectsCreatedThisRun() {
+        try {
+            for (io.minio.Result<io.minio.messages.Item> r : minioClient.listObjects(
+                    io.minio.ListObjectsArgs.builder()
+                            .bucket(bucket).prefix(ProbeCleanup.AUDIT_EXPORT_PREFIX).recursive(true).build())) {
+                io.minio.messages.Item item = r.get();
+                if (item.lastModified().toInstant().isBefore(runStart)) {
+                    continue;   // 上一轮或更早留下的 —— **不在本类的射程内**（见方法注释的警告）
+                }
+                removeObject(item.objectName());
+            }
+        } catch (Exception ex) {
+            log.warn("审计导出对象收尾扫描失败（不影响用例结论）：{}", ex.getMessage());
+        }
+    }
+
+    private void removeObject(String objectKey) {
+        try {
+            minioClient.removeObject(io.minio.RemoveObjectArgs.builder()
+                    .bucket(bucket).object(objectKey).build());
+        } catch (Exception ex) {
+            log.warn("删除导出对象失败：{}（{}）", objectKey, ex.getMessage());
+        }
     }
 
     // ==================================================================
