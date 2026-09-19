@@ -12,6 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -42,8 +43,9 @@ class DocumentImageDescriberTest {
         storage = new FakeStorage();
         VisionDescriber vision = new VisionDescriber(
                 caller, new FakeCache(), new ImageCompressor(), new FakeRecorder());
-        // 阈值取 12000（与生产默认一致），这样用例里的面积值可以直接对着它读
-        describer = new DocumentImageDescriber(storage, vision, 12_000d, true);
+        // 阈值取 12000（与生产默认一致），这样用例里的面积值可以直接对着它读；
+        // 并发取 4（生产默认）—— 下面的去重用例要求"派发前就去重"，与并发数无关
+        describer = new DocumentImageDescriber(storage, vision, 12_000d, true, 4);
     }
 
     // ==================================================================
@@ -184,7 +186,7 @@ class DocumentImageDescriberTest {
     void disabledReturnsBlocksUntouched() {
         DocumentImageDescriber off = new DocumentImageDescriber(
                 storage, new VisionDescriber(caller, new FakeCache(),
-                new ImageCompressor(), new FakeRecorder()), 12_000d, false);
+                new ImageCompressor(), new FakeRecorder()), 12_000d, false, 4);
         List<Block> blocks = List.of(imageBlock("图 3", 200_000, "md5-e", "images/1/1/e.jpg"));
 
         DocumentImageDescriber.Result result = off.describe(blocks);
@@ -194,6 +196,78 @@ class DocumentImageDescriberTest {
         assertThat(result.issues())
                 .as("关掉是'这个环境没开'，不是'这张图理解不了' —— 不留 issue")
                 .isEmpty();
+    }
+
+    // ==================================================================
+    // 并行（2026-09-19 改）
+    // ==================================================================
+
+    @Test
+    @DisplayName("并行：去重**必须在派发之前**做完（同 md5 只调一次，与并发无关）")
+    void dedupHappensBeforeDispatch() {
+        caller.raw = "公司 logo。";
+        // 同一张 logo 出现 4 次 —— 若去重被挪到并行之后，就会**并发调 4 次**
+        //（那正是需求 06:160 点名的"公司 logo 这类图"，会重复花钱且结果可能不一致）
+        List<Block> blocks = List.of(
+                imageBlock("", 200_000, "logo-md5", "images/1/1/a.jpg"),
+                imageBlock("", 200_000, "logo-md5", "images/1/1/b.jpg"),
+                imageBlock("", 200_000, "logo-md5", "images/1/1/c.jpg"),
+                imageBlock("", 200_000, "logo-md5", "images/1/1/d.jpg"));
+
+        DocumentImageDescriber.Result result = describer.describe(blocks);
+
+        assertThat(caller.callCount)
+                .as("同一 md5 只允许调一次 —— 并行之后这条只能靠「派发前分诊」保证")
+                .isEqualTo(1);
+        assertThat(result.described()).isEqualTo(1);
+        assertThat(result.skipped()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("并行：结果**按下标保序**（不随完成顺序变）")
+    void resultsKeepInputOrder() {
+        caller.raw = "同一段描述。";
+        // ⚠️ 分不清"哪张"是替身的固有局限（`describeOne` 传的 presignedUrl 是 null，
+        //    而三张图的字节又都一样）—— 但**题注前缀来自块本身**，足以定位。
+        //    判据因此落在"每个位置的题注对不对"，而不是"模型返回了哪句话"。
+        List<Block> blocks = List.of(
+                imageBlock("图一", 200_000, "md5-1", "images/1/1/1.jpg"),
+                imageBlock("图二", 200_000, "md5-2", "images/1/1/2.jpg"),
+                imageBlock("图三", 200_000, "md5-3", "images/1/1/3.jpg"));
+
+        DocumentImageDescriber.Result result = describer.describe(blocks);
+
+        assertThat(result.blocks()).hasSize(3);
+        // ⚠️ 判据落在**题注的出现顺序**上，而不是 `orderNo` —— 后者由 `imageBlock` 助手
+        //    统一给 1（那是块自己的字段，本用例没在验它）。而题注前缀来自入参的块、按位对应，
+        //    所以"顺序对不对"在它上面一眼可见。题注在第一行（`withDescription` 拼的）。
+        assertThat(result.blocks()).extracting(b -> b.rawContent().split("\n")[0])
+                .as("题注的出现顺序必须与入参一致 —— 顺序是回表与详情页的阅读顺序，"
+                        + "绝不能随网络抖动而变")
+                .containsExactly("图一", "图二", "图三");
+    }
+
+    @Test
+    @DisplayName("并行：真的并行了（4 张图必须**同时在**模型里 —— 串行会让它超时）")
+    void actuallyRunsInParallel() {
+        int n = 4;
+        DocumentImageDescriber parallel = new DocumentImageDescriber(
+                storage, new VisionDescriber(new RendezvousCaller(n), new FakeCache(),
+                new ImageCompressor(), new FakeRecorder()), 12_000d, true, n);
+        List<Block> blocks = List.of(
+                imageBlock("一", 200_000, "p-1", "images/1/1/1.jpg"),
+                imageBlock("二", 200_000, "p-2", "images/1/1/2.jpg"),
+                imageBlock("三", 200_000, "p-3", "images/1/1/3.jpg"),
+                imageBlock("四", 200_000, "p-4", "images/1/1/4.jpg"));
+
+        DocumentImageDescriber.Result result = parallel.describe(blocks);
+
+        // 替身要求 4 个调用**在栅栏上会合**才返回；串行的话第一个就会等超时 ⇒ 全失败。
+        // 所以"4 张全描述成功"本身就是"它们真的同时在跑"的证据。
+        assertThat(result.described())
+                .as("4 张必须全部成功 —— 替身要求它们在栅栏上会合，串行会让第一个就超时")
+                .isEqualTo(n);
+        assertThat(result.failed()).isZero();
     }
 
     // ==================================================================
@@ -250,6 +324,39 @@ class DocumentImageDescriberTest {
                            Purpose purpose, int calls, long promptTokens,
                            long completionTokens, Integer latencyMs) {
             // 用量另有专测
+        }
+    }
+
+    /**
+     * **只证明"真的并行了"** 的替身：每个调用都要在栅栏上**会合**才返回。
+     *
+     * <p>串行执行时，第一个调用会独自等满超时然后抛 —— 于是"全部成功"就等价于
+     * "它们确实同时在跑"。这比断言墙钟时间稳（计时断言会 flaky），
+     * 又能抓住"把并发上限写成 1"这种退化。
+     */
+    private static final class RendezvousCaller implements VisionCaller {
+
+        private final CyclicBarrier barrier;
+
+        RendezvousCaller(int parties) {
+            this.barrier = new CyclicBarrier(parties);
+        }
+
+        @Override
+        public VisionRaw call(String prompt, byte[] image, String presignedUrl, String mime) {
+            try {
+                // 超时给得短：串行时第一个调用会在这里等满，用例当场变红而不是挂住
+                barrier.await(3, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (Exception ex) {
+                throw new IllegalStateException(
+                        "没有等到其余并发调用会合（说明它们是**串行**跑的）：" + ex);
+            }
+            return VisionRaw.of("会合成功。");
+        }
+
+        @Override
+        public VisionModelRef modelRef() {
+            return new VisionModelRef("4", "Qwen/Qwen3-VL-8B-Instruct");
         }
     }
 

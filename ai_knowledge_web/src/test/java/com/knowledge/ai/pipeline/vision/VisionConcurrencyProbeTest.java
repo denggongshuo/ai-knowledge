@@ -42,10 +42,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>直接打 caller 的代价是：本探针的调用**不进用量表**（`ModelUsageRecorder` 在 Describer 里），
  * 也**不写缓存**。两件事都是本探针想要的 —— 探针不该污染生产统计，也不该在 Redis 里留 30 天的垃圾。
  *
- * <h3>⚠️ 它会真花钱</h3>
- * <p>端点是**远程云 API**（`api-siliconflow.cn`）。15 次 `Qwen3-VL-8B` 调用，
- * 成本量级是分/角 —— 但**它确实不是零**。故：
- * {@code @Tag("network")}（不进默认跑批）+ 端点不可用时 {@code Assumptions} **跳过并说明原因**。
+ * <h3>⚠️ 它会真花钱 —— 所以是**显式 opt-in**</h3>
+ * <p>端点是**远程云 API**（`api-siliconflow.cn`），单次调用实测 **95~115 秒**。
+ * 默认那两档就要 5 次调用、约 160 秒。放进默认跑批等于给每次全量再挂三分钟 + 真账单
+ * —— 那不该是默认行为。
+ *
+ * <pre>
+ *   mvn -B test -Dtest=VisionConcurrencyProbeTest -Dvision.probe.run=true
+ *   # 想看完整曲线再加：-Dvision.probe.levels=1,2,4,8
+ * </pre>
+ *
+ * <p>{@code @Tag("network")} + 端点不可用时 {@code Assumptions} **跳过并说明原因**
+ * （静默跳过会让"没量过"看着像"量过没问题"）。
  */
 @SpringBootTest
 @Tag("network")
@@ -87,6 +95,12 @@ class VisionConcurrencyProbeTest {
     @Test
     @DisplayName("并发 1 / N 的墙钟时间与吞吐（只量，只对'不抛异常'断言）")
     void concurrencyThroughput() throws Exception {
+        // 🔴 **显式 opt-in**：本探针**真花钱**（外部付费 API），而且单次是**分钟级**
+        //    —— 默认只跑 1,4 两档也要 5 次调用、实测约 160 秒。
+        //    放进默认跑批 = 给每次全量再挂三分钟 + 真账单，那不该是默认行为。
+        //    要跑：`mvn test -Dtest=VisionConcurrencyProbeTest -Dvision.probe.run=true`
+        Assumptions.assumeTrue(Boolean.getBoolean("vision.probe.run"),
+                "需要显式开启：-Dvision.probe.run=true（本探针会真调付费 API 且耗时数分钟）");
         Assumptions.assumeTrue(Files.isRegularFile(SAMPLE), "缺样本 " + SAMPLE);
         Assumptions.assumeTrue(caller.modelRef().present(),
                 "VL 模型未配置（modelRef 不 present），跳过");

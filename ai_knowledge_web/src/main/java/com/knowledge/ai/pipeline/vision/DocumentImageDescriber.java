@@ -13,6 +13,10 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 
 /**
  * **文档侧的图片描述**（`T-512` 步 5）—— 把 {@code IMAGE} 块从"只有题注"补成"题注 + VL 描述"。
@@ -89,18 +93,35 @@ public class DocumentImageDescriber {
      */
     private final boolean enabled;
 
+    /**
+     * 同时最多几张图在调 VL（`T-512` 步 5 的并行上限，可配）。
+     *
+     * <h3>为什么要有这个数，以及为什么默认是 4</h3>
+     * <p>改并行之前是**逐张串行**：单张实测 **95~115 秒**（比上游记录的 40~60 秒更慢），
+     * `1-DeepSeek` 那份 26 张 ⇒ **单篇约 45 分钟**。
+     * <p>{@code VisionConcurrencyProbeTest} 实测端点**真并行**（并发 8 时吞吐 11.3 次/分，
+     * 串行只有 0.5），所以并行是本批收益最大的一处改动。
+     *
+     * <p>⚠️ 但**默认取 4 而不是 8**，是有意的保守：端点是**外部付费云服务**，
+     * 实测只跑了一轮、没被限流，而"没观测到限流"不等于"不会限流"。
+     * 并发 4 已把 45 分钟压到约 5 分钟；要更快就调这个值（8 实测也没问题）。
+     */
+    private final int concurrency;
+
     public DocumentImageDescriber(DocStorage docStorage,
                                   VisionDescriber visionDescriber,
                                   @Value("${m05.image.min-area:12000}") double minArea,
-                                  @Value("${m05.image.describe.enabled:true}") boolean enabled) {
+                                  @Value("${m05.image.describe.enabled:true}") boolean enabled,
+                                  @Value("${m05.image.describe.concurrency:4}") int concurrency) {
         this.docStorage = docStorage;
         this.visionDescriber = visionDescriber;
         this.minArea = minArea;
         this.enabled = enabled;
+        this.concurrency = concurrency;
     }
 
     /**
-     * 逐块补描述。
+     * 逐块补描述 —— **三阶段：分诊（串行）→ 并行描述 → 组装（串行、保序）**。
      *
      * @param blocks 分片产出（本方法**不改写**入参，返回新列表）
      * @return 新块列表 + 三个计数 + 新增的 issue
@@ -115,25 +136,31 @@ public class DocumentImageDescriber {
             log.info("图片描述开关未开启（m05.image.describe.enabled=false），跳过：块数={}", blocks.size());
             return new Result(blocks, 0, 0, 0, List.of());
         }
-        List<Block> out = new ArrayList<>(blocks.size());
-        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
-        // 同篇去重（需求 06:160）。**只在篇内**去重 —— 跨文档是语料级的，
-        // 与 DocumentCleaner「无状态纯函数」的设计冲突，本批不做（见计划 §9 W4）
-        Set<String> seenMd5 = new HashSet<>();
-        int described = 0;
-        int skipped = 0;
-        int failed = 0;
 
-        for (Block block : blocks) {
+        // `out` 按**入参下标**占位（末尾统一剔掉 null）。🔴 并行之后"保序"只能靠下标 ——
+        // 按完成顺序追加会让块序随网络抖动而变，而它是回表与详情页的阅读顺序
+        List<Block> out = new ArrayList<>(java.util.Collections.nCopies(blocks.size(), null));
+        List<ParsedDocument.DocumentIssue> issues = new ArrayList<>();
+        Set<String> seenMd5 = new HashSet<>();
+        List<Candidate> candidates = new ArrayList<>();
+        int skipped = 0;
+
+        // ==================== 阶段 1 · 分诊（串行）====================
+        // 🔴 **去重必须在这里做完，绝不能挪到派发之后**（本次改并行最要紧的一条）：
+        //    "同篇 imageMd5 只调一次"靠的是"谁先到谁被描述"。并行派发之后那个顺序就没了
+        //    ⇒ 同一个 md5 会被**并发调两次**，而那正是需求 06:160 点名的
+        //    「公司 logo 这类图」要防的事（重复花钱，且两次结果可能不一致）。
+        for (int i = 0; i < blocks.size(); i++) {
+            Block block = blocks.get(i);
             ImageInfo info = block.imageInfo();
             if (block.blockType() != BlockType.IMAGE || info == null) {
-                out.add(block);
+                out.set(i, block);
                 continue;
             }
             // 没字节的图在**解析期**就登记过 `IMAGE_NOT_EXTRACTABLE` 了，这里无事可做。
             // 但带题注的块要留着 —— 题注是作者写的真内容，能进索引（需求 06:158）
             if (!info.hasBytes()) {
-                addIfHasContent(out, block);
+                out.set(i, withContentOrNull(block));
                 continue;
             }
             // ---- 过滤① 尺寸下限 ----
@@ -143,7 +170,7 @@ public class DocumentImageDescriber {
                 issues.add(skipIssue(block, "该图面积过小（" + Math.round(area)
                         + " < 阈值 " + Math.round(minArea) + "），判定为图标或分隔线，"
                         + "未调用图片理解；若它确有内容，请告知管理员调低 " + "m05.image.min-area"));
-                addIfHasContent(out, block);
+                out.set(i, withContentOrNull(block));
                 continue;
             }
             // ---- 过滤② 同篇 md5 去重（需求 06:160 的原话理由：「公司 logo 这类图」）----
@@ -151,46 +178,146 @@ public class DocumentImageDescriber {
                 skipped++;
                 issues.add(skipIssue(block, "该图与本文档中另一张图内容相同（imageMd5 重复），"
                         + "已复用同一份理解结果、不重复调用；这是需求 06:160 点名的去重"));
-                addIfHasContent(out, block);
+                out.set(i, withContentOrNull(block));
                 continue;
             }
-            // ---- 真调 VL ----
-            try {
-                byte[] bytes = docStorage.open(info.objectKey());
-                VisionResult result = visionDescriber.describe(new VisionDescriber.VisionInput(
-                        info.md5(), bytes, null, "image/jpeg",
-                        // ⚠️ **文档解析期传 null** —— 这里没有"用户的问题"。
-                        //    本行此前是 VisionDescriber 里那句"文档解析期传 null"的**唯一落点**，
-                        //    `T-512` 步 5 起它真的被传了（此前那条 javadoc 是承诺，不是事实）
-                        null));
-                if (!result.hasDescription()) {
-                    failed++;
-                    issues.add(ParsedDocument.DocumentIssue.missing(block.pageNo(),
-                            "第 " + block.pageNo() + " 页的图片理解未成功（VL 返回空或调用失败），"
-                                    + "该图暂以题注参与检索；请在模型配置里确认 VL 可用后重建索引",
-                            ParsedDocument.IssueKind.IMAGE_DESC_FAILED));
-                    addIfHasContent(out, block);
-                    continue;
-                }
-                described++;
-                out.add(withDescription(block, info, result));
-            } catch (RuntimeException ex) {
-                // 读字节失败（对象丢了）/ VL 抛了 —— 都**不牵连文档**，但必须留痕
+            candidates.add(new Candidate(i, block, info));
+        }
+
+        // ==================== 阶段 2 · 并行描述 ====================
+        Attempt[] attempts = describeAll(candidates);
+
+        // ==================== 阶段 3 · 组装（串行，按下标保序）====================
+        int described = 0;
+        int failed = 0;
+        for (int i = 0; i < attempts.length; i++) {
+            Attempt attempt = attempts[i];
+            if (attempt == null) {
+                // 走到这里说明**任务本身**炸了（不是"描述失败"）—— `describeOne` 从不抛。
+                // 按失败计并保留原块，绝不留一个 NPE（那会看着像代码缺陷而不是外部故障）
+                Candidate candidate = candidates.get(i);
                 failed++;
-                issues.add(ParsedDocument.DocumentIssue.missing(block.pageNo(),
-                        "第 " + block.pageNo() + " 页的图片理解失败：" + ex.getMessage()
+                issues.add(ParsedDocument.DocumentIssue.missing(candidate.block().pageNo(),
+                        "第 " + candidate.block().pageNo() + " 页的图片描述任务未能完成（内部异常），"
+                                + "该图暂以题注参与检索；请重新上传该文档",
+                        ParsedDocument.IssueKind.IMAGE_DESC_FAILED));
+                out.set(candidate.slot(), withContentOrNull(candidate.block()));
+                continue;
+            }
+            if (attempt.failure() != null) {
+                failed++;
+                issues.add(ParsedDocument.DocumentIssue.missing(attempt.block().pageNo(),
+                        "第 " + attempt.block().pageNo() + " 页的图片理解失败：" + attempt.failure()
                                 + "；该图暂以题注参与检索，请重新上传该文档",
                         ParsedDocument.IssueKind.IMAGE_DESC_FAILED));
-                addIfHasContent(out, block);
+                out.set(attempt.slot(), withContentOrNull(attempt.block()));
+            } else {
+                described++;
+                out.set(attempt.slot(),
+                        withDescription(attempt.block(), attempt.info(), attempt.result()));
             }
         }
 
-        log.info("图片描述完成：考虑={} 成功={} 跳过={} 失败={}",
-                described + skipped + failed, described, skipped, failed);
-        return new Result(List.copyOf(out), described, skipped, failed, List.copyOf(issues));
+        List<Block> kept = out.stream().filter(java.util.Objects::nonNull).toList();
+        log.info("图片描述完成：考虑={} 成功={} 跳过={} 失败={} 并发上限={}",
+                described + skipped + failed, described, skipped, failed, concurrency);
+        return new Result(kept, described, skipped, failed, List.copyOf(issues));
     }
 
-    /** 把描述拼进块内容：**题注在前、描述在后**（需求 `06:158` 的"题注优先级更高"）。 */
+    /**
+     * 并发描述，**结果与入参等长同序**（某个下标为 {@code null} = 该任务本身炸了）。
+     *
+     * <h3>为什么不用 {@code VisionDescriber#describeAll}</h3>
+     * <p>它的契约是"返回列表与输入**等长同序**"，而本类要做的是**去重之后张数变少**
+     * —— 两个语义对不上。而且它内部不设并发上限（聊天侧最多 3 张，不需要）。
+     * 所以这里自己编排，只复用它**每一张**的描述逻辑（{@link VisionDescriber#describe}）。
+     *
+     * <h3>并发上限为什么必须给</h3>
+     * <p>端点是**外部付费云服务**。实测它真并行（并发 8 时吞吐 **11.3 次/分**，
+     * 而串行只有 0.5 —— 见 {@code VisionConcurrencyProbeTest}），
+     * 但**没有上限的并发**会同时打爆速率限制与账单。上限做成配置（{@link #concurrency}）。
+     *
+     * <h3>为什么用数组收集结果，而不是 {@code List}</h3>
+     * <p>{@code ArrayList.set} 在多线程下**不是**线程安全的，包一层
+     * {@code Collections.synchronizedList} 又要额外加锁。数组的**引用写入是原子的**，
+     * 且每个任务只写自己的下标；{@code Future.get()} 提供 happens-before，
+     * 所以汇总时能看见全部写入。
+     */
+    private Attempt[] describeAll(List<Candidate> candidates) {
+        Attempt[] attempts = new Attempt[candidates.size()];
+        if (candidates.isEmpty()) {
+            return attempts;
+        }
+        if (candidates.size() == 1) {
+            // 单张不起线程：启一个虚拟线程比干活还贵，而单张是**最常见**的情形
+            attempts[0] = describeOne(candidates.getFirst());
+            return attempts;
+        }
+        Semaphore permits = new Semaphore(Math.max(1, concurrency));
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<?>> futures = new ArrayList<>(candidates.size());
+            for (int i = 0; i < candidates.size(); i++) {
+                int slot = i;
+                Candidate candidate = candidates.get(i);
+                futures.add(pool.submit(() -> {
+                    try {
+                        permits.acquire();
+                        try {
+                            attempts[slot] = describeOne(candidate);
+                        } finally {
+                            permits.release();
+                        }
+                    } catch (InterruptedException ex) {
+                        // 中断 = 服务在停。补一个"失败"而不是留 null ——
+                        // null 会在阶段 3 走"任务炸了"那条路，而那描述的**不是**这里发生的事
+                        Thread.currentThread().interrupt();
+                        attempts[slot] = Attempt.failed(candidate, "描述被中断（服务正在停止）");
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> future : futures) {
+                awaitQuietly(future);
+            }
+        }
+        return attempts;
+    }
+
+    /** 等一个并行任务。**不抛**：`describeOne` 已经把失败折成结果，这里只兜"任务本身炸了"。 */
+    private static void awaitQuietly(Future<?> future) {
+        try {
+            future.get();
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ex) {
+            // 阶段 3 会按"attempts[i] == null"兜底，所以这里只留痕
+            log.warn("图片描述任务异常（该图会退回题注）：{}", ex.getMessage());
+        }
+    }
+
+    /** 描述一张图。**绝不抛** —— 任何失败都折成 {@link Attempt#failure()}。 */
+    private Attempt describeOne(Candidate candidate) {
+        ImageInfo info = candidate.info();
+        try {
+            byte[] bytes = docStorage.open(info.objectKey());
+            VisionResult result = visionDescriber.describe(new VisionDescriber.VisionInput(
+                    info.md5(), bytes, null, "image/jpeg",
+                    // ⚠️ **文档解析期传 null** —— 这里没有"用户的问题"。
+                    //    本行此前是 VisionDescriber 里那句"文档解析期传 null"的**唯一落点**，
+                    //    `T-512` 步 5 起它真的被传了（此前那条 javadoc 是承诺，不是事实）
+                    null));
+            return result.hasDescription()
+                    ? new Attempt(candidate.slot(), candidate.block(), info, result, null)
+                    : Attempt.failed(candidate, "VL 返回空或调用失败");
+        } catch (RuntimeException ex) {
+            // 读字节失败（对象丢了）/ VL 抛了 —— 都**不牵连文档**，但必须留痕
+            return Attempt.failed(candidate, ex.getMessage());
+        }
+    }
+
+    /**
+     * 把描述拼进块内容：**题注在前、描述在后**（需求 `06:158` 的"题注优先级更高"）。
+     */
     private static Block withDescription(Block block, ImageInfo info, VisionResult result) {
         String content = info.hasCaption()
                 ? info.caption() + "\n" + result.desc()
@@ -201,7 +328,7 @@ public class DocumentImageDescriber {
     }
 
     /**
-     * 内容为空的图片块**不进结果**。
+     * 内容为空的图片块返回 {@code null}（由调用方剔除）。
      *
      * <p>空 `rawContent` 的 `IMAGE` 块会被 {@code ChunkViews.IMAGE_DESC} 投影成空串，
      * 而空串会被**嵌进向量**（`ChunkVectorizer` 只按"该不该进池"筛，不按"文本空不空"）——
@@ -209,9 +336,19 @@ public class DocumentImageDescriber {
      * `ChunkingService` 已经在源头拦了一道（没字节又没题注的不产出块），
      * 这里是第二道：**描述失败/被跳过之后**才变空的那些。
      */
-    private static void addIfHasContent(List<Block> out, Block block) {
-        if (block.rawContent() != null && !block.rawContent().isBlank()) {
-            out.add(block);
+    private static Block withContentOrNull(Block block) {
+        return block.rawContent() != null && !block.rawContent().isBlank() ? block : null;
+    }
+
+    /** 待描述的一张图：它在结果里的**下标**、原块、以及图片身份。 */
+    private record Candidate(int slot, Block block, ImageInfo info) {
+    }
+
+    /** 一次描述尝试。{@code failure != null} ⇒ 失败（`result` 为 {@code null}）。 */
+    private record Attempt(int slot, Block block, ImageInfo info, VisionResult result, String failure) {
+
+        static Attempt failed(Candidate candidate, String reason) {
+            return new Attempt(candidate.slot(), candidate.block(), candidate.info(), null, reason);
         }
     }
 
