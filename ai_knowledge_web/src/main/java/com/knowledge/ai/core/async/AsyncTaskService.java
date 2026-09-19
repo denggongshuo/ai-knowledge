@@ -61,14 +61,27 @@ public class AsyncTaskService {
 
     private final SysAsyncTaskRepository repository;
 
+    /**
+     * 通知的唯一产出点（`T-B03`）。
+     *
+     * <p><b>🔴 为什么它由本类持有、而不是挂在 {@link SysAsyncTaskRepository#markDone} 上</b>：
+     * 终态写入有两条路（内存命中走 {@link TaskContext}，库回退直达 repository），
+     * 交汇点上**拿不到 `result`**（那列不持久化），而 {@code audit-export} 的通知要靠
+     * `result.fileUrl` 才有可点的动作。⇒ 生成点必须在"手里还攥着 result"的这一层。
+     * 全文与代价见 {@link com.knowledge.ai.core.notice.NoticePublisher} 的 javadoc。
+     */
+    private final com.knowledge.ai.core.notice.NoticePublisher noticePublisher;
+
     private final Map<String, AsyncTaskInfo<Object>> registry = new ConcurrentHashMap<>();
 
     /** 幂等键 → taskId。仅在任务未结束时保留。 */
     private final Map<String, String> idempotencyIndex = new ConcurrentHashMap<>();
 
-    public AsyncTaskService(@Qualifier("taskExecutor") Executor executor, SysAsyncTaskRepository repository) {
+    public AsyncTaskService(@Qualifier("taskExecutor") Executor executor, SysAsyncTaskRepository repository,
+                            com.knowledge.ai.core.notice.NoticePublisher noticePublisher) {
         this.executor = executor;
         this.repository = repository;
+        this.noticePublisher = noticePublisher;
     }
 
     /**
@@ -161,7 +174,7 @@ public class AsyncTaskService {
         // 落库：与业务行**同一个事务**（提交方在事务里时），故必须等提交后才真正投递
         repository.insert(info, subject.kbId(), subject.docId(), subject.ownerId(), idempotencyKey);
 
-        TaskContext context = new TaskContext(info, repository);
+        TaskContext context = new TaskContext(info, repository, noticePublisher);
         String submitterTraceId = info.getTraceId();
         executor.execute(() -> run(type, taskId, submitterTraceId, work, context));
 
@@ -297,20 +310,27 @@ public class AsyncTaskService {
         AsyncTaskInfo<Object> info = registry.get(taskId);
         if (info != null) {
             // 复用 TaskContext 的终态语义（stage 覆写成"已完成"、finishedAt 落上）
-            new TaskContext(info, repository).complete(null);
+            new TaskContext(info, repository, noticePublisher).complete(null);
             return;
         }
         repository.markDone(taskId, chunkDone, chunkTotal);
+        // ⚠️ **库回退分支（路径②）也要发通知** —— 这一支恰恰是"重启后由 worker 领走"的
+        // 那些任务，也就是**耗时最长、用户最需要被告知**的那一类。少接这一条，
+        // 长任务会安静地跑完而没有任何通知，且现象很难被注意到。
+        // 代价：这一支**没有 result**（领取方不持有它），只能发不带结果的动作 —— 见 NoticePublisher。
+        noticePublisher.onTaskDone(taskId, null);
     }
 
     /** 领取方回报**终态失败**（不可重试 / 已耗尽重试）。 */
     public void reportFailed(String taskId, String reason) {
         AsyncTaskInfo<Object> info = registry.get(taskId);
         if (info != null) {
-            new TaskContext(info, repository).fail(new IllegalStateException(reason));
+            new TaskContext(info, repository, noticePublisher).fail(new IllegalStateException(reason));
             return;
         }
         repository.markFailed(taskId, reason);
+        // 同上：库回退分支也要发（失败更需要被告知 —— 那是"任务中断"类告警）
+        noticePublisher.onTaskFailed(taskId, reason);
     }
 
     /**
@@ -386,11 +406,16 @@ public class AsyncTaskService {
 
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
 
+        /** 终态时发通知（`T-B03`）。**只有这一条产出路径** —— 别在业务里另写。 */
+        private final com.knowledge.ai.core.notice.NoticePublisher publisher;
+
         private volatile boolean finished;
 
-        TaskContext(AsyncTaskInfo<Object> info, SysAsyncTaskRepository repository) {
+        TaskContext(AsyncTaskInfo<Object> info, SysAsyncTaskRepository repository,
+                    com.knowledge.ai.core.notice.NoticePublisher publisher) {
             this.info = info;
             this.repository = repository;
+            this.publisher = publisher;
         }
 
         public String taskId() {
@@ -463,6 +488,10 @@ public class AsyncTaskService {
             info.setFinishedAt(LocalDateTime.now());
             info.setStage("已完成");
             persistTerminal();
+            // 通知在**终态落库之后**发：先让"这事做完了"成为事实，再说"告诉谁"。
+            // ⚠️ 传 result —— 这一层是唯一还拿得到它的地方（见 NoticePublisher 的 javadoc）。
+            // 发布失败只记 warn，绝不回滚终态（publisher 内部已包住）。
+            publisher.onTaskDone(info.getTaskId(), result);
         }
 
         /** 任务失败结束。 */
@@ -477,6 +506,7 @@ public class AsyncTaskService {
             String message = error.getMessage();
             info.setErrorMsg(message == null || message.isBlank() ? error.getClass().getSimpleName() : message);
             persistTerminal();
+            publisher.onTaskFailed(info.getTaskId(), info.getErrorMsg());
         }
 
         /**
