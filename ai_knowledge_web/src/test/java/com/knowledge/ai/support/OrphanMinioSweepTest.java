@@ -1,8 +1,11 @@
 package com.knowledge.ai.support;
 
+import com.knowledge.ai.core.async.AsyncTaskInfo;
+import com.knowledge.ai.core.async.AsyncTaskService;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
 import org.junit.jupiter.api.AfterEach;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -126,6 +129,115 @@ class OrphanMinioSweepTest extends ApiTestSupport {
 
         jdbc.update("update sys_user set avatar = null where id = ?", userId);
     }
+
+    // ==================================================================
+    // T-O11 —— `audit-export/`：**唯一一个归属不在列里的前缀**
+    // ==================================================================
+
+    @Test
+    @DisplayName("T-O11 判据 1/2：`audit-export/` 的归属**在对象名里** —— 账号在就留、账号硬删了才删")
+    void auditExportOwnerComesFromTheObjectPath() throws Exception {
+        // ① 探针账号 —— 它收尾会被 `cleanUsers` **硬删**，正属"归属真的会消失"那一类
+        TestUser probe = createUser("o11.export");
+        Long probeId = jdbc.queryForObject(
+                "select id from sys_user where username = ?", Long.class, probe.username());
+        assertThat(probeId).as("探针账号必须真的建出来了，否则本判据测的是空气").isNotNull();
+
+        // ② 种子超管 —— 他的行**永远在**（`AuditQueryFlowTest` 的真导出人就是他）
+        Long adminId = jdbc.queryForObject(
+                "select id from sys_user where username = ?", Long.class, ADMIN);
+        assertThat(adminId).as("种子超管必须在 —— 这是负向锚的另一半").isNotNull();
+
+        String probeOrphan = put(ProbeCleanup.AUDIT_EXPORT_PREFIX + probeId + "/20260919T120000-audit.csv");
+        String adminKept = put(ProbeCleanup.AUDIT_EXPORT_PREFIX + adminId + "/20260919T120000-audit.csv");
+
+        // ③ **差分**：唯一变量是"那个账号的行还在不在"
+        deleteUser(probe.username());
+        assertThat(jdbc.queryForObject(
+                "select count(*) from sys_user where id = ?", Integer.class, probeId))
+                .as("探针账号必须真被硬删了 —— 否则这条差分退化成'两个都有主'，测不出东西")
+                .isZero();
+
+        ProbeCleanup.sweepOrphanMinioObjects(minioClient, minioBucket, jdbc, Duration.ZERO);
+
+        assertThat(exists(probeOrphan))
+                .as("账号行没了 ⇒ 无主 ⇒ 必须删。⚠️ 它没有归属**列**，"
+                        + "`documents/` 那套「查 sys_document.storage_path」的问法对它一个字都用不上 —— "
+                        + "判的是**对象名第 2 段**")
+                .isFalse();
+        assertThat(exists(adminKept))
+                .as("🔴 **负向锚（本判据的重点）**：种子超管还在 ⇒ 他的导出一根毫毛都不能碰。"
+                        + "两个对象同龄、同前缀、同结构 —— 差异只有一个：账号行还在不在。"
+                        + "删错一个就是**删掉真实用户的审计导出**")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("T-O11 判据 5：**对象名 ↔ 解析器对得上** —— 真导出产出的 key 必须解析得出导出人")
+    void realExportKeyIsResolvableToItsOwner() throws Exception {
+        String token = loginAsAdmin().data("$.accessToken");
+        Long adminId = jdbc.queryForObject(
+                "select id from sys_user where username = ?", Long.class, ADMIN);
+        String today = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+
+        RawResponse accepted = post("/api/audit/export",
+                java.util.Map.of("startTime", today, "endTime", today), token).assertOk("提交导出");
+        String taskId = accepted.data("$.taskId");
+        assertThat(taskId).isNotBlank();
+
+        // 等任务**真跑完** —— 只断言"接口返回了 taskId"是不够的：任务体里查库 / 生成 CSV /
+        // 写 MinIO 任一步挂了，接口照样返回 taskId（`AuditQueryFlowTest` 判据 11/12 的原话）
+        AsyncTaskInfo<?> info = awaitTerminal(taskId);
+        String objectKey = String.valueOf(((java.util.Map<?, ?>) info.getResult()).get("objectKey"));
+        mine.add(objectKey);        // 自己删（兜底是兜底，不该被用例当成清理手段）
+        jdbc.update("delete from sys_async_task where task_id = ?", taskId);
+
+        assertThat(ProbeCleanup.pathOwnerId(ProbeCleanup.AUDIT_EXPORT_PREFIX, objectKey))
+                .as("🔴 **这是防「路径约定漂移」的机器检查，不是重复断言**："
+                        + "`AuditExportService#store` 一旦改了对象名格式，兜底会**静默失效** —— "
+                        + "它扫不到任何'有主'的对象，于是把**真实导出当无主删掉**。"
+                        + "所以必须拿**真产出的 key** 去喂解析器；拿一个手拼的样例喂它只能证明"
+                        + "'我拼的那个能被解析'，证明不了生产写的那个能被解析")
+                .isEqualTo(adminId);
+    }
+
+    /**
+     * **冻结清单**：系统目前会往桶里写这些前缀。
+     *
+     * <p>新增一个就改这里 —— 强制"**过一次人的判断**"：进 `ProbeCleanup` 的覆盖集（并写明归属列/归属来源），
+     * 还是登记成豁免（并写明理由）。手法与 `AuditCoverageFlowTest#expectedActions()` 的 25 条一致：
+     * **逐条写死，防的是"扫描式断言对漏挂是盲的"**。
+     */
+    private static final java.util.Set<String> FROZEN_MINIO_PREFIXES = java.util.Set.of(
+            "documents/", "parsed/", "chat-attachments/", "avatars/", "images/", "audit-export/");
+
+    @Test
+    @DisplayName("T-O11 判据 6：六个前缀**逐个表态** —— 覆盖集必须与冻结清单完全相等")
+    void everyKnownPrefixIsClassified() {
+        assertThat(ProbeCleanup.coveredMinioPrefixes())
+                .as("🔴 本仓「新增持久化产物必须同步登记」这条约定**只靠 javadoc 已经被抓过两次**："
+                        + "加 `images/` 时漏登记 ⇒ 一轮跑批在桶里留 180 个孤儿；"
+                        + "`audit-export/` 更久（从 `O10` 到 `T-O11` 一直不在清单里，实测攒到 137 个）。"
+                        + "冻结清单 + 这条断言就是那个**机器检查** —— 新前缀必须先过一次人的判断，"
+                        + "而不是靠下一个人恰好想起来还有这么一类")
+                .containsExactlyInAnyOrderElementsOf(FROZEN_MINIO_PREFIXES);
+    }
+
+    /** 等异步任务到终态（超时**判红**，不静默返回）。 */
+    private AsyncTaskInfo<?> awaitTerminal(String taskId) throws Exception {
+        long deadline = System.currentTimeMillis() + 20_000;
+        while (System.currentTimeMillis() < deadline) {
+            AsyncTaskInfo<?> info = asyncTaskService.find(taskId).orElse(null);
+            if (info != null && info.getStatus().terminal()) {
+                return info;
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("导出任务未在 20s 内到达终态：" + taskId);
+    }
+
+    @Autowired
+    private AsyncTaskService asyncTaskService;
 
     // ==================================================================
     // 工具

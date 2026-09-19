@@ -125,8 +125,19 @@ public final class ProbeArtifacts {
      *       / {@code ChatAttachmentFlowTest} 各写一遍 `removeObject`）。
      *       ⚠️ 这正是 `#130` 判定会漏的那个形状（"每个类自己清"已被证明漏过 76 行/轮）。
      *       **本批只把它摆到明面上，没有补兜底** —— 补它要一个 Java 侧的 MinIO 列举能力，
-     *       而那是独立的一块（登记在计划 §9）。</li>
+     *       而那是独立的一块（登记在计划 §9）。<br>
+     *       （`T-O10` 补上了那个能力，`T-O11` 又把它扩到第六个前缀 —— 见下。）</li>
      * </ul>
+     *
+     * <h3>MinIO 前缀的登记在别处（`T-O11` 补的指针）</h3>
+     * <p>上面这一组的对账口径是**脚本侧的非表产物**。而后缀"到底有几个、各自归属从哪来"
+     * 登记在 {@link ProbeCleanup#coveredMinioPrefixes()}（六个），
+     * 并有**冻结清单 + 机器检查**兜着它：
+     * {@code OrphanMinioSweepTest#everyKnownPrefixIsClassified}。
+     * ⚠️ 那条机器检查是 `T-O11` 补的，因为"只写 javadoc 提醒"**已经被抓过两次**
+     * （加 {@code images/} 时漏登记 ⇒ 一轮跑批留 180 个孤儿；{@code audit-export/}
+     * 则从 `O10` 到 `T-O11` 一直不在清单里，实测攒到 137 个）。
+     * **新增一个会往桶里写的前缀时，先看那里。**
      */
     public static final Set<String> NON_TABLE = Set.of(
             "minio:storage_path", "minio:parse_path",

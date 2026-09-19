@@ -164,6 +164,47 @@ public final class ProbeCleanup {
     }
 
     /**
+     * **无主打点明细兜底**（`#210` · `2026-09-19` 测试可靠性批）。
+     *
+     * <h3>它抓的是什么</h3>
+     * <p>{@code sys_retrieval_trace_chunk} 里 {@code trace_id} 指向一个**不存在**的
+     * {@code sys_retrieval_trace} 行。实测基线里躺过 **110 行**这种行（父表 0 行，
+     * 而那张表的 AUTO_INCREMENT 已经是 371）。
+     *
+     * <h3>为什么会有 —— 根因有代码证据，不是猜的</h3>
+     * <p>{@code RetrievalTraceWriter#write} 在**同一个 {@code REQUIRES_NEW} 事务**里
+     * 先 insert 主表、后 insert 明细；而用例收尾的两条 DELETE **跨在这个事务的提交窗口两侧**：
+     * <pre>
+     *   worker:      BEGIN → insert trace(T) → insert chunks(T) → COMMIT
+     *   用例收尾:  ① DELETE chunks WHERE trace_id IN (SELECT … 已提交的 …)   ← 看不见 T ⇒ 删 0 行
+     *              ┊  ← worker 在这里 COMMIT（主行与明细**一起**可见）
+     *              ② DELETE trace WHERE session_id &gt; floor                  ← 这次看得见 ⇒ 主行被删
+     *   ⇒ 明细留下、主行没了 = 孤儿
+     * </pre>
+     * ⚠️ **窗口只有"两条 DELETE 之间"那一段** ⇒ 它难复现：实测**单独反复跑
+     * {@code ChatStreamingFlowTest} 3 轮，每轮后孤儿都是 0**。
+     * 所以这条兜底不是"修好了那个竞态"，而是**让竞态的代价从"永久累积"变成"多一次 DELETE"**。
+     *
+     * <h3>为什么只能靠它（这张表的特殊性）</h3>
+     * <p>它**既没有 {@code user_id} 也没有 {@code kb_id}** —— 一旦成了孤儿，
+     * **没有任何归属维度能认领它**，`sweepOrphanKbArtifacts` 与 `cleanUsers` 结构上都够不着。
+     * 能问的只剩"**与归属无关的那个观测点**"：主行还在不在。
+     *
+     * <h3>🔴 它不会误删在途数据 —— 这句话必须写下来</h3>
+     * <p>`write()` 是**先主后明细、且同一个事务**（见 {@code RetrievalTraceWriter} 的 INSERT 顺序）
+     * ⇒ 不存在"明细已可见、主行还没可见"的中间态：要么两者都不可见，要么**一起**可见。
+     * 所以"明细在、主行不在"只可能是**已经被删过**的那一半。
+     * ⚠️ **若哪天有人把 `write()` 改成两个事务、或先写明细**，这条兜底立刻变成
+     * **会删在途数据**的机制 —— 改那里的人必须回来读这一段。
+     *
+     * @return 删掉的行数。**&gt; 0 是信号**，不是正常现象 —— 说明竞态真的发生了
+     */
+    public static int sweepOrphanTraceChunks(JdbcTemplate jdbc) {
+        return jdbc.update("delete from sys_retrieval_trace_chunk "
+                + "where trace_id not in (select trace_id from sys_retrieval_trace)");
+    }
+
+    /**
      * **按日期**清模型用量（`T-905` · `S6-M09-B` 新增）—— 清**当天**那一格到今天为止。
      *
      * <h3>为什么是"按日期"而不是"按归属"</h3>
@@ -234,8 +275,23 @@ public final class ProbeCleanup {
      * 这一次是"观测工具与被观测对象不是同一个"。）
      *
      * <h3>边界（写下来，免得下一个人以为它管全桶）</h3>
-     * <p><b>只覆盖"有归属列的前缀"。</b>没有归属列的对象**结构上判不了无主** ——
-     * `audit-export/` 就是（`#78` 已登记：它没有归属列）。
+     * <p>🔴 **`T-O11` 订正了旧版这里的一句话。** 旧版写的是：
+     * 「没有归属列的对象**结构上判不了无主** —— `audit-export/` 就是」。
+     * **对了一半** —— 它确实没有归属**列**，但归属**在对象名的路径里**
+     * ⇒ 它现在**进了清单**（见 {@link Owner#PATH_USER_ID}）。
+     *
+     * <p>⚠️ **但那条判据的射程必须说清，否则下一个人会以为它管全了**：
+     * `PATH_USER_ID` 判的是「**那个账号的行还在不在**」。于是：
+     * <ul>
+     *   <li>✅ **探针账号**（{@code ApiTestSupport#createUser} 造的，收尾走 {@link #cleanUsers}
+     *       的**硬删**）—— 它们留下的导出对象会被扫到；</li>
+     *   <li>🔴 **种子超管 `admin`** —— 他才是 {@code AuditQueryFlowTest} 的真实导出人，
+     *       而他的行**永远在** ⇒ **兜底对他产出的残留一个字都做不了**。</li>
+     * </ul>
+     * ⇒ 那一半**只能靠造它的用例自己清**（{@code AuditQueryFlowTest#cleanExportTasks}）。
+     * **两条合起来才叫覆盖**：兜底管"归属真的消失了"，用例管"归属还在、但产物是测试造的"。
+     * 这与 `#187` 的结论是同一句 —— **不为一条不存在的流程写代码**：所以这里**没有、也不该有**
+     * 一条"按时间清 `admin` 的导出"的判据，那会**删掉真实用户的导出**。
      *
      * <p><b>调用点只在 {@code ApiTestSupport}</b>，`RetrievalFlowSupport` **刻意没加** ——
      * 那个基座的用例全是**直接插库造数据**（`insertDocWithChunks` 之类），**不往桶里写对象**，
@@ -250,10 +306,8 @@ public final class ProbeCleanup {
                                              JdbcTemplate jdbc, java.time.Duration minAge) {
         java.time.Instant cutoff = java.time.Instant.now().minus(minAge);
         int removed = 0;
-        for (String[] prefix : MINIO_PREFIXES) {
-            String objectPrefix = prefix[0];
-            String table = prefix[1];
-            String column = prefix[2];
+        for (MinioPrefix prefix : MINIO_PREFIXES) {
+            String objectPrefix = prefix.prefix();
             try {
                 for (io.minio.Result<io.minio.messages.Item> result : minioClient.listObjects(
                         io.minio.ListObjectsArgs.builder()
@@ -263,10 +317,12 @@ public final class ProbeCleanup {
                     if (item.lastModified().toInstant().isAfter(cutoff)) {
                         continue;
                     }
-                    Integer rows = jdbc.queryForObject(
-                            "select count(*) from " + table + " where " + column + " = ?",
-                            Integer.class, item.objectName());
-                    if (rows != null && rows > 0) {
+                    Boolean owned = hasOwner(prefix, item.objectName(), jdbc);
+                    if (owned == null) {
+                        // **判不了就别动它** —— 与"猜一个 chunkId"同一条口径：删错比少删严重得多
+                        continue;
+                    }
+                    if (owned) {
                         continue;       // 有主，活着
                     }
                     minioClient.removeObject(io.minio.RemoveObjectArgs.builder()
@@ -282,28 +338,132 @@ public final class ProbeCleanup {
         return removed;
     }
 
+    /**
+     * 这个对象**有没有主**。
+     *
+     * @return {@code true} = 有主（保留）· {@code false} = 无主（可删）·
+     *         🔴 {@code null} = **判不了**（调用方必须保留 + 留痕，不许当成"无主"）
+     */
+    private static Boolean hasOwner(MinioPrefix prefix, String objectName, JdbcTemplate jdbc) {
+        if (prefix.owner() == Owner.PATH_USER_ID) {
+            Long userId = pathOwnerId(prefix.prefix(), objectName);
+            if (userId == null) {
+                log.warn("对象名解析不出归属人（**跳过不删**，可能对象名格式变了）：{}", objectName);
+                return null;
+            }
+            // ⚠️ 判据是「**行在不在**」，**刻意不带 `deleted_at is null`**：
+            //    `sys_user` 是**软删**（本仓 `#187` 追根时查实过），而软删的用户随时可能被恢复，
+            //    他的审计导出仍然是他的；更关键的是**审计产物本身是合规材料**，
+            //    不该因为账号停用就被兜底清掉。⇒ 只有**硬删**（行真没了）才算无主。
+            Integer rows = jdbc.queryForObject(
+                    "select count(*) from sys_user where id = ?", Integer.class, userId);
+            return rows != null && rows > 0;
+        }
+        Integer rows = jdbc.queryForObject(
+                "select count(*) from " + prefix.table() + " where " + prefix.column() + " = ?",
+                Integer.class, objectName);
+        return rows != null && rows > 0;
+    }
+
     /** 默认下限：10 分钟。取值理由见 {@link #sweepOrphanMinioObjects} —— 只要盖过"上传中"那一窗口即可。 */
     public static final java.time.Duration DEFAULT_MIN_AGE = java.time.Duration.ofMinutes(10);
 
     /**
-     * 四个前缀 → **归属列**。表名/列名都是**编译期常量**（不是用户输入），所以拼进 SQL 没有注入面。
+     * **归属从哪来**（`T-O11` 把前缀登记从"三元组"升级成"带来源的两类"）。
      *
-     * <p>⚠️ 新增一个"系统产出的对象前缀"时，**必须在这里加一行**，否则它**结构上不在兜底的输入里**
-     * —— 那正是 `#149` 记的"闸覆盖了一类产物、另一类不在输入里"那个形态。
+     * <p>为什么需要这个区分：`O10` 的 javadoc 当时写着「没有归属列的对象**结构上判不了无主**」，
+     * 而 `audit-export/` 被判进了那一类。**查完之后那句话对了一半** ——
+     * 它确实没有归属**列**，但归属**在对象名的路径里**（见 {@link #PATH_OWNER}）。
      */
-    private static final String[][] MINIO_PREFIXES = {
-            {"documents/", "sys_document", "storage_path"},
-            {"parsed/", "sys_document", "parse_path"},
-            {"chat-attachments/", "sys_chat_attachment", "object_key"},
-            {"avatars/", "sys_user", "avatar"},
+    private enum Owner {
+        /** 归属是**库里的列** —— 判据 `select count(*) from {表} where {列} = 对象名`。 */
+        COLUMN,
+        /**
+         * 归属是**对象名路径的第 2 段**（`audit-export/{userId}/…`）。
+         *
+         * <h4>为什么只能这样（`AuditExportService` 查出来的事实）</h4>
+         * <p>它的对象名由 {@code AuditExportService#store} 拼成
+         * {@code audit-export/{userId}/{时间戳}-audit.csv} —— **归属写进了路径**。
+         * 而库里**没有任何一列**指向这个对象：{@code objectKey} 只活在任务体的
+         * {@code payload} 里，而 {@code SysAsyncTaskRepository#find} 明写
+         * 「⚠️ {@code result} **不持久化**」⇒ **任务一结束，全库就再没有它的落点**。
+         * 所以「加一列」不是顺手加一列（要动 `AsyncTaskService` 的序列化契约 + 迁移），
+         * 而**路径第 2 段是唯一还活着的归属信息**。
+         */
+        PATH_USER_ID,
+    }
+
+    /**
+     * 一个受管前缀。
+     *
+     * <p>表名/列名都是**编译期常量**（不是用户输入），所以拼进 SQL 没有注入面。
+     *
+     * @param table  {@link Owner#COLUMN} 用归属表；{@link Owner#PATH_USER_ID} 固定 {@code sys_user}
+     * @param column {@link Owner#COLUMN} 用归属列；{@link Owner#PATH_USER_ID} 固定 {@code id}
+     */
+    private record MinioPrefix(String prefix, Owner owner, String table, String column) {
+    }
+
+    /** `audit-export/` 的前缀常量（`AuditExportService#store` 用的是同一个字面量，见 {@code 判据 5} 的机器检查）。 */
+    public static final String AUDIT_EXPORT_PREFIX = "audit-export/";
+
+    /**
+     * **受管前缀清单**。⚠️ 新增一个"系统产出的对象前缀"时，**必须在这里加一行**，
+     * 否则它**结构上不在兜底的输入里** —— 那正是 `#149` 记的"闸覆盖了一类产物、
+     * 另一类不在输入里"那个形态。
+     *
+     * <p>🔴 **只写 javadoc 拦不住**（本仓已复现：加 `images/` 时漏了那一行 ⇒ 一轮跑批留 **180 个孤儿**；
+     * 而 `audit-export/` 更久 —— 从 `O10` 到 `T-O11` 一直不在清单里，实测攒到 **137 个**）。
+     * ⇒ 现在有一条**机器检查**兜着它：见 {@code OrphanMinioSweepTest#everyKnownPrefixIsClassified}。
+     */
+    private static final List<MinioPrefix> MINIO_PREFIXES = List.of(
+            new MinioPrefix("documents/", Owner.COLUMN, "sys_document", "storage_path"),
+            new MinioPrefix("parsed/", Owner.COLUMN, "sys_document", "parse_path"),
+            new MinioPrefix("chat-attachments/", Owner.COLUMN, "sys_chat_attachment", "object_key"),
+            new MinioPrefix("avatars/", Owner.COLUMN, "sys_user", "avatar"),
             // `T-512` 步 2b 新增的第五个前缀 —— 图片块的原图。
-            // ⚠️ 上面那句 javadoc 说的"新增前缀必须在这里加一行"，**本批真的被抓了一次**：
-            //    加 `images/` 时漏了这一行，于是那一轮全量跑批在桶里留了 **180 个孤儿**
-            //    （对照 `documents/` 是 0 —— 因为它在清单里）。
-            //    归属列取 `sys_chunk.object_key`（图片块那一行），不是 `sys_document`：
-            //    图是**块级**产物，一篇文档删了但块还在的情况是存在的。
-            {"images/", "sys_chunk", "object_key"},
-    };
+            // 归属列取 `sys_chunk.object_key`（图片块那一行），不是 `sys_document`：
+            // 图是**块级**产物，一篇文档删了但块还在的情况是存在的。
+            new MinioPrefix("images/", Owner.COLUMN, "sys_chunk", "object_key"),
+            // `T-O11` 新增的第六个 —— 也是**唯一一个归属不在列里**的（见 Owner#PATH_USER_ID）。
+            new MinioPrefix(AUDIT_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"));
+
+    /**
+     * 兜底**覆盖了哪些前缀**（供机器检查比对，见 {@code OrphanMinioSweepTest}）。
+     *
+     * <p>⚠️ 它只暴露 `prefix`，不暴露归属列 —— 用例要断言的是"**这个前缀有没有被表态**"，
+     * 不是"它归属列叫什么"。前者是漏项的防线，后者会把实现细节冻进用例。
+     */
+    public static List<String> coveredMinioPrefixes() {
+        return MINIO_PREFIXES.stream().map(MinioPrefix::prefix).toList();
+    }
+
+    /**
+     * 从对象名里取**归属人 id**（只对 {@link Owner#PATH_USER_ID} 的前缀有意义）。
+     *
+     * <p>`audit-export/{userId}/{时间戳}-audit.csv` → 取第 2 段并转数字。
+     *
+     * <p>⚠️ 解析不出来返回 {@code null}，调用方**跳过不删** ——
+     * 这与 {@code RetrievalTraceWriter#numericId} 是同一条口径：**不猜**。
+     * 猜一个 id 出来的后果是**删错人的东西**，比少删一个严重得多。
+     *
+     * <p>包级可见是**故意的**：`OrphanMinioSweepTest` 要用它做「对象名 ↔ 解析器对得上」的机器检查。
+     */
+    static Long pathOwnerId(String prefix, String objectName) {
+        if (objectName == null || !objectName.startsWith(prefix)) {
+            return null;
+        }
+        String rest = objectName.substring(prefix.length());
+        int slash = rest.indexOf('/');
+        if (slash <= 0) {
+            return null;
+        }
+        try {
+            return Long.valueOf(rest.substring(0, slash));
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
 
     private static String placeholders(int count) {
         return java.util.stream.IntStream.range(0, count)

@@ -185,6 +185,16 @@ public abstract class ApiTestSupport {
             // **> 0 是信号，不是正常现象** —— 说明有类漏清了（与 kb 族那条同源）
             log.warn("[探针兜底] 删掉 {} 个无主 MinIO 对象 —— 有类漏清了，请补它的收尾", orphanObjects);
         }
+        // `#210`：**打点明细的兜底**。它与上面三条的处境不同 —— 那张表**两个归属列都没有**
+        // （无 `user_id`、无 `kb_id`），成了孤儿就**没有任何维度认领得了**，
+        // 所以只能问"主行还在不在"这个**与归属无关**的观测点。
+        // ⚠️ 它抓的是"用例收尾的两条 DELETE 夹住了异步打点提交"那个竞态（难复现，实测单独跑 3 轮均为 0），
+        //    理由与"为什么不会误删在途数据"写在 `ProbeCleanup#sweepOrphanTraceChunks` 的 javadoc 里。
+        int orphanTraceChunks = ProbeCleanup.sweepOrphanTraceChunks(jdbc);
+        if (orphanTraceChunks > 0) {
+            log.warn("[探针兜底] 删掉 {} 行孤儿打点明细 —— 清理与异步写库的窗口撞上了（#210）",
+                    orphanTraceChunks);
+        }
     }
 
     /**
