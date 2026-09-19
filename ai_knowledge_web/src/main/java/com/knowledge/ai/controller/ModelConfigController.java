@@ -3,6 +3,8 @@ package com.knowledge.ai.controller;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
+import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.security.RequiresPerm;
@@ -171,5 +173,106 @@ public class ModelConfigController {
     @RequiresPerm("system:model")
     public ApiResponse<ModelConfigDtos.TestResult> test(@PathVariable("id") Long id) {
         return ApiResponse.ok(modelConfigService.test(id));
+    }
+
+    // ==================================================================
+    // T-906 / T-908 —— 「换模型」线：本版本**只保留切换**，换 + 重建如实回「不支持」
+    //
+    // 这四个端点在本版本**只为了说一句话而存在**。它们不是占位、不是待开发 ——
+    // 而是**产品口径的落地点**（用户 2026-09-19 裁定，见 `plan/2026-09-19-S6-M09-C.md`）。
+    //
+    // 🔴 为什么四个一起拒（而不是"反正 GET 是只读的，就把真数字算给它"）：
+    //   两个 `*-impact` 唯一的消费方是「换 + 重建」的确认弹窗。**返回真数字会让
+    //   「不支持」看起来像「能换」** —— 用户会一路填到勾选「我已知晓影响范围」
+    //   才撞墙，而那时他已经认真读过一遍假的耗时与 token 估算了。
+    //   「不给一条走不通的表单」比「表单填得动但提交必失败」诚实。
+    //
+    // 🔴 为什么不做（免得下一个人重新挖一遍，本仓已因此返工 6 次）：
+    //   ① **换嵌入**：跨维度换模型在当前实现下**写进去就抛** ——
+    //      `MilvusChunkWriter` 把维度写成了编译期常量（`private static final int DIMENSION
+    //      = MilvusConstants.DIMENSION`），而维度漂移的处置在
+    //      `MilvusCollectionInitializer#verifyDimension` 里写死为**人工**
+    //      `DROP COLLECTION` + 重启 + 全量重建。做通要连带 维度去常量 + 库内维度持久化列
+    //      + collection 整体重建 + **全站检索中断**（需求自己写的「旧数据不会保留」）。
+    //   ② **换 VL + 重建**：成本结构不对 —— 重建要逐张真调 VL（实测 40~60 秒/张），
+    //      而本仓**没有多篇含图文档的真实语料** ⇒ 交付了也**没人能证伪**"重建后确实更好"。
+    //   ③ 🔴 **这个入口现在没有要处理的对象** —— 《09》§1.12 把换 VL 的价值定在
+    //      「已入库文档的图片描述不会自动更新」，而库里 `sys_chunk` 全 0、
+    //      Milvus 向量数 0 ⇒ 没有一份"旧模型产的描述"存在。
+    //
+    // ⚠️ 「启用切换」（`activate`）**不在这里面** —— 它不改已入库数据，
+    //    重排切换按《09》§1.11 本就不需要重建索引，且它是已过 `G6-4` 的能力。
+    //    收紧它等于**回退一个已验收的功能**。
+    //
+    // ⚠️ 四个都**不写 `@AuditLog`**：拒绝不是"谁改了什么"，记进审计只会把真正的高危日志淹掉
+    //    （与 `test` 那条「只读探测不记审计」同一条取舍）。
+    // ==================================================================
+
+    /**
+     * {@code GET /system/model/embedding-impact} —— **本版本不支持**换嵌入模型。
+     *
+     * <p>契约形状见 `10-接口约定汇总.md` §14（`{kbCount, docCount, chunkCount, estimateMinutes,
+     * extraTokens}`）与 mock（`ai_knowledge_app/src/mock/index.ts:1428`）。本版本**刻意不返回
+     * 那五个数**，理由见本段上方注释。
+     */
+    @GetMapping("/embedding-impact")
+    @RequiresPerm("system:model")
+    public ApiResponse<Void> embeddingImpact() {
+        throw unsupportedEmbeddingSwitch();
+    }
+
+    /**
+     * {@code POST /system/model/change-embedding} —— **本版本不支持**换嵌入模型。
+     *
+     * <p>⚠️ **刻意不声明 `@RequestBody`**：请求体（`{model, dimension, rebuildMode}`）本版本
+     * 一律不看。若声明成具体 DTO，一个字段类型不对的请求会先被 Bean Validation 拦成
+     * 「参数校验失败」—— 而真正该告诉用户的是「本版本不支持」，与请求体写得对不对无关。
+     *
+     * <p>🔴 **不落 `sys_async_task`、不返回 `taskId`**：返回一个假的任务号等于
+     * 「假启动」—— 用户会去通知中心等一个永远不会来的结果。
+     */
+    @PostMapping("/change-embedding")
+    @RequiresPerm("system:model")
+    public ApiResponse<Void> changeEmbedding() {
+        throw unsupportedEmbeddingSwitch();
+    }
+
+    /**
+     * {@code GET /system/model/vl-impact} —— **本版本不支持**重建含图文档。
+     *
+     * <p>契约形状见 `10-接口约定汇总.md` §14（`{kbCount, imageDocCount, imageCount,
+     * estimateMinutes, extraTokens}`）。与上面那个同理：**返回真数字会让「不支持」看着像「能换」**。
+     */
+    @GetMapping("/vl-impact")
+    @RequiresPerm("system:model")
+    public ApiResponse<Void> vlImpact() {
+        throw unsupportedVlRebuild();
+    }
+
+    /**
+     * {@code POST /system/model/rebuild-image-docs} —— **本版本不支持**重建含图文档。
+     *
+     * <p>⚠️ 同 {@link #changeEmbedding()}：不声明 `@RequestBody`、不落作业、不返回 `taskId`。
+     */
+    @PostMapping("/rebuild-image-docs")
+    @RequiresPerm("system:model")
+    public ApiResponse<Void> rebuildImageDocs() {
+        throw unsupportedVlRebuild();
+    }
+
+    /** 换嵌入：现象（跨维度要重建整个集合、旧数据不保留）+ 下一步动作（人工流程）。 */
+    private static BizException unsupportedEmbeddingSwitch() {
+        return BizException.of(ErrorCode.MODEL_SWITCH_UNSUPPORTED,
+                "本版本不支持更换嵌入模型：更换它需要重建整个向量集合，跨维度时旧数据不会保留，"
+                        + "风险尚未评估。当前只开放对话模型的切换；"
+                        + "如确需更换，请联系管理员按《11-M05-存储生命周期规则（O7）》走人工流程。");
+    }
+
+    /** 换 VL：现象（不会自动更新）+ 下一步动作（重新上传，当前唯一可行的那条路）。 */
+    private static BizException unsupportedVlRebuild() {
+        return BizException.of(ErrorCode.MODEL_SWITCH_UNSUPPORTED,
+                "本版本不支持自动重建含图文档：重建需要逐张重新调用 VL 模型（实测 40~60 秒/张），"
+                        + "本版本未开放该入口 —— 已入库文档的图片描述仍由原模型产出，不会自动更新。"
+                        + "如需让它们跟上新模型，当前只能重新上传该文档（会重新走一遍解析与图片理解）。");
     }
 }
