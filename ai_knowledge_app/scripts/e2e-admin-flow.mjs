@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /**
- * S2 页面级 E2E：用户管理 / 角色管理 / 授权管理 三页切真后端。
+ * S2 页面级 E2E：用户管理 / 角色管理 / 授权管理 三页切真后端
+ * （`S6-M09-C` 起加了第四页 **模型配置**）。
  *
  * <h3>为什么单独一个脚本</h3>
  * S2 的完成判据是「后端做完 + 与前端联调通过」（进度/README §4），页面级验收从 S1 起是硬要求。
  * 本脚本沿用 S1 的两个 E2E 脚本的技术路线（CDP 直驱无头 Edge、**零新增依赖**、
- * 断言看业务 code 不看 HTTP 码），覆盖 M02 的三页：
+ * 断言看业务 code 不看 HTTP 码），覆盖 M02 的三页 + M09 的一页：
  * <ol>
  *   <li><b>用户管理</b> `/system/user` —— 部门树 + 用户列表来自真后端（128 人 / 分页 10 行 / admin 首行）；</li>
  *   <li><b>角色管理</b> `/system/role` —— 5 角色 + 权限树 total=38；</li>
  *   <li><b>授权管理</b> `/system/grant` —— 12×5 矩阵 + 8 库授权列表；并在矩阵上做一次
  *       「改档 → 保存 → 还原 → 保存」的**真实写入**，证明写侧接口与审计打点接通（G2-3/G2-4/G2-9）。</li>
+ *   <li><b>模型配置</b> `/system/model`（`S6-M09-C`）—— 四条**反面**判据：本版本把
+ *       「换模型 + 重建」收敛成「只保留切换」，故要证**界面上再也看不到那些入口 ·
+ *       mock 的假影响量不上屏 · 四条「换 + 重建」接口不再被调用 · 全程无 404**。</li>
  * </ol>
  *
  * <h3>判据 vs 观察项</h3>
@@ -348,16 +352,69 @@ async function main() {
     const shot3 = await send('Page.captureScreenshot', { format: 'png' })
     writeFileSync(`${OUT_DIR}/grant.png`, Buffer.from(shot3.data, 'base64'))
 
-    // ==================== 4. console 与溯源 ====================
+    // ==================== 4. 模型配置（/system/model）====================
+    // `S6-M09-C` 把「换模型 + 重建」这条线收敛成「只保留切换」：换嵌入 / 换 VL 重建
+    // 四条接口一律如实回「不支持」。页面级要证的因此是**四条反面的事** ——
+    // 界面上再也看不到那些入口、假数不上屏、四条接口不再被调用、全程没有 404。
+    // ⚠️ **先记 ledger 水位线**：`ledger` 是**跨页累积**的，不切片就会把前面几页的 404
+    // 算到本页头上。实测踩到：`/api/notices/unread-count` 在每一页都 404（`M11` 通知中心
+    // 未开工，是**已登记**的缺口），于是"模型配置页无 404"这条**误报**了 4 次。
+    // 本仓「误报比漏报更伤」——一条会误报的判据等于没有判据。
+    const ledgerMark = ledger.length
+
+    await navigate('/system/model')
+    await waitFor(`!!document.querySelector('.sys-model-page')`, { label: '模型配置页渲染' })
+    await evaluate(PAGE_TOOLS)
+    const cfgEntry = await waitForApi((e) => e.url.includes('/api/system/model/config') && e.method === 'GET', { label: 'GET /api/system/model/config' })
+    check(true, '模型配置页调用 GET /api/system/model/config', assertBizOk(cfgEntry, 'GET /api/system/model/config'))
+
+    const pageText = await evaluate(`window.__t.norm(document.body.innerText)`)
+    // 🔴 「不支持」必须**写在页面上**，不能只写在后端的错误码里 —— 用户看不到错误码
+    check(pageText.includes('本版本不支持'), '页面明写「本版本不支持」', '')
+    // 🔴 mock 里那五个数（`src/mock/index.ts:1429`）一个都不许上屏。
+    //    它们此前**在真后端下也会渲染**（`embedImpact` 是个 mock 初值对象）
+    const mockNumbers = ['38,502', '38502', '1,246', '1246', '1180', '42 分钟']
+    const leaked = mockNumbers.filter((n) => pageText.includes(n))
+    check(leaked.length === 0, '页面不出现 mock 的假影响量（8 库 / 1246 篇 / 38502 片 / 42 分钟 / 1180 万）', leaked.join(' | ') || '—')
+    // 🔴 被删掉的入口不许回来（负向锚：任何一个回来都会让这条转红）
+    check(!pageText.includes('切换并重建'), 'VL 不再提供「切换并重建含图文档」入口', '')
+    check(!pageText.includes('模拟「检测到配置变更」'), '嵌入不再提供「模拟检测到配置变更」演示入口', '')
+    check(!pageText.includes('确认重建全部索引'), '嵌入不再提供「确认重建全部索引」按钮', '')
+    // 🔴 本页浏览下来：没有 404，也没去调那四条「换 + 重建」接口
+    // ⚠️ 只切片看**本页**的请求（见上面 ledgerMark 的注释）
+    const pageLedger = ledger.slice(ledgerMark)
+    const all404 = pageLedger.filter((e) => e.url.includes('/api/') && e.status === 404)
+
+    // 🔴 **本页自己的接口**一个 404 都不许有 —— 这是本批的实质判据
+    const own404 = all404.filter((e) => e.url.includes('/api/system/'))
+    check(own404.length === 0, '模型配置页**自己的**接口无 404（`/api/system/*`）',
+      own404.map((e) => `${e.method} ${e.url.replace(BASE, '')}`).join(' | ') || '—')
+
+    // ⚠️ 剩下的 404 里，`/notices/*` 是**已登记**的 `M11` 通知中心未开工缺口
+    //    （顶栏那个未读数轮询在**每一页**都 404）。把它登记成**观察项**而不是判据 ——
+    //    否则这条判据会一直红，而"一直红"等于没有判据（本仓「误报比漏报更伤」）。
+    const known404 = all404.filter((e) => e.url.includes('/notices/'))
+    const other404 = all404.filter((e) => !e.url.includes('/notices/'))
+    observe('模型配置页 404 分布', `本页自己 ${own404.length} · /notices/ 已知缺口 ${known404.length} · 其它 ${other404.length}`)
+    check(other404.length === 0, '模型配置页无「非 /notices/」的意外 404',
+      other404.map((e) => `${e.method} ${e.url.replace(BASE, '')}`).join(' | ') || '—')
+
+    const refusedCalls = pageLedger.filter((e) => /embedding-impact|change-embedding|vl-impact|rebuild-image-docs/.test(e.url))
+    check(refusedCalls.length === 0, '页面不再调用「换 + 重建」四条接口', refusedCalls.map((e) => e.url.replace(BASE, '')).join(' | ') || '—')
+
+    const shot4 = await send('Page.captureScreenshot', { format: 'png' })
+    writeFileSync(`${OUT_DIR}/model.png`, Buffer.from(shot4.data, 'base64'))
+
+    // ==================== 5. console 与溯源 ====================
     const bad = consoleMsgs.filter((m) => /Failed to resolve component|Unhandled error|TypeError|is not a function/.test(m.text))
-    check(bad.length === 0, '三页 console 无未捕获异常', bad.map((b) => b.text).join(' | ') || '—')
+    check(bad.length === 0, '四页 console 无未捕获异常', bad.map((b) => b.text).join(' | ') || '—')
     // mock 不产出 x-trace-id，故关键读接口都带它 = 确实打到了真后端
     const keyEntries = [usersEntry, deptEntry, rolesEntry2, permEntry, matrixEntry, kbEntry]
     const missingTrace = keyEntries.filter((e) => !headerOf(e.headers, 'x-trace-id'))
     check(missingTrace.length === 0, '关键 /api 响应均带 x-trace-id（证明确为真后端）', `${keyEntries.length - missingTrace.length}/${keyEntries.length}`)
 
     console.log(`\n接口台账：\n${ledger.map((e) => `  ${e.method.padEnd(6)} ${e.url.replace(BASE, '')} → ${e.status}`).join('\n')}`)
-    console.log(`截图：${OUT_DIR}/{user,role,grant}.png`)
+    console.log(`截图：${OUT_DIR}/{user,role,grant,model}.png`)
   } finally {
     await sleep(200)
     try {
