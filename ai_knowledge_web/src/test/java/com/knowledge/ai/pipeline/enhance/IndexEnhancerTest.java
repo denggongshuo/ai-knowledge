@@ -347,7 +347,9 @@ class IndexEnhancerTest {
      * 而那恰恰是最该走正常构造路径的一条。
      */
     private static IndexEnhancer enhancerWith(ChatCaller caller, boolean enabled) {
-        return new IndexEnhancer(caller, enabled);
+        // 门控取**生产默认**（开）：本类的用例全部在"门控生效"的前提下断言 HyQ 的产出，
+        // 而门控关闭那条路是 `T-O09` 判据 5 的 A/B 对照组，由 `RetrievalEvalTest` 覆盖
+        return new IndexEnhancer(caller, enabled, true);
     }
 
     private static ParsedDocument doc() {
@@ -365,6 +367,38 @@ class IndexEnhancerTest {
                 new Block("3. 接口设计", BlockType.HEADING, "3. 接口设计", 1, 1, null, null, null),
                 new Block("接口鉴权流程采用令牌方式，令牌有效期 2 小时。", BlockType.PARAGRAPH,
                         "3. 接口设计", 2, 1, null, null, null));
+    }
+
+    // ==================================================================
+    // T-O09 判据 5：门控的 A/B 对照组开关
+    // ==================================================================
+
+    @Test
+    @DisplayName("T-O09 判据 5：关掉门控 ⇒ **标题也生成**（门控开时它被跳过）—— A/B 的对照组口径")
+    void disablingTheGateGeneratesForEveryNonBlankBlock() {
+        FakeCaller gatedCaller = new FakeCaller(GOOD_JSON);
+        FakeCaller openCaller = new FakeCaller(GOOD_JSON);
+
+        int gated = hyqCount(new IndexEnhancer(gatedCaller, true, true).enhance(doc(), blocks()));
+        int open = hyqCount(new IndexEnhancer(openCaller, true, false).enhance(doc(), blocks()));
+
+        assertThat(gated)
+                .as("门控开：标题被 `HyqGate` 明确跳过（「拿标题生成问句是噪声」）、"
+                        + "段落放行 ⇒ 1 条").isEqualTo(1);
+        assertThat(open)
+                .as("🔴 门控关 = **对每个非空源块**都生成 ⇒ 2 条。这条口径必须与"
+                        + "`T-O09` 步 5 之前的行为对齐（那时没有任何门控），"
+                        + "否则量出来的不是「门控值多少」而是「门控 + 我以为该保留的那几条值多少」")
+                .isEqualTo(2);
+        assertThat(openCaller.prompts)
+                .as("模型调用次数是成本那一半的分子 —— A/B 必须同时报它，"
+                        + "只报召回率会得出「门控纯粹是损失」的错误结论")
+                .hasSizeGreaterThan(gatedCaller.prompts.size());
+    }
+
+    private static int hyqCount(IndexEnhancer.Result result) {
+        return (int) result.blocks().stream()
+                .filter(b -> b.blockType() == BlockType.HYPOTHESIS_QA).count();
     }
 
     // ==================================================================

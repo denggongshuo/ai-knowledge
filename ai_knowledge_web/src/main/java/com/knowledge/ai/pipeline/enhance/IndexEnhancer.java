@@ -90,10 +90,26 @@ public class IndexEnhancer {
      */
     private final boolean enabled;
 
+    /**
+     * HyQ 门控（`T-O09` 步 5）是否生效。{@code false} = **绕过门控、对所有源块生成**。
+     *
+     * <h3>它为什么存在</h3>
+     * <p>`HyqGate` 的类注释写着「阈值是**保守**的…在没有量化依据之前，把规则定得激进
+     * 等于拿召回质量换成本而没人知道换了多少」，并指明"必须先有基线 + A/B"。
+     * 这个开关就是那次 A/B 的**对照组**：关掉它 = 回到 `T-O09` 步 5 之前的行为
+     * （那时 `appendHypotheticalQuestions` 没有任何门控）。
+     *
+     * <p>⚠️ **它不是为了生产**（生产该开）。把它做成配置而不是"测试里反射改字段"，
+     * 是因为 A/B 的两组必须**跑在完全相同的代码路径上**，差的那一个变量就是它。
+     */
+    private final boolean hyqGateEnabled;
+
     public IndexEnhancer(ChatCaller chatCaller,
-                         @Value("${m05.enhance.enabled:true}") boolean enabled) {
+                         @Value("${m05.enhance.enabled:true}") boolean enabled,
+                         @Value("${m05.enhance.hyq.gate-enabled:true}") boolean hyqGateEnabled) {
         this.chatCaller = chatCaller;
         this.enabled = enabled;
+        this.hyqGateEnabled = hyqGateEnabled;
     }
 
     /** 调用结果的性质 —— 调用方据此决定日志，测试据此断言"哪一种失败"。 */
@@ -168,6 +184,19 @@ public class IndexEnhancer {
      * @return 见 {@link Result}
      */
     public Result enhance(ParsedDocument doc, List<Block> blocks) {
+        return enhance(doc, blocks, hyqGateEnabled);
+    }
+
+    /**
+     * 同 {@link #enhance(ParsedDocument, List)}，但**显式指定**这一趟的 HyQ 门控开关。
+     *
+     * <p>为什么做成重载而不是把字段设成可变的：A/B 的两组要在**同一次运行**里跑完，
+     * 而可变字段会让"这一趟用的是哪个值"取决于调用顺序 —— 那正是最难查的一类偏差。
+     * 显式传参让"这一组是什么条件"写在调用点上。
+     *
+     * @param hyqGateEnabled {@code false} = 绕过 {@code HyqGate}，对所有源块生成 HyQ
+     */
+    public Result enhance(ParsedDocument doc, List<Block> blocks, boolean hyqGateEnabled) {
         if (!enabled) {
             return new Result(blocks, Status.DISABLED, "增强开关未开启（m05.enhance.enabled=false）", null);
         }
@@ -208,7 +237,7 @@ public class IndexEnhancer {
         int chapterBlocks = appendChapterSummaries(withSummary, blocks, enhancement);
 
         // `T-507` 的 HyQ 半边 + `T-O09` 步 5 的门控
-        int hyqBlocks = appendHypotheticalQuestions(withSummary, blocks);
+        int hyqBlocks = appendHypotheticalQuestions(withSummary, blocks, hyqGateEnabled);
 
         return new Result(List.copyOf(withSummary), Status.OK,
                 "摘要 " + enhancement.summary().length() + " 字 · 标签 " + enhancement.labels().size()
@@ -274,13 +303,14 @@ public class IndexEnhancer {
      *
      * @return 真正落成块的 HyQ 条数（一个源块最多落**一条** HyQ 块，里面可含多句）
      */
-    private int appendHypotheticalQuestions(List<Block> out, List<Block> sourceBlocks) {
+    private int appendHypotheticalQuestions(List<Block> out, List<Block> sourceBlocks,
+                                            boolean gateEnabled) {
         int produced = 0;
         int skipped = 0;
         int attempted = 0;
 
         for (Block block : sourceBlocks) {
-            String reason = HyqGate.reason(block);
+            String reason = gateEnabled ? HyqGate.reason(block) : bypassReason(block);
             if (reason == null) {
                 skipped++;
                 continue;
@@ -309,9 +339,30 @@ public class IndexEnhancer {
             produced++;
         }
 
-        log.info("[增强] HyQ：门控放行 {} 个块 / 跳过 {} 个块，产出 {} 条假设问句块（{}）",
-                attempted, skipped, produced, EnhancePrompts.VERSION);
+        log.info("[增强] HyQ：{}放行 {} 个块 / 跳过 {} 个块，产出 {} 条假设问句块（{}）",
+                gateEnabled ? "门控" : "**门控已关闭**", attempted, skipped, produced,
+                EnhancePrompts.VERSION);
         return produced;
+    }
+
+    /**
+     * 门控关闭时的放行判据（`T-O09` 判据 5 的 A/B 对照组）。
+     *
+     * <p><b>"全量"的边界写死在这里：只挡空块。</b>其余一律放行 —— 包括
+     * {@code HyqGate} 明确排除的**标题**与**表格子块**。
+     * 理由是这条口径要与它对照的那个行为对齐：`T-O09` 步 5 之前
+     * {@code appendHypotheticalQuestions} **没有任何门控**，逐个源块就调。
+     * 若在这里"顺手"保留几条类型规则，量出来的就不是"门控值多少"，而是
+     * "门控值多少 + 我以为该保留的那几条值多少" —— 两个变量混在一个数里。
+     *
+     * <p>⚠️ 保留"空块"这一条**不是门控**，是退化输入的保护：空文本送进提示词
+     * 必然拿不回问题，那一跳是纯粹的白花钱。
+     */
+    private static String bypassReason(Block block) {
+        if (block == null || block.rawContent() == null || block.rawContent().isBlank()) {
+            return null;
+        }
+        return "门控已关闭（A/B 对照组）：对所有非空源块生成";
     }
 
     // ==================================================================
