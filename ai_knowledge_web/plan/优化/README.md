@@ -27,6 +27,7 @@
 | **O8** | `T-O08` | [分片契约：块视图分离](./O8-chunk-view-separation.md) | 块内容与嵌入视图分离 + 多视图泛化 | **P0** | — | 3 人天 | ✅ 已完成（`S4-M05-C1` 步 0 · 2026-09-16） | `S4-M05-C1` 步 0 | `10-M05-分片产出契约（D-5）` |
 | **O9** | `T-O09` | [去重与成本治理](./O9-dedup-and-cost-control.md) | 内容指纹 + 样板抑制 + HyQ 门控 | **P2** | O8 | 3 人天 | ✅ **已结项**（`S5-M08-B`，2026-09-18） | 步 1/2/3/4/7 于 `S5-M07-A` 交 · **步 5（HyQ 门控）/ 步 6（章节级摘要）本批交** | `T-504`~`T-507` 下游；判据 1/2/3/4/7 全通过，**判据 5 只有一半**（调用量已量 · **召回质量 A/B 挂起**，要真模型）· 步 3 的语料级回扫仍顺延 |
 | **O10** | `T-O10` | [探针产物兜底](./O10-probe-artifact-fallback.md) | **Java 用例侧的 MinIO 对象兜底**（扫四个前缀的无主对象） | **P0** | — | ≈1.5 人天 | ✅ **已完成**（`S6-M05-C`，2026-09-18）—— `ProbeCleanup#sweepOrphanMinioObjects`（**四前缀一次收口** + **时间下限**防误删）+ 接进 `ApiTestSupport` 收尾 + `OrphanMinioSweepTest` **3 条**（含 **2 条差分式负向锚**）。⚠️ **`audit-export/` 明确不覆盖**（无归属列可判）。✅ **顺带解掉 `#194`**、**覆盖 `#78` 的 `avatars/`**。🔴 **施工中我报错过一次数**（按 `ls` 数行读出"905 个孤儿对象"，用客户端一量是 **0**）—— 教训：**用与删除同一个工具去量**，见方案 §2.5 | **`S6-M05-C`** ✅ | `test/support/ProbeCleanup#sweepOrphanMinioObjects` · `ApiTestSupport` · `OrphanMinioSweepTest` |
+| **O11** | `T-O11` | [审计导出兜底](./O11-audit-export-fallback.md) | **`audit-export/` 无主对象兜底** —— 归属在**对象名路径里**（`audit-export/{userId}/…`），不在列里 | **P1** | `T-O10`（沿用其全部纪律：时间下限 / 客户端计数 / `>0` 是信号） | ≈2 人天 | 🟡 **进行中**（`2026-09-19-测试可靠性` 批，2026-09-19） | **`2026-09-19-测试可靠性`** | `test/support/ProbeCleanup`（`MINIO_PREFIXES` 扩成两类归属）· `AuditQueryFlowTest#cleanExportTasks` · `OrphanMinioSweepTest` |
 
 > 🔴 **2026-09-18 · `S6-M09-A` 未认领 O 项**（用户裁定）—— **连续第六批低于下限 4**。
 > 该批 4 个功能任务已写满，且剩下的候选**各自的依赖都还没到**：
