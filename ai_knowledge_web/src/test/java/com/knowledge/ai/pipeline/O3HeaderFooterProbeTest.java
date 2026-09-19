@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -266,6 +267,127 @@ class O3HeaderFooterProbeTest {
             }
         });
         dump("raw-edge-lines", sb.toString());
+    }
+
+    // ==================================================================
+    // `T-O03` 的「整页守卫」（`S6-M05-E` 步 0）
+    // ==================================================================
+
+    /**
+     * 🔴 **整页盒子与真装饰图，在「面积」上分不分得开** —— `T-O03` 装饰图判定的前置探针。
+     *
+     * <h3>它回答什么</h3>
+     * <p>`#205`（`C2` 补探捞出来的）要求先排除「**≈整页**」的盒子，否则 `T-O03` 会把
+     * 全扫描件的**整页内容**判成装饰图。而**产物里没有页面尺寸**（`PdfDocumentParser`
+     * 只读 root 的 `number of pages`；`DocElement` 里只有**图片**带几何）⇒
+     * 「盒子面积 / 页面面积」这个比值算不出来。
+     *
+     * <p>🔑 **改判思路**：整页扫描件的盒子面积与一枚 logo 差着**一个量级**
+     * （A4 页面积 ≈ 501,000 pt²，而 logo 通常 10⁴ 量级）⇒ 用**绝对面积上界**就够，
+     * 不必知道页面尺寸。**本探针就是去量那条交界在不在、在哪。**
+     *
+     * <h3>产出是「结论」，可能是否掉这条思路</h3>
+     * <p>若两份候选面积**交叠**（有的 logo 很大、有的整页图不大），结论就是"一条上界不够"。
+     * 那同样是**有价值的结论**（与 `T-O02` 那条"探针推翻了建议的页级阈值 10"同族）——
+     * 本仓对探针的口径是「**先量再定**，产出常常是否掉那个数」。
+     *
+     * <h3>顺带答一个便宜的问题</h3>
+     * <p>把 opendataloader 的**根字段名**打出来 —— `T-O03` 若真需要页面尺寸，
+     * 得先知道它在不在那份 JSON 里。**本探针已经拿到了 root，问一句不花额外代价。**
+     */
+    @Test
+    @DisplayName("T-O03 步 0：整页盒子 vs 装饰图，用「绝对面积」分不分得开（`#205` 的守卫）")
+    void decoyGuardGeometry() throws Exception {
+        StringBuilder sb = new StringBuilder();
+        sb.append("`T-O03` 装饰图判定的「整页守卫」前置探针（`S6-M05-E` 步 0）\n");
+        sb.append("问题：`#205` 要排除「≈整页」的盒子，而**产物里没有页面尺寸**。\n");
+        sb.append("改判：用**绝对面积上界**代替「面积占页面比例」。本探针量那条交界在不在。\n");
+        sb.append("参考：A4 = 595×842 ≈ 501,000 pt² · Letter = 612×792 ≈ 484,700 pt²\n");
+        sb.append("⚠️ 坐标是 PDF 用户空间（pt），不是像素。\n\n");
+
+        for (Path sample : SAMPLES) {
+            sb.append("== ").append(sample.getFileName()).append('\n');
+            if (!Files.isRegularFile(sample)) {
+                sb.append("   **缺样本**\n\n");
+                continue;
+            }
+            JsonNode root = runAndReadJson(sample);
+
+            // 顺带：根字段里有没有页尺寸？（决定"要不要补那条能力"）
+            List<String> rootFields = new ArrayList<>();
+            root.fieldNames().forEachRemaining(rootFields::add);
+            sb.append("   根字段：").append(rootFields).append('\n');
+            sb.append("   ⚠️ 上面若没有 page size / width / height 之类，就是**JSON 里也没有** ⇒ ")
+                    .append("「按页面比例」这条路连原料都不存在\n");
+
+            List<double[]> boxes = new ArrayList<>();        // [pageNo, w, h]
+            collectBoxes(root.get("kids"), 0, boxes);
+            if (boxes.isEmpty()) {
+                sb.append("   没有带包围盒的图元素 —— 这份样本对本题无信息\n\n");
+                continue;
+            }
+
+            double[] areas = boxes.stream().mapToDouble(b -> b[1] * b[2]).sorted().toArray();
+            double[] maxBox = boxes.stream().max(Comparator.comparingDouble(b -> b[1] * b[2])).orElseThrow();
+            sb.append(String.format(Locale.ROOT,
+                    "   带盒图元素 %d 个 · 最大面积 %.0f（%.0f × %.0f，第 %.0f 页）%n",
+                    boxes.size(), maxBox[1] * maxBox[2], maxBox[1], maxBox[2], maxBox[0]));
+            sb.append(String.format(Locale.ROOT, "   面积分位：min %.0f · 中位 %.0f · p90 %.0f · max %.0f%n",
+                    areas[0], areas[areas.length / 2], areas[(int) (areas.length * 0.9)],
+                    areas[areas.length - 1]));
+            sb.append(String.format(Locale.ROOT, "   ≥ 0.5×A4 的盒子 %d 个 · ≥ 0.9×A4 的 %d 个%n",
+                    countAtLeast(areas, 501_120 * 0.5), countAtLeast(areas, 501_120 * 0.9)));
+
+            // 按**尺寸**去重 → 每个尺寸出现在几页（装饰图的形态：同尺寸反复出现）
+            Map<String, java.util.Set<Integer>> pagesBySize = new TreeMap<>();
+            for (double[] b : boxes) {
+                String size = String.format(Locale.ROOT, "%.0f×%.0f", b[1], b[2]);
+                pagesBySize.computeIfAbsent(size, k -> new java.util.TreeSet<>()).add((int) b[0]);
+            }
+            sb.append("   尺寸去重后 ").append(pagesBySize.size()).append(" 种；出现页数最多的 5 种：\n");
+            pagesBySize.entrySet().stream()
+                    .sorted(Comparator.comparingInt((Map.Entry<String, java.util.Set<Integer>> e)
+                            -> -e.getValue().size()))
+                    .limit(5)
+                    .forEach(e -> sb.append("      ").append(e.getKey())
+                            .append("  出现在 ").append(e.getValue().size()).append(" 页\n"));
+            sb.append('\n');
+        }
+
+        sb.append("判读：若「整页」那批（面积接近 A4）与「logo」那批之间有**空档** ⇒ ")
+                .append("一条绝对面积上界够用；若交叠 ⇒ 要另找判据。\n");
+        sb.append("⚠️ 采样边界：**5 份样本**。正向样本（真的跨页重复的装饰图）历来只能靠合成 —— ")
+                .append("这里验的是「有没有反例」，不是「有没有正例」。\n");
+        dump("decoy-guard", sb.toString());
+    }
+
+    /** 递归收集 image 元素的 `[pageNo, w, h]`（坐标为 PDF 用户空间 pt）。 */
+    private static void collectBoxes(JsonNode kids, int inheritedPageNo, List<double[]> out) {
+        if (kids == null || !kids.isArray()) {
+            return;
+        }
+        for (JsonNode el : kids) {
+            int pageNo = el.path("page number").asInt(inheritedPageNo);
+            if ("image".equals(el.path("type").asText())) {
+                JsonNode box = el.get("bounding box");
+                if (box != null && box.isArray() && box.size() == 4) {
+                    double w = Math.abs(box.get(2).asDouble() - box.get(0).asDouble());
+                    double h = Math.abs(box.get(3).asDouble() - box.get(1).asDouble());
+                    out.add(new double[] {pageNo, w, h});
+                }
+            }
+            collectBoxes(el.get("kids"), pageNo, out);
+        }
+    }
+
+    private static int countAtLeast(double[] sorted, double threshold) {
+        int n = 0;
+        for (double v : sorted) {
+            if (v >= threshold) {
+                n++;
+            }
+        }
+        return n;
     }
 
     // ==================================================================
