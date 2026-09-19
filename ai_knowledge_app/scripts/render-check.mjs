@@ -2,13 +2,20 @@
 /**
  * 全站渲染自检（无头 Edge，逐页访问并按「每页精确断言」校验渲染结果）
  *
- * 用法： node scripts/render-check.mjs
+ * 用法： node scripts/render-check.mjs [--base=http://127.0.0.1:5173]
  * 前置：
- *   1) dev server 已在 5173 运行
- *   （注入登录态用的 public/_selfcheck.html 由本脚本自动生成并在结束时清理）
+ *   1) dev server 已在 `--base` 指定的地址运行（**默认 5173，mock 模式**）
+ *   2) 注入登录态用的 public/_selfcheck.html 由本脚本自动生成并在结束时清理
+ *
+ * 🔴 **退出码是有语义的（`#226`）**：
+ *   - `0` 全部路由通过
+ *   - `1` 有路由**渲染断言失败**（页面真的坏了）
+ *   - `2` **开工前置不满足**（server 不可达 / 不是这个前端 / API 层探针失败）
+ *     —— 这时**一条路由都不会跑**，因为跑出来的红没有解释价值。
  *
  * 说明：
  *   - 用 Node 直接驱动 msedge.exe，不经过 npm/.cmd 包装器，避免在受限沙箱里被 wsl.exe 拦截
+ *   - 路由清单与断言在 **`lib/routes.mjs`**（与 `console-check.mjs` 共用的单一事实源）
  *   - 断言用「页面主体特征」（.page-title / .err-title / 认证卡 / 聊天页类名），
  *     而不是通用文案，否则会被侧边栏菜单文案误命中
  *   - 额外校验标签栏边界：布局壳内的页面必须有 .tags-view，壳外（认证页 / 错误页）
@@ -18,45 +25,24 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { ROUTES, NO_SHELL } from './lib/routes.mjs'
+import { probeDevServer, reportPrecondition } from './lib/dev-server.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-const BASE = 'http://localhost:5173'
-const PROFILE = 'F:/work/code/ai-knowledge/temp/edge-selfcheck'
-const OUT_DIR = 'F:/work/code/ai-knowledge/temp/render-check'
 
 /**
- * 路由清单：每页给一条精确断言（正则在整页 HTML 上匹配）
- * - public: true 表示无需登录态，直接访问
- * - expect: 必须出现的页面主体特征；缺失即判定渲染失败
+ * `--base=http://host:port`，默认 mock 模式的 dev server。
+ *
+ * ⚠️ 这里**曾经硬编码** `localhost:5173`。而 vite 在端口被占用时会**自动换到下一个端口**，
+ * 于是"脚本打的是哪个 dev server"这件事**无从检查** —— 那正是 `#226` 里
+ * "同一份代码一个 25/25、一个 7/25"最合理的解释。现在它可配、且会被前置自检说出来。
  */
-const ROUTES = [
-  { path: '/login', public: true, expect: /class="auth-card"/, label: '登录页' },
-  { path: '/register', public: true, expect: /class="auth-card"/, label: '注册页' },
-  { path: '/forgot-password', public: true, expect: /class="auth-card"/, label: '忘记密码' },
-  { path: '/chat', expect: /class="[a-z-]*chat[a-z-]*"/, label: '知识问答' },
-  { path: '/notice', expect: /class="page-title"[^>]*>消息通知/, label: '消息通知' },
-  { path: '/kb', expect: /class="page-title"[^>]*>知识库管理/, label: '知识库管理' },
-  { path: '/kb/create', expect: /class="page-title"[^>]*>创建知识库/, label: '创建知识库' },
-  { path: '/kb/1', expect: /class="page-title"[^>]*>产品技术文档库/, label: '知识库设置' },
-  { path: '/kb/1/upload', expect: /class="page-title"[^>]*>文档上传/, label: '文档上传' },
-  { path: '/doc/1', expect: /class="page-title"[^>]*>AI 知识库平台白皮书 V3/, label: '文档详情' },
-  { path: '/doc/1/preview', expect: /class="page-title"[^>]*>AI 知识库平台白皮书 V3/, label: '文档预览' },
-  { path: '/doc/download', expect: /class="page-title"[^>]*>文档下载/, label: '文档下载' },
-  { path: '/recycle', expect: /class="page-title"[^>]*>回收站/, label: '回收站' },
-  { path: '/ops/qa', expect: /class="page-title"[^>]*>问答运营/, label: '问答运营' },
-  { path: '/ops/retrieval', expect: /class="page-title"[^>]*>检索质量分析/, label: '检索质量分析' },
-  { path: '/ops/usage', expect: /class="page-title"[^>]*>使用统计/, label: '使用统计' },
-  { path: '/profile', expect: /class="page-title"[^>]*>个人信息/, label: '个人信息' },
-  { path: '/system/user', expect: /class="page-title"[^>]*>用户管理/, label: '用户管理' },
-  { path: '/system/role', expect: /class="page-title"[^>]*>角色管理/, label: '角色管理' },
-  { path: '/system/grant', expect: /class="page-title"[^>]*>授权管理/, label: '授权管理' },
-  { path: '/system/model', expect: /class="page-title"[^>]*>模型配置/, label: '模型配置' },
-  { path: '/system/audit', expect: /class="page-title"[^>]*>审计日志/, label: '审计日志' },
-  { path: '/403', expect: /class="err-title"[^>]*>你没有访问该页面的权限/, label: '403 无权访问' },
-  { path: '/500', expect: /class="err-title"[^>]*>服务端发生异常/, label: '500 服务异常' },
-  { path: '/no-such-page', expect: /class="err-title"[^>]*>页面地址可能已失效/, label: '404 页面不存在' },
-]
+const arg = (name, fallback) =>
+  (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
+const BASE = arg('base', 'http://localhost:5173')
+const PROFILE = 'F:/work/code/ai-knowledge/temp/edge-selfcheck'
+const OUT_DIR = 'F:/work/code/ai-knowledge/temp/render-check'
 
 if (!existsSync(EDGE)) {
   console.error(`找不到 Edge：${EDGE}`)
@@ -106,8 +92,10 @@ const pad = (s, n) => String(s).padEnd(n, ' ')
 const rows = []
 let failed = 0
 
-/** 不在布局壳内的路由（全屏页），不应出现标签栏 */
-const NO_SHELL = new Set(['/login', '/register', '/forgot-password', '/403', '/500', '/no-such-page'])
+// 🔴 **前置自检** —— 在跑任何路由之前，先说清"我打的是哪个 server、它跑在哪个模式"。
+// 前置不满足 → **exit 2**（与"路由断言失败"的 exit 1 **分开**，让调用方一眼分得清
+// 「环境没准备好」与「页面真的坏了」）。理由见 `lib/dev-server.mjs` 的模块头注。
+reportPrecondition(await probeDevServer(BASE), 'render-check')
 
 for (const r of ROUTES) {
   const url = r.public ? `${BASE}/#${r.path}` : `${BASE}/_selfcheck.html?to=${r.path}`

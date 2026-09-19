@@ -12,17 +12,25 @@
  *   把结果写回外层 DOM → 用 Edge --dump-dom 抓出来 → 在本脚本里断言。
  *   （同源所以能读 contentDocument；--dump-dom 只序列化外层 DOM，所以结果要写回外层）
  *
- * 用法： node scripts/layout-check.mjs
- * 前置： dev server 已在 5173 运行
+ * 用法： node scripts/layout-check.mjs [--base=http://127.0.0.1:5173]
+ * 前置： dev server 已在 `--base` 指定的地址运行（默认 5173，mock 模式）
+ *
+ * 🔴 **退出码**：`0` 全过 · `1` 有路由的高度链断了 · `2` **前置不满足**（没跑任何路由）。
+ * 分开的理由见 `lib/dev-server.mjs` 的模块头注（`#226`）。
  */
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { probeDevServer, reportPrecondition } from './lib/dev-server.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-const BASE = 'http://localhost:5173'
+
+/** `--base=http://host:port`，默认 mock 模式的 dev server（理由同 `render-check.mjs`）。 */
+const arg = (name, fallback) =>
+  (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
+const BASE = arg('base', 'http://localhost:5173')
 const PROFILE = 'F:/work/code/ai-knowledge/temp/edge-layoutcheck'
 const OUT_DIR = 'F:/work/code/ai-knowledge/temp/layout-check'
 const BOOTSTRAP = resolve(ROOT, 'public/_layoutcheck.html')
@@ -102,6 +110,11 @@ function dump(url, outFile) {
 
 const pad = (s, n) => String(s).padEnd(n, ' ')
 let failed = 0
+
+// 🔴 **前置自检**（同 `render-check.mjs`）：前置不满足 → **exit 2**，一条路由都不跑。
+// 理由：本脚本上一批报过 **4/4 全红**而根因未查明 —— 一个"量高度"的判据在
+// 「页面根本没挂载」时会给出 `未渲染`，与「高度链真的断了」**长得一模一样**（`#226`）。
+reportPrecondition(await probeDevServer(BASE), 'layout-check')
 
 console.log(`${pad('ROUTE', 16)} ${pad('mainH', 7)} ${pad('viewH', 7)} ${pad('pageH', 7)} ${pad('溢出', 6)} STATUS`)
 console.log('-'.repeat(70))

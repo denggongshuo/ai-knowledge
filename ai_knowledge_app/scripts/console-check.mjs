@@ -10,16 +10,25 @@
  * <h3>判定口径</h3>
  * - **失败**：`Runtime.exceptionThrown`（真正未捕获）、JS 的 `console.error`、
  *   非网络来源的 `Log` error。这些都代表真实缺陷。
+ * - 🔴 **失败（`#227` 补的两条）**：① **页面没挂载**（`#app` 没有子节点）
+ *   ② **期望的页面特征没出现**（与 `render-check` 同一份 `expect`）。
+ *   ⚠️ 修前只有"有没有 error"这一条判据，而**页面整页挂掉 = 没有 error** ⇒ 恒绿。
  * - **预期**：`[未实现接口] … → 404` 的降噪提示（request 层每接口只打一次），
  *   以及浏览器对 404 的网络资源日志（source=network）—— 不计失败，只当观察项列出。
  *
  * <h3>前置</h3>
- * 后端 8080 + 真后端模式的前端 dev（`VITE_USE_MOCK=false`，绑 127.0.0.1）。
+ * 后端 8080 + 前端 dev（**真后端模式**为常规用法：`VITE_USE_MOCK=false`，绑 127.0.0.1；
+ * mock 模式也能跑）。脚本会先做 **dev server 前置自检**并把模式打出来。
  * <pre>node scripts/console-check.mjs --base=http://127.0.0.1:5174</pre>
+ *
+ * <h3>退出码</h3>
+ * `0` 全过 · `1` 有路由失败 · `2` **前置不满足**（server 不可达 / API 层探针失败，一条路由都没跑）。
  */
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { ROUTES } from './lib/routes.mjs'
+import { probeDevServer, reportPrecondition } from './lib/dev-server.mjs'
 
 const arg = (name, fallback) => (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
 const BASE = arg('base', 'http://127.0.0.1:5174')
@@ -30,34 +39,15 @@ const PROFILE = 'F:/work/code/ai-knowledge/temp/edge-console-check'
 const OUT_DIR = 'F:/work/code/ai-knowledge/temp/console-check'
 const CDP_PORT = Number(process.env.E2E_CDP_PORT || 9336)
 
-/** 与 render-check.mjs 同一份路由清单（22 个业务页 + 3 公开页 + 3 错误页）。 */
-const ROUTES = [
-  { path: '/login', public: true },
-  { path: '/register', public: true },
-  { path: '/forgot-password', public: true },
-  { path: '/chat' },
-  { path: '/notice' },
-  { path: '/kb' },
-  { path: '/kb/create' },
-  { path: '/kb/1' },
-  { path: '/kb/1/upload' },
-  { path: '/doc/1' },
-  { path: '/doc/1/preview' },
-  { path: '/doc/download' },
-  { path: '/recycle' },
-  { path: '/ops/qa' },
-  { path: '/ops/retrieval' },
-  { path: '/ops/usage' },
-  { path: '/profile' },
-  { path: '/system/user' },
-  { path: '/system/role' },
-  { path: '/system/grant' },
-  { path: '/system/model' },
-  { path: '/system/audit' },
-  { path: '/403' },
-  { path: '/500' },
-  { path: '/no-such-page' },
-]
+/**
+ * 路由清单从 **`lib/routes.mjs`** 来 —— 与 `render-check.mjs` 共用**同一份**。
+ *
+ * 🔴 这里此前是一份**手抄的拷贝**，注释还写着「与 render-check.mjs 同一份路由清单」
+ * —— **那句话是靠注释维持的**：抄出来的那份**没有 `expect`**，于是本脚本只能断言
+ * "控制台没有 error"，而**页面整页挂掉 = 没有 error** ⇒ 一条恒绿的判据（`#227`）。
+ * 现在清单是单一事实源，本脚本也**用同一份 `expect` 做渲染断言**。
+ */
+
 
 // ---------------------------------------------------------------- CDP
 let ws
@@ -109,8 +99,24 @@ async function main() {
   rmSync(PROFILE, { recursive: true, force: true })
   mkdirSync(OUT_DIR, { recursive: true })
 
-  const token = await apiLogin()
-  console.log(`admin 登录 OK（${token.length} 字符）；开始遍历 ${ROUTES.length} 路由 …\n`)
+  // 🔴 **前置自检**：先证明"我打的是哪个 server、它在哪个模式"。
+  // 本脚本**两种模式都能跑**，所以只在连不上/探针失败时退出（exit 2）。
+  // 注意顺序：放在 `apiLogin()` **之前** —— 否则"后端没起"会先以登录失败的面目出现，
+  // 把人引去查后端，而真正的问题可能是"打错了 dev server"。
+  const server = reportPrecondition(await probeDevServer(BASE), 'console-check')
+
+  // mock 模式下**不去连真后端**：守卫只检查 localStorage 里有没有 token
+  // （`stores/auth.ts` 的 `isLoggedIn: (s) => !!s.token`），页面数据全部来自 mock 层。
+  // ⇒ 这时还去连 8080，只会让"本来在 mock 下就能跑的判据"依赖一个它并不需要的东西，
+  //    而那个依赖失败时报的是"登录失败"，把人引去查后端（真正的问题可能是别的）。
+  let token
+  if (server.mode === 'mock') {
+    token = 'console_check_mock_token'
+    console.log(`mock 模式：跳过真后端登录（占位 token，页面数据来自 mock 层）；开始遍历 ${ROUTES.length} 路由 …\n`)
+  } else {
+    token = await apiLogin()
+    console.log(`admin 登录 OK（${token.length} 字符）；开始遍历 ${ROUTES.length} 路由 …\n`)
+  }
 
   const child = spawn(
     EDGE,
@@ -179,8 +185,28 @@ async function main() {
       logEntries = []
       // 带 query + hash 整页重载：让 guard 读最新登录态、每页重新 onMounted
       await send('Page.navigate', { url: `${BASE}/?boot=${Date.now()}#${r.path}` })
-      await waitFor(`!!document.querySelector('#app') && document.querySelector('#app').children.length > 0`, { timeout: 20000 })
+
+      // 🔴 **必须接住 `waitFor` 的返回值**（`#227` 的根因）
+      //    原写法是 `await waitFor(...)` —— 返回值被**整个丢掉**。
+      //    于是"页面**根本没挂载**"与"挂载了、也没报错"在下游**完全分不出来**，后者照样记 ✓。
+      //    这与 `#187`（`await quiesceParseJobs(code)` 的返回值被丢）是**同一个形状**：
+      //    信息存在，但在传递的路上被扔了。
+      const mounted = await waitFor(
+        `!!document.querySelector('#app') && document.querySelector('#app').children.length > 0`,
+        { timeout: 20000 },
+      )
       await sleep(1500) // 等页面内请求落地（含 404 的未实现接口）
+
+      // ② **渲染断言** —— 用与 `render-check` **同一份** `expect`。
+      //    只断言"控制台没有 error"是不够的：**页面整页挂掉 = 没有 error** ⇒ 恒绿。
+      // ⚠️ 但本脚本跑的是**真后端**，而清单里有几条 `expect` 的标题**只在 mock 数据里**
+      //    （`lib/routes.mjs` 的 `mockData` 标记）。真后端模式下**跳过**这几条 ——
+      //    不跳的话这个闸会在它**本该跑的模式里恒红**，那比恒绿好不了多少。
+      //    ⚠️ 跳过必须**打印出来**，不静默：否则"跳过"与"通过"长得一样。
+      const skipExpect = r.mockData === true && server.mode === 'real'
+      const rendered = skipExpect
+        ? mounted
+        : mounted && (await evaluate(`(${r.expect.toString()}).test(document.documentElement.outerHTML)`))
 
       const uncaught = exceptions.length
       const jsErr = jsConsole.filter((m) => m.type === 'error')
@@ -189,11 +215,17 @@ async function main() {
         .map((m) => m.text)
         .filter((t) => t.includes('[未实现接口]'))
 
-      const bad = uncaught + jsErr.length + logErr.length
+      const bad = uncaught + jsErr.length + logErr.length + (mounted ? 0 : 1) + (rendered ? 0 : 1)
       if (bad > 0) failed++
       rows.push({ path: r.path, uncaught, jsErr: jsErr.length, logErr: logErr.length, notices: [...new Set(notices)] })
+      const marks = `${mounted ? '' : ' **没挂载**'}${rendered ? '' : ' **期望的页面特征没出现**'}${skipExpect ? ' （数据依赖断言：真后端模式跳过）' : ''}`
       const detail = bad ? ` uncaught=${uncaught} jsErr=${jsErr.length} logErr=${logErr.length}` : ''
-      console.log(`${bad ? '✗' : '✓'} ${r.path.padEnd(22)} 未捕获=${uncaught} jsError=${jsErr.length} logError=${logErr.length} 未实现提示=${notices.length}${detail}`)
+      console.log(`${bad ? '✗' : '✓'} ${r.path.padEnd(22)} 未捕获=${uncaught} jsError=${jsErr.length} logError=${logErr.length} 未实现提示=${notices.length}${marks}${detail}`)
+      if (!mounted) {
+        console.log('      [挂载] #app 里没有任何子节点 —— **页面整页没渲染**（这正是修前会被漏掉的那种）')
+      } else if (!rendered) {
+        console.log(`      [渲染] ${r.label ?? ''} 的页面特征没出现 —— 断言：${r.expect}`)
+      }
       if (bad) {
         for (const e of exceptions) console.log(`      [exceptionThrown] ${e.text.slice(0, 200)}`)
         for (const e of jsErr) console.log(`      [console.error] ${e.text.slice(0, 200)}`)
