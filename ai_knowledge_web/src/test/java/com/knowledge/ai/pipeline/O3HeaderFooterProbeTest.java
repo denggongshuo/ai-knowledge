@@ -45,6 +45,33 @@ class O3HeaderFooterProbeTest {
     private static final Path SAMPLE = Path.of("..", "docs", "测试文件",
             "江西省农村信用社联合社_业务中台整体规划项目_项目管理章程.pdf").toAbsolutePath().normalize();
 
+    /**
+     * 几何清册与干跑**共用的样本集**（`S6-M05-C2` 补到 **5/5**）。
+     *
+     * <h3>为什么抽成常量</h3>
+     * <p>它原先在 {@code imageGeometryInventory} 与 {@code dryRunOfBothHeuristics}
+     * 里**各写了一份一字不差的数组** —— 本仓对"两处各写一份"的判词是"必然漂"。
+     * 本批补样本时正好撞上：只改一处就会出现"清册看 5 份、干跑只跑 3 份"。
+     *
+     * <h3>为什么补这两份</h3>
+     * <p>此前只有 3/5，而 `S4-M05-C2` §3.5 那句「没有一份含跨页同位置的图」
+     * **实际只对 3/5 成立**。补的这两份恰好是**图类型最不同**的：
+     * <ul>
+     *   <li>{@code 2-提示词工程.pdf} —— PPT 导出型，**57 个图元素**（出图率仅 11%，最极端）；</li>
+     *   <li>{@code 健康生活方式（指导手册）.pdf} —— 21.8MB 扫描件型，15 图元素（出图率 100%）。</li>
+     * </ul>
+     * ⚠️ 补完**很可能仍是「正向证据只能靠合成」** —— 因为「跨文档重复」要**多份文档**
+     * 才看得出，单份样本测不了。**这里验的是"有没有反例"，不是"有没有正例"。**
+     */
+    private static final Path[] SAMPLES = {
+            SAMPLE,
+            Path.of("..", "docs", "测试文件", "1-DeepSeek使用.pdf").toAbsolutePath().normalize(),
+            Path.of("..", "docs", "测试文件", "百福云PaaS平台应用部署快速入门 v1.0.pdf")
+                    .toAbsolutePath().normalize(),
+            Path.of("..", "docs", "测试文件", "2-提示词工程.pdf").toAbsolutePath().normalize(),
+            Path.of("..", "docs", "测试文件", "健康生活方式（指导手册）.pdf").toAbsolutePath().normalize(),
+    };
+
     @Test
     @DisplayName("O3 步 0.1：元素类型全集是 6 种，且**没有**原生 header/footer")
     void elementTypeInventoryHasNoHeaderFooter() throws Exception {
@@ -117,12 +144,7 @@ class O3HeaderFooterProbeTest {
     @Test
     @DisplayName("O3 步 3 前置：image 元素到底带不带几何信息（决定装饰图判定做不做得了）")
     void imageGeometryInventory() throws Exception {
-        Path[] samples = {
-                SAMPLE,
-                Path.of("..", "docs", "测试文件", "1-DeepSeek使用.pdf").toAbsolutePath().normalize(),
-                Path.of("..", "docs", "测试文件", "百福云PaaS平台应用部署快速入门 v1.0.pdf")
-                        .toAbsolutePath().normalize(),
-        };
+        Path[] samples = SAMPLES;
 
         StringBuilder sb = new StringBuilder();
         for (Path sample : samples) {
@@ -156,12 +178,7 @@ class O3HeaderFooterProbeTest {
     @Test
     @DisplayName("O3 步 0 干跑：真样本上「跨页重复」两条启发式分别能判出什么")
     void dryRunOfBothHeuristics() throws Exception {
-        Path[] samples = {
-                SAMPLE,
-                Path.of("..", "docs", "测试文件", "1-DeepSeek使用.pdf").toAbsolutePath().normalize(),
-                Path.of("..", "docs", "测试文件", "百福云PaaS平台应用部署快速入门 v1.0.pdf")
-                        .toAbsolutePath().normalize(),
-        };
+        Path[] samples = SAMPLES;
 
         StringBuilder sb = new StringBuilder();
         for (Path sample : samples) {
