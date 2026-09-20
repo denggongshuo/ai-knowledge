@@ -73,6 +73,14 @@ public final class ProbeArtifacts {
             Map.entry("sys_notice_read",
                     "通知已读状态（T-B02）。无主判据：通知没了、或人没了。**子表，先于 sys_notice 清**"),
             Map.entry("sys_notice_setting", "通知设置（T-B02）。无主判据：人没了"),
+            Map.entry("sys_qa_miss",
+                    "未命中池（T-A00）。无主判据：`last_user_id` 悬空（最近提问人已删）。"
+                            + "⚠️ 归属列叫 `last_user_id` 而不是 `user_id` —— 它是**聚合行**"
+                            + "（一行可能对应多个提问人），叫 user_id 是用名字撒谎。"
+                            + "🔴 代价：覆盖率闸扫的是**精确等于** `user_id` 的列名 ⇒ **闸看不见本表**，"
+                            + "这一行是**手工**登记的，不是被闸逼出来的（`V31` 头注警告的正是这个形状）。"
+                            + "⚠️ 无主判据**不能直接搬生产**：删掉最近那位提问人会让整行消失，"
+                            + "而那一行还聚合着别人的提问 —— 生产该按保留策略清"),
             Map.entry("sys_model_usage",
                     "模型用量（T-905）。🔴 **一个归属列都没有**（无 kb_id/doc_id/user_id）—— "
                             + "所以清理口径只能是**按日期清当天**（`ProbeCleanup#sweepProbeUsage`），"

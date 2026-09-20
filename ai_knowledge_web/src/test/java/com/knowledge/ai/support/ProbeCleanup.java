@@ -261,6 +261,32 @@ public final class ProbeCleanup {
     }
 
     /**
+     * 未命中池的无主兜底（`T-A00` · `S8-M10-A` 新增）。
+     *
+     * <h3>它为什么需要一个兜底</h3>
+     * <p>`sys_qa_miss` 是**聚合行**：一行代表"一个问法被问了几次"，由
+     * `MissSink` 在检索打点之后自动 upsert（**不经过任何用例的显式代码**）。
+     * 也就是说，凡是走真 HTTP 提问、且被判成未命中的用例，都会**悄悄**往池子里写
+     * —— 与 `T-B03` 的通知是同一个形状（"接线之后，所有跑过链路的用例都成了产出方"）。
+     *
+     * <h3>归属判据：`last_user_id` 悬空</h3>
+     * <p>它只有这一个归属线索。⚠️ 与 `sweepOrphanNotices` 一样，**这条不能直接搬生产**：
+     * 池子行聚合的是**多个**提问人，删掉最近那位提问人就让整行消失是**过度删除** ——
+     * 生产里该按保留策略清，而不是按人清。这里成立只因为"探针账号的提问都是探针造的"。
+     *
+     * <h3>⚠️ 它抓不到"归属还在"的残留（射程如实写明）</h3>
+     * <p>用**种子超管**提问产生的未命中行，`last_user_id` 仍然有效 ⇒ 不属于无主，
+     * 这条兜底看不见它。那一半靠用例自己清（`QaMissFlowTest` 就是这么做的）。
+     *
+     * @return 删掉的行数
+     */
+    public static int sweepOrphanMisses(JdbcTemplate jdbc) {
+        return jdbc.update("delete from sys_qa_miss "
+                + "where last_user_id is not null "
+                + "  and last_user_id not in (select id from sys_user)");
+    }
+
+    /**
      * **按日期**清模型用量（`T-905` · `S6-M09-B` 新增）—— 清**当天**那一格到今天为止。
      *
      * <h3>为什么是"按日期"而不是"按归属"</h3>

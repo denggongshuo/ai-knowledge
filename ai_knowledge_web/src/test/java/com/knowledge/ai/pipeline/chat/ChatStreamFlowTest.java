@@ -39,6 +39,15 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
     /** 本用例开始前 `sys_chat_session` 的最大 id —— 之后新增的全是本轮造的。 */
     private long sessionFloor;
 
+    /**
+     * 本用例开始前 `sys_qa_miss` 的最大 id（`T-A00`）。
+     *
+     * <p>⚠️ **必须自己删，不能靠无主兜底**：本类的提问人是 `reader()` = **种子超管**
+     * （`userId = 1`），那一行删不掉 —— 超管当然还在。这正是
+     * `ProbeCleanup#sweepOrphanMisses` javadoc 里说的"射程之外的那一半"。
+     */
+    private long missFloor;
+
     @BeforeEach
     void m08SetUp() {
         RetrievalTestStubs.resetStream();
@@ -47,6 +56,8 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         RetrievalTestStubs.resetRerank();
         Long max = jdbc.queryForObject("select coalesce(max(id), 0) from sys_chat_session", Long.class);
         sessionFloor = max == null ? 0L : max;
+        Long missMax = jdbc.queryForObject("select coalesce(max(id), 0) from sys_qa_miss", Long.class);
+        missFloor = missMax == null ? 0L : missMax;
     }
 
     @AfterEach
@@ -57,6 +68,9 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         jdbc.update("delete from sys_retrieval_trace where session_id > ?", sessionFloor);
         jdbc.update("delete from sys_chat_message where session_id > ?", sessionFloor);
         jdbc.update("delete from sys_chat_session where id > ?", sessionFloor);
+        // `T-A00` 的池子行（本类只有 `missIsSunkIntoPool` 会造）—— 提问人是种子超管，
+        // 无主兜底够不着它，见 `missFloor` 的注释
+        jdbc.update("delete from sys_qa_miss where id > ?", missFloor);
         // 基类的探针清理**不会自动跑**（它没有 @AfterEach），每个用例类自己调 —— 与
         // RetrievalServiceTest / TableLookupFlowTest 等一致
         cleanProbeData();
@@ -228,6 +242,53 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
                 .as("miss_flag 是 G5-11 后半的落点")
                 .isEqualTo(1);
         assertThat(intOf(row.get("rerank_applied"))).isEqualTo(1);
+    }
+
+    // ==================== T-A00 · 未命中沉淀 ====================
+
+    @Test
+    @DisplayName("T-A00：未命中沉淀进池子；同一问法两次提问合成一行，且与打点行**对得上**")
+    void missIsSunkIntoPool() {
+        kbId = insertKb("M08A_POOL");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+        RetrievalTestStubs.rerankStub = lowScoreRerank();
+
+        // 同一句话问两次，**标点不同** —— 归一化的那半边就靠这一步验
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少"), new RecordingSink());
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少！！"), new RecordingSink());
+
+        List<java.util.Map<String, Object>> rows = jdbc.queryForList(
+                "select * from sys_qa_miss where id > ?", missFloor);
+        assertThat(rows)
+                .as("两次提问必须合成**一行**（`G8-2`：不是把每次提问当成一行）")
+                .hasSize(1);
+        assertThat(((Number) rows.getFirst().get("ask_count")).intValue()).isEqualTo(2);
+
+        // 🔴 对账：池子是打点的**派生**，两个数说的必须是同一件事。
+        //    ⚠️ 本条的强度全在"同一个窗口"上：池子按 id 水位线、打点按 session 水位线，
+        //    两边都只圈本轮自己造的那些。少了任何一边的窗口，它就退化成"比两个全局数"
+        //    —— 而全局数会因为别的用例而恒不相等，于是这条判据只能被删掉。
+        Long asked = jdbc.queryForObject(
+                "select coalesce(sum(ask_count), 0) from sys_qa_miss where id > ?", Long.class, missFloor);
+        Long missed = jdbc.queryForObject(
+                "select count(*) from sys_retrieval_trace where session_id > ? and miss_flag = 1",
+                Long.class, sessionFloor);
+        assertThat(asked)
+                .as("池子的提问次数合计必须等于 miss_flag=1 的打点行数 —— 对不上说明有一边漏了")
+                .isEqualTo(2L)
+                .isEqualTo(missed);
+
+        // 池子里的"最高相似度"与打点里的 Top1 是**同一个算法**算出来的
+        Double poolTop = jdbc.queryForObject(
+                "select max_top_score from sys_qa_miss where id > ?", Double.class, missFloor);
+        Double traceTop = jdbc.queryForObject(
+                "select max(top1_score) from sys_retrieval_trace where session_id > ? and miss_flag = 1",
+                Double.class, sessionFloor);
+        assertThat(poolTop)
+                .as("两处对不上而两边看着都合理 —— 这正是要钉住它的理由")
+                .isEqualTo(traceTop);
     }
 
     // ==================== 断连仍留痕 ====================

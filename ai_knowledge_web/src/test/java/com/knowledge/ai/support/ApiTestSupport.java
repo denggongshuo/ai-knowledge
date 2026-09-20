@@ -206,6 +206,13 @@ public abstract class ApiTestSupport {
             //    与上面几条不同，别把它当成"有类漏清了"的信号（见 `sweepOrphanNotices` 的 javadoc）。
             log.info("[探针兜底] 清掉 {} 行无主通知（所含已读/设置行同批清了）", orphanNotices);
         }
+        // `T-A00`（本批）：**未命中池的兜底**。与通知同一条来历 —— `MissSink` 接线之后，
+        // 凡是走真 HTTP 提问且被判未命中的用例都会往池子里写，而那是**旁路**写的
+        // （不在任何用例的清理代码里）。⚠️ 同样排在后面：`cleanUsers` 先删人，行才变无主。
+        int orphanMisses = ProbeCleanup.sweepOrphanMisses(jdbc);
+        if (orphanMisses > 0) {
+            log.info("[探针兜底] 清掉 {} 行无主未命中问题（最近提问人已删）", orphanMisses);
+        }
     }
 
     /**
