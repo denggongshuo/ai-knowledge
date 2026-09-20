@@ -1555,10 +1555,22 @@ register('POST', '/api/audit/export', async (req, res) => {
 })
 
 // ============ 文档域（详情 / 预览 / 下载） ============
-/** 块类型归组：正文 / 表格 / 摘要 */
-function blockGroup(t: string): 'text' | 'table' | 'summary' {
+/**
+ * 块类型归组：正文 / 表格 / **图片** / 摘要。
+ *
+ * <h3>⚠️ `image` 档是后补的，而且它是一处**真缺口**</h3>
+ * <p>需求 §4.4 的 chips 有五档（全部 / 正文 / 表格 / **图片** / 摘要），而这里原先只有
+ * 三档 —— `IMAGE` 被归进了 `text`。于是「筛图片」在 mock 模式下**筛不出任何东西**
+ * （不是"没有图片块"，是"这一档根本不存在"），而 `ChunkStat.image` 又是独立字段。
+ * 后端 `DocDetailService` 的五档与它对齐（`all/text/table/image/summary`）。
+ *
+ * <p>⚠️ `HYPOTHESIS_QA` 归 `text`：8 种 blockType 要归进 4 个展示分组，而需求的原文
+ * 只点了 `PARAGRAPH/HEADING/CODE/LIST` —— HyQ 块展示上就是一条正文。
+ */
+function blockGroup(t: string): 'text' | 'table' | 'image' | 'summary' {
   if (t === 'TABLE') return 'table'
   if (t === 'SUMMARY') return 'summary'
+  if (t === 'IMAGE') return 'image'
   return 'text'
 }
 

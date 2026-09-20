@@ -101,7 +101,16 @@ export interface DocInfo {
   securityLevel: SecretLevel
   owner: string
   uploadedAt: string
-  version: string
+  /**
+   * 文档版本号。
+   *
+   * ⚠️ **真后端目前恒回 `null`（本版本没有该来源）** —— 版本机制整块未落地：
+   * 没有版本表、同名上传不归档，属 `T-606`~`T-608`。**不要**拿
+   * `sys_document.parse_version` 顶替：那是**解析器指纹**（`V20` 的注释明写
+   * 「≠ 文档版本」），一个说"谁解析的"、一个说"第几版"。
+   * ⚠️ mock 里给的 `'v3'` 是示例数据，不是能力声明。
+   */
+  version: string | null
 }
 
 /** 分片 */
@@ -702,14 +711,27 @@ export interface DocMeta extends DocInfo {
   /** 图片总数 / 已理解数（V2 新增） */
   imageTotal?: number
   imageParsed?: number
-  /** 被引用次数（问答引用） */
-  citations: number
-  downVotes: number
-  lastIndexAt: string
+  /**
+   * 被引用次数（问答引用）。
+   *
+   * ⚠️ **`null` = 未采集，不是"0 次"** —— `cited` 列存在但写入方恒写 null
+   * （引用角标属 `T-804`）⇒ 后端如实给 null，页面**不许渲染成「0 次」**：
+   * 那是一句关于内容的断言，而我们并没有那个事实（长期约定「判不了与判否分开报」）。
+   */
+  citations: number | null
+  /** 点踩次数。同 `citations`：`null` = 未采集（同一根因） */
+  downVotes: number | null
+  /** 最近索引时刻；**从没跑过解析任务时为 `null`** */
+  lastIndexAt: string | null
   /** 知识库级密级（文档密级不可低于此） */
   kbSecurityLevel: SecretLevel
-  /** 内容标签（大模型生成，可人工修正） */
-  tags: string[]
+  /**
+   * 内容标签（大模型生成，可人工修正）。
+   *
+   * ⚠️ **`null` = 未落库**（文档级内容标签至今没有归属表，`IndexEnhancer` 的 javadoc
+   * 自己写着这一条）⇒ 不要用 `tags.length` 判断"没有标签"，那是两件事。
+   */
+  tags: string[] | null
 }
 
 /** 文档版本（同名上传自动归档，不覆盖） */
@@ -727,35 +749,102 @@ export interface DocVersion {
 
 /** 索引任务记录 */
 export interface IndexTask {
-  id: number
+  /**
+   * 任务 id。
+   *
+   * ⚠️ 是**字符串**（`sys_async_task` 的主键就是 `task_id VARCHAR(64)`，那张表
+   * **没有数字 id 列**）。mock 里给的 `1/2/3/4` 是示例数据的序号，不是真事实 ——
+   * 真后端下发的是任务 id 本身，页面上只用它当 `:key`。
+   */
+  id: string
   stage: string
   at: string
-  version: string
-  status: 'SUCCESS' | 'RUNNING' | 'FAILED' | 'INFO'
-  durationSec?: number
-  chunkCount?: number
-  detail?: string
+  /** ⚠️ 恒 `null`（同 `DocInfo.version`：版本机制未落地，不是"这份任务没有版本"） */
+  version: string | null
+  /**
+   * **原样**取后端状态机 `AsyncTaskStatus` 的四态（`PENDING/RUNNING/DONE/FAILED`），
+   * 不在 API 边界改名。
+   *
+   * ⚠️ 改名的代价不只是"哪个词好看"：一旦后端把它映射成 `SUCCESS`，这个取值就
+   * **再也不可能三方逐字相等**，`check-enums.mjs` 的取值登记表（它只比"三方一致"）
+   * 就覆盖不了它 ⇒ 三份词表又回到"靠人同步"。
+   *
+   * ⚠️ 原类型里还有一个 `INFO` —— 它在本仓**没有任何定义**（既不在 `AsyncTaskStatus` 里，
+   * CSS 里也没有 `.dot.info`，那一行的圆点本来就是裸的），本批收回。
+   */
+  status: 'DONE' | 'RUNNING' | 'FAILED' | 'PENDING'
+  durationSec?: number | null
+  /** 分片数。⚠️ `null` = 未知（后端那列 0 的口径就是"还没数出来"），不是 0 个 */
+  chunkCount?: number | null
+  detail?: string | null
 }
 
-/** 分片块类型统计 */
+/**
+ * 分片块类型统计。
+ *
+ * <h3>🔴 `total` = <b>顶层块数</b>，两条等式都要成立（`G7-2`）</h3>
+ * <pre>
+ *   text + table + summary + image == total      桶内自洽
+ *   total + tableSubBlocks          == 全表行数   没有一行掉在地上
+ * </pre>
+ * 表格子块（子块的 `parentId != null`）**不进任何一个桶、也不进 `total`**，
+ * 单独走 `tableSubBlocks`。⚠️ 只断言第一条时，「把 total 改小」就能假绿 ——
+ * 所以后端用例 `DocDetailFlowTest` 两条都断言了。
+ */
 export interface ChunkStat {
   total: number
   text: number
   table: number
   summary: number
-  /** 图片块数（V2 新增） */
-  image?: number
-  /** 表格已拆出的子块数 */
+  /**
+   * 图片块数。
+   *
+   * ⚠️ `null`（而不是 0）= **这一类块对它不适用** —— `T-512` 之前落的文档没有
+   * IMAGE 块，「0 张图」与「这份文档早于图片能力上线」不是一件事。
+   */
+  image?: number | null
+  /** 表格已拆出的子块数（**不属于**上面四个桶） */
   tableSubBlocks: number
-  avgTokens: number
-  /** 标题路径覆盖率 % */
+  /**
+   * 平均 token 数。分母与 `total` 同源（顶层块）。
+   * ⚠️ 空文档（`total = 0`）时为 `null` —— 0 会被读成"分片都很短"。
+   */
+  avgTokens: number | null
+  /** 标题路径覆盖率 %（分母 = 顶层块：子块**继承**父块路径，算进去会让含大表的文档虚高） */
   titlePathCoverage: number
 }
 
-/** 父子块关系（检索命中子块 → parent_id → 完整父块） */
+/**
+ * 父子块关系（`GET /doc/{id}/chunks/{parentId}`）。
+ *
+ * <h3>⚠️ 相对 mock 的旧形状：多了 `children[]`，去掉了 `child`</h3>
+ * <p>门禁 `G7-1` 的原文是「返回父块完整内容 + **全部**子块」，而一个 `child`
+ * 表达不了"全部"（旧的单一 `child` 是 mock 的产物 —— 那里恰好只有一个子块）。
+ * 需求 §4.5 那张「命中子块 → 父块」的图描述的是**检索**场景，而检索详情面板用的是
+ * 打点里的 `trace.chunks`，从不调本接口 ⇒ 没有真实消费方被破坏。
+ */
 export interface ParentChunkRelation {
-  child: { ref: string; content: string }
-  parent: { ref: string; title: string; rows: number; cols: number; returnedRows: number; content: string }
+  parent: {
+    id: number
+    orderNo: number
+    /** 表格块引用号（`T-03`） */
+    ref: string
+    /** **表标题**（Markdown 的 `**…**` 前导行）；没有时为空串。⚠️ 刻意不回落成"所属章节" */
+    title: string
+    /** 所属章节（标题路径） */
+    titlePath: string
+    /** 数据行数（**不含表头**）；父块内容不是管道表时为 0 */
+    rows: number
+    cols: number
+    /** 本次**实际返回**的数据行数。本页返回整表 ⇒ 恒等于 `rows` */
+    returnedRows: number
+    /** 完整 Markdown（含表标题与表头） */
+    content: string
+  }
+  /** 全部子块（行式文本），按 `orderNo` 升序 */
+  children: { id: number; orderNo: number; ref: string; content: string }[]
+  /** `children.length` 的显式副本，让"全部"可断言 */
+  total: number
 }
 
 /** 文档目录项 */

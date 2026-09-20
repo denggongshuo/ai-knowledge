@@ -94,28 +94,74 @@ function tagTypeOf(t: string): 'warning' | 'primary' | 'info' {
   return 'info'
 }
 
+/** 本页加载时失败的端点（**按端点降级**：一个坏了不该让整页什么都不显示）。 */
+const loadErrors = ref<string[]>([])
+/** 当前选中的那个子块（父子块关系框里高亮它）。 */
+const relationChildId = ref<number | null>(null)
+
 onMounted(async () => {
   loading.value = true
-  try {
-    const [m, c, t, ts] = await Promise.all([
-      docApi.meta(docId.value),
-      docApi.chunks(docId.value),
-      docApi.toc(docId.value),
-      docApi.indexTasks(docId.value),
-    ])
-    meta.value = m
-    chunks.value = c.list
-    stat.value = c.stat
-    toc.value = t.list
-    tasks.value = ts.list
-    pageCount.value = m.pageCount
-    // 父子块关系（默认给出，选中表格块时展示）
-    relation.value = await docApi.parentChunk(docId.value, 0)
-    selectedChunkId.value = chunks.value[0]?.id ?? null
-  } finally {
-    loading.value = false
+  // ⚠️ 用 `allSettled` 而不是 `all`：`all` 只要一个端点失败就整页空白，
+  // 而"文档不存在"/"某个端点还没实现"是**会发生**的（详情页的版本列表就是后一种）。
+  // 逐个记下失败项并在页面上说清楚 —— 静默的空白页最难排查。
+  const [m, c, t, ts] = await Promise.allSettled([
+    docApi.meta(docId.value),
+    docApi.chunks(docId.value),
+    docApi.toc(docId.value),
+    docApi.indexTasks(docId.value),
+  ])
+  const failed: string[] = []
+  if (m.status === 'fulfilled') {
+    meta.value = m.value
+    pageCount.value = m.value.pageCount
+  } else {
+    failed.push('文档元信息')
   }
+  if (c.status === 'fulfilled') {
+    chunks.value = c.value.list
+    stat.value = c.value.stat
+    selectedChunkId.value = chunks.value[0]?.id ?? null
+  } else {
+    failed.push('分片列表')
+  }
+  if (t.status === 'fulfilled') {
+    toc.value = t.value.list
+  } else {
+    failed.push('目录树')
+  }
+  if (ts.status === 'fulfilled') {
+    tasks.value = ts.value.list
+  } else {
+    failed.push('索引任务')
+  }
+  loadErrors.value = failed
+  loading.value = false
 })
+
+/**
+ * 取某个表格块的父子块关系（`G7-1`）。
+ *
+ * <h3>🔴 这里原先写的是 `parentChunk(docId, 0)` —— 一个必然报错的调用</h3>
+ * <p>契约与实体都禁止用 `0` 当"无父块"的哨兵（顶层块的 `parentId` 是 `null`），
+ * 真后端会对 `0` 明确报错。它此前"没出问题"，**只因为打的是 mock**。
+ *
+ * <p>现在按块的真实身份决定参数：选中**父块**（`blockType = TABLE` 且 `parentId` 为
+ * `null`）时传它自己的 id；选中**子块**时传它指向的父块 id，并把那个子块高亮。
+ */
+async function loadRelation(chunk: ChunkInfo | null) {
+  relation.value = null
+  relationChildId.value = null
+  if (!chunk || chunk.blockType !== 'TABLE') return
+  const parentId = chunk.parentId ?? chunk.id
+  try {
+    const rel = await docApi.parentChunk(docId.value, parentId)
+    relation.value = rel
+    relationChildId.value = chunk.parentId == null ? (rel.children[0]?.id ?? null) : chunk.id
+  } catch {
+    // 关系取不到不影响别的区块 —— 关系框自己不显示即可（不弹全局错误）
+    relation.value = null
+  }
+}
 
 const visibleChunks = computed(() =>
   chunkFilter.value === 'all' ? chunks.value : chunks.value.filter((c) => groupOf(c.blockType) === chunkFilter.value),
@@ -126,9 +172,24 @@ function sizeText(b: number) {
 }
 
 // ---------------- 联动 ----------------
-function selectToc(item: TocItem) {
+/**
+ * 点目录项 → 滚到对应分片。
+ *
+ * ⚠️ 原先这里写的是 `if (item.id === 'h3') currentPage.value = 3` —— 拿 mock 的
+ * 层级引用串（`'h3'`）当判断条件。真后端下发的 `id` 是**分片 id 的字符串形式**，
+ * 那个分支永远不会命中（而现象只是"点了目录没反应"）。现在按真 id 定位到块。
+ */
+async function selectToc(item: TocItem) {
   selectedTocId.value = item.id
-  if (item.id === 'h3') currentPage.value = 3
+  chunkFilter.value = 'all'
+  selectedChunkId.value = Number(item.id)
+  await nextTick()
+  await selectChunkById(Number(item.id))
+}
+
+/** 滚到某个分片卡片并闪一下（目录树与原文段落两处联动共用）。 */
+async function selectChunkById(id: number) {
+  chunkEls.value[id]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 /** 点原文段落 → 右栏滚动并高亮对应分片 */
 async function selectParagraph(p: { id: string; chunkIndex: number }) {
@@ -137,7 +198,7 @@ async function selectParagraph(p: { id: string; chunkIndex: number }) {
   await nextTick()
   chunkEls.value[p.chunkIndex]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
-/** 点分片卡片 → 中栏滚动到对应位置并闪一下 */
+/** 点分片卡片 → 中栏滚动到对应位置并闪一下；表格块顺带取父子关系 */
 async function selectChunk(c: ChunkInfo) {
   selectedChunkId.value = c.id
   await nextTick()
@@ -145,6 +206,7 @@ async function selectChunk(c: ChunkInfo) {
   el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   el?.classList.add('flash')
   setTimeout(() => el?.classList.remove('flash'), 900)
+  await loadRelation(c)
 }
 
 function setChunkRef(id: number, el: unknown) {
@@ -182,6 +244,27 @@ function openNewWindow() {
 
 <template>
   <div v-loading="loading" class="page preview-page">
+    <!--
+      降级说明：某个端点失败时**说清是哪一块**，而不是整页空白。
+      ⚠️ 纯文字（不写死"接口未实现"）—— 失败原因可能是网络、后端没起、或该端点还没做，
+      页面无从区分，就不要替它下结论。
+    -->
+    <el-alert
+      v-if="loadErrors.length"
+      class="load-warn"
+      type="warning"
+      :closable="false"
+      show-icon
+      title="部分内容没能加载"
+      :description="`以下部分暂时取不到：${loadErrors.join('、')}。其余内容照常显示。`"
+    />
+    <!-- 整页无内容（多半是文档不存在 / 库不可见）：给可行动的说明，别留一片空白 -->
+    <el-empty
+      v-if="!loading && !meta && loadErrors.length"
+      description="这篇文档打不开：它可能不存在，或你所在的部门看不到它所属的知识库。"
+    >
+      <el-button @click="goBack(router, '/kb')">返回知识库列表</el-button>
+    </el-empty>
     <!-- 页头 -->
     <div v-if="meta" class="page-head">
       <div class="head-left">
@@ -346,21 +429,32 @@ function openNewWindow() {
                 </div>
               </div>
 
-              <!-- 父子块关系 -->
+              <!-- 父子块关系（`G7-1`：父块完整内容 + **全部**子块） -->
               <div v-if="relation" class="relation-box">
                 <div class="rel-title">父子块关系</div>
                 <div class="row-inline">
-                  <el-tag size="small" type="warning">命中</el-tag>
-                  <span class="tiny">子块 {{ relation.child.ref }}</span>
-                </div>
-                <div class="rel-content child">{{ relation.child.content }}</div>
-                <div class="rel-arrow">↓ parent_id</div>
-                <div class="row-inline">
                   <el-tag size="small">父块</el-tag>
-                  <span class="tiny">{{ relation.parent.title }}</span>
+                  <span class="tiny">
+                    {{ relation.parent.ref }}
+                    <template v-if="relation.parent.title"> · {{ relation.parent.title }}</template>
+                    <template v-if="relation.parent.titlePath"> · 所属章节 {{ relation.parent.titlePath }}</template>
+                  </span>
                 </div>
                 <div class="rel-content parent">
                   {{ relation.parent.rows }} 行 × {{ relation.parent.cols }} 列全部返回，含表头与表标题（实际返回 {{ relation.parent.returnedRows }} 行）
+                </div>
+                <div class="rel-content parent mono">{{ relation.parent.content }}</div>
+                <div class="rel-arrow">↑ parent_id</div>
+                <div class="rel-title">
+                  该表格的全部子块（{{ relation.total }} 条，检索命中的是其中之一）
+                </div>
+                <div
+                  v-for="child in relation.children"
+                  :key="child.id"
+                  class="rel-content child"
+                  :class="{ active: child.id === relationChildId }"
+                >
+                  <span class="tiny mono">{{ child.ref }}</span> {{ child.content }}
                 </div>
                 <div class="rel-foot">
                   检索命中的是<b>子块</b>（精度高），喂给大模型的是<b>整个父块表格</b>（上下文全）。
@@ -448,10 +542,11 @@ function openNewWindow() {
               v-for="t in tasks"
               :key="t.id"
               :timestamp="t.at"
-              :type="t.status === 'SUCCESS' ? 'success' : t.status === 'RUNNING' ? 'primary' : t.status === 'FAILED' ? 'danger' : 'info'"
+              :type="t.status === 'DONE' ? 'success' : t.status === 'RUNNING' ? 'primary' : t.status === 'FAILED' ? 'danger' : 'info'"
               placement="top"
             >
-              <div class="tl-title">{{ t.stage }}<el-tag size="small" type="info" class="ml-6">{{ t.version }}</el-tag></div>
+              <!-- ⚠️ `version` 恒 null（版本机制未落地）⇒ 渲染成「—」，别留一个空白的标签 -->
+              <div class="tl-title">{{ t.stage }}<el-tag size="small" type="info" class="ml-6">{{ t.version ?? '—' }}</el-tag></div>
               <div class="tiny muted">
                 <template v-if="t.durationSec">耗时 {{ t.durationSec }} 秒 · {{ t.chunkCount }} 个分片</template>
                 <template v-else>{{ t.detail }}</template>

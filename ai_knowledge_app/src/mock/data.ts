@@ -558,11 +558,26 @@ export const mockDocVersions: DocVersion[] = [
 ]
 
 /** 索引任务记录 */
+/**
+ * 索引任务记录（详情页「版本历史」Tab 的上半）。
+ *
+ * ⚠️ 两处与真后端对齐的修正：
+ * <ol>
+ *   <li>{@code id} 是**字符串** —— `sys_async_task` 的主键就是 `task_id VARCHAR(64)`，
+ *       那张表**没有数字 id 列**，原先的 `4/3/2/1` 是示例数据的序号，不是真事实；</li>
+ *   <li>{@code 'INFO'} 这个取值**已收回** —— 它在本仓没有任何定义（既不在
+ *       `AsyncTaskStatus` 里，CSS 里也没有 `.dot.info`，那一行的圆点本来就是裸的）。
+ *       真后端原样下发 `AsyncTaskStatus` 的四态：`PENDING/RUNNING/DONE/FAILED`。</li>
+ * </ol>
+ */
 export const mockIndexTasks: IndexTask[] = [
-  { id: 4, stage: '索引完成', at: '2026-09-11 14:34', version: 'v3', status: 'SUCCESS', durationSec: 74, chunkCount: 222, detail: '切分 + 表格识别 + 向量化' },
-  { id: 3, stage: '开始索引', at: '2026-09-11 14:33', version: 'v3', status: 'RUNNING', detail: '切分 + 表格识别 + 向量化' },
-  { id: 2, stage: '索引完成', at: '2026-08-15 10:22', version: 'v2', status: 'SUCCESS', durationSec: 62, chunkCount: 198 },
-  { id: 1, stage: '首次索引', at: '2026-06-02 14:05', version: 'v1', status: 'INFO', durationSec: 58, chunkCount: 176 },
+  { id: 'tk-20260911-1502', stage: '排队中', at: '2026-09-11 15:02', version: 'v3', status: 'PENDING' },
+  { id: 'tk-20260911-1433', stage: '开始索引', at: '2026-09-11 14:33', version: 'v3', status: 'RUNNING', detail: '切分 + 表格识别 + 向量化' },
+  { id: 'tk-20260911-1434', stage: '索引完成', at: '2026-09-11 14:34', version: 'v3', status: 'DONE', durationSec: 74, chunkCount: 222, detail: '切分 + 表格识别 + 向量化' },
+  { id: 'tk-20260815-1022', stage: '索引完成', at: '2026-08-15 10:22', version: 'v2', status: 'DONE', durationSec: 62, chunkCount: 198 },
+  { id: 'tk-20260602-1405', stage: '首次索引', at: '2026-06-02 14:05', version: 'v1', status: 'DONE', durationSec: 58, chunkCount: 176 },
+  // 失败那一档要给**具体原因**（`G4-3`：不许只说"失败"两字）—— 这里顺带把文案示范出来
+  { id: 'tk-20260520-1108', stage: '解析失败', at: '2026-05-20 11:08', version: null, status: 'FAILED', detail: '该文件没有文本层（扫描件），请先做 OCR 或换一份带文本层的文件后重传' },
 ]
 
 /** 分片块类型统计（198 正文 + 12 表格 + 4 摘要 + 8 图片 = 222） */
@@ -587,17 +602,25 @@ export const mockChunks: ChunkInfo[] = [
   { id: 214, docId: 1, docTitle: 'AI 知识库平台白皮书 V3', titlePath: '文档级摘要', blockType: 'SUMMARY', index: 222, tokens: 186, parentId: null, content: '本文档描述 2026 版产品技术架构、接口鉴权与检索策略，涵盖分片增强、混合检索与重排链路。' },
 ]
 
-/** 父子块关系（命中子块 → parent_id → 完整父块） */
+/** 父子块关系（父块完整内容 + **全部**子块，`G7-1`） */
 export const mockParentChunk: ParentChunkRelation = {
-  child: { ref: 'T-03-002', content: '错误码 10021，含义 无知识库访问权限，处理建议 检查该用户的角色与知识库授权' },
   parent: {
+    id: 88,
+    orderNo: 3,
     ref: 'T-03',
     title: '表 2：接口错误码对照表',
+    titlePath: '3. 接口设计 > 3.2 错误码规范',
     rows: 14,
     cols: 3,
     returnedRows: 14,
     content: '| 错误码 | 含义 | 处理建议 |\n|---|---|---|\n| 10021 | 无知识库访问权限 | 检查该用户的角色与知识库授权 |\n| 10022 | 文档已被删除 | 刷新文档列表或联系管理员 |\n| … | … | … |',
   },
+  children: [
+    { id: 89, orderNo: 1, ref: 'T-03-001', content: '错误码 10020，含义 无操作权限，处理建议 联系管理员分配角色' },
+    { id: 90, orderNo: 2, ref: 'T-03-002', content: '错误码 10021，含义 无知识库访问权限，处理建议 检查该用户的角色与知识库授权' },
+    { id: 91, orderNo: 3, ref: 'T-03-003', content: '错误码 10022，含义 文档已被删除，处理建议 刷新文档列表' },
+  ],
+  total: 3,
 }
 
 /** 文档目录树 */

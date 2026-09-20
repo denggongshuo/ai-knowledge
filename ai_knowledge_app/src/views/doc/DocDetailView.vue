@@ -37,27 +37,51 @@ const targetKbId = ref<number>(1)
 const tags = ref<string[]>([])
 const newTag = ref('')
 
+/** 本页加载时失败的端点（**按端点降级**：一个坏了不该让整页什么都不显示）。 */
+const loadErrors = ref<string[]>([])
+
 onMounted(async () => {
   loading.value = true
-  try {
-    const [m, v, t, c, kbs] = await Promise.all([
-      docApi.meta(docId.value),
-      docApi.versionList(docId.value),
-      docApi.indexTasks(docId.value),
-      docApi.chunkStat(docId.value),
-      kbApi.list(),
-    ])
-    meta.value = m
-    versions.value = v.list
-    indexTasks.value = t.list
-    chunkStat.value = c
-    kbOptions.value = ((kbs.list as unknown as { id: number; name: string }[]) ?? []).map((x) => ({ id: x.id, name: x.name }))
-    secretLevel.value = m.securityLevel
-    targetKbId.value = m.kbId
-    tags.value = [...m.tags]
-  } finally {
-    loading.value = false
+  // ⚠️ 原先是 `Promise.all` 且**没有 catch** —— 五个请求里任何一个失败
+  // （`/doc/{id}/versions` 还没实现、文档不存在、后端没起）都会让整页空白，
+  // 而空白的表现与"数据为空"长得一样。改成 allSettled + 逐项说明。
+  const [m, v, t, c, kbs] = await Promise.allSettled([
+    docApi.meta(docId.value),
+    docApi.versionList(docId.value),
+    docApi.indexTasks(docId.value),
+    docApi.chunkStat(docId.value),
+    kbApi.list(),
+  ])
+  const failed: string[] = []
+  if (m.status === 'fulfilled') {
+    meta.value = m.value
+    secretLevel.value = m.value.securityLevel
+    targetKbId.value = m.value.kbId
+    // ⚠️ `tags` 可能是 `null`（= 未落库），**不是**空数组 —— 展开 null 会当场抛异常
+    tags.value = m.value.tags ? [...m.value.tags] : []
+  } else {
+    failed.push('文档元信息')
   }
+  if (v.status === 'fulfilled') {
+    versions.value = v.value.list
+  } else {
+    failed.push('版本历史')
+  }
+  if (t.status === 'fulfilled') {
+    indexTasks.value = t.value.list
+  } else {
+    failed.push('索引任务')
+  }
+  if (c.status === 'fulfilled') {
+    chunkStat.value = c.value
+  } else {
+    failed.push('分片统计')
+  }
+  if (kbs.status === 'fulfilled') {
+    kbOptions.value = ((kbs.value.list as unknown as { id: number; name: string }[]) ?? []).map((x) => ({ id: x.id, name: x.name }))
+  }
+  loadErrors.value = failed
+  loading.value = false
 })
 
 /** 密级只能提高，不能低于知识库密级 */
@@ -68,9 +92,23 @@ const secretOptions = computed(() => {
 })
 
 const kbChanged = computed(() => meta.value != null && targetKbId.value !== meta.value.kbId)
+/**
+ * ⚠️ `meta.tags` 可能是 `null`（= **未落库**，不是"没有标签"）——
+ * 直接 `.join()` 会抛异常。空数组与 `null` 在这里都用 `?? []` 收起：
+ * 这一条只回答"用户改没改"，不回答"服务端有没有这个能力"。
+ */
 const attrDirty = computed(
-  () => meta.value != null && (secretLevel.value !== meta.value.securityLevel || kbChanged.value || tags.value.join() !== meta.value.tags.join()),
+  () => meta.value != null && (secretLevel.value !== meta.value.securityLevel || kbChanged.value
+    || tags.value.join() !== (meta.value.tags ?? []).join()),
 )
+/**
+ * 属性保存（`PATCH /doc/{id}/attributes`）**本版本不可用** —— 它的两个半边都缺前置：
+ * 「移动知识库」要单篇重建（`T-610`）、「密级只能提高」（`I-6`）要改检索侧的密级过滤，
+ * 否则"提高密级"在检索上无效（越权可见）。二者与 `T-601` 合成 `S7-M06-B`。
+ *
+ * ⚠️ 按钮**置灰并给原因**，而不是让用户点了之后弹一个"保存成功"（那是假成功）。
+ */
+const ATTR_SAVE_BLOCKED_REASON = '本版本不支持修改文档属性：移动知识库需要单篇重建、密级提高需要检索侧同步过滤，两者与 T-601 同批交付。'
 
 function addTag() {
   const v = newTag.value.trim()
@@ -119,30 +157,22 @@ async function reindex() {
   await docApi.reindex(docId.value)
   ElMessage.success('已发起重新索引，用于修复解析失败的文档')
 }
-async function saveAttr() {
-  if (!meta.value) return
-  if (!attrDirty.value) return ElMessage.info('没有需要保存的修改')
-  if (kbChanged.value) {
-    await ElMessageBox.confirm(
-      `移动知识库后需重建索引：将把「${meta.value.title}」从「${meta.value.kbName}」移动到「${kbOptions.value.find((k) => k.id === targetKbId.value)?.name}」。确认继续？`,
-      '移动知识库',
-      { type: 'warning' },
-    )
-  }
-  await docApi.saveAttributes(docId.value, { secretLevel: secretLevel.value, kbId: targetKbId.value, tags: tags.value })
-  meta.value.securityLevel = secretLevel.value
-  meta.value.tags = [...tags.value]
-  if (kbChanged.value) {
-    meta.value.kbId = targetKbId.value
-    meta.value.kbName = kbOptions.value.find((k) => k.id === targetKbId.value)?.name ?? meta.value.kbName
-  }
-  ElMessage.success(kbChanged.value ? '属性已保存，正在重建索引' : '属性已保存，立即生效')
-}
+/**
+ * ⚠️ 这里**原先有** `saveAttr()`，本批**删掉了**它。
+ *
+ * <p>删而不是留着：保存按钮已置灰（理由见 {@link ATTR_SAVE_BLOCKED_REASON}），
+ * 留一个"还在、还能调"的函数，下一个人接 `T-601` 时最可能的动作是**只把按钮解禁**
+ * ——而那时后端的两个前置（单篇重建 / 检索侧密级过滤）还没落地，于是"点保存 → 弹成功 →
+ * 刷新没变"这条最难查的形态就回来了。**死代码不是起点，是诱饵。**
+ *
+ * <p>它当时那段「移动知识库」确认弹窗的文案在 `T-601` 立据点（需求 `06:712`
+ * 「移动后需重建索引（复用 16 页的变更确认弹窗）」）—— 那批照着写即可。
+ */
 function discard() {
   if (!meta.value) return
   secretLevel.value = meta.value.securityLevel
   targetKbId.value = meta.value.kbId
-  tags.value = [...meta.value.tags]
+  tags.value = meta.value.tags ? [...meta.value.tags] : []
   ElMessage.info('已放弃修改')
 }
 
@@ -194,6 +224,23 @@ async function removeDoc() {
 
 <template>
   <div v-loading="loading" class="page doc-detail">
+    <!-- 降级说明：某个端点失败时**说清是哪一块**，而不是整页空白 -->
+    <el-alert
+      v-if="loadErrors.length"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="mb-12"
+      title="部分内容没能加载"
+      :description="`以下部分暂时取不到：${loadErrors.join('、')}。其余内容照常显示。`"
+    />
+    <!-- 整页无内容（多半是文档不存在 / 库不可见）：给可行动的说明，别留一片空白 -->
+    <el-empty
+      v-if="!loading && !meta && loadErrors.length"
+      description="这篇文档打不开：它可能不存在，或你所在的部门看不到它所属的知识库。"
+    >
+      <el-button @click="goBack(router, '/kb')">返回知识库列表</el-button>
+    </el-empty>
     <div v-if="meta" class="page-head">
       <div class="head-left">
         <el-button text :icon="ArrowLeft" @click="goBack(router, '/kb')">返回</el-button>
@@ -252,7 +299,14 @@ async function removeDoc() {
                   <el-tag v-for="t in tags" :key="t" closable @close="removeTag(t)">{{ t }}</el-tag>
                   <span v-if="!tags.length" class="hint">暂无标签</span>
                 </div>
-                <div class="hint">标签会参与检索过滤，建议控制在 3~8 个</div>
+                <!--
+                  ⚠️ 如实说明"标签还没有落点"。文档级内容标签至今没有归属表
+                  （`IndexEnhancer` 的 javadoc 自己写着这一条），所以这里编辑的标签
+                  **存不下来** —— 说清楚比让用户以为存上了强。
+                -->
+                <div class="hint warn">
+                  内容标签本版本还没有落库表（大模型已能抽取，缺的是归属）⇒ 这里的编辑暂不保存。
+                </div>
               </el-form-item>
 
               <div class="sec-title mt-16"><el-icon><Collection /></el-icon><b>文档信息</b></div>
@@ -274,7 +328,17 @@ async function removeDoc() {
                 <dt>上传人</dt><dd>{{ meta.owner }}</dd>
                 <dt>上传时间</dt><dd class="mono">{{ meta.uploadedAt }}</dd>
                 <dt>最近索引</dt><dd class="mono">{{ meta.lastIndexAt }}</dd>
-                <dt>被引用</dt><dd>{{ meta.citations }} 次问答引用 · {{ meta.downVotes }} 次点踩</dd>
+                <!--
+                  ⚠️ 这两个数**恒为 null**（未采集）：`cited` 列存在但写入方写死 null，
+                  引用角标属 `T-804`。所以这里显示「未采集」而**不是「0 次」** ——
+                  后者是一句关于内容的断言，而我们并没有那个事实（长期约定：
+                  判不了必须与判否分开报）。
+                -->
+                <dt>被引用</dt>
+                <dd v-if="meta.citations === null && meta.downVotes === null" class="hint">
+                  未采集（引用角标能力未上线，暂时拿不到"被引用 / 点踩"的次数）
+                </dd>
+                <dd v-else>{{ meta.citations ?? 0 }} 次问答引用 · {{ meta.downVotes ?? 0 }} 次点踩</dd>
               </dl>
             </div>
 
@@ -334,6 +398,19 @@ async function removeDoc() {
         <!-- ============ 版本历史 ============ -->
         <el-tab-pane name="version">
           <template #label>版本历史<span class="tab-num">{{ versions.length }}</span></template>
+          <!--
+            ⚠️ 本版本两件事都还没有：`GET /doc/{id}/versions` 未实现（`T-606`），
+            而"同名上传归档为新版本"的机制也不存在（没有版本表）。
+            ⇒ 说清楚，而不是渲染一张恒空的表（空表读起来像"这篇文档只有一个版本"）。
+          -->
+          <el-alert type="info" :closable="false" show-icon class="mb-12">
+            <template #title>
+              <span class="alert-text">
+                版本历史本版本尚未交付：同名上传归档、版本对比与回滚属后续批次。
+                现在每篇文档都只有一个版本。
+              </span>
+            </template>
+          </el-alert>
           <el-table :data="versions" border>
             <el-table-column prop="version" label="版本" width="100">
               <template #default="{ row }">
@@ -387,7 +464,8 @@ async function removeDoc() {
               <div class="sc-label">摘要块</div>
             </div>
             <div class="stat-card">
-              <div class="sc-val">{{ chunkStat.avgTokens }}</div>
+              <!-- ⚠️ 空文档时后端给的是 null（0/0 的均值是"判不了"，不是 0）⇒ 渲染成「—」 -->
+              <div class="sc-val">{{ chunkStat.avgTokens ?? '—' }}</div>
               <div class="sc-label">平均 tokens</div>
             </div>
             <div class="stat-card">
@@ -442,11 +520,17 @@ async function removeDoc() {
       <div class="save-bar">
         <span class="sb-left">
           <el-icon><InfoFilled /></el-icon>
-          <span class="tiny muted">属性修改后立即生效，无需重建索引；<b>移动知识库除外</b></span>
+          <!--
+            ⚠️ 这段话在**本版本是对的**：属性保存整体不可用（见下方按钮的 disabled 理由）。
+            不说清就会出现"点了保存、弹了成功、刷新后没变"——那正是最难查的一类假成功。
+          -->
+          <span class="tiny muted">{{ ATTR_SAVE_BLOCKED_REASON }}</span>
         </span>
         <div class="sb-actions">
           <el-button :disabled="!attrDirty" @click="discard">取消</el-button>
-          <el-button type="primary" :disabled="!attrDirty" @click="saveAttr">保存属性</el-button>
+          <el-tooltip :content="ATTR_SAVE_BLOCKED_REASON" placement="top">
+            <span><el-button type="primary" disabled>保存属性</el-button></span>
+          </el-tooltip>
         </div>
       </div>
     </el-card>
@@ -666,7 +750,7 @@ async function removeDoc() {
   margin-top: 5px;
   background: var(--el-color-info);
 }
-.dot.success {
+.dot.done {
   background: var(--el-color-success);
 }
 .dot.running {
@@ -674,6 +758,14 @@ async function removeDoc() {
 }
 .dot.failed {
   background: var(--el-color-danger);
+}
+/*
+ * `PENDING`（排队中）—— 本批补的第四档。
+ * ⚠️ 原先类型里那一档叫 `INFO`，而**这里根本没有 `.dot.info`** ⇒ 那一行的圆点是裸的
+ * （它落到 `.dot` 的默认灰，与"没有任何状态"长得一样）。现在与后端状态机一对一。
+ */
+.dot.pending {
+  background: var(--el-color-warning);
 }
 .txt,
 .tl-title {

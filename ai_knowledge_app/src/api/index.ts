@@ -150,9 +150,24 @@ export const docApi = {
   indexTasks: (id: number | string) => http.get<{ list: IndexTask[]; total: number }>(`/doc/${id}/index-tasks`),
   chunkStat: (id: number | string) => http.get<ChunkStat>(`/doc/${id}/chunk-stat`),
   toc: (id: number | string) => http.get<{ list: TocItem[] }>(`/doc/${id}/toc`),
-  chunks: (id: number | string, type?: string) =>
-    http.get<{ list: ChunkInfo[]; total: number; stat: ChunkStat }>(`/doc/${id}/chunks`, { type }),
-  parentChunk: (id: number | string, parentId: number | string) => http.get<ParentChunkRelation>(`/doc/${id}/chunks/${parentId}`),
+  /**
+   * 分片列表。
+   *
+   * `type` 是**闭集**：`all/text/table/image/summary`（需求 §4.4 的四个展示分组 + 全部）。
+   * ⚠️ 闭集之外的取值后端会回 `10030` —— **刻意不静默当成 `all`**：
+   * "我筛了图片，它把全部给我了"会让用户以为这个库真没有图片块。
+   */
+  chunks: (id: number | string, type?: string, page?: number, size?: number) =>
+    http.get<{ list: ChunkInfo[]; total: number; stat: ChunkStat }>(`/doc/${id}/chunks`, { type, page, size }),
+  /**
+   * 父块完整内容 + **全部**子块（`G7-1`）。
+   *
+   * ⚠️ `parentId` 必须是**父块**（`blockType = 'TABLE'` 且 `parentId === null`）的真实 id：
+   * 传子块 id、传非表格块、传 `0` 都会得到明确的业务错。**`0` 不是"无父块"的哨兵**
+   * ——顶层块的 `parentId` 是 `null`（`ChunkInfo.parentId` 的注释里写了这条）。
+   */
+  parentChunk: (id: number | string, parentId: number | string) =>
+    http.get<ParentChunkRelation>(`/doc/${id}/chunks/${parentId}`),
   saveAttributes: (id: number | string, body: { secretLevel?: string; kbId?: number; tags?: string[] }) =>
     http.patch<{ saved: boolean; docId: number; needReindex: boolean }>(`/doc/${id}/attributes`, body),
   /** 任务进度轮询 */
