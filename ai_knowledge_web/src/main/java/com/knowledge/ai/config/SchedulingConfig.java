@@ -32,6 +32,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 public class SchedulingConfig {
 
     public SchedulingConfig() {
-        log.info("定时调度已启用（@EnableScheduling）——当前任务：审计日志留存清理（T-306）");
+        log.info("定时调度已启用（@EnableScheduling）——当前任务：审计日志留存清理（T-306）"
+                + " / 运营统计预计算（T-A04，可用 app.ops.precompute-cron-enabled=false 关掉）");
     }
 }

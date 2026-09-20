@@ -65,7 +65,7 @@ public class RetrievalTraceWriter {
 
     private static final String INSERT_TRACE = """
             insert into sys_retrieval_trace
-              (trace_id, user_id, session_id, message_id, query_text,
+              (trace_id, user_id, dept_id, session_id, message_id, query_text,
                mode, kb_ids, kb_count, doc_scope_count, doc_scope_fallback,
                vector_hits, bm25_hits, fused_count,
                query_analysis_millis, embed_millis, vector_search_millis, bm25_recall_millis,
@@ -75,7 +75,7 @@ public class RetrievalTraceWriter {
                miss_threshold, low_score_warn, rerank_applied, rerank_note, degrade_note,
                miss_flag, rerank_before_top1, top1_score, chunk_count)
             values
-              (:traceId, :userId, :sessionId, :messageId, :queryText,
+              (:traceId, :userId, :deptId, :sessionId, :messageId, :queryText,
                :mode, :kbIds, :kbCount, :docScopeCount, :docScopeFallback,
                :vectorHits, :bm25Hits, :fusedCount,
                0, :embedMillis, :vectorSearchMillis, :bm25RecallMillis,
@@ -113,6 +113,9 @@ public class RetrievalTraceWriter {
             var insert = entityManager.createNativeQuery(INSERT_TRACE)
                     .setParameter("traceId", write.traceId())
                     .setParameter("userId", write.userId())
+                    // 部门**快照**（需求 `08` §3.7）：写入时冻结，之后调岗不改历史统计。
+                    // 见 `deptOf` —— 刻意不取登录态里的那个（那是登录时点的值）
+                    .setParameter("deptId", deptOf(write.userId()))
                     .setParameter("sessionId", write.sessionId())
                     .setParameter("messageId", write.messageId())
                     .setParameter("queryText", trace.query())
@@ -165,6 +168,43 @@ public class RetrievalTraceWriter {
             // 与"用户压根没提问"在库里长得一模一样，事后无从分辨
             log.warn("[打点] 检索链路打点写入失败，本次问答不受影响：traceId={} err={}",
                     write.traceId(), ex.getMessage());
+        }
+    }
+
+    /**
+     * 提问人**当时**的部门（需求 `08` §3.7「部门维度取当时的部门快照，而不是实时关联」）。
+     *
+     * <h4>🔴 为什么在这里查、而不是取调用方手里的 {@code LoginUser.deptId}</h4>
+     * <p>登录态里那个值来自 **JWT claim**（`JwtService:190` 的 `CLAIM_DEPT`）——
+     * 它是**登录那一刻**的部门。token 存活期内调岗的话，它就是**过期值**，
+     * 而这一列要的是**提问时**的部门。PK 查一次（`sys_user` 主键），
+     * 而这一段本来就在 `REQUIRES_NEW` 里做若干次写，代价可忽略。
+     *
+     * <p>⚠️ **与 `ChatStreamService` 手里的 `user` 比，这里多花的这一次查是"买"到了
+     * "快照来自请求那一刻"这件事** —— 而 §3.7 那一行的整个存在理由就是这件事。
+     *
+     * <h4>为什么它自己吞异常</h4>
+     * <p>打点失败**绝不能**影响问答（类注释）。若让这次查询的异常冒到 {@link #write} 的
+     * `try` 里，一行本来能落的打点会因为一个**附属列**查不到而整行丢失 ——
+     * 那正是"少了一行与用户没提问长得一样"那个后果。
+     *
+     * @return 部门 id；`userId` 为空 / 用户已软删（查不到）/ 用户的 `dept_id` 本就是 NULL ⇒ `null`
+     */
+    private Long deptOf(Long userId) {
+        if (userId == null) {
+            return null;
+        }
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object> rows = entityManager.createNativeQuery(
+                            "select dept_id from sys_user where id = :id")
+                    .setParameter("id", userId)
+                    .getResultList();
+            return rows.isEmpty() || rows.get(0) == null ? null : ((Number) rows.get(0)).longValue();
+        } catch (RuntimeException ex) {
+            log.warn("[打点] 部门快照查询失败（该列记 NULL，归「未分配」）：userId={} err={}",
+                    userId, ex.getMessage());
+            return null;
         }
     }
 

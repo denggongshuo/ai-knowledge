@@ -7,6 +7,7 @@ import com.knowledge.ai.pipeline.chat.ChatWireMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -57,11 +58,20 @@ public class OpsRetrievalService {
 
     private final SystemThresholdService systemThresholdService;
 
+    /**
+     * `T-A04`：五个端点**全部改读按天汇总表**（`G8-10`）。
+     *
+     * <p>⚠️ 它只做一件事：确保窗口内的天都已经被算进汇总表（缺哪补哪）。
+     * 那一步是幂等的，且**今天必然重算一次**（见 `OpsPrecomputeService` 的类注释
+     * —— 用户问完一句立刻打开页面，看到的必须是算进去了的）。
+     */
+    private final OpsPrecomputeService precomputeService;
+
     // ==================== ① overview ====================
 
     public OpsRetrievalDtos.Overview overview(String range) {
-        LocalDateTime from = TimeWindow.from(range);
-        RetrievalOpsRepository.Window w = repository.window(from);
+        Ctx c = ctx(range);
+        RetrievalOpsRepository.Window w = repository.dailyWindow(c.from(), c.to());
         double missThreshold = systemThresholdService.thresholds().missThreshold();
 
         return new OpsRetrievalDtos.Overview(
@@ -70,7 +80,7 @@ public class OpsRetrievalService {
                 rate(w.hits(), w.comparable()),
                 // ⚠️ 净提升取 rerank-effect 的**同子集**口径，不是本对象两个比率的差
                 //（那两个比率分母不同，相减会把"覆盖率"混进"提升"里）
-                gain(from),
+                gain(c),
                 w.avgChunks(),
                 missThreshold);
     }
@@ -78,12 +88,12 @@ public class OpsRetrievalService {
     // ==================== ② pipeline ====================
 
     public OpsRetrievalDtos.Pipeline pipeline(String range) {
-        LocalDateTime from = TimeWindow.from(range);
-        RetrievalOpsRepository.Stages s = repository.stages(from);
-        long totalRows = repository.window(from).total();
+        Ctx c = ctx(range);
+        RetrievalOpsRepository.Stages s = repository.dailyStages(c.from(), c.to());
+        long totalRows = repository.dailyWindow(c.from(), c.to()).total();
 
         Double fused = s.fusedCount();
-        Double gain = gain(from);
+        Double gain = gain(c);
 
         // 段名与顺序**取自 `ChatWireMapper`**（检索详情面板的同一套）——
         // 两处各写一份的话，面板与这张图迟早对不上，而"对不上"表现为两个页面各说各话、各自都自洽。
@@ -114,7 +124,8 @@ public class OpsRetrievalService {
     // ==================== ③ score-distribution ====================
 
     public OpsRetrievalDtos.ScoreDistribution scoreDistribution(String range) {
-        RetrievalOpsRepository.Buckets b = repository.buckets(TimeWindow.from(range));
+        Ctx c = ctx(range);
+        RetrievalOpsRepository.Buckets b = repository.dailyBuckets(c.from(), c.to());
 
         // ⚠️ 分母是**提问总数**（含"无法定档"那档）⇒ 各档合计恰为 100%
         long[] counts = {b.excellent(), b.good(), b.fair(), b.marginal(), b.miss(),
@@ -132,12 +143,12 @@ public class OpsRetrievalService {
     // ==================== ④ rerank-effect ====================
 
     public OpsRetrievalDtos.RerankEffect rerankEffect(String range) {
-        LocalDateTime from = TimeWindow.from(range);
+        Ctx c = ctx(range);
         // ⚠️ `window` 只取**一次**：取两次的话，两次查询之间新落一行打点
         // ⇒ `comparable` 与 `avgLatencyMs` 来自**两个快照**，两个数各自都对而互相矛盾
         //（与 `QaOpsRepository#filter` 的"只写一处"是同一条纪律）
-        RetrievalOpsRepository.Window w = repository.window(from);
-        RetrievalOpsRepository.BeforeAfter ba = repository.beforeAfter(from);
+        RetrievalOpsRepository.Window w = repository.dailyWindow(c.from(), c.to());
+        RetrievalOpsRepository.BeforeAfter ba = repository.dailyBeforeAfter(c.from(), c.to());
 
         Double before = rate(ba.beforeHits(), ba.covered());
         Double after = rate(ba.afterHits(), ba.covered());
@@ -152,9 +163,9 @@ public class OpsRetrievalService {
     // ==================== ⑤ kb-quality ====================
 
     public OpsRetrievalDtos.KbQuality kbQuality(String range) {
-        LocalDateTime from = TimeWindow.from(range);
-        LocalDateTime mid = TimeWindow.mid(range);
-        List<RetrievalOpsRepository.KbAgg> aggs = repository.singleKbAggregates(from, mid);
+        Ctx c = ctx(range);
+        List<RetrievalOpsRepository.KbAgg> aggs =
+                repository.dailySingleKbAggregates(c.from(), c.midDate(), c.to());
 
         Map<Long, String> names = kbNames(aggs);
         List<OpsRetrievalDtos.KbQualityRow> rows = new ArrayList<>(aggs.size());
@@ -176,7 +187,7 @@ public class OpsRetrievalService {
         rows.sort(Comparator.comparing(OpsRetrievalDtos.KbQualityRow::missRate,
                 Comparator.nullsLast(Comparator.naturalOrder())));
 
-        long others = repository.multiKbQuestions(from);
+        long others = repository.dailyMultiKbQuestions(c.from(), c.to());
         if (others > 0) {
             // 跨库提问单独一行 —— 拆给每个库会把一次提问算多次，各库合计就会**超过**提问总数，
             // 而需求 §2.8 第 4 条要求的是 ≤（并点名"未列出的归入其他"）
@@ -188,9 +199,38 @@ public class OpsRetrievalService {
 
     // ==================== 内部 ====================
 
+    /**
+     * 一次请求要用的窗口（`T-A04`）。
+     *
+     * <p>🔴 **五个端点全部从这里取窗口**，而它做的第一件事是
+     * {@link OpsPrecomputeService#ensureCovered} —— 把"这个窗口算过了没有"
+     * 这件事收敛到**一处**。五个端点各判一次的话，会出现"同一次请求里
+     * overview 算的是新数、pipeline 读的是旧数"这种**页面上看不出来**的错位
+     *（与 `TimeWindow` 类注释里那条"各写一份的后果是统计卡的 7 天与榜单的 7 天
+     * 不是同一个 7 天"是同一条纪律）。
+     *
+     * <p>⚠️ `midDate` 与 `from`/`to` **来自同一个 `TimeWindow`**：
+     * `mid` 是**天边界**（日历天口径改动的直接后果），所以它能直接与 `stat_date` 比。
+     * 滚动窗口下这个等式不成立 —— 那时 `mid` 落在一天中间，按天切会多算/少算半天。
+     */
+    private Ctx ctx(String range) {
+        LocalDate from = TimeWindow.fromDate(range);
+        LocalDate to = LocalDate.now();
+        precomputeService.ensureCovered(from);
+        return new Ctx(from, to, TimeWindow.mid(range).toLocalDate());
+    }
+
+    /**
+     * @param from    窗口起点（含）
+     * @param to      窗口终点（含）= 今天
+     * @param midDate 前半 / 后半的分界天（见 `ctx`）
+     */
+    private record Ctx(LocalDate from, LocalDate to, LocalDate midDate) {
+    }
+
     /** `rerank-effect` 的净提升（百分点），算不出来回 `null`。 */
-    private Double gain(LocalDateTime from) {
-        RetrievalOpsRepository.BeforeAfter ba = repository.beforeAfter(from);
+    private Double gain(Ctx c) {
+        RetrievalOpsRepository.BeforeAfter ba = repository.dailyBeforeAfter(c.from(), c.to());
         Double before = rate(ba.beforeHits(), ba.covered());
         Double after = rate(ba.afterHits(), ba.covered());
         return before == null || after == null ? null : Math.round((after - before) * 10) / 10d;

@@ -5,6 +5,7 @@ import jakarta.persistence.PersistenceContext;
 import org.springframework.stereotype.Repository;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,8 +37,15 @@ import java.util.List;
 @Repository
 public class RetrievalOpsRepository {
 
-    /** 分档边界（需求 §2.3 的五个区间）。**从高到低**，最后一段是开区间。 */
-    private static final double[] BOUNDS = {0.80, 0.60, 0.40, 0.35};
+    /**
+     * 分档边界（需求 §2.3 的五个区间）。**从高到低**，最后一段是开区间。
+     *
+     * <p>⚠️ **包内可见**（不是 `private`）：`OPS` 的按天汇总表（`T-A04`）也要按同一组边界
+     * 数五档 —— 两处各写一份的话，"实时算"与"读汇总表"会**漂移**，
+     * 而那种漂移的现象是"某天之后各档合计对不上提问总数"，看起来像数据坏了。
+     * 单一事实源在这里比封装重要。
+     */
+    static final double[] BOUNDS = {0.80, 0.60, 0.40, 0.35};
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -205,6 +213,41 @@ public class RetrievalOpsRepository {
         return lng(n);
     }
 
+    /**
+     * 窗口内**按库**的提问数 —— 读按天汇总表（`T-A04`），`kb_id = 0` 是「其他」桶。
+     *
+     * <h4>🔴 它同时服务页 20 与页 21，这不是"顺便"</h4>
+     * <p>需求 `08` §3.4 逐字写着页 21 的库热度「**与 20 页的知识库提问数必须一致
+     * —— 同一个数不要在两个页面各写一遍**」。把两个页面指到**同一张表的同一列**
+     * （`sys_ops_retrieval_daily.total`）之后，那句话由**构造**保证：
+     * 不存在"两处实现碰巧一致、改一处就漂"的可能。
+     *
+     * <p>⚠️ 这与 `singleKbAggregates`（实时、按 `kb_ids` 字符串分组）**必须给出同样的数**：
+     * 前者的 `kb_count = 1` 判据与本表写入时的哨兵判据是**同一套**
+     * （见 {@link OpsPrecomputeRepository#rebuildRetrievalDaily} 的派生表）。
+     * 判据里有一条"读汇总表 == 实时算"专门钉住这件事。
+     *
+     * @return `[Long kbId, long questions]`，按提问数降序；含 `kb_id = 0` 那一行
+     */
+    @SuppressWarnings("unchecked")
+    public List<Object[]> dailyKbTotals(LocalDate from, LocalDate to) {
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select d.kb_id, sum(d.total)
+                        from sys_ops_retrieval_daily d
+                        where d.stat_date >= :from and d.stat_date <= :to
+                        group by d.kb_id
+                        order by sum(d.total) desc
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getResultList();
+        List<Object[]> out = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            out.add(new Object[]{lng(r[0]), lng(r[1])});
+        }
+        return out;
+    }
+
     /** 库 id → 库名（含软删的：软删的也要有名字，否则"某一个库"与"其他"的账对不上）。 */
     public List<Object[]> kbNames(List<Long> ids) {
         if (ids.isEmpty()) {
@@ -216,6 +259,170 @@ public class RetrievalOpsRepository {
                 .setParameter("ids", ids)
                 .getResultList();
         return rows;
+    }
+
+    // ==================== 汇总表读法（`T-A04` · `G8-10`）====================
+    //
+    // 🔴 下面六个方法是上面六个**实时**查询的"读汇总表"版本。每一对**必须给出同样的数**，
+    //   否则"离线预计算"这件事本身就成了一个静默的口径漂移来源。
+    //   有一条判据逐条断言这件事（造一个已知的打点集合 → 补算 → 两条路对比，逐位相等）。
+    //
+    // ⚠️ 三处**故意的**差异，都不是漂移：
+    //   ① 时间谓词从 `created_at >= :from` 变成 `stat_date between :from and :to`
+    //      —— 二者在**日历天口径**下是同一批行（`TimeWindow.fromDate` 的注释写了这条）；
+    //   ② `multiKbQuestions` 的实时版只抓 `kb_count <> 1`，而哨兵 0 还含
+    //      "`kb_count = 1` 但 `kb_ids` 不是单个数字"那种行 ⇒ 汇总版是**超集**
+    //      （那类行在库里实际不存在，`kb_ids` 恒是数字串）；
+    //   ③ `h1/h2` 的分界从 `created_at >= :mid` 变成 `stat_date >= :midDate`
+    //      —— 同理，`mid` 是**天边界**。
+
+    /** `window` 的汇总表版。 */
+    public Window dailyWindow(LocalDate from, LocalDate to) {
+        Object[] r = (Object[]) entityManager.createNativeQuery("""
+                        select coalesce(sum(total), 0),
+                               coalesce(sum(comparable), 0) + coalesce(sum(empty_recall), 0),
+                               coalesce(sum(comparable), 0),
+                               coalesce(sum(no_rerank), 0),
+                               coalesce(sum(empty_recall), 0),
+                               sum(top1_sum) / nullif(sum(top1_count), 0),
+                               coalesce(sum(hits), 0),
+                               sum(chunk_sum) / nullif(sum(total), 0),
+                               sum(applied_rerank_ms_sum)
+                                   / nullif(coalesce(sum(comparable), 0)
+                                            + coalesce(sum(empty_recall), 0), 0)
+                        from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getSingleResult();
+        return new Window(lng(r[0]), lng(r[1]), lng(r[2]), lng(r[3]), lng(r[4]),
+                dbl(r[5]), lng(r[6]), dbl(r[7]), dbl(r[8]));
+    }
+
+    /** `beforeAfter` 的汇总表版。 */
+    public BeforeAfter dailyBeforeAfter(LocalDate from, LocalDate to) {
+        Object[] r = (Object[]) entityManager.createNativeQuery("""
+                        select coalesce(sum(covered), 0),
+                               coalesce(sum(before_hits), 0),
+                               coalesce(sum(after_hits), 0)
+                        from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getSingleResult();
+        return new BeforeAfter(lng(r[0]), lng(r[1]), lng(r[2]));
+    }
+
+    /**
+     * `stages` 的汇总表版。
+     *
+     * <p>分母一律是 `sum(full_rows)`（"跑完全链路"的行数），与实时版
+     * `where llm_generation_millis is not null` 同一行集 —— 这是
+     * `检索侧 + 生成 + 其他 == 全链路` 那条判据能成立的前提。
+     * ⚠️ `otherMs` 是**残差**（总数 − 六段 − 生成），与实时版同一个算法。
+     */
+    public Stages dailyStages(LocalDate from, LocalDate to) {
+        String sums = "sum(query_ms_sum) + sum(embed_ms_sum) + sum(vector_ms_sum)"
+                + " + sum(bm25_ms_sum) + sum(fuse_ms_sum) + sum(rerank_ms_sum)";
+        Object[] r = (Object[]) entityManager.createNativeQuery("""
+                        select sum(query_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(embed_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(vector_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(bm25_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(fuse_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(rerank_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(scope_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(table_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(llm_ms_sum) / nullif(sum(full_rows), 0),
+                               sum(fused_sum) / nullif(sum(full_rows), 0),
+                               coalesce(sum(full_rows), 0),
+                               (""" + sums + """
+                               ) / nullif(sum(full_rows), 0),
+                               sum(total_ms_sum) / nullif(sum(full_rows), 0),
+                               (sum(total_ms_sum) - (""" + sums + """
+                               ) - sum(llm_ms_sum)) / nullif(sum(full_rows), 0)
+                        from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getSingleResult();
+        return new Stages(dbl(r[0]), dbl(r[1]), dbl(r[2]), dbl(r[3]), dbl(r[4]), dbl(r[5]),
+                dbl(r[6]), dbl(r[7]), dbl(r[8]), dbl(r[9]), lng(r[10]),
+                dbl(r[11]), dbl(r[12]), dbl(r[13]));
+    }
+
+    /** `buckets` 的汇总表版（五档边界用的是行自己的判定线，见 `V36` 的列注释）。 */
+    public Buckets dailyBuckets(LocalDate from, LocalDate to) {
+        Object[] r = (Object[]) entityManager.createNativeQuery("""
+                        select coalesce(sum(b_excellent), 0),
+                               coalesce(sum(b_good), 0),
+                               coalesce(sum(b_fair), 0),
+                               coalesce(sum(b_marginal), 0),
+                               coalesce(sum(b_miss), 0),
+                               coalesce(sum(no_rerank), 0),
+                               coalesce(sum(empty_recall), 0),
+                               coalesce(sum(total), 0)
+                        from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getSingleResult();
+        return new Buckets(lng(r[0]), lng(r[1]), lng(r[2]), lng(r[3]), lng(r[4]),
+                lng(r[5]), lng(r[6]), lng(r[7]));
+    }
+
+    /**
+     * `multiKbQuestions` 的汇总表版 —— 哨兵 `kb_id = 0` 那一桶。
+     *
+     * <p>⚠️ 与实时版有**一处已知的超集关系**：实时版抓 `kb_count &lt;&gt; 1`，
+     * 而哨兵 0 还包含"`kb_count = 1` 但 `kb_ids` 不是单个数字"那种行
+     * （见 `OpsPrecomputeRepository#rebuildRetrievalDaily` 的派生表）。
+     * 那类行在实际库里不存在（`kb_ids` 恒是数字串），
+     * 真出现了也是**该归「其他」**而不是该混进某个库 —— 故取超集是更保守的一侧。
+     */
+    public long dailyMultiKbQuestions(LocalDate from, LocalDate to) {
+        Object n = entityManager.createNativeQuery("""
+                        select coalesce(sum(total), 0) from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to and kb_id = 0
+                        """)
+                .setParameter("from", from)
+                .setParameter("to", to)
+                .getSingleResult();
+        return lng(n);
+    }
+
+    /** `singleKbAggregates` 的汇总表版（只取 `kb_id > 0` 的确定归属行）。 */
+    @SuppressWarnings("unchecked")
+    public List<KbAgg> dailySingleKbAggregates(LocalDate from, LocalDate midDate, LocalDate to) {
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select cast(kb_id as char),
+                               coalesce(sum(total), 0),
+                               coalesce(sum(comparable), 0),
+                               sum(top1_sum) / nullif(sum(top1_count), 0),
+                               coalesce(sum(miss_count), 0),
+                               coalesce(sum(case when stat_date >= :mid then comparable else 0 end), 0),
+                               coalesce(sum(case when stat_date >= :mid then miss_count else 0 end), 0),
+                               coalesce(sum(case when stat_date < :mid then comparable else 0 end), 0),
+                               coalesce(sum(case when stat_date < :mid then miss_count else 0 end), 0)
+                        from sys_ops_retrieval_daily
+                        where stat_date >= :from and stat_date <= :to and kb_id > 0
+                        group by kb_id
+                        """)
+                .setParameter("from", from)
+                .setParameter("mid", midDate)
+                .setParameter("to", to)
+                .getResultList();
+
+        List<KbAgg> out = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            out.add(new KbAgg(String.valueOf(r[0]), lng(r[1]), lng(r[2]), dbl(r[3]), lng(r[4]),
+                    lng(r[5]), lng(r[6]), lng(r[7]), lng(r[8])));
+        }
+        return out;
     }
 
     // ==================== 行类型 ====================
