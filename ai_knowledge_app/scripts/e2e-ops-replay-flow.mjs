@@ -32,7 +32,8 @@
  *
  * <h3>自清纪律</h3>
  * 探针库走 `teardownKbProbe`；池子行按 id 删（提问人是超管，无主兜底够不着）；
- * 会话四张表按水位线删；`temp/` 下的探针文件删掉。
+ * 会话四张表**先按本轮精确的 `session_id` 删、水位线只作兜底**（末尾那段注释写了为什么）；
+ * `temp/` 下的探针文件删掉。
  *
  * <h3>前置</h3>
  * <pre>
@@ -204,6 +205,8 @@ window.__m = {
 let edge
 let kbId
 let missId = 0
+/** 本次提问**精确**的会话 id（不靠水位线 —— 见 ask 之后那段注释）。 */
+let sessionId = 0
 let sessionFloor = 0
 
 async function main() {
@@ -243,6 +246,15 @@ async function main() {
     `select count(*) from sys_retrieval_trace where query_text like '%贝尔不等式%' and miss_flag = 1;`,
   )
   check(trace >= 1, '打点里出现 miss_flag=1 的行（判定线真的判出了未命中）', `行数=${trace}`)
+
+  // 🔴 **把本次提问的会话 id 精确记下来**（不靠水位线）。
+  // 由来（`S8-M10-B` 收尾时被一次全量跑批逮到）：水位线清理只保护"本轮造的"——
+  // 一旦某轮因任何原因没跑到位，那一行就**永远没人认领**（E2E 按自己的水位线清、
+  // Java 套件也按自己的水位线清，**水位线以下的历史行两不管**），
+  // 而后果是 `QaMissFlowTest#overviewComesFromTraces`（断言"7 天窗口为空"）**确定性地红**，
+  // 现象却是"四指标算错了"。精确删除是这条路的正解。
+  sessionId = Number(mysqlScalar(
+    `select session_id from sys_retrieval_trace where query_text like '%贝尔不等式%' order by id desc limit 1;`) || 0)
 
   const pool = bizOk(await api(`/ops/qa/misses?keyword=${encodeURIComponent('贝尔不等式')}`), '清单')
   const hit = (pool.list ?? []).find((m) => m.question.includes('贝尔不等式'))
@@ -573,6 +585,19 @@ main()
         mysqlScalar(`delete from sys_qa_miss where id = ${missId};`)
       } catch (e) {
         observe('⚠️ 池子行清理失败', `${missId}: ${e.message}`)
+      }
+    }
+    // 🔴 先按**精确 session id** 删（水位线是兜底，不是主路 —— 见提问之后那段注释）
+    if (sessionId) {
+      try {
+        mysqlScalar(`delete from sys_retrieval_trace_chunk where trace_id in `
+          + `(select trace_id from sys_retrieval_trace where session_id = ${sessionId});`)
+        mysqlScalar(`delete from sys_retrieval_trace where session_id = ${sessionId};`)
+        mysqlScalar(`delete from sys_chat_message where session_id = ${sessionId};`)
+        mysqlScalar(`delete from sys_chat_session where id = ${sessionId};`)
+        observe('本轮的会话/打点已精确删除', `sessionId=${sessionId}`)
+      } catch (e) {
+        observe('⚠️ 精确删除失败', e.message)
       }
     }
     // 会话 / 消息 / 打点（含明细）—— 同样是超管名下的，没人替本脚本清

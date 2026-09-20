@@ -76,6 +76,9 @@ class QaMissFlowTest extends ApiTestSupport {
     @AfterEach
     void removeFixtures() {
         jdbc.update("delete from sys_qa_miss where id > ?", missFloor);
+        // 本类自己插的打点也自己清（`overviewComesFromTraces` 会插 4 行）——
+        // 「清理必须走必走路径」：@AfterEach 就是那条路
+        clearTraceWindow();
     }
 
     // ==================== G8-2 · 聚合 ====================
@@ -227,6 +230,15 @@ class QaMissFlowTest extends ApiTestSupport {
     @Test
     @DisplayName("overview：四指标来自打点窗口；无数据时 avgTopScore 是 null 而不是 0")
     void overviewComesFromTraces() {
+        // 🔴 **先把打点窗口清空** —— 这条用例断言的是"空窗口"与"窗口内恰好这几行"，
+        // 而 `sys_retrieval_trace` 是**共享**的：任何一次真链路提问都会让它红，
+        // 而现象是"四指标算错了"（与 `#185`「断言环境状态」同族）。
+        // **实测踩到过一次**：`S8-M10-B` 的 E2E 留下一行打点（会话 1438），
+        // 全量跑批就红在这一行 —— 而那一行**谁都不认领**：E2E 按自己的水位线清、
+        // Java 套件也按自己的水位线清，**水位线以下的历史行两不管**。
+        // 与 `ModelUsageFlowTest` 同一条纪律：**先让共享状态回到已知值**，不是"顺手删数据"。
+        clearTraceWindow();
+
         Map<String, Object> empty = overview();
         assertThat(num(empty, "totalQuestions")).isZero();
         assertThat(empty.get("avgTopScore"))
@@ -251,6 +263,20 @@ class QaMissFlowTest extends ApiTestSupport {
     }
 
     // ==================== 夹具 ====================
+
+    /**
+     * 清空打点窗口（近 7 天）。
+     *
+     * <p>⚠️ 先删明细再删主表（顺序反了会留下孤儿明细 —— `#210` 那族）。
+     * ⚠️ 只清 `sys_retrieval_trace` 两表，**不动** `sys_qa_miss`（那是本类自己按水位线管的）。
+     */
+    private void clearTraceWindow() {
+        jdbc.update("delete from sys_retrieval_trace_chunk where trace_id in "
+                + "(select trace_id from sys_retrieval_trace where created_at >= ?)",
+                LocalDateTime.now().minusDays(7));
+        jdbc.update("delete from sys_retrieval_trace where created_at >= ?",
+                LocalDateTime.now().minusDays(7));
+    }
 
     private long seed(String question, String kbIds, double score) {
         qaMissRepository.upsert(MissKeyNormalizer.keyOf(question), question, userId, score, kbIds,
