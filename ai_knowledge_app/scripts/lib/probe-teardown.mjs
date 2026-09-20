@@ -657,6 +657,83 @@ export function sweepOrphanNotices() {
   return before - mysqlCount('select count(*) from sys_notice;')
 }
 
+/**
+ * 无主会话族（`T-O23` · `S7-M06-B` 立）。
+ *
+ * <h3>它补的是哪个洞</h3>
+ * <p>三个 E2E 脚本的会话族清理**按水位线**（`coalesce(max(id),0)` 起算），也就是
+ * **只保护"本轮造的"**。于是一旦某一轮因任何原因没跑到收尾（被打断 / 抛错 / 被强杀），
+ * 那一轮的会话族就**永远没人认领** —— 后面每一轮的水位线都在它上面，谁都够不着。
+ * <b>实测</b>：`S7-M06-B` 开工核基线时库里躺着 1 会话 + 2 消息 + 1 打点 + 5 明细，
+ * 来自**上一批 O 轨的证伪实验**，而上一批的收尾写着"残留全 0"。
+ *
+ * <h3>谓词：**该会话的每一条打点都无主**</h3>
+ * <p>「无主」= 这条打点引用的分片**在 `sys_chunk` 里一个都不剩**。这是本仓既有的
+ * 「无主残留」口径（`sweepOrphanNotices` / `sweepOrphanMisses` 同源），
+ * 判据是**与归属无关的观测点**（"它还挂得上父行吗"），而不是"谁清的"。
+ *
+ * <p>🔴 **为什么要求"每一条"都无主**，而不是"存在一条无主就删"：
+ * 真实用户的会话里若**只有**某一条打点引用的文档被彻底删了，那个会话**不该**被清 ——
+ * 他其余的问答还指着活着的文档。要求**全部**无主，等价于"整个会话说的都是已经不存在的内容"，
+ * 此时它引用的分片早就悬空，删它不损失任何还能取到的信息。
+ *
+ * <p>⚠️ **顺序有要求**：会话那一步必须**在删明细之前**跑（它要读"分片还在不在"的**当时**状态）。
+ * 先删明细的话，每条打点都会变成"一条明细都不剩"，判据就退化成"清空全部打点"。
+ */
+export function sweepOrphanChatFamily() {
+  const count = () => mysqlCount('select count(*) from sys_chat_session;')
+    + mysqlCount('select count(*) from sys_chat_message;')
+    + mysqlCount('select count(*) from sys_retrieval_trace;')
+    + mysqlCount('select count(*) from sys_retrieval_trace_chunk;')
+  const before = count()
+
+  // "每一条打点都无主"的会话 —— 同一段子查询在下面三处复用（**必须读删除前的状态**）
+  const orphanSession = 'select t.session_id from sys_retrieval_trace t'
+    + ' where t.session_id is not null'
+    + '   and exists (select 1 from sys_retrieval_trace_chunk c where c.trace_id = t.trace_id)'
+    + '   and not exists (select 1 from sys_retrieval_trace_chunk c'
+    + '                    join sys_chunk k on k.id = c.chunk_id where c.trace_id = t.trace_id)'
+
+  mysqlScalar(
+    `delete from sys_chat_message where session_id in (${orphanSession});`
+    + `delete from sys_chat_session where id in (${orphanSession});`,
+  )
+  // 悬空明细 → 悬空打点（自上而下，与外溢面同一条顺序纪律）
+  mysqlScalar('delete from sys_retrieval_trace_chunk where chunk_id not in (select id from sys_chunk);')
+  mysqlScalar('delete from sys_retrieval_trace where trace_id not in'
+    + ' (select trace_id from sys_retrieval_trace_chunk);')
+  return before - count()
+}
+
+/**
+ * 兜底：把**被中断的轮次**留下的探针库一并收掉（`T-O23` 的第二种形态 · `S7-M06-B` 立）。
+ *
+ * <h3>它补的是哪个洞</h3>
+ * <p>每个脚本收尾时只清**自己那两个 `code`**（那是刻意的：射程要精确）。于是一旦某一轮
+ * 没跑到 `finally`（被打断、被强杀、CDP 挂死），它建的探针库就**永远没人认领** ——
+ * 后面每一轮都不认识那些 code。<b>实测</b>：`S7-M06-B` 施工期间被 `TaskStop` 打断过三次，
+ * 库里于是躺着 **9 个探针库 + 15 条分片 + 4 个会话**，而每一轮的收尾都报"残留 = 0"
+ * （它只报自己那一份，且**它说的没错**）。
+ *
+ * <h3>为什么敢按前缀删</h3>
+ * <p>与 {@link teardownUserProbe} 同一条口径：**前缀是探针自己取的**（`kb_e2e*` 这种
+ * 人类不会用的名字），所以"命中前缀"本身就是归属证据。⚠️ 前缀必须**逐字登记在调用方**
+ * （不要用 `like '%probe%'` 这种宽匹配 —— 那会误伤 `hybrid-probe` 之外的合法库）。
+ *
+ * @param prefixes 探针库 code 的**前缀**列表（调用方自己的 + 同族脚本的）
+ * @returns 收掉的库的 code 列表
+ */
+export async function sweepAbandonedKbProbes(prefixes) {
+  const where = prefixes.map((p) => `code like '${p}%'`).join(' or ')
+  if (!where) return []
+  const csv = String(mysqlScalar(`select group_concat(code) from sys_kb where ${where};`) || '')
+  const codes = csv.split(',').map((s) => s.trim()).filter(Boolean)
+  for (const code of codes) {
+    await teardownKbProbe(code)
+  }
+  return codes
+}
+
 export async function teardownKbProbe(code) {
   // ⓪ `S4-E1` 起多了一步：**先让解析作业停下来**，否则它们是"删完之后还在写"的源头
   // 🔴 `#187`：**必须接住它的返回值**。原写法是 `await quiesceParseJobs(code)` ——
@@ -702,11 +779,20 @@ export async function teardownKbProbe(code) {
   // ④.6 无主未命中问题（`T-A00` 的外溢面）—— 与 ④.5 同理由、同顺序要求。
   const missesRemoved = sweepOrphanMisses()
 
+  // ④.7 无主会话族（`T-O23`）—— **必须排在 ④ 之后**：④ 刚把探针库的分片删掉，
+  //     那些打点**在这一刻才变成**无主。顺序反了要等下一轮才扫得到。
+  //     ⚠️ 它清的不只是"本轮探针库"的会话族，还包括**前几轮异常退出留下的**
+  //     （水位线够不着的那批）—— 那正是这个函数存在的理由。
+  const chatRemoved = sweepOrphanChatFamily()
+
   // ⑤ 残留自检 —— 独立观测点
   const residue = await findKbProbeResidue(code, { ids, minioKeys, quiesceTimedOut: !!quiesce.timedOut })
   return {
     code, ids, minioKeys,
-    removed: { minio: minioRemoved, sql: '见 residue', notices: noticesRemoved, misses: missesRemoved },
+    removed: {
+      minio: minioRemoved, sql: '见 residue', notices: noticesRemoved, misses: missesRemoved,
+      chatFamily: chatRemoved,
+    },
     residue, quiesce,
   }
 }

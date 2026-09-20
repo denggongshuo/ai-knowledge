@@ -36,7 +36,8 @@
  * 用法：`node scripts/check-ledgers.mjs`（在 `ai_knowledge_app/` 下跑）
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { basename, dirname, resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { basename, dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -327,6 +328,141 @@ for (const [label, path] of [['L2 plan/README.md 索引', INDEX], ['L3 plan/汇�
     if (!onDisk.has(f)) problems.push(`${label}：表里有而盘上**没有**（死链）—— ${f}`)
   }
   notes.push(`${label}：登记 ${listed.size} 个文件`)
+}
+
+// ---------------------------------------------------------------------------
+// L4 · 回填清单与索引状态列（`S7-M06-B` 立）
+//
+// 由来是**同一个形状的两次实测**（都在 `S7-M06-A` 的收尾阶段）：
+//   · 计划的「本批同步的文档回填」清单里把 `00-开工速览.md` 勾成了 `[x]`，
+//     而那份文件在本批的 12 个提交里**一次都没出现** —— 于是下一个开工的人
+//     读到的是**上一批的定位**，而清单上写着"已完成"。**勾选框本身在撒谎。**
+//   · `plan/README.md` 的索引行状态列停在 `🟡 进行中`（那行是批次**还在跑**时应急补的），
+//     而计划文件自己第 1 行写着 `✅ 已完成`；L2 只查"在不在索引里"，**不查状态**。
+//
+// 判据：**清单里打勾的，必须真的被这批的提交改过；计划说自己完成，索引就得说完成。**
+// ---------------------------------------------------------------------------
+
+function gitLines(args) {
+  try {
+    // 🔴 `-c core.quotepath=false` 是**必须的**：少了它，非 ASCII 路径会被 git 转义成
+    //    `"docs/\350\277\233\345\272\246/..."` 再吐出来 ⇒ 与清单里的中文路径**一个都对不上**
+    //    ⇒ 闸会**大面积误报**（本脚本第一版把每一份计划的每一个勾选项都报成了漏做）。
+    //    ⚠️ 它误报的方向恰好是"说别人没做"，比漏报更容易被当成真的 —— 所以这条闸自己也要先证伪。
+    return execFileSync('git', ['-c', 'core.quotepath=false', ...args], { cwd: REPO, encoding: 'utf8' })
+      .split('\n').map((s) => s.trim()).filter(Boolean)
+  } catch {
+    return null
+  }
+}
+
+/** git 是否跟踪该路径（相对仓库根，正斜杠）。不跟踪的（gitignore）没法做 git 对账。 */
+function gitTracks(rel) {
+  try {
+    execFileSync('git', ['-c', 'core.quotepath=false', 'ls-files', '--error-unmatch', rel],
+      { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 本批改动过的全部文件（相对仓库根，正斜杠）。`null` = 取不到（**取不到 ≠ 没问题**）。 */
+function filesTouchedBy(file) {
+  const rel = relative(REPO, file).replace(/\\/g, '/')
+  const commits = gitLines(['log', '--format=%H', '--', rel])
+  if (!commits || commits.length === 0) return null
+  const first = commits[commits.length - 1] // `git log` 新→旧
+  const last = commits[0]
+  const changed = new Set()
+  // 立据那一次提交里的文件 + 之后到回填之间的文件
+  for (const args of [['show', '--format=', '--name-only', first], ['log', '--format=', '--name-only', `${first}..${last}`]]) {
+    const out = gitLines(args)
+    if (!out) return null
+    out.forEach((f) => changed.add(f))
+  }
+  return changed
+}
+
+/** `plan/README.md` 里每一行的文件名 → {status, date}。 */
+function indexStatusOf(path) {
+  const rows = new Map()
+  const lines = readFileSync(path, 'utf8').split('\n')
+  for (const line of lines) {
+    if (!tableRow(line)) continue
+    const cells = line.split('|').map((c) => c.trim())
+    // `| 文件 | 描述 | 状态 | 日期 |` ⇒ split 后首尾各一个空串
+    const m = /^`([^`]+\.md)`$/.exec(cells[1] ?? '')
+    if (!m) continue
+    rows.set(m[1], { status: cells[cells.length - 3] ?? '', date: cells[cells.length - 2] ?? '' })
+  }
+  return rows
+}
+
+const indexRows = existsSync(INDEX) ? indexStatusOf(INDEX) : new Map()
+/** 回填清单里**不是路径**的条目（模式，如 `.workbuddy/memory/<日期>.md`）—— 报出来，不静默丢。 */
+const skipped = []
+
+for (const f of onDisk) {
+  const path = resolve(PLAN_DIR, f)
+  const text = readFileSync(path, 'utf8')
+  const head = (text.split('\n')[0] ?? '').trim()
+  const done = /状态：\s*✅/.test(head)
+  const inProgress = /状态：\s*🟡/.test(head)
+
+  // ---- L4b · 状态列与计划自述一致（**两个方向都查**）----
+  const row = indexRows.get(f)
+  if (!row) {
+    // 漏登由 L2 报；这里不重复
+  } else {
+    const rowDone = /✅/.test(row.status)
+    if (done && !rowDone) {
+      problems.push(`L4b ${f}：计划第 1 行说**已完成**，而 \`plan/README.md\` 的状态列是「${row.status}」`
+        + '（L2 只查"在不在索引里"，不查状态 —— 这一列此前没有任何机器盯着）')
+    }
+    if (inProgress && rowDone) {
+      problems.push(`L4b ${f}：计划第 1 行说**进行中**，而索引状态列说「${row.status}」`)
+    }
+    if (done && rowDone && !/\d{4}-\d{2}-\d{2}/.test(row.date)) {
+      problems.push(`L4b ${f}：索引说已完成，但**完成日期为空**（那一列是"什么时候交的"的唯一记录）`)
+    }
+  }
+
+  // ---- L4a · 回填清单里勾了的，必须真的被这批改过 ----
+  const checked = [...text.matchAll(/^\s*-\s*\[x\][^\n]*?`([^`]+\.md)`/gm)].map((m) => m[1])
+  if (checked.length === 0) continue
+  const touched = filesTouchedBy(path)
+  if (touched === null) {
+    console.error(`✗ 前置不满足：L4a 取不到 ${f} 的提交范围（git 不可用？）—— 取不到 ≠ 没问题`)
+    process.exit(EXIT_PRECONDITION)
+  }
+  const norm = new Set([...touched].map((p) => p.replace(/\\/g, '/')))
+  for (const raw of checked) {
+    // 🔴 **路径写法要归一化**：清单里两种写法都有（`docs\进度\...` 与 `docs/进度/...`），
+    //    而 git 只认正斜杠 ⇒ 不归一化的话反斜杠那批会被当成"不是路径"**静默跳过** ——
+    //    闸于是漏掉一半输入，而它自己看着是绿的（这正是本仓那条"闸的输入为空"的形态）。
+    const target = raw.replace(/\\/g, '/')
+    // 清单里有些条目是**模式**而不是路径（`.workbuddy/memory/<日期>.md`）——
+    // 对它们无从做 git 对账。判据是"仓库里到底有没有这个文件"，
+    // 而不是"它看起来像不像路径"（后者只能靠猜）。
+    // 🔴 还要**排掉 git 不跟踪的**：`.workbuddy/memory/*.md` 是 gitignore 的，
+    //    它们在盘上存在、也**确实被每一批改过**，但 git 里一行记录都没有 ⇒
+    //    不排掉就会把每一批都报成漏做（第一版正是如此）。判据只能是"git 跟不跟踪它"。
+    if (!existsSync(resolve(REPO, target)) || !gitTracks(target)) {
+      skipped.push(target)
+      continue
+    }
+    const candidates = [...norm].filter((p) => p.endsWith(target))
+    if (candidates.length === 0) {
+      problems.push(`L4a ${f}：回填清单里把 \`${target}\` 勾成了 \`[x]\`，`
+        + '但它**不在本批改动过的文件里** —— 勾选框说做了、git 说没做')
+    }
+  }
+}
+if (indexRows.size > 0) notes.push(`L4 索引状态列：读了 ${indexRows.size} 行 · 回填清单勾选项已逐条对 git`)
+if (skipped.length > 0) {
+  notes.push(`L4a 跳过 ${skipped.length} 条**不是路径**的清单项（模式而非文件）：`
+    + `${[...new Set(skipped)].join(' · ')}`)
 }
 
 // ---------------------------------------------------------------------------

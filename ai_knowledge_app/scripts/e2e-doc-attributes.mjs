@@ -39,6 +39,7 @@ import {
   mysqlCount,
   mysqlScalar,
   teardownKbProbe,
+  sweepAbandonedKbProbes,
   kbResidueClean,
   describeKbResidue,
   milvusVectorCount,
@@ -237,6 +238,8 @@ let srcKbId = 0
 let tgtKbId = 0
 let lowKbId = 0
 let docId = 0
+/** 本轮提问产生的会话 id（**精确清理**用，不靠水位线 —— 见 `T-O23`）。 */
+let sessionId = 0
 
 async function main() {
   // ---------- ① 前置：**必须是真后端模式** ----------
@@ -256,6 +259,13 @@ async function main() {
   // ---------- ② 登录 ----------
   token = bizOk(await api('/auth/login', { method: 'POST', body: { ...PROBE, remember: true }, as: '' }), '登录').accessToken
   check(!!token, '拿到 accessToken')
+
+  // 🔴 **开工先把"被中断的轮次"留下的探针库收掉**（`T-O23`）。
+  //    每个脚本收尾只清自己的 code，那一轮一旦没跑到 finally 就**永远没人认领**。
+  //    实测：本脚本施工期间被强杀三次 ⇒ 库里积了 9 个探针库，而每一轮的收尾都报"残留 = 0"
+  //    （它只报自己那一份，**并且它说的没错**）—— 所以兜底必须由**下一轮**来做。
+  const swept = await sweepAbandonedKbProbes(['kb_e2edocattr_'])
+  if (swept.length > 0) observe('收掉上一轮（或更早被中断的轮次）留下的探针库', `${swept.length} 个：${swept.join(' · ')}`)
 
   // ---------- ③ 建三个探针库（三档密级）----------
   srcKbId = await createKb(SRC_CODE, '内部', 'INTERNAL')
@@ -475,6 +485,11 @@ async function main() {
   const traceFloor = mysqlCount('select coalesce(max(id), 0) from sys_retrieval_trace;')
   await api('/chat/completions', { method: 'POST', body: { message: MAGIC, useVision: false } })
   await sleep(1200)
+  // 🔴 **把本次提问的会话 id 精确记下来**（不靠水位线）—— 这一条是本批开工时从库里
+  //    实测出来的教训：水位线只保护"本轮造的"，前一轮的残留**永远没人认领**。
+  //    精确删除是这条路的正解（`S8-M10-B` 在未命中池上也是这么做的）。
+  sessionId = Number(mysqlScalar(
+    `select session_id from sys_retrieval_trace where id > ${traceFloor} order by id desc limit 1;`) || 0)
   const recalledAfterMove = mysqlCount(
     'select count(*) from sys_retrieval_trace_chunk c join sys_retrieval_trace t on t.trace_id = c.trace_id '
     + `where t.id > ${traceFloor} and c.doc_id = ${docId};`)
@@ -550,6 +565,20 @@ run()
       /* 忽略 */
     }
 
+    // 🔴 本轮**提问**产生的会话族：按**精确 id** 删（`T-O23`）。
+    //    不靠水位线，也不指望"它的打点会变无主" —— 那两条都在本批开工时被实测证伪过。
+    try {
+      if (sessionId > 0) {
+        mysqlScalar(
+          `delete from sys_retrieval_trace_chunk where trace_id in (select trace_id from sys_retrieval_trace where session_id = ${sessionId});`
+          + `delete from sys_retrieval_trace where session_id = ${sessionId};`
+          + `delete from sys_chat_message where session_id = ${sessionId};`
+          + `delete from sys_chat_session where id = ${sessionId};`)
+      }
+    } catch (e) {
+      check(false, '收尾：会话族精确清理抛错', e.message)
+    }
+
     let clean = false
     try {
       const residues = []
@@ -565,6 +594,13 @@ run()
       }
       clean = residues.every((r) => kbResidueClean(r))
       check(clean, '收尾：探针库族残留 = 0（断言，不是日志）', descs.join(' / '))
+      // 🔴 **第二族也要断言**（会话/打点/消息）—— 本批开工时那批残留**正是这一族**，
+      //    而当时所有的收尾报的都是"探针库族 = 0"。**只核一族等于没核。**
+      const chatLeft = mysqlCount('select count(*) from sys_chat_session;')
+        + mysqlCount('select count(*) from sys_chat_message;')
+        + mysqlCount('select count(*) from sys_retrieval_trace;')
+        + mysqlCount('select count(*) from sys_retrieval_trace_chunk;')
+      check(chatLeft === 0, '收尾：**会话族**残留 = 0（光核探针库族不够 —— 本批开工实测）', `剩余 ${chatLeft} 行`)
     } catch (e) {
       check(false, '收尾：残留自检自身抛错', e.message)
     }
