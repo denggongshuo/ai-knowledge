@@ -208,8 +208,8 @@ class NoticeFlowTest extends ApiTestSupport {
     // ==================== T-B01 · 待我处理 ====================
 
     @Test
-    @DisplayName("T-B01：pending **只出有源的那半**（解析问题），未命中那半不发 —— 不发 ≠ 发 0")
-    void pendingOnlyShowsParseIssues() {
+    @DisplayName("T-B01：pending 按**文档**去重（解析那项）；未命中那项**有才发**、数与 11 页同源")
+    void pendingItemsAreSourced() {
         // 源 = sys_parse_issue。kb_id 指向一个不存在的库 ⇒ 收尾由 kb 族兜底扫掉。
         // ⚠️ 夹具刻意造成「2 篇文档 / 3 个问题行」——见下面的负向锚。
         insertParseIssue(9_000_001L, 9_000_011L);
@@ -219,9 +219,9 @@ class NoticeFlowTest extends ApiTestSupport {
         var res = get("/api/notices/pending", token).assertOk("待我处理");
         List<Map<String, Object>> list = res.data("$.list");
 
-        assertThat(list).as("🔴 只有一项：未命中那一项必须**不存在**，而不是 count=0").hasSize(1);
-        assertThat(list.getFirst().get("key")).isEqualTo("parse");
-        assertThat(((Number) list.getFirst().get("count")).longValue())
+        Map<String, Object> parse = find(list, "parse");
+        assertThat(parse).as("解析问题有数据 ⇒ 必须在场").isNotNull();
+        assertThat(((Number) parse.get("count")).longValue())
                 .as("按**文档**去重：2 篇")
                 .isEqualTo(2);
 
@@ -230,6 +230,30 @@ class NoticeFlowTest extends ApiTestSupport {
         assertThat(jdbc.queryForObject(
                 "select count(*) from sys_parse_issue where doc_id in (9000011, 9000012)",
                 Integer.class)).as("问题行确实是 3 行（2 篇文档）").isEqualTo(3);
+
+        // ---------- 「未命中」那一项 ----------
+        // 🔴 `S6-M11` 时这里断言的是「**必须不存在**，而不是 count=0」—— 那时它没有源，
+        //    发 0 会被读成"确实没有"。`T-A00`（S8-M10-A）落地后源是真的了，口径变成
+        //    「**有才发**」（需求 §2.3：这一栏是"**需要人工介入的**聚合"）。
+        //    ⇒ 判据改成**对两端都成立、且两端都不空**的形状：
+        //    在场则数必须对得上，不在场必须是"池子里确实一个待处理的都没有"。
+        // ⚠️ 旧写法（`hasSize(1)`）在池子为空时**恒绿** —— 它证不了任何东西，
+        //    而池子在 `mvn test` 里恰好总是空的（本批就是被 E2E 把数压到 0 时才发现的）。
+        long pendingMisses = jdbc.queryForObject(
+                "select count(*) from sys_qa_miss where status in ('PENDING', 'IN_LIST')", Long.class);
+        Map<String, Object> miss = find(list, "miss");
+        if (pendingMisses == 0) {
+            assertThat(miss).as("池子里没有待处理 ⇒ 不出这一项（不是一张 count=0 的卡片）").isNull();
+        } else {
+            assertThat(miss).as("池子里有待处理 ⇒ 必须出，且与 11 页统计卡同源").isNotNull();
+            assertThat(((Number) miss.get("count")).longValue())
+                    .as("G6-13：与 `/ops/qa/overview` 的 pending 是**同一个数**")
+                    .isEqualTo(pendingMisses);
+        }
+    }
+
+    private static Map<String, Object> find(List<Map<String, Object>> list, String key) {
+        return list.stream().filter(p -> key.equals(p.get("key"))).findFirst().orElse(null);
     }
 
     // ==================== 小工具 ====================
