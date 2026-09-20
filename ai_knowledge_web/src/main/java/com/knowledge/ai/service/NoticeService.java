@@ -24,19 +24,18 @@ import java.util.Map;
  * <p>写侧在 {@code core/notice/NoticePublisher} —— 本类**只读不写**（唯一的写是"标已读"与
  * "存设置"，那两件是用户对自己数据的操作，不是"产出通知"）。
  *
- * <h3>🔴 `pending` 只出有源的那一半</h3>
+ * <h3>🔴 `pending` 的两项现在都有源了（`S8-M10-A` 起）</h3>
  * <p>需求 §2.3 的「待我处理」有两项：**未命中问题** 与 **解析失败**。
- * 其中未命中问题的源是**未命中清单**，属 `T-A00`（S8）—— 本仓**没有那张表**
- * （`sys_retrieval_trace.miss_flag` 只是原始标记，不是"已沉淀为清单"）。
- * ⇒ 本批只出解析那一项，未命中那一项**不发**。
+ * `S6-M11` 时只有后者有源 —— 前者要的**未命中清单**当时还没有那张表
+ * （`sys_retrieval_trace.miss_flag` 只是原始标记，不是"已沉淀为清单"），
+ * 于是那一项**刻意不发**（**不发 ≠ 发 0**：0 会被读成"确实没有待处理"，
+ * 与"这个问题还没有地方去数"意义完全相反）。
  *
- * <p>⚠️ **不发 ≠ 发 0**。这是本仓已经定过的口径（`#169`：模型用量只覆盖对话链路时
- * 「刻意不给 0：那会被读成'本月确实没用量'」）。这里同理 —— 发 0 会被读成
- * "**确实没有待处理的未命中问题**"，而事实是"**这个问题还没有地方去数**"。
- * 两者对用户的意义完全相反。
+ * <p>`T-A00` 落地后那条口径的**适用条件消失了**：未命中清单已经是真表，
+ * 于是那一项照常发 —— 此时**发 0 才是诚实的**（它真的表示"确实没有"）。
  *
- * <p>`G6-13`（「`/notices/pending` 的 `total` 与 `/ops/qa/overview` 待处理数一致」）
- * 因此标**挂起**，待 `T-A00` 落地后**与那批合并验收**。
+ * <p>`G6-13`（`/notices/pending` 的待处理数与 `/ops/qa/overview` 一致）由此结清：
+ * 两处的数都来自 {@link QaMissService#pendingCount()}，**同一个方法**。
  */
 @Slf4j
 @Service
@@ -51,6 +50,14 @@ public class NoticeService {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
     private final NoticeRepository noticeRepository;
+
+    /**
+     * 「待我处理」里未命中那一项的来源（`T-A00`）。
+     *
+     * <p>⚠️ 依赖方向是**单向**的：`QaMissService` 不认识通知。反过来注入就会成环 ——
+     * 而 Spring 的构造器注入遇到环会**启动失败**（不是运行时才出问题，这点是好事）。
+     */
+    private final QaMissService qaMissService;
 
     // ==================== 列表 · `T-B00` ====================
 
@@ -79,17 +86,39 @@ public class NoticeService {
         return new NoticeDtos.UnreadCountResponse(noticeRepository.unreadCount(userId));
     }
 
-    /** `GET /notices/pending` —— 见类注释：**只出有源的那一项**。 */
+    /**
+     * `GET /notices/pending` —— 待我处理聚合（需求 §2.3 的两项）。
+     *
+     * <p>两项**都出**了（`S6-M11` 时只有解析那一项，未命中那项因为**没有表**而刻意不发）。
+     * 现在未命中清单已经落地（`T-A00` / `V32`），它的数来自 {@link QaMissService#pendingCount()}
+     * —— **与侧边栏角标、与 11 页统计卡是同一个方法**，`G6-13` 的「同源」就落在这一点上。
+     *
+     * <p>🔴 **`total` 是各类目 count 之和，不是类目个数**（本批修）。与 mock 一致
+     * （`mock/index.ts` 的 `mockPendingItems.reduce((s, p) => s + p.count, 0)`）——
+     * 此前返回 `list.size()`，于是「共 2 条待办」与实际 26 条对不上。前端目前没用这个字段，
+     * 所以它一直没暴露；而 `G6-13` 要拿它和统计卡比，这个数不对就**验不了**。
+     */
     public NoticeDtos.PendingResponse pending() {
-        int docs = noticeRepository.pendingParseIssueCount();
         List<NoticeDtos.PendingItem> list = new ArrayList<>();
+
+        // 未命中问题（源 = sys_qa_miss）—— 排在前面，与 mock 的顺序一致
+        int misses = qaMissService.pendingCount();
+        if (misses > 0) {
+            list.add(new NoticeDtos.PendingItem("miss", "未命中问题待处理", misses,
+                    "检索分数低于阈值的提问，已沉淀为清单，需补文档后重放验证",
+                    "/ops/qa", "去处理"));
+        }
+
+        int docs = noticeRepository.pendingParseIssueCount();
         if (docs > 0) {
             list.add(new NoticeDtos.PendingItem("parse", "文档解析问题待处理", docs,
                     docs + " 篇文档存在未识别表格或解析失败，内容无法被检索命中",
                     "/kb", "查看解析质量"));
         }
-        // ⚠️ 未命中问题那一项**刻意不发** —— 见类注释。
-        return new NoticeDtos.PendingResponse(list, list.size());
+
+        // ⚠️ 这里**不是** list.size()：那是"有几个类目"，而字段名叫 total。
+        long total = list.stream().mapToLong(NoticeDtos.PendingItem::count).sum();
+        return new NoticeDtos.PendingResponse(list, total);
     }
 
     // ==================== 已读 · `T-B02` ====================

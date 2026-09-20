@@ -93,6 +93,9 @@ public class RetrievalTraceWriter {
               (:traceId, :rankNo, :chunkId, :docId, :score, :source, :tableParentId, null)
             """;
 
+    /** 未命中沉淀（`T-A00`）—— 打点行写完之后按 `miss_flag` 派生池子那一步。 */
+    private final MissSink missSink;
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -148,6 +151,12 @@ public class RetrievalTraceWriter {
             insert.executeUpdate();
 
             writeChunks(write.traceId(), chunks);
+
+            // 🔴 顺序是**先打点、后沉淀**（`T-A00`）：沉淀自己开 `REQUIRES_NEW`。
+            // 反过来先沉淀的话，打点一旦失败就留下"池子里有一行、打点里查不到"——
+            // 那是**不可重建**的（池子行说不出它是从哪次提问来的）；
+            // 而"打点在、池子少一行"可以由 miss_flag=1 的打点重建出来。
+            missSink.record(write);
         } catch (RuntimeException ex) {
             // 绝不因为打点写不进去而让问答失败。traceId 必须带出来 —— 否则"少了一行"
             // 与"用户压根没提问"在库里长得一模一样，事后无从分辨
@@ -197,7 +206,12 @@ public class RetrievalTraceWriter {
      *
      * <p>一条都没召回时返回 {@code null} —— "没有 Top1"与"Top1 是 0 分"是两件事。
      */
-    private static Double top1(List<RetrievedChunk> chunks) {
+    /**
+     * 名次最靠前那条的分（`T-707` · `I-14`）。**包内可见** ——
+     * {@link MissSink} 用它给池子算"最高相似度"，两处必须是**同一个算法**，
+     * 否则池子里的数与打点里的数对不上，而两边看着都合理。
+     */
+    static Double top1(List<RetrievedChunk> chunks) {
         return chunks.stream()
                 .min(Comparator.comparingInt(RetrievedChunk::rank))
                 .map(RetrievedChunk::score)
@@ -212,7 +226,8 @@ public class RetrievalTraceWriter {
         }
     }
 
-    private static String joinIds(List<Long> ids) {
+    /** 逗号拼接（包内可见，理由同 {@link #top1} —— 池子与打点表的 `kb_ids` 同口径）。 */
+    static String joinIds(List<Long> ids) {
         if (ids == null || ids.isEmpty()) {
             return "";
         }
