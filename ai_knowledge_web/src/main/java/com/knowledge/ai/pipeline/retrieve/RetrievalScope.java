@@ -112,8 +112,20 @@ public class RetrievalScope {
             return new Scope(List.of(), Set.of(), List.of(), false);
         }
 
-        List<String> partitions = existingPartitions(kbs);
         DocScope docScope = visibleDocIds(kbIds, secretLevels);
+        if (docScope.docIds().isEmpty()) {
+            // 🔴🔴 **一篇都看不见时绝不能继续往下走**（`S7-M06-B` 实测踩到，是一处真的越权口子）：
+            //    `Scope#milvusFilter()` 在 `docIds` 为空时会退成"只按库过滤" ——
+            //    那不是"少召回几条"，而是**取消了文档级过滤** ⇒ 库里所有分片都能被召回。
+            //    触发它的状态很常见：**库可见，但库里每一篇都超密级**（刚把文档逐个提到机密、
+            //    而用户上限只到内部），或者库里的文档全被软删。
+            //    这里短路：`kbIds` 照旧带出去（库**确实**可见，trace 上不该说它不存在），
+            //    但 `partitions` 给空 ⇒ `empty()` 为真 ⇒ 调用方不检索。
+            log.info("[检索] 可见库里有 0 篇可见文档，本次不检索：kbIds={} 用户={}",
+                    kbIds, user.getUsername());
+            return new Scope(kbIds, docScope.docIds(), List.of(), false);
+        }
+        List<String> partitions = existingPartitions(kbs);
         return new Scope(kbIds, docScope.docIds(), partitions, docScope.fallback());
     }
 
@@ -267,12 +279,27 @@ public class RetrievalScope {
             return docIds.size();
         }
 
-        /** 下发给 Milvus 的过滤表达式；退化路径只按库过滤。 */
+        /**
+         * 下发给 Milvus 的过滤表达式；退化路径只按库过滤。
+         *
+         * <p>🔴 **{@code docIds} 为空时**给一个**恒不匹配**的表达式，**不回退成"只按库过滤"**。
+         * 回退等于**取消**文档级过滤 —— 库里所有分片都会被召回，而那是越权可见。
+         * 这条不是主路径（{@code RetrievalScope#resolve} 已经在那种状态下短路了），
+         * 是**防御**：{@code Scope} 是个公开 record，别处（含用例）可以直接构造它。
+         *
+         * <p>用 {@code -1} 而不是 {@code 0}：分片 id 是自增正数，两者都匹配不到 ——
+         * 但本仓有一条明确口径「**禁用 {@code 0} 当哨兵**」（凡 0 都要先问"它是真值还是哨兵"），
+         * 用一个本来就取不到的负数可以省掉读者这一次怀疑。
+         */
         public String milvusFilter() {
             String byKb = MilvusConstants.FIELD_KB_ID + " in ["
                     + kbIds.stream().map(String::valueOf).collect(Collectors.joining(",")) + "]";
-            if (docFallback || docIds.isEmpty()) {
+            if (docFallback) {
+                // 退化路径：doc 条件不进表达式，改由 `allowsDoc` 在结果侧兜（那条**必须**真的判）
                 return byKb;
+            }
+            if (docIds.isEmpty()) {
+                return byKb + " and " + MilvusConstants.FIELD_DOC_ID + " in [-1]";
             }
             return byKb + " and " + MilvusConstants.FIELD_DOC_ID + " in ["
                     + docIds.stream().map(String::valueOf).collect(Collectors.joining(",")) + "]";

@@ -1,6 +1,9 @@
 package com.knowledge.ai.pipeline.retrieve;
 
 import com.knowledge.ai.core.constant.MilvusConstants;
+import com.knowledge.ai.core.enums.DataScope;
+import com.knowledge.ai.core.enums.SecretLevel;
+import com.knowledge.ai.core.security.LoginUser;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -109,15 +112,118 @@ class RetrievalScopeFlowTest extends RetrievalFlowSupport {
     @Test
     @DisplayName("密级高于用户上限的知识库不参与召回")
     void kbAboveUserSecretLevelIsInvisible() {
-        long secretKb = insertKb("scope-probe-secret", "SECRET");
+        // 🔴 **修掉一处假绿**（`S7-M06-B` 施工时发现）：夹具的 `insertDocWithChunks` /
+        //    `seedVectors` 用的是**字段 `kbId`**（默认库），不是"刚建的那个库" ——
+        //    第一版没重指 `kbId`，于是文档与向量全落在**默认库**里，而断言搜的是 `secretKb`。
+        //    那样"零召回"的原因是**新库压根没有内容**，与密级一点关系没有：
+        //    把这一格的密级换成 PUBLIC，它照样绿。
+        kbId = insertKb("scope-probe-secret", "SECRET");
         long docId = insertDocWithChunks("绝密探针", "这段正文属于绝密知识库");
         seedVectors(docId, 1);
+        awaitVectorsVisible("这段正文属于绝密知识库", 1);
+
+        // 正对照：上限够的账号搜得到（证明内容真的在那个库里）
+        assertThat(retrievalService.search(reader(), "这段正文属于绝密知识库", List.of(kbId)).chunks())
+                .as("正对照：超管（绝密上限）应当搜得到它").isNotEmpty();
 
         // 一个密级上限只有 PUBLIC 的用户：连这个库都不该出现
-        RetrievalResult result = retrievalService.search(publicOnlyReader(), "绝密探针", List.of(secretKb));
+        RetrievalResult result = retrievalService.search(publicOnlyReader(),
+                "这段正文属于绝密知识库", List.of(kbId));
 
         assertThat(result.chunks()).as("密级超限 → 零召回").isEmpty();
-        assertThat(result.trace().kbIds()).doesNotContain(secretKb);
+        assertThat(result.trace().kbIds()).doesNotContain(kbId);
+    }
+
+    @Test
+    @DisplayName("G7-3/I-6 · 文档级密级：生效值 = max(文档, 库) —— **A/B/A 三格缺一不可**")
+    void docSecretLevelIsTheMaxOfDocAndKb() {
+        // 上限 = 内部的账号：能看见「内部」的库，但看不见「机密」及以上的库/文档
+        LoginUser internalUpper = internalUpperReader();
+        // ⚠️ 查询串 = 分片正文本身。夹具的向量是**真的**（`seedVectors` 走 `VectorWriter`），
+        //    但检索要 token 交集 ⇒ 拿一个不相干的串去查，"零召回"什么都证明不了。
+        String q = "这段正文被单独提到了绝密级别";
+
+        // ---- ① / ②：文档**自己**比库更严 ----
+        // 🔴 夹具的 `insertDocWithChunks` / `seedVectors` / `awaitVectorsVisible` **都用字段
+        //    `kbId`**（不是"文档自己的库"）⇒ 必须先把它指到本用例的库上，否则文档与向量
+        //    都落在**默认库**里，而这里却在搜另一个库 —— "零召回"于是与密级毫无关系。
+        //    （这条正是第一版的翻车点：它是被下面的正对照逮出来的。）
+        kbId = insertKb("scope-probe-docsec", "INTERNAL");
+        long doc = insertDocWithChunks("自己绝密", q);
+        seedVectors(doc, 1);
+        awaitVectorsVisible(q, 1);
+
+        // 正对照：同一个库、**同一个账号、同一个问句**，先确认它本来搜得到。
+        // 少了这一句，「零召回」既可能是密级挡的、也可能是检索没匹配上 —— 判据就废了。
+        jdbc.update("update sys_document set secret_level = null where id = ?", doc);
+        assertThat(retrievalService.search(internalUpper, q, List.of(kbId)).chunks())
+                .as("正对照：文档未覆盖（继承内部）⇒ 这个账号本来搜得到")
+                .isNotEmpty();
+
+        // 提到绝密 ⇒ 同一个账号同一个问句必须搜不到
+        jdbc.update("update sys_document set secret_level = 'SECRET' where id = ?", doc);
+        RetrievalResult blocked = retrievalService.search(internalUpper, q, List.of(kbId));
+        assertThat(blocked.trace().kbIds())
+                .as("库本身不超限（内部 ≤ 内部上限）⇒ 挡住它的**必须**是文档级那条")
+                .contains(kbId);
+        assertThat(blocked.chunks())
+                .as("🔴 文档自己提到绝密 ⇒ 库级放行也召回不到它（生效值 = max(文档, 库)）")
+                .isEmpty();
+
+        // 🔴 这条**单独钉 `resolve` 的短路**。为什么不能省：上面那条"零召回"是
+        //    `milvusFilter()` 的防御（空 docIds ⇒ `doc_id in [-1]`）**独自**就能满足的 ——
+        //    实测把短路的判断去掉，上面那条照样绿（证伪失败）。两处修的是同一件事，
+        //    判据只钉得住一处就等于没钉住另一处。
+        RetrievalScope.Scope scope = retrievalScope.resolve(internalUpper, List.of(kbId));
+        assertThat(scope.partitions()).as("可见文档为 0 ⇒ 不给 Milvus 任何分区（省一次必然空的往返）")
+                .isEmpty();
+        assertThat(scope.kbIds()).as("但库仍要如实报出来 —— 它**确实**可见，只是里面没有你能看的文档")
+                .contains(kbId);
+        assertThat(scope.empty()).as("empty() 为真 ⇒ 调用方短路，根本不去连 Milvus").isTrue();
+
+        // 🔴 再钉一下 `milvusFilter()` 的**防御分支**。短路之后它在服务路径上已经走不到了
+        //    （`resolve` 不会再把空 docIds 交出去），但它防的是"别处直接构造 Scope"——
+        //    而 `Scope` 是公开 record，用例与将来的调用方都可能那么干。
+        //    直接构造一个空 docIds 的 Scope，断言它**恒不匹配**而不是退回"只看库"。
+        RetrievalScope.Scope handMade = new RetrievalScope.Scope(
+                List.of(kbId), java.util.Set.of(), List.of("probe-partition"), false);
+        assertThat(handMade.milvusFilter())
+                .as("🔴 空 docIds 时**绝不能**回退成只按库过滤 —— 那是取消过滤 = 越权可见")
+                .contains(MilvusConstants.FIELD_DOC_ID + " in [-1]")
+                .doesNotEndWith(MilvusConstants.FIELD_KB_ID + " in [" + kbId + "]");
+
+        // 对照组（B 回到 A）：撤回覆盖 ⇒ 又搜得到。这一步同时证明上一格的"空"是它造成的
+        jdbc.update("update sys_document set secret_level = null where id = ?", doc);
+        assertThat(retrievalService.search(internalUpper, q, List.of(kbId)).chunks())
+                .as("对照组：撤回覆盖后应当恢复召回")
+                .isNotEmpty();
+
+        // ---- ③：库级超限（文档未覆盖，文档级那条兜不住）----
+        String q2 = "这段正文继承所属知识库的机密级别";
+        kbId = insertKb("scope-probe-docsec-kb", "CONFIDENTIAL");
+        long inherited = insertDocWithChunks("继承机密", q2);
+        seedVectors(inherited, 1);
+        awaitVectorsVisible(q2, 1);
+        assertThat(retrievalService.search(reader(), q2, List.of(kbId)).chunks())
+                .as("正对照：上限够的账号（超管/绝密）能搜到它 —— 否则下面那一格的空不算数")
+                .isNotEmpty();
+
+        RetrievalResult byKb = retrievalService.search(internalUpper, q2, List.of(kbId));
+        // 判据落在 `kbIds` 上才是决定性的：库**根本不在集合里**（而不是"库里搜不到"）
+        assertThat(byKb.trace().kbIds()).as("密级超限的库连出现都不出现").doesNotContain(kbId);
+        assertThat(byKb.chunks()).as("库级超限 ⇒ 零召回（文档级那条是 null，兜不住）").isEmpty();
+    }
+
+    /** 密级上限 = 「内部」的账号：看得见「内部」的库，看不见「机密」及以上的。 */
+    private static LoginUser internalUpperReader() {
+        return LoginUser.builder()
+                .userId(1L)
+                .username("admin")
+                .deptId(1L)
+                .superAdmin(false)
+                .dataScope(DataScope.ALL)
+                .secretLevelUpper(SecretLevel.INTERNAL)
+                .build();
     }
 
     @Test

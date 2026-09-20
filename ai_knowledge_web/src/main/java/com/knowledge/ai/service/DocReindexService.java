@@ -168,12 +168,14 @@ public class DocReindexService {
         int targetGeneration = recordWriter.currentKbGeneration(targetKbIdChecked);
         String oldPartition = MilvusConstants.partitionName(doc.kbId(), doc.indexGeneration());
 
-        // ① 先落"不可检索"，让中途失败表现为"待重建"而不是"可检索却没有向量"
-        entityManager.createNativeQuery(
+        // ① 先落"不可检索"，让中途失败表现为"待重建"而不是"可检索却没有向量"。
+        //    ⚠️ 必须包在事务里：Hibernate 6+ 对原生 update 会校验活动事务，
+        //       否则抛 `TransactionRequiredException: No active transaction for update or delete query`
+        transactionTemplate.executeWithoutResult(tx -> entityManager.createNativeQuery(
                         "update sys_document set status = 'INDEXING', updated_at = :now where id = :id")
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", docId)
-                .executeUpdate();
+                .executeUpdate());
 
         // ② 删**旧库分区**里这篇的向量。⚠️ 这一步必须显式做：
         //    `ChunkVectorizer` 写目标分区时自带的 `replaceDocument` 只在**目标分区内**按 doc_id 删，

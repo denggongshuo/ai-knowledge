@@ -8,6 +8,7 @@ import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 
@@ -54,6 +55,12 @@ public class DocAttributeService {
     private final DocAccessService docAccessService;
 
     private final DocReindexService docReindexService;
+
+    /**
+     * 只用来把**那一条 update** 包进最小事务（见 {@link #applySecretLevel} 里的说明）。
+     * 不写成 {@code @Transactional} 方法：那样会把 Milvus 的往返也圈进事务里。
+     */
+    private final TransactionTemplate transactionTemplate;
 
     /**
      * 保存属性。三个字段都可缺省，语义是"**只改我传了的那些**"。
@@ -111,11 +118,25 @@ public class DocAttributeService {
                     "文档密级只能提高，不能降低（`I-6`）—— 当前生效密级是「" + current.getLabel()
                             + "」，不能改成「" + wanted.getLabel() + "」。");
         }
-        entityManager.createNativeQuery(
+        // 🔴 与库里那一列**逐字相同**时不动它。`updated_at` 的语义是"最近修改时间"，
+        //    没有修改却把它推进，那一列就成了一句谎 —— 而读它的不只是页面：
+        //    "这篇什么时候被人动过"要靠它回答。
+        // ⚠️ 判据取"**文档自己那一列**是否已等于新值"，**不是**"生效值是否已等于新值"：
+        //    文档原本是 `NULL`（继承）而用户把它设成与库相同的值时，那是一次**真实的**
+        //    语义变化（继承 → 显式覆盖，需求 §6.7 的「（继承知识库）」标注会因此消失），
+        //    必须写下去。
+        if (wanted.name().equals(doc.ownSecretLevel())) {
+            return;
+        }
+        // ⚠️ **必须包在事务里**：Hibernate 6+ 对 update/delete 原生查询会校验
+        //    「有没有活动事务」，没有就抛 `TransactionRequiredException: No active transaction
+        //    for update or delete query` —— 而它的现象是 500，看起来像"接口坏了"。
+        //    不靠调用方开事务（那样这个方法换个调用点就会炸），自己包一层最小事务。
+        transactionTemplate.executeWithoutResult(tx -> entityManager.createNativeQuery(
                         "update sys_document set secret_level = :level, updated_at = :now where id = :id")
                 .setParameter("level", wanted.name())
                 .setParameter("now", LocalDateTime.now())
                 .setParameter("id", doc.id())
-                .executeUpdate();
+                .executeUpdate());
     }
 }
