@@ -148,7 +148,7 @@ public final class ProbeArtifacts {
      *
      * <h3>MinIO 前缀的登记在别处（`T-O11` 补的指针）</h3>
      * <p>上面这一组的对账口径是**脚本侧的非表产物**。而后缀"到底有几个、各自归属从哪来"
-     * 登记在 {@link ProbeCleanup#coveredMinioPrefixes()}（六个），
+     * 登记在 {@link ProbeCleanup#coveredMinioPrefixes()}（**七个** —— `T-A02` 加了 `ops-export/`），
      * 并有**冻结清单 + 机器检查**兜着它：
      * {@code OrphanMinioSweepTest#everyKnownPrefixIsClassified}。
      * ⚠️ 那条机器检查是 `T-O11` 补的，因为"只写 javadoc 提醒"**已经被抓过两次**

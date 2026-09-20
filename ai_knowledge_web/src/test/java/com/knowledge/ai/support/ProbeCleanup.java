@@ -490,6 +490,15 @@ public final class ProbeCleanup {
     public static final String AUDIT_EXPORT_PREFIX = "audit-export/";
 
     /**
+     * `ops-export/` 的前缀常量（`T-A02` 新增）—— `OpsExportService.PREFIX` 用的是同一个字面量。
+     *
+     * <p>⚠️ 它**刻意不复用** {@code audit-export/}：本清单的整套判据建立在「**路径即归属**」上
+     * （`T-O11` 定），让运营报表躺在叫"审计导出"的前缀下，等于给下一个人埋一个
+     * "这是审计件"的误读 —— 而误读它的人正是要决定"能不能删"的那个人。
+     */
+    public static final String OPS_EXPORT_PREFIX = "ops-export/";
+
+    /**
      * **受管前缀清单**。⚠️ 新增一个"系统产出的对象前缀"时，**必须在这里加一行**，
      * 否则它**结构上不在兜底的输入里** —— 那正是 `#149` 记的"闸覆盖了一类产物、
      * 另一类不在输入里"那个形态。
@@ -508,7 +517,10 @@ public final class ProbeCleanup {
             // 图是**块级**产物，一篇文档删了但块还在的情况是存在的。
             new MinioPrefix("images/", Owner.COLUMN, "sys_chunk", "object_key"),
             // `T-O11` 新增的第六个 —— 也是**唯一一个归属不在列里**的（见 Owner#PATH_USER_ID）。
-            new MinioPrefix(AUDIT_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"));
+            new MinioPrefix(AUDIT_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"),
+            // `T-A02` 新增的第七个 —— 运营报表导出（`OpsExportService#store`）。
+            // 与第六个同形：`ops-export/{userId}/{时间戳}-qa-ops.csv`，归属同样在路径里。
+            new MinioPrefix(OPS_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"));
 
     /**
      * 兜底**覆盖了哪些前缀**（供机器检查比对，见 {@code OrphanMinioSweepTest}）。

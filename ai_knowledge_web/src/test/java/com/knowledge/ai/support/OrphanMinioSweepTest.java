@@ -209,10 +209,13 @@ class OrphanMinioSweepTest extends ApiTestSupport {
      * **逐条写死，防的是"扫描式断言对漏挂是盲的"**。
      */
     private static final java.util.Set<String> FROZEN_MINIO_PREFIXES = java.util.Set.of(
-            "documents/", "parsed/", "chat-attachments/", "avatars/", "images/", "audit-export/");
+            "documents/", "parsed/", "chat-attachments/", "avatars/", "images/", "audit-export/",
+            // `T-A02` 加了第七个 —— 它**刻意不复用** `audit-export/`（理由见 `ProbeCleanup` 的
+            // `OPS_EXPORT_PREFIX`）。这一次是**先加清单再加服务**，与 `images/` 那次相反。
+            "ops-export/");
 
     @Test
-    @DisplayName("T-O11 判据 6：六个前缀**逐个表态** —— 覆盖集必须与冻结清单完全相等")
+    @DisplayName("T-O11 判据 6：七个前缀**逐个表态** —— 覆盖集必须与冻结清单完全相等")
     void everyKnownPrefixIsClassified() {
         assertThat(ProbeCleanup.coveredMinioPrefixes())
                 .as("🔴 本仓「新增持久化产物必须同步登记」这条约定**只靠 javadoc 已经被抓过两次**："

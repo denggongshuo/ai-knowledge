@@ -33,7 +33,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 27 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 **37** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
+ * 在 S6-M09-B 已经到 36 —— 两处数字长期不一致，直到 `T-A02` 加第 37 条时才被发现。
+ * **冻结清单**只有一个数字，就是本类断言的那个；本行已按它对正。
  *
  * <p>⚠️ 与计划书的算术偏差（实测为准）：计划头写「总数由 12 → 23」，实测 HEAD 为 <b>13</b>、
  * C2 结束时为 <b>24</b>（新增 11 条不变）。差异来自撰写时把 {@code AuditContext} 的 javadoc 示例
@@ -145,6 +148,12 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // 本批只落**导出**（反馈处置属 T-807）。⚠️ 「删除会话」**不在**这个清单里：
         // 需求用枚举的方式裁过了，没点名的不加（理由见 AuditRiskPolicy 的对应位置）
         expected.put(AuditModule.QA + " 导出会话", RiskLevel.HIGH);
+        // `T-A02` 新增：运营报表导出。同样不是判断题 —— `AuditRiskPolicy` 的
+        // `Category.DATA_EXPORT` 枚举注释里**逐字列着「导出报表」**。
+        // ⚠️ 与上一条的差别：那份是**某个用户自己的**会话正文，这份是**全站**未命中清单
+        // （含提问原文 + 提问人姓名），外带面更宽；两者同属 §4.3②，档次一致。
+        // 同为 QA 模块的采集范围 —— 《05》§4.2 的「问答」行本就含「会话导出」，报表导出是它同一类。
+        expected.put(AuditModule.QA + " 导出运营报表", RiskLevel.HIGH);
         // ---- 系统 · 模型配置（4）---- （S6-M09-A 新增：T-900~T-903 的四个写动作）
         // 四条同属 `MODEL_CONFIG_CHANGE`：`AuditRiskPolicy` 的 Category javadoc 原话就是
         // 「四类模型的**新增、编辑、删除、启用或切换**」。⚠️「连接测试」**不在**这里 ——
@@ -289,7 +298,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 36 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 37 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
@@ -300,8 +309,10 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "导出会话。⚠️ 只加这一条 —— 「删除会话」按《05》§4.2 的枚举不在采集范围内）"
                         + "→ 35（S6-M09-A 的 T-900~T-903 四条模型配置）"
                         + "→ **36**（S6-M09-B 的 T-O04：恶意内容拦截。⚠️ 它是本仓唯一一条"
-                        + "**操作人写「系统」**的高危记录 —— 扫描跑在上传响应之后的后台线程上）")
-                .hasSize(36);
+                        + "**操作人写「系统」**的高危记录 —— 扫描跑在上传响应之后的后台线程上）"
+                        + "→ **37**（`T-A02` 的「问答 / 导出运营报表」。⚠️ 它不是新裁定 —— "
+                        + "`AuditRiskPolicy` 的 `DATA_EXPORT` 枚举注释里早就逐字列着「导出报表」）")
+                .hasSize(37);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {
