@@ -82,6 +82,44 @@ export const VALUE_LEDGERS = [
     ],
   },
   {
+    id: 'AsyncTaskStatus',
+    what: '索引任务状态（`GET /doc/{id}/index-tasks` 的 `status`；后端状态机原样下发，不在 API 边界改名）',
+    /**
+     * ⚠️ 这一组是本批（`S7-M06-A`）新登记的，起因是一次**自纠**：
+     * 后端第一版把 `DONE` 映射成 `SUCCESS` 再下发 —— 那样做**三方永远不可能逐字相等**，
+     * 这张表就覆盖不了它（它只会比"三方一致"）。取消改名后三者相同，闸才盯得住。
+     * 顺带收回 mock 里那个本仓没有任何定义的 `INFO`（CSS 里连 `.dot.info` 都没有）。
+     */
+    sources: [
+      {
+        name: '后端枚举',
+        expect: 4,
+        file: 'ai_knowledge_web/src/main/java/com/knowledge/ai/core/async/AsyncTaskStatus.java',
+        extract: (text) => [...text.matchAll(/^\s{4}([A-Z_]+)\(/gm)].map((m) => m[1]),
+      },
+      {
+        name: '前端类型',
+        expect: 4,
+        file: 'ai_knowledge_app/src/types/index.ts',
+        extract: (text) => {
+          const m = text.match(/status:\s*'DONE'[^\n]*/)
+          return m ? [...m[0].matchAll(/'([^']+)'/g)].map((x) => x[1]) : []
+        },
+      },
+      {
+        name: 'mock 取值',
+        expect: 4,
+        file: 'ai_knowledge_app/src/mock/data.ts',
+        extract: (text) => {
+          const block = text.match(/export const mockIndexTasks[\s\S]*?\n\]/)
+          if (!block) return []
+          // 去重：同一状态在样例里出现多次（DONE 有三条）
+          return [...new Set([...block[0].matchAll(/status:\s*'([^']+)'/g)].map((m) => m[1]))]
+        },
+      },
+    ],
+  },
+  {
     id: 'MissStatus',
     what: '未命中清单的状态机（需求 `08` §1.3 的四态）',
     sources: [
