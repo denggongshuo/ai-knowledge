@@ -35,6 +35,9 @@ const misses = ref<MissQuestion[]>([])
 const missTotal = ref(0)
 const topQuestions = ref<TopQuestion[]>([])
 const feedback = ref<FeedbackStats | null>(null)
+/** 这两栏的后端接口属 `T-A02`（本批不交付）—— 用来把"没交付"与"没有数据"分开。 */
+const topNotDelivered = ref(false)
+const feedbackNotDelivered = ref(false)
 
 const selected = ref<MissQuestion[]>([])
 const statusFilter = ref('all')
@@ -68,11 +71,21 @@ async function loadMisses() {
   missTotal.value = res.total
 }
 async function loadTop() {
-  const res = await opsApi.topQuestions({ range: range.value, limit: 20 })
-  topQuestions.value = res.list
+  try {
+    const res = await opsApi.topQuestions({ range: range.value, limit: 20 })
+    topQuestions.value = res.list
+  } catch {
+    // 后端还没实现（属 `T-A02`）—— **区分「没交付」与「没有数据」**：
+    // 不区分的话，这一栏空着会被读成"确实没有高频问题"，而事实是这个数字还没地方取
+    topNotDelivered.value = true
+  }
 }
 async function loadFeedback() {
-  feedback.value = await opsApi.feedbackStats()
+  try {
+    feedback.value = await opsApi.feedbackStats()
+  } catch {
+    feedbackNotDelivered.value = true
+  }
 }
 
 /** 状态标签（模板中避免用 any 索引 Record） */
@@ -86,19 +99,18 @@ const negativeTop = computed(() => (feedback.value?.reasons ?? []).reduce((s, r)
 // ---------------- 状态流转 ----------------
 async function setStatus(item: MissQuestion, status: MissStatus) {
   const res = await opsApi.patchMiss(item.id, status)
-  item.status = status
-  if (status === 'IGNORED') item.ignoredBy = '系统管理员'
   if (overview.value) overview.value.pending = res.pending
+  // ⚠️ **改完重新拉一次列表**，不本地改 `item`。
+  // 原来这里写的是 `item.ignoredBy = '系统管理员'` —— 一个**写死的假值**：
+  // 谁点的忽略，只有服务端知道（`ignored_by`），前端猜不出来。
+  // 本地改还会让"被筛掉的行留在列表里"（比如筛选条件是"待处理"时刚被忽略的那条）。
+  await loadMisses()
   ElMessage.success(`已标记为「${MISS_STATUS[status].text}」`)
 }
 async function batchSet(status: MissStatus) {
   if (!selected.value.length) return ElMessage.warning('请先选择问题')
   for (const item of selected.value) await opsApi.patchMiss(item.id, status)
-  selected.value.forEach((i) => {
-    i.status = status
-    if (status === 'IGNORED') i.ignoredBy = '系统管理员'
-  })
-  await loadOverview()
+  await Promise.all([loadMisses(), loadOverview()])
   ElMessage.success(`已批量标记为「${MISS_STATUS[status].text}」`)
   selected.value = []
 }
@@ -164,10 +176,10 @@ async function exportReport() {
       </div>
       <div class="stat-card danger">
         <div class="sc-val">{{ overview.missed }}<span class="sc-sub">{{ overview.missedRate }}%</span></div>
-        <div class="sc-label">未命中提问（Top1 &lt; 0.35）</div>
+        <div class="sc-label">未命中提问（Top1 &lt; {{ overview.missThreshold }}）</div>
       </div>
       <div class="stat-card">
-        <div class="sc-val">{{ overview.avgTopScore }}</div>
+        <div class="sc-val">{{ overview.avgTopScore ?? '—' }}</div>
         <div class="sc-label">平均顶级召回相似度</div>
       </div>
       <div class="stat-card warn">
@@ -228,13 +240,16 @@ async function exportReport() {
                 <el-tag size="small" :type="row.askCount >= 10 ? 'danger' : 'info'">{{ row.askCount }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="asker" label="提问人" width="100" />
+            <el-table-column label="提问人" width="100">
+              <!-- ⚠️ 这里原来用 `prop="asker"`：值为 null 时格子是**空的**，与"这一列没数据"分不开 -->
+              <template #default="{ row }">{{ row.asker ?? '—' }}</template>
+            </el-table-column>
             <el-table-column label="最高相似度" width="140">
               <template #default="{ row }">
                 <span v-if="row.scoreAfter != null" class="score-up">
-                  <span class="mono muted">{{ row.topScore }}</span> → <b class="mono">{{ row.scoreAfter }}</b>
+                  <span class="mono muted">{{ row.topScore ?? '—' }}</span> → <b class="mono">{{ row.scoreAfter }}</b>
                 </span>
-                <span v-else class="mono score-low">{{ row.topScore }}</span>
+                <span v-else class="mono score-low">{{ row.topScore ?? '—' }}</span>
               </template>
             </el-table-column>
             <el-table-column label="最近提问" width="140">
@@ -268,12 +283,19 @@ async function exportReport() {
           <div class="hint mt-8">
             默认按提问次数降序，把「很多人问但答不上来」排在最前。用户问法<b>保持原样不做归一化改写</b>——真实问法是校准 HyQ 的原始素材。
             标记<b>「含图片描述」</b>的问题，其知识库文档包含图片，且图片已由 VL 模型转成文字描述参与检索；若此类问题持续未命中，优先排查 VL 描述质量（而非文本切分）。
+            <br />⚠️ <b>本版本还不会出现这个标记</b> —— 检索打点里没有「这次提问带没带图」这一列，后端无从判断，故如实<b>不发这个字段</b>（不猜一个）。
           </div>
         </el-tab-pane>
 
         <!-- ==================== 高频问题榜 ==================== -->
         <el-tab-pane name="top">
           <template #label><span class="tab-l">高频问题榜</span></template>
+
+          <el-alert v-if="topNotDelivered" type="warning" :closable="false" show-icon class="mb-12">
+            <template #title>
+              <span class="alert-text">本版本未交付这一栏（后端接口属 <b>T-A02</b>）—— 空着<b>不是</b>「没有高频问题」。</span>
+            </template>
+          </el-alert>
 
           <div class="card-head-row mb-12">
             <div class="hint">正面看：确认主流需求优先保证质量；<b>反向看（更有价值）</b>：真实问法是校准 HyQ 生成提示词的语料——分数偏低说明 HyQ 与用户实际问法有偏差。</div>
@@ -293,6 +315,12 @@ async function exportReport() {
         <!-- ==================== 点踩原因归因 ==================== -->
         <el-tab-pane name="feedback">
           <template #label><span class="tab-l">点踩原因归因</span></template>
+
+          <el-alert v-if="feedbackNotDelivered" type="warning" :closable="false" show-icon class="mb-12">
+            <template #title>
+              <span class="alert-text">本版本未交付这一栏（后端接口属 <b>T-A02</b>）—— 空着<b>不是</b>「没有人点踩」。</span>
+            </template>
+          </el-alert>
 
           <div v-if="feedback" class="fb-top">
             <div class="fb-rate">

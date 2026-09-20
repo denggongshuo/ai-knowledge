@@ -65,11 +65,9 @@ const NAV_GROUPS: NavGroup[] = [
   {
     name: '运营分析',
     items: [
-      // ⚠️ `badge: '23'` 已销（`S6-M11`）—— 与上面 `'5'` 同形，是原型演示值。
-      // 它的真数 = 未命中清单的待处理数，而**那张清单属 `T-A00`（S8）**：
-      // 库里没有那张表（只有 `sys_retrieval_trace.miss_flag` 这个原始标记）。
-      // ⇒ 本批**不假装** —— 不显示角标（不显示 ≠ 显示 0：0 会被读成"确实没有待处理"）。
-      // 待 `T-A00` 落地后接回来。
+      // ✅ `badge: '23'`（原型演示值）在 `S6-M11` 销掉、**在 `S8-M10-A` 接了真数** ——
+      // 真数 = 未命中清单的待处理数（`/notices/pending` 的 `miss` 那一项），
+      // 与 11 页统计卡、`/ops/qa/overview` 的 `pending` **同源**（`G6-13`/`G8-4`）。
       { path: '/ops/qa', title: '问答运营', icon: DataAnalysis },
       { path: '/ops/retrieval', title: '检索质量分析', icon: Filter },
       { path: '/ops/usage', title: '使用统计', icon: Grid },
@@ -121,6 +119,15 @@ watch(
 // 刷新后 token 已恢复，但 user 在内存中丢失 → 拉取 profile 补全
 const unreadCount = ref(0)
 
+/**
+ * 「问答运营」的待办数（未命中清单里待处理 / 已认领的那些）。
+ *
+ * <p>⚠️ 它**只在有 `ops:qa:view` 时才显示**。理由：`/ops/qa/*` 挂了权限码，
+ * 普通用户点进去是 403 —— 给一个进不去的页面标"有 3 件事等你"，比不标更糟。
+ * （导航项本身还没做权限过滤，那是另一件事；这里至少不让角标说谎。）
+ */
+const opsPending = ref(0)
+
 /** 未读角标的轮询间隔（需求 `09` §2.6：「建议 30s 轮询**或** SSE 推送」，二选一取前者）。 */
 const UNREAD_POLL_MS = 30_000
 let unreadTimer: ReturnType<typeof setInterval> | undefined
@@ -128,6 +135,14 @@ let unreadTimer: ReturnType<typeof setInterval> | undefined
 function refreshUnread() {
   noticeApi.unreadCount().then((r) => (unreadCount.value = r.count)).catch(() => {
     /* 角标拉取失败不阻塞渲染（保持上一次的值比归零更诚实） */
+  })
+  // 「问答运营」的待办角标（`G8-4`）。**与未读数同一跳**取，不另起一条轮询 ——
+  // 两条轮询会各自漂移，而它们表达的是同一件事（"有多少事等我"）。
+  noticeApi.pending().then((r) => {
+    const miss = r.list.find((p) => p.key === 'miss')
+    opsPending.value = miss ? miss.count : 0
+  }).catch(() => {
+    /* 同上：保持上一次的值 */
   })
 }
 
@@ -159,7 +174,21 @@ function navBadge(item: NavItem): string | number | undefined {
   if (item.path === '/notice') {
     return unreadCount.value > 0 ? unreadCount.value : undefined
   }
+  if (item.path === '/ops/qa') {
+    return canHandleOps() && opsPending.value > 0 ? opsPending.value : undefined
+  }
   return item.badge
+}
+
+/**
+ * 当前账号能不能看运营页。
+ *
+ * <p>`*` 是超管通配（`SUPER_ADMIN` 拿的就是它，不是逐条权限码）——
+ * 少了这一条，超管反而看不到角标，而现象是"角标只有在管理员账号上不出现"。
+ */
+function canHandleOps(): boolean {
+  const perms = auth.user?.permissions ?? []
+  return perms.includes('*') || perms.includes('ops:qa:view')
 }
 
 const activePath = computed(() => {

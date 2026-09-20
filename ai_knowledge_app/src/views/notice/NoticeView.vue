@@ -182,7 +182,7 @@ async function saveSettings() {
           </div>
           <el-alert type="info" :closable="false" show-icon class="mt-12">
             <template #title>
-              <span class="alert-text">「待我处理」与「问答运营」页的待处理数保持一致（23），配合角标形成待办感知。</span>
+              <span class="alert-text">「待我处理」与「问答运营」页的待处理数**同源**（同一张未命中清单），配合侧边栏角标形成待办感知。</span>
             </template>
           </el-alert>
         </template>

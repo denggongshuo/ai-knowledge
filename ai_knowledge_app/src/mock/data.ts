@@ -663,6 +663,8 @@ export const mockQaOverview: QaOverview = {
   missedRate: 8.4,
   avgTopScore: 0.71,
   pending: 23,
+  // 与 `V2` 种子的 `retrieval.miss-threshold` 同值（0.35）—— 卡片标题显示它
+  missThreshold: 0.35,
 }
 
 /** 未命中问题清单（默认按提问次数降序；用户问法保持原样不改写） */

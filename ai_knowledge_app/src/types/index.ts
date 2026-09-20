@@ -797,13 +797,14 @@ export interface MissQuestion {
   /** 同一语义问题的聚合次数（用于排优先级） */
   askCount: number
   lastAskAt: string
-  asker: string
-  /** 最高相似度；已解决的显示 补录前 → 补录后 */
-  topScore: number
-  scoreAfter?: number
+  /** ⚠️ 可空：那个用户已经不在了（软删）⇒ 不能用「未知」顶替，也用空串假装有名字 */
+  asker: string | null
+  /** 最高相似度；已解决的显示 补录前 → 补录后。⚠️ 可空：真的没有分数时可空，**不是 0** */
+  topScore: number | null
+  scoreAfter?: number | null
   status: MissStatus
-  /** 忽略人（避免反复忽略又反复冒出） */
-  ignoredBy?: string
+  /** 忽略人（避免反复忽略又反复冒出）。⚠️ 同 `asker`，可空 */
+  ignoredBy?: string | null
   kbName: string
   /** 该问题是否来自「带图片描述」的提问（V2 新增，未命中沉淀保留图片信息） */
   hasImageDesc?: boolean
@@ -814,9 +815,12 @@ export interface QaOverview {
   totalQuestions: number
   missed: number
   missedRate: number
-  avgTopScore: number
+  /** ⚠️ 可空：还没有人提问过 ⇒ 没有平均值。给 0 会被读成「召回质量极差」 */
+  avgTopScore: number | null
   /** 待处理数（同步侧边栏角标） */
   pending: number
+  /** 当前的未命中判定线 —— 卡片标题显示它，**别在前端写死 0.35** */
+  missThreshold: number
 }
 
 /** 高频问题（真实问法是校准 HyQ 的语料） */
