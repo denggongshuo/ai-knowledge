@@ -3,11 +3,14 @@ package com.knowledge.ai.controller;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.dto.doc.DocDtos;
+import com.knowledge.ai.service.DocAttributeService;
 import com.knowledge.ai.service.DocDetailService;
+import com.knowledge.ai.service.DocReindexService;
 import com.knowledge.ai.service.DocService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -47,6 +50,10 @@ public class DocController {
     private final DocService docService;
 
     private final DocDetailService docDetailService;
+
+    private final DocAttributeService docAttributeService;
+
+    private final DocReindexService docReindexService;
 
     /**
      * {@code POST /api/kb/{kbId}/doc/upload} —— 上传文档。
@@ -203,11 +210,54 @@ public class DocController {
      * {@code GET /api/doc/{id}/index-tasks} —— 该文档的解析/索引任务记录（详情页「版本历史」Tab 的上半）。
      *
      * <p>权限码取 {@code doc:detail} 而不是 {@code doc:reindex}：这一条是**看历史**，
-     * 不是"重建"。重建权限（{@code doc:reindex}）守的是写侧那条端点（`T-610`，本批不做）。
+     * 不是"重建"。重建权限（{@code doc:reindex}）守的是下面那条写侧端点（`T-610`）。
      */
     @GetMapping("/api/doc/{id}/index-tasks")
     @RequiresPerm("doc:detail")
     public ApiResponse<DocDtos.IndexTaskPage> indexTasks(@PathVariable("id") long docId) {
         return ApiResponse.ok(docDetailService.indexTasks(docId));
+    }
+
+    /**
+     * {@code PATCH /api/doc/{id}/attributes} —— 修改文档属性（`T-601` · 需求 `06` §6.7）。
+     *
+     * <p>body `{ secretLevel?, kbId?, tags? }`（那三个就是面板上的**全部可编辑项**）。
+     *
+     * <p>权限 {@code doc:update}（第 44 个码）—— ⚠️ 它**只表达"能改属性"**；
+     * "能不能改**这一篇**"由服务层按库判（移动要源库 `MANAGE` + 目标库 `doc:upload`）。
+     * 码是角色级的、授权是逐库的，两者不能互相顶替（与 {@code doc:delete} 同一条分工）。
+     *
+     * <p>两条门禁的落点都在这条路径后面：
+     * <ul>
+     *   <li>**`G7-3`** —— 密级只能提高，降到低于知识库密级会被拒（`10030`）；</li>
+     *   <li>**`G7-4`** —— 移动知识库触发重建（响应 {@code needReindex: true}）且**审计留痕**
+     *       （「文档 / 移动知识库」）。</li>
+     * </ul>
+     */
+    @PatchMapping("/api/doc/{id}/attributes")
+    @RequiresPerm("doc:update")
+    public ApiResponse<DocDtos.AttributeSaved> saveAttributes(@PathVariable("id") long docId,
+                                                             @RequestBody DocDtos.AttributesRequest request) {
+        return ApiResponse.ok(docAttributeService.save(docId, request));
+    }
+
+    /**
+     * {@code POST /api/doc/{id}/reindex} —— 单篇重建（`T-610` · 需求 `06` §5「重新索引」）。
+     *
+     * <p>**只负责受理**：立刻返回 {@code taskId}，进度走 {@code GET /doc/tasks/{taskId}}
+     * （与库级 `POST /kb/{id}/reindex` 同一条口径）。
+     *
+     * <p>🔴 它是**重新解析**（需求 §4：「会重新执行解析与表格识别，是修复未识别表格的主要入口」；
+     * §5：「用于修复**解析失败**的个别文档」）—— 走整条流水线，不是"拿现有分片重新嵌入"。
+     *
+     * <p>权限 {@code doc:reindex}（S0 就有的码，本批**不新增**）。走 `@AuditLog`「文档 / 重建索引」：
+     * 需求 `05` §6 的文档审计动作表**逐字列着**它。⚠️ 与**库级**重建刻意不审计形成对照 ——
+     * 那条的理由是"内容一样，只是重算索引"（`KbController#reindex` 的注释），
+     * 而**这条会重新解析**，表格识别与摘要都会重算 ⇒ **内容语义真的会变**。
+     */
+    @PostMapping("/api/doc/{id}/reindex")
+    @RequiresPerm("doc:reindex")
+    public ApiResponse<DocDtos.DocReindexAccepted> reindex(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docReindexService.submit(docId));
     }
 }

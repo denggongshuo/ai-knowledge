@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 **37** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 **39** 个动作逐条写死，少一个、多一个、等级错一档都红。
  * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
  * 在 S6-M09-B 已经到 36 —— 两处数字长期不一致，直到 `T-A02` 加第 37 条时才被发现。
  * **冻结清单**只有一个数字，就是本类断言的那个；本行已按它对正。
@@ -122,7 +122,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // 所以搬表这一步没人替你做（AuditRiskPolicy 里留了注释）
         expected.put(AuditModule.KB + " 删除知识库", RiskLevel.HIGH);
         expected.put(AuditModule.KB + " 清空索引", RiskLevel.HIGH);
-        // ---- 文档（4）---- （S4-M05-A 新增：上传入库；S4-E2 新增解析链路三条）
+        // ---- 文档（6）---- （S4-M05-A 新增：上传入库；S4-E2 新增解析链路三条；S7-M06-B 新增两条）
         expected.put(AuditModule.DOC + " 上传文档", RiskLevel.NORMAL);
         // `T-O06`（S4-E2）：同一件事的三个时点 —— 谁触发 / 跑成了 / 跑砸了。
         // 三点都是 NORMAL（不改权限、不删数据、不导出），但**都必须留痕**：
@@ -134,6 +134,14 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // ⚠️ 它的操作人是「系统」（扫描跑在上传响应之后的后台线程上）——
         // 这是唯一一条这样记的高危动作，不要因为"操作人是系统"就以为档次标错了。
         expected.put(AuditModule.DOC + " 恶意内容拦截", RiskLevel.HIGH);
+        // `S7-M06-B`（2026-09-20）：需求《05》§6 文档审计动作表里的**最后两条**。
+        // 🔴 「重建索引」这条要**与库级重建分开读**：库级那条刻意不审计
+        // （`KbController#reindex` 的注释：「内容一样，只是重算索引」），
+        // 而**文档级会重新解析**（需求《06》§4「会重新执行解析与表格识别」）⇒ 内容语义真的会变。
+        expected.put(AuditModule.DOC + " 重建索引", RiskLevel.NORMAL);
+        // 🔴 「移动知识库」的判据不只是"记了一条"：它要能证明**移动确实发生过** ——
+        // 所以配套判据查的是 `sys_document.kb_id` 真的变了 + 旧库分区向量归零。
+        expected.put(AuditModule.DOC + " 移动知识库", RiskLevel.NORMAL);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -298,7 +306,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("判据 1·2：@AuditLog 冻结清单 37 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
+    @DisplayName("判据 1·2：@AuditLog 冻结清单 39 条 · 与策略表逐条相等 · 模块名全在前端下拉里")
     void annotationInventoryMatchesFrozenPlan() {
         Map<String, RiskLevel> actual = scanAnnotations();
 
@@ -311,8 +319,11 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "→ **36**（S6-M09-B 的 T-O04：恶意内容拦截。⚠️ 它是本仓唯一一条"
                         + "**操作人写「系统」**的高危记录 —— 扫描跑在上传响应之后的后台线程上）"
                         + "→ **37**（`T-A02` 的「问答 / 导出运营报表」。⚠️ 它不是新裁定 —— "
-                        + "`AuditRiskPolicy` 的 `DATA_EXPORT` 枚举注释里早就逐字列着「导出报表」）")
-                .hasSize(37);
+                        + "`AuditRiskPolicy` 的 `DATA_EXPORT` 枚举注释里早就逐字列着「导出报表」）"
+                        + "→ **39**（`S7-M06-B` 的「文档 / 重建索引」+「文档 / 移动知识库」。"
+                        + "⚠️ 两条都是需求《05》§6 的文档动作表里**逐字列着**的 —— "
+                        + "不是新裁定，是那份表里的最后两条待落地项）")
+                .hasSize(39);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

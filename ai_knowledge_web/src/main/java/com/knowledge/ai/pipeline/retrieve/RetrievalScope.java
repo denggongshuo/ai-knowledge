@@ -44,10 +44,24 @@ import java.util.stream.Collectors;
  * 这条纪律的落点：多写一遍就是多一个漏掉的机会，而漏掉的后果是越权可见。
  *
  * <h3>密级在这一层拦，而不是在 Milvus 标量上再拦一遍</h3>
- * <p>密级是**知识库**的属性（{@code sys_kb.secret_level}），库不可见则它的文档全不可见 ——
- * 于是"密级超限"已经在 {@link #visibleKbs} 的 WHERE 里被表达成"这些库根本不在集合里"。
- * Milvus 那列 {@code secret_level} 仍然保留（它是写入侧的标量），但检索时**不重复过滤**：
- * 两处都判、两处口径一旦不一致，就是"某批分片谁都搜不到"这种查不出原因的故障。
+ * <p>密级的**生效值 = max(文档密级, 库密级)**（不变量 `I-6`：文档密级只能提高、不能低于
+ * 其所属库）—— 于是它是**两级**的，而两级都在本类的 WHERE 里表达：
+ * <ul>
+ *   <li>库级：{@link #visibleKbs} 的 {@code k.secret_level in (:secretLevels)}
+ *       —— "超限的库根本不在集合里"；</li>
+ *   <li>文档级：{@link #visibleDocIds} 的 {@code d.secret_level is null or d.secret_level in (…)}
+ *       —— {@code NULL} = 该文档未覆盖（继承库级）。</li>
+ * </ul>
+ * 🔴 两条**合取**即等价于「max(文档, 库) ≤ 上限」：`max(d,k) ≤ 上限 ⟺ d ≤ 上限 且 k ≤ 上限`
+ * 是纯序论恒等式，而 `:secretLevels` 就是"≤ 上限"那个**闭集**。
+ * ⚠️ **绝不要在 SQL 里改用 {@code greatest} 排序数** —— 密级名按字母序与密级序**错位**
+ * （{@code greatest('INTERNAL','CONFIDENTIAL')} = {@code 'INTERNAL'}），而那种 bug 的现象是
+ * "**有人看得见绝密**"、不是报错。
+ *
+ * <p>Milvus 那列 {@code secret_level} 仍然保留（它是**写入时的快照**，`MilvusChunkWriter` 写的），
+ * 但检索时**不读它** —— 按它过滤会让「提高密级」必须**重建索引**才生效，而需求 `06` §6.7
+ * 明写「属性修改后**立即生效，无需重建索引**」。而两处都判、口径一旦不一致，就是
+ * "某批分片谁都搜不到"这种查不出原因的故障。
  */
 @Slf4j
 @Component
@@ -86,7 +100,11 @@ public class RetrievalScope {
      */
     @Transactional(readOnly = true)
     public Scope resolve(LoginUser user, List<Long> requestedKbIds) {
-        List<KbRow> kbs = visibleKbs(user, requestedKbIds);
+        // 🔴 密级白名单**只算一次**，库级与文档级共用同一个列表。两处各算一遍就可能出现
+        // "库按一个上限、文档按另一个上限"的漂移 —— 而那种漂移的现象是"某篇文档谁都搜不到"，
+        // 与"某批分片谁都搜不到"同一个查不出的形状。
+        List<String> secretLevels = allowedSecretLevels(user);
+        List<KbRow> kbs = visibleKbs(user, requestedKbIds, secretLevels);
         List<Long> kbIds = kbs.stream().map(KbRow::id).toList();
         if (kbIds.isEmpty()) {
             // 一条分片都搜不到，而且这一步**不该**去连 Milvus —— 空集合直接短路，
@@ -95,7 +113,7 @@ public class RetrievalScope {
         }
 
         List<String> partitions = existingPartitions(kbs);
-        DocScope docScope = visibleDocIds(kbIds);
+        DocScope docScope = visibleDocIds(kbIds, secretLevels);
         return new Scope(kbIds, docScope.docIds(), partitions, docScope.fallback());
     }
 
@@ -105,7 +123,7 @@ public class RetrievalScope {
      * <p>前四项**整条**来自 {@link DataScopeService#kbVisibility}（别名固定 {@code k}，
      * 参数 {@code ds_uid}/{@code ds_dept}），本方法只补后两项 —— 见类注释。
      */
-    private List<KbRow> visibleKbs(LoginUser user, List<Long> requestedKbIds) {
+    private List<KbRow> visibleKbs(LoginUser user, List<Long> requestedKbIds, List<String> secretLevels) {
         if (requestedKbIds != null && !requestedKbIds.isEmpty()) {
             // 空集合会在 SQL 里变成 `k.id in ()` —— MySQL 有语法错。
             // 上面已判过空，这里再判一次是防"调用方传了个只含 null 的列表"
@@ -129,7 +147,7 @@ public class RetrievalScope {
 
         Query query = entityManager.createNativeQuery(sql.toString());
         cond.params().forEach(query::setParameter);
-        query.setParameter("secretLevels", allowedSecretLevels(user));
+        query.setParameter("secretLevels", secretLevels);
         if (requestedKbIds != null && !requestedKbIds.isEmpty()) {
             query.setParameter("requested", requestedKbIds.stream().filter(java.util.Objects::nonNull).distinct().toList());
         }
@@ -188,15 +206,26 @@ public class RetrievalScope {
      * <p>只查 {@code sys_document}，不看 {@code sys_chunk}：库级可见性已经限定了范围，
      * 而"哪些文档属于它"是文档表的事实。按 {@code id} 升序，让表达式**可复现** ——
      * 同一份数据两次调用拼出同一个字符串，日志与取证才能直接比对。
+     *
+     * <p>🔴 **文档级密级（`I-6` · `S7-M06-B`）**：`d.secret_level` 为 {@code NULL} 表示
+     * **该文档未覆盖、密级继承所属库**，此时生效值就是库级 —— 而库级超限的库**根本不在
+     * {@code kbIds} 里**（{@link #visibleKbs} 已拦），所以 {@code NULL} 行**应当放行**。
+     * `null` 与 {@code in (:secretLevels)} 是**或**的关系，不是"null 当不匹配"。
+     *
+     * <p>⚠️ 这里**不写 {@code coalesce(d.secret_level, k.secret_level)}**（那要 join
+     * {@code sys_kb}）：两条条件的合取与「取两者较大值 ≤ 上限」**等价**，理由见类注释。
+     * 也因此本方法**不需要知道库密级**。
      */
-    private DocScope visibleDocIds(List<Long> kbIds) {
+    private DocScope visibleDocIds(List<Long> kbIds, List<String> secretLevels) {
         @SuppressWarnings("unchecked")
         List<Number> rows = entityManager.createNativeQuery("""
                         select d.id from sys_document d
                          where d.kb_id in (:kbIds) and d.deleted_at is null
+                           and (d.secret_level is null or d.secret_level in (:secretLevels))
                          order by d.id
                         """)
                 .setParameter("kbIds", kbIds)
+                .setParameter("secretLevels", secretLevels)
                 .getResultList();
 
         // LinkedHashSet：**保序**（按 id 升序），于是 milvusFilter() 拼出的表达式可复现 ——

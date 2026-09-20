@@ -170,13 +170,20 @@ public final class DocDtos {
      *                       不是数据库里的列
      * @param lastIndexAt    最近一次解析任务完成时刻；**没有索引任务过时为 {@code null}**
      *                       （不是空串：空串在前端会被渲染成一个空白的"最近索引"）
-     * @param securityLevel  **当前生效**的密级 = 文档级与库级取上界。⚠️ 本批没有文档级密级列
-     *                       （`I-6` 的落地是 `S7-M06-B`），所以现在恒等于 {@code kbSecurityLevel} ——
-     *                       这不是"忘了做"，见 {@code S7-M06-A} §1-#10
-     * @param citations      见上，恒 {@code null}
-     * @param downVotes      见上，恒 {@code null}
-     * @param version        见上，恒 {@code null}
-     * @param tags           见上，恒 {@code null}
+     * @param securityLevel     **当前生效**的密级 = `max(文档级, 库级)`（`I-6` · `S7-M06-B`）。
+     *                          由 {@link com.knowledge.ai.core.enums.SecretLevel#max} 在 Java 侧算 ——
+     *                          **不在 SQL 里取上界**（密级名按字母序与密级序错位，那样会做反）。
+     *                          因 {@code sys_kb.secret_level} 是 {@code NOT NULL} ⇒ 本字段**恒非 null**
+     * @param kbSecurityLevel   所属知识库的密级（原样回显，供页面做下拉的**下限**与对照）
+     * @param ownSecurityLevel  文档**自己**的密级；**{@code null} = 未覆盖（继承知识库）** ——
+     *                          需求 `06` §6.7 要的「内部（**继承知识库**）」标注靠它才渲染得出来。
+     *                          ⚠️ 它**不是**"没有密级"（生效值见 {@code securityLevel}），
+     *                          也不要拿它跟 {@code kbSecurityLevel} 比相等来判断"是否继承" ——
+     *                          用户主动把文档设成与库相同的值，在数据上与"继承"是两回事
+     * @param citations         见上，恒 {@code null}
+     * @param downVotes         见上，恒 {@code null}
+     * @param version           见上，恒 {@code null}
+     * @param tags              见上，恒 {@code null}
      */
     public record DocMetaView(long id, long kbId, String kbName, String title, String path, String type,
                              long size, int pageCount, long chunkCount, String status,
@@ -184,7 +191,7 @@ public final class DocDtos {
                              String fileDesc, String department, String md5, String storagePath,
                              long tableTotal, long tableParsed, Long imageTotal, Long imageParsed,
                              Long citations, Long downVotes, String lastIndexAt,
-                             String kbSecurityLevel, List<String> tags) {
+                             String kbSecurityLevel, String ownSecurityLevel, List<String> tags) {
     }
 
     // ==================== T-602 · 目录树 ====================
@@ -328,5 +335,55 @@ public final class DocDtos {
     }
 
     public record IndexTaskPage(List<IndexTaskRow> list, long total) {
+    }
+
+    // ==================== T-601 · 属性修改（写侧） ====================
+
+    /**
+     * `PATCH /api/doc/{id}/attributes` 的请求体（需求 `06` §6.7 的字面 body：
+     * `{ secretLevel, kbId, tags[] }`）。
+     *
+     * <p><b>三个字段都可缺省</b>，语义是"**只改我传了的那些**" —— 传 {@code null} 不是
+     * "把它清空"。所以它们都是包装类型，不能用原始类型（那会把"没传"读成 0/空）。
+     *
+     * <p>🔴 `tags` **本版本不支持**（文档级内容标签**没有归属表**，见 {@link DocMetaView} 的
+     * {@code tags}）。传了不会静默忽略：**明确回业务错**，否则用户以为存上了
+     * （那是本仓最不能接受的形态 —— 与"假导出"同类）。
+     *
+     * @param secretLevel 新的文档密级。**只能提高**：必须 ≥ 当前生效密级
+     *                    （{@code max(文档, 库)}），否则 `10030`（`G7-3`）
+     * @param kbId        **移动到**该知识库（不传 = 不动）。要同时满足
+     *                    「对源库 `MANAGE`」与「对目标库 `doc:upload`」—— 见
+     *                    {@code DocAttributeService} 的口径说明
+     */
+    public record AttributesRequest(String secretLevel, Long kbId, List<String> tags) {
+    }
+
+    /**
+     * 属性保存结果（对齐前端 `api/index.ts:172` 的
+     * `{ saved: boolean; docId: number; needReindex: boolean }`）。
+     *
+     * <p>{@code needReindex} = **本次修改触发了重建索引**（移动知识库那一路）。
+     * 它对应需求 `06` §6.7 的两句：「属性修改**后立即生效，无需重建索引**；
+     * **移动知识库除外**」+「移动知识库**触发重建**」—— 于是页面据此提示用户
+     * 「已移动，正在重建索引」。⚠️ 只改密级/不传 `kbId` 时恒 {@code false}。
+     */
+    public record AttributeSaved(boolean saved, long docId, boolean needReindex) {
+    }
+
+    // ==================== T-610 · 单篇重建 ====================
+
+    /**
+     * 单篇重建的受理结果（对齐前端 `api/index.ts:178` 的
+     * `{ docId: number; taskId: string; status: string }`）。
+     *
+     * <p>🔴 **它只负责受理**（与库级的 `POST /kb/{id}/reindex` 同一条口径，`10` §5）：
+     * 重建要重新解析整篇（含表格识别与图片理解），是长任务 ⇒ 立刻返回 {@code taskId}，
+     * 进度走 `GET /doc/tasks/{taskId}`。
+     *
+     * <p>{@code status} 恒为 {@code ACCEPTED}：此刻作业**刚入队、还没被 worker 领取**，
+     * 报 {@code RUNNING} 是一句关于执行状态的谎（与 `10:708` 给库级那条登记的值一致）。
+     */
+    public record DocReindexAccepted(long docId, String taskId, String status) {
     }
 }

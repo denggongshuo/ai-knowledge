@@ -1,6 +1,7 @@
 package com.knowledge.ai.entity;
 
 import com.knowledge.ai.core.enums.DocStatus;
+import com.knowledge.ai.core.enums.SecretLevel;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -110,6 +111,24 @@ public class SysDocument {
      */
     @Column(name = "remark", length = 500)
     private String remark;
+
+    /**
+     * 文档**自己**的密级（`I-6` 的落地 · `V37` · `S7-M06-B`）。
+     *
+     * <p>🔴 **{@code null} 是"未覆盖（继承所属知识库）"，不是"没有密级"** —— 在此之前
+     * 文档的密级一直就是继承库的。{@code V37} 的注释写了为什么**不做回填**：
+     * 没有发生过的事，不要在数据里补一个看起来发生过的值。
+     * <p><b>生效密级 = {@code max(本字段, kb.secretLevel)}</b>，而那个 max **只在 Java 侧算**
+     * （{@link SecretLevel#within} 比序数）。检索侧的 SQL **不排序数** ——
+     * 密级名按字母序与密级序是**错位**的（`greatest('INTERNAL','CONFIDENTIAL')` 会返回
+     * `'INTERNAL'`），而那种 bug 的现象是"**有人看得见绝密**"而不是报错。
+     * 见 {@code RetrievalScope#visibleDocIds} 里那个合取项。
+     * <p>写入侧的口径：`PATCH /doc/{id}/attributes` 只放行 **≥ 生效密级**的新值
+     * （`G7-3`「只能提高」），比较同样走 {@link SecretLevel#within}。
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "secret_level", length = 16)
+    private SecretLevel secretLevel;
 
     /**
      * 状态机（《03》§4.2）。

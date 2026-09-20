@@ -1,5 +1,6 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.enums.SecretLevel;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
@@ -77,6 +78,9 @@ public class DocDetailService {
 
     private final DataScopeService dataScopeService;
 
+    /** 可见性判定的**唯一**落点（`I-7`）—— 本类不再自己写那段 SQL。 */
+    private final DocAccessService docAccessService;
+
     // ==================================================================
     // T-600 · 文档元信息
     // ==================================================================
@@ -97,7 +101,8 @@ public class DocDetailService {
                                d.table_total, d.table_parsed, d.image_total, d.image_parsed,
                                dep.name, d.pages_with_text,
                                (select max(t.finished_at) from sys_async_task t
-                                 where t.doc_id = d.id and t.type = 'doc-parse' and t.status = 'DONE')
+                                 where t.doc_id = d.id and t.type = 'doc-parse' and t.status = 'DONE'),
+                               d.secret_level
                         from sys_document d
                         join sys_kb k on k.id = d.kb_id
                         left join sys_user u on u.id = d.owner_id
@@ -110,20 +115,38 @@ public class DocDetailService {
         String type = (String) r[5];
         long pagesTotal = num(r[7]);
         long pagesWithText = num(r[20]);
-        String secretLevel = (String) r[10];
+        String kbLevel = (String) r[10];
+        String ownLevel = (String) r[22];
+        // 🔴 生效密级 = max(文档级, 库级) —— 在 **Java 侧**算，且只走这一个方法。
+        //    ⚠️ 不要改成 SQL 的 greatest()：密级名按字母序与密级序**错位**
+        //    （greatest('INTERNAL','CONFIDENTIAL') 返回 'INTERNAL'）⇒ 判断做反，
+        //    而现象是"有人看得见绝密"而不是报错。见 SecretLevel#max 与 RetrievalScope 的类注释。
+        //    `sys_kb.secret_level` 是 NOT NULL ⇒ 生效值**恒非 null**（`max(null, kb)` 返回 kb）。
+        SecretLevel effective = SecretLevel.max(level(ownLevel), level(kbLevel));
+        String effectiveLevel = effective == null ? kbLevel : effective.name();
 
         return new DocDtos.DocMetaView(
                 num(r[0]), num(r[1]), (String) r[2], (String) r[3], (String) r[4], type,
                 num(r[6]), (int) pagesTotal, num(r[8]), (String) r[9],
-                // `I-6` 的落地（文档级密级列）属 S7-M06-B ⇒ 当前生效密级 == 库级。
-                // 这不是"忘了做"：没有文档级列时它就是库级，见本批 §1-#10
-                secretLevel,
+                effectiveLevel,
                 r[11] == null ? "—" : (String) r[11], time(r[12]), null,
                 fileDesc(type, pagesTotal, pagesWithText), (String) r[19],
                 (String) r[13], (String) r[14],
                 num(r[15]), num(r[16]), num(r[17]), num(r[18]),
                 null, null, r[21] == null ? null : time(r[21]),
-                secretLevel, null);
+                kbLevel, ownLevel, null);
+    }
+
+    /** 库里的密级字符串 → 枚举；**认不出的一律当 {@code null}**（不抛：读侧不该为脏数据炸掉整页）。 */
+    private static SecretLevel level(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return SecretLevel.valueOf(raw);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /**
@@ -432,32 +455,12 @@ public class DocDetailService {
      * 后者**不许**退化成 10044：那会把「你可以去申请授权」说成「这文档没了」，
      * 两件事的下一步动作完全不同（「判不了必须与判否分开报」）。
      *
-     * @return {@code [docId, kbId]}
+     * <p>⚠️ **实现已移到 {@link DocAccessService}**（`S7-M06-B`）—— 本方法只是个转发。
+     * 抽出去的理由：`T-601` 的属性修改与 `T-610` 的单篇重建要用**同一个**判定，
+     * 而"同一个根因在两处各写一遍"就是多一个漏掉的机会，**漏掉的后果是越权可见**。
      */
-    private Object[] requireVisibleDoc(long docId) {
-        List<?> rows = entityManager.createNativeQuery(
-                        "select d.id, d.kb_id from sys_document d where d.id = :id and d.deleted_at is null")
-                .setParameter("id", docId)
-                .getResultList();
-        if (rows.isEmpty()) {
-            throw BizException.of(ErrorCode.DOC_NOT_FOUND);
-        }
-        Object[] r = (Object[]) rows.get(0);
-        long kbId = num(r[1]);
-
-        LoginUser user = LoginUserContext.require();
-        DataScopeService.ScopeCondition cond = dataScopeService.kbVisibility(user);
-        // ⚠️ 拼接处保留前导空格：text block 会剥掉每行行尾空白，写成 `... and " + cond.sql()`
-        // 会拼出 `andEXISTS`（B1 §8.1 实测踩到）
-        Query query = entityManager.createNativeQuery(
-                "select count(*) from sys_kb k where k.id = :kbId and " + cond.sql());
-        query.setParameter("kbId", kbId);
-        cond.params().forEach(query::setParameter);
-        Number visible = (Number) query.getSingleResult();
-        if (visible == null || visible.longValue() == 0) {
-            throw BizException.of(ErrorCode.KB_ACCESS_DENIED);
-        }
-        return new Object[]{num(r[0]), kbId};
+    private void requireVisibleDoc(long docId) {
+        docAccessService.requireVisibleDoc(docId);
     }
 
     /**
