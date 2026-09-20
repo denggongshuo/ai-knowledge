@@ -71,10 +71,13 @@ class UserAdminFlowTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("G2-2 权限树：total=38、4 大分组、系统管理 17 叶、叶子 id 即权限码")
+    @DisplayName("G2-2 权限树：total=40、4 大分组、系统管理 18 叶、叶子 id 即权限码")
     void permissionTree() {
         var resp = get("/api/permissions/tree", token).assertOk("权限树");
-        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(38L);
+        // ⚠️ 这个数是**权限点的总数**，会随新增权限码而变 —— 改它的时候顺手问一句
+        // "新加的两个码授给了谁"（`S8-M10-A` 的 `ops:qa:view`/`ops:qa:handle` 见 `V32`：
+        // `KB_ADMIN` 两个都有、`AUDITOR` 只有读）。38 → 40 就是那一次。
+        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(40L);
         List<Map<String, Object>> tree = resp.data("$.tree");
         assertThat(tree).hasSize(4);
         // 后端比 mock 树多一个 doc:recycle（回收站管理，V1 刻意单列的不可逆动作权限）：
@@ -83,7 +86,9 @@ class UserAdminFlowTest extends ApiTestSupport {
         Map<String, Object> doc = byLabel(tree, "文档");
         assertThat((List<?>) doc.get("children")).hasSize(8);
         Map<String, Object> system = byLabel(tree, "系统管理");
-        assertThat((List<?>) system.get("children")).hasSize(16);
+        // 16 → 18：`V32` 往这一组加了两个 ops 码（`ops:qa:view`/`ops:qa:handle`），
+        // 与 `audit:view`/`audit:export` 同组 —— 运营分析页与审计日志是同一类"全站视角的管理页"
+        assertThat((List<?>) system.get("children")).hasSize(18);
         // 叶子 id == code（前端勾选树按 id→code 映射，两者相等才不会错位）
         Map<String, Object> first = ((List<Map<String, Object>>) doc.get("children")).getFirst();
         assertThat(first.get("id")).isEqualTo(first.get("code"));

@@ -427,7 +427,8 @@ main()
     try {
       if (kbId) {
         const r = await teardownKbProbe(KB_CODE)
-        observe('探针库收尾', `MinIO ${r.removed.minio} · sql ${r.residue?.sql ?? '?'}`)
+        // `residue.sql` 是个对象（各表的残留计数），直接插进模板串会打成 `[object Object]`
+        observe('探针库收尾', `MinIO ${r.removed.minio} · 池子 ${r.removed.misses ?? 0} · 残留 ${JSON.stringify(r.residue?.sql ?? {})}`)
       }
     } catch (e) {
       observe('⚠️ 探针库收尾失败', e.message)
