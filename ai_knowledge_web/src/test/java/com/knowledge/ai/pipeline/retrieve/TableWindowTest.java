@@ -249,6 +249,24 @@ class TableWindowTest {
 
     // ==================== 构造 ====================
 
+    @Test
+    @DisplayName("S7-M06-A：与 MarkdownTable 对同一段内容给出的行数逐位相等（两个读者不分叉）")
+    void agreesWithMarkdownTableOnRowCount() {
+        // `S7-M06-A`（T-604）新增了第二个表格读者：`core.text.MarkdownTable` ——
+        // 它给"父块 N 行 × M 列"里的 N，而本类给回表窗口的行号。
+        // 两者认表格行的判据必须**逐字相同**（都以 `|` 开头的行是表格行、其余是前导行），
+        // 否则同一张表在预览页与检索侧会显示不同的行数，而那种偏差不报错、只让数字对不上。
+        // ⚠️ 这条只能写在本包：TableWindow 是包内可见的
+        String content = table(3);
+
+        TableWindow.Window window = TableWindow.of(content, 2, 3, LIMIT, 5);
+
+        assertThat(com.knowledge.ai.core.text.MarkdownTable.of(content).rows())
+                .isEqualTo(3)
+                .isEqualTo(window.totalRows());
+        assertThat(window.windowed()).isFalse();
+    }
+
     /** 一张 {@code rows} 个数据行的 Markdown 管道表，形状与 {@code ParsedTable#toMarkdown()} 一致（以换行结尾）。 */
     private static String table(int rows) {
         StringBuilder sb = new StringBuilder("| 型号 | 单价 |\n|---|---|\n");
