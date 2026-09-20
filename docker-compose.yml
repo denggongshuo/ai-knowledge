@@ -47,7 +47,16 @@ services:
       # - ./mysql/init:/docker-entrypoint-initdb.d
     command:
       - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
+      # 🔴 `T-O13`（2026-09-20）：原来是 `utf8mb4_unicode_ci` —— 那是**分歧的根因**：
+      #    没写 `COLLATE` 的迁移（V17/V22/V23/V25/V27/V31）继承了这个默认，
+      #    而写了的那批是 `utf8mb4_0900_ai_ci` ⇒ 库里两套排序规则并存 ⇒
+      #    跨表比较字符串列报 `1267 Illegal mix of collations`（只在跑到那条 SQL 时才炸）。
+      # 收敛方向 = `0900_ai_ci`（MySQL 8 原生、也是多数派），并已在 `V33` 里
+      # `ALTER DATABASE` + 把 9 张业务表 `CONVERT` 过去。
+      # ⚠️ **改这一行要重建容器才生效** —— 所以它不是兜底（兜底是 `V33` 的 ALTER DATABASE），
+      #    它只是让"重装一套新环境"从第一天就只有一套排序规则。
+      # 闸：`CollationUniformityTest`（全库一致 + 库默认 + 冻结豁免）。
+      - --collation-server=utf8mb4_0900_ai_ci
       - --mysql-native-password=ON
       - --max_connections=200
     healthcheck:
