@@ -17,7 +17,7 @@ import {
   Picture,
 } from '@element-plus/icons-vue'
 import { kbApi, sysApi } from '@/api'
-import type { KbConfigForm, SplitPresetDef, SecretLevel, RetrievalMode, DeptNode, ConfigDiffItem, ReindexImpact } from '@/types'
+import type { KbConfigForm, SplitPresetDef, SecretLevel, RetrievalMode, DeptNode, ConfigDiffItem, ReindexImpact, EmbeddingInfo } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -43,7 +43,26 @@ const meta = ref({ name: '', code: '', department: '', docCount: 0, chunkCount: 
 const form = ref<KbConfigForm | null>(null)
 const orig = ref<KbConfigForm | null>(null)
 const presets = ref<SplitPresetDef[]>([])
-const embedding = ref({ model: 'BAAI/bge-m3', dimension: 1024, norm: 'L2 归一化', locked: true })
+/**
+ * 嵌入模型信息（`#225` · `T-O16`）。
+ *
+ * <h3>🔴 初值为什么是 `null`，而不是一份写死的 `BAAI/bge-m3 · 1024 维`</h3>
+ * 那三个值原来在前端各写了一份（这里的初值与后端 `KbService#embeddingInfo()` 是
+ * **两个来源**）。页面在 `/kb/presets` 回来之前、以及**它失败的时候**，
+ * 显示的就是那一份猜的 —— 而它长得和真值一模一样（`#85` 那一族的「陷阱：
+ * 没人用所以漂移看不见」）。改成 `null`：拿到之前/拿不到时显示「—」，**不猜**。
+ * ⚠️ 与同一个文件里的 `vlModel` 同一条口径（它的初值本来就是 `'—'`）。
+ */
+const embedding = ref<EmbeddingInfo | null>(null)
+
+/**
+ * 嵌入模型的展示文本。`—` = **还没有这个值**（接口没回来，或它失败了）——
+ * 与 `avgTopScore` 用 `null` 而不是 0 是同一条口径：**不拿猜的值冒充**（`#225`）。
+ */
+const embeddingText = computed(() => {
+  const e = embedding.value
+  return e ? `${e.model} · ${e.dimension} 维 · ${e.norm}` : '—'
+})
 const vlModel = ref({ name: '—', enabled: false, appliedAt: '' })
 const deptTree = ref<DeptNode[]>([])
 const roleOptions = ref<{ code: string; name: string }[]>([])
@@ -478,7 +497,7 @@ async function deleteKb() {
                 </el-form-item>
               </div>
               <div class="readonly-box mt-8">
-                <span class="mono">{{ embedding.model }} · {{ embedding.dimension }} 维 · {{ embedding.norm }}</span>
+                <span class="mono">{{ embeddingText }}</span>
                 <el-icon><Lock /></el-icon>
               </div>
               <div class="hint">嵌入模型由服务端统一配置，前端只读</div>

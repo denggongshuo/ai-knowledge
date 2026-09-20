@@ -12,7 +12,7 @@ import {
   Picture,
 } from '@element-plus/icons-vue'
 import { kbApi, sysApi } from '@/api'
-import type { KbConfigForm, SplitPresetDef, SecretLevel, RetrievalMode, DeptNode, ConfigDiffItem } from '@/types'
+import type { ConfigDiffItem, DeptNode, EmbeddingInfo, KbConfigForm, RetrievalMode, SecretLevel, SplitPresetDef } from '@/types'
 
 const router = useRouter()
 
@@ -52,7 +52,23 @@ const loading = ref(false)
 const submitting = ref(false)
 const form = ref<KbConfigForm>(baseConfig())
 const presets = ref<SplitPresetDef[]>([])
-const embedding = ref({ model: 'BAAI/bge-m3', dimension: 1024, norm: 'L2 归一化', locked: true })
+/**
+ * 嵌入模型信息（`#225` · `T-O16`）—— 初值 `null`，**不写死一份猜的默认值**。
+ * 页面在 `/kb/presets` 回来之前、以及它失败的时候显示 `—`；
+ * 写死的话那三个值和真值长得一模一样，看不出"这是猜的"（`#85` 那一族）。
+ */
+const embedding = ref<EmbeddingInfo | null>(null)
+
+/** 详情行的完整文本；`—` = 还没有这个值（不猜）。 */
+const embeddingText = computed(() => {
+  const e = embedding.value
+  return e ? `${e.model} · ${e.dimension} 维 · ${e.norm}` : '—'
+})
+/** 配置摘要里的短文本（不带归一化口径）。 */
+const embeddingShort = computed(() => {
+  const e = embedding.value
+  return e ? `${e.model} · ${e.dimension} 维` : '—'
+})
 const vlModel = ref({ name: '—', enabled: false, appliedAt: '' })
 const deptTree = ref<DeptNode[]>([])
 const roleOptions = ref<{ code: string; name: string }[]>([])
@@ -429,7 +445,7 @@ function goBack() {
               <div class="field-block mt-16">
                 <div class="field-title">嵌入模型</div>
                 <div class="readonly-box">
-                  <span class="mono">{{ embedding.model }} · {{ embedding.dimension }} 维 · {{ embedding.norm }}</span>
+                  <span class="mono">{{ embeddingText }}</span>
                   <el-icon><Lock /></el-icon>
                 </div>
                 <div class="hint">由服务端统一配置，前端只读；更换需全库重建索引</div>
@@ -578,7 +594,7 @@ function goBack() {
           <div class="confirm-info">
             <div class="ci-row"><span>知识库编码</span><b class="mono">{{ form.code }}</b></div>
             <div class="ci-row"><span>归属部门</span><b>{{ deptName(form.deptId) }}</b></div>
-            <div class="ci-row"><span>嵌入模型</span><b class="mono">{{ embedding.model }} · {{ embedding.dimension }} 维</b></div>
+            <div class="ci-row"><span>嵌入模型</span><b class="mono">{{ embeddingShort }}</b></div>
             <div class="ci-row"><span>VL 视觉模型</span><b class="mono">{{ vlModel.enabled ? vlModel.name : '未配置' }}</b></div>
             <div class="ci-row"><span>预计索引成本</span><b>约 2.5 万 tokens / 篇</b></div>
           </div>
