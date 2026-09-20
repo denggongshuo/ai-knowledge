@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ref, computed, onMounted, watch } from 'vue'
 import { Download, InfoFilled, TrendCharts, UserFilled, DataLine } from '@element-plus/icons-vue'
 import { opsApi } from '@/api'
 import type { UsageOverview, TrendPoint, DeptUsage, KbHeat, ActiveUserStat } from '@/types'
@@ -15,17 +14,28 @@ const depts = ref<DeptUsage[]>([])
 const deptSum = ref({ active: 0, users: 0, questions: 0 })
 const heats = ref<KbHeat[]>([])
 const heatTotal = ref(0)
+const othersQuestions = ref(0)
+const othersPercent = ref<number | null>(null)
 const topUsers = ref<ActiveUserStat[]>([])
+const topTotal = ref(0)
 
-onMounted(async () => {
+/**
+ * 拉五个端点。
+ *
+ * 🔴 **`range` 必须传下去**（`S8-M10-E` 接真时修的）。改之前五个方法里四个把
+ * `range: '7d'` 写死、页面也从不传 —— 于是右上角那个下拉框**换了不生效**，
+ * 而页面上的数**看着完全正常**（它确实是一份正确的 7 天统计）。
+ */
+async function load() {
   loading.value = true
   try {
+    const r = range.value
     const [o, t, d, h, u] = await Promise.all([
-      opsApi.usageOverview(),
-      opsApi.trend(),
-      opsApi.byDept(),
-      opsApi.byKb(),
-      opsApi.topUsers({ range: '7d', limit: 10 }),
+      opsApi.usageOverview({ range: r }),
+      opsApi.trend({ range: r }),
+      opsApi.byDept({ range: r }),
+      opsApi.byKb({ range: r }),
+      opsApi.topUsers({ range: r, limit: 10 }),
     ])
     overview.value = o
     trend.value = t.list
@@ -34,32 +44,79 @@ onMounted(async () => {
     deptSum.value = { active: d.active, users: d.users, questions: d.questions }
     heats.value = h.list
     heatTotal.value = h.questions
+    othersQuestions.value = h.othersQuestions
+    othersPercent.value = h.othersPercent
     topUsers.value = u.list
+    topTotal.value = u.total
   } finally {
     loading.value = false
   }
-})
+}
+
+onMounted(load)
+// 换时间范围要**重新拉**，否则选 30 天看到的还是 7 天的数（那正是上面那条注释说的事）
+watch(range, load)
+
+// ==================== 空值一律显示 `—` ====================
+// 后端把"算不出来"如实回 `null`（分母为 0 时）。页面**不能**把它渲染成
+// `null%` / 空字符串 / 0 —— 那三个都会被读成一个**结论**，而真相是"没有分母"。
+const DASH = '—'
+function num1(v: number | null | undefined) {
+  return v === null || v === undefined ? DASH : v
+}
+/** 百分数：`null` ⇒ `—`；否则固定一位小数（与后端的舍入口径一致）。 */
+function pct(v: number | null | undefined) {
+  return v === null || v === undefined ? DASH : v.toFixed(1) + '%'
+}
+/** 部门活跃率：`totalUsers` 为 0 时**也算不出来**（0/0）。 */
+function activeRateOf(d: DeptUsage) {
+  return d.totalUsers === 0 ? DASH : Math.round((d.activeUsers / d.totalUsers) * 100) + '%'
+}
 
 const maxTrend = computed(() => Math.max(...trend.value.map((t) => t.value), 1))
 const maxHeat = computed(() => Math.max(...heats.value.map((h) => h.questions), 1))
 
 /** 部门读数：提问数高+人均低 = 推广到了但没形成习惯；提问数低+人均高 = 少数人的工具 */
 function deptSignal(d: DeptUsage): { text: string; type: 'warning' | 'success' | 'info' } {
-  const deptAvg = overview.value?.avgPerUser ?? 17.6
-  if (d.perUser < deptAvg && d.questions > 100) return { text: '人多但用得浅', type: 'warning' }
-  if (d.perUser >= deptAvg && d.activeUsers / d.totalUsers < 0.4) return { text: '用得深但没推开', type: 'info' }
+  const avg = overview.value?.avgPerUser
+  // 人均**算不出来**时不给读数 —— 拿"没有分母"去和一个数比大小，结论必然是错的
+  if (avg === null || avg === undefined || d.perUser === null) {
+    return { text: '样本不足', type: 'info' }
+  }
+  if (d.perUser < avg && d.questions > 0) return { text: '人多但用得浅', type: 'warning' }
+  if (d.perUser >= avg && d.activeUsers / Math.max(d.totalUsers, 1) < 0.4) {
+    return { text: '用得深但没推开', type: 'info' }
+  }
   return { text: '健康', type: 'success' }
 }
 
-function scoreClass(v: number) {
+/**
+ * 相似度的着色。
+ *
+ * 🔴 `null`（该用户一行有分数的都没有）**必须单独判**：JS 里 `null < 0.7` 是 `true`，
+ * 直接写 `v < 0.7` 会把每一个"没测到"的人染成"分低"—— 那是一个**关于内容的结论**，
+ * 与"没测到"是两件事（`S8-M10-B` 定的「判不了必须与判否分开报」）。
+ */
+function scoreTone(v: number | null) {
+  if (v === null) return 'unknown'
   if (v >= 0.78) return 'good'
   if (v >= 0.7) return ''
   return 'low'
 }
-
-function exportReport() {
-  ElMessage.success('导出任务已创建，完成后通过通知中心提醒')
+function isWarn(v: number | null) {
+  return v !== null && v < 0.7
 }
+
+/**
+ * 「导出报表」—— **本版本不提供**。
+ *
+ * ⚠️ 原来这里弹的是「导出任务已创建，完成后通过通知中心提醒」，而**一个请求都没发**：
+ * 需求 `08` §3.6 给这一页列的五条端点里**没有导出**（§3.9 的"不做"清单里也没有它），
+ * 而「导出运营报表」那个动作在页 11（`POST /ops/qa/export`），导出的是**未命中清单**、
+ * 不是使用统计。⇒ 那条 toast 说的是**一件没有发生的事**，按本仓口径要销掉。
+ * 处置与页 11 的 `regenerateHyq()` 一致：**如实说明**，不假装。
+ */
+const exportNote = '本版本未提供使用统计的导出（需求 08 §3.6 未列此端点；页 11 的导出导的是未命中清单）'
 </script>
 
 <template>
@@ -78,7 +135,9 @@ function exportReport() {
           <el-option label="近 30 天" value="30d" />
           <el-option label="近 90 天" value="90d" />
         </el-select>
-        <el-button :icon="Download" @click="exportReport">导出报表</el-button>
+        <el-tooltip :content="exportNote" placement="bottom">
+          <el-button :icon="Download" disabled>导出报表</el-button>
+        </el-tooltip>
       </div>
     </div>
 
@@ -88,15 +147,15 @@ function exportReport() {
         <div class="sc-val">
           {{ overview.activeUsers }}<span class="sc-of">/ {{ overview.totalUsers }}</span>
         </div>
-        <div class="sc-bar"><i :style="{ width: overview.activeRate + '%' }" /></div>
-        <div class="sc-label">活跃用户 · 覆盖率 {{ overview.activeRate }}%</div>
+        <div class="sc-bar"><i :style="{ width: (overview.activeRate ?? 0) + '%' }" /></div>
+        <div class="sc-label">活跃用户 · 覆盖率 {{ pct(overview.activeRate) }}</div>
       </div>
       <div class="stat-card">
         <div class="sc-val">{{ overview.totalQuestions.toLocaleString() }}</div>
         <div class="sc-label">提问总数（使用规模）</div>
       </div>
       <div class="stat-card highlight">
-        <div class="sc-val">{{ overview.avgPerUser }}</div>
+        <div class="sc-val">{{ num1(overview.avgPerUser) }}</div>
         <div class="sc-label">人均提问（使用深度，&lt; 3 次说明没形成习惯）</div>
       </div>
       <div class="stat-card">
@@ -129,16 +188,17 @@ function exportReport() {
         </div>
 
         <div v-if="overview" class="trend-sum">
-          <div class="ts-item"><span>工作日均值</span><b class="mono">{{ overview.workdayAvg }}</b></div>
-          <div class="ts-item"><span>周末均值</span><b class="mono">{{ overview.weekendAvg }}</b></div>
-          <div class="ts-item"><span>日均</span><b class="mono">{{ overview.dailyAvg }}</b></div>
+          <div class="ts-item"><span>工作日均值</span><b class="mono">{{ num1(overview.workdayAvg) }}</b></div>
+          <div class="ts-item"><span>周末均值</span><b class="mono">{{ num1(overview.weekendAvg) }}</b></div>
+          <div class="ts-item"><span>日均</span><b class="mono">{{ num1(overview.dailyAvg) }}</b></div>
         </div>
 
         <div class="guide-note">
           <el-icon><InfoFilled /></el-icon>
           <span>
-            周末提问量骤降（工作日 {{ overview?.workdayAvg }} vs 周末 {{ overview?.weekendAvg }}），说明使用场景集中在工作时段——
-            据此可把<b>索引重建、模型切换这类重任务安排到夜间或周末执行</b>。某天异常高峰通常对应一次推广或内容上线，可作效果验证。
+            工作日与周末的日均差说明<b>使用场景是否集中在工作时段</b>（工作日 {{ num1(overview?.workdayAvg) }} vs
+            周末 {{ num1(overview?.weekendAvg) }}）——
+            差距大时可把<b>索引重建、模型切换这类重任务安排到夜间或周末执行</b>。某天异常高峰通常对应一次推广或内容上线，可作效果验证。
           </span>
         </div>
       </el-card>
@@ -148,15 +208,37 @@ function exportReport() {
         <template #header>
           <div class="card-head-row">
             <h3><el-icon><DataLine /></el-icon> 知识库热度</h3>
-            <span class="hint">合计 {{ heatTotal.toLocaleString() }}（与检索质量页一致）</span>
+            <span class="hint">合计 {{ (heatTotal + othersQuestions).toLocaleString() }}（与检索质量页一致）</span>
           </div>
         </template>
         <div v-for="h in heats" :key="h.kbName" class="heat-row">
           <span class="hr-name ellipsis">{{ h.kbName }}</span>
           <div class="hr-bar"><i :style="{ width: (h.questions / maxHeat) * 100 + '%' }" /></div>
           <span class="hr-val mono">{{ h.questions }}</span>
-          <span class="hr-pct mono">{{ h.percent }}%</span>
+          <span class="hr-pct mono">{{ pct(h.percent) }}</span>
         </div>
+        <!-- 「其他」桶与单库行**并排显示**：它一起参与占比分配 ⇒ 两者合计恰好 100% -->
+        <div v-if="othersQuestions > 0" class="heat-row">
+          <span class="hr-name ellipsis">其他（跨库提问）</span>
+          <div class="hr-bar"><i :style="{ width: (othersQuestions / maxHeat) * 100 + '%' }" /></div>
+          <span class="hr-val mono">{{ othersQuestions }}</span>
+          <span class="hr-pct mono">{{ pct(othersPercent) }}</span>
+        </div>
+
+        <!--
+          🔴 诚实空态：**当前链路上单库行恒为 0** ——
+          `ChatRequest` 没有 `kbIds`、提问页也没有库选择器，每次提问覆盖**全部可见库**
+          ⇒ 一次提问装不进任何一个库，只能归「其他」。
+          这不是"数据还没到"，是**源不存在** ⇒ 如实说明，**不拿别的数填满它**。
+        -->
+        <el-alert
+          v-if="heats.length === 0"
+          type="info"
+          :closable="false"
+          class="mt-12"
+          title="暂时没有「单库提问」的行"
+          description="当前每次提问都覆盖全部可见库（提问页没有库范围选择），因此无法把一次提问归给某一个库 —— 全部计入上面的「其他（跨库提问）」。这与「检索质量分析」页的各库排行是同一个口径、同一个数。"
+        />
 
         <div class="guide-note mt-12">
           <el-icon><InfoFilled /></el-icon>
@@ -180,17 +262,24 @@ function exportReport() {
         <el-table-column prop="totalUsers" label="部门人数" width="100" />
         <el-table-column label="活跃率" width="100">
           <template #default="{ row }">
-            <span class="mono">{{ Math.round((row.activeUsers / row.totalUsers) * 100) }}%</span>
+            <span class="mono">{{ activeRateOf(row) }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="questions" label="提问数" width="100" sortable />
-        <el-table-column label="人均" width="90" sortable :sort-method="(a: DeptUsage, b: DeptUsage) => b.perUser - a.perUser">
+        <!-- ⚠️ 排序里也要处理 null：`b.perUser - a.perUser` 只要有一边是 null 就是 NaN，
+             而 NaN 参与的排序**不会报错**，只会给出一个说不清的顺序 -->
+        <el-table-column
+          label="人均"
+          width="90"
+          sortable
+          :sort-method="(a: DeptUsage, b: DeptUsage) => (b.perUser ?? -1) - (a.perUser ?? -1)"
+        >
           <template #default="{ row }">
-            <b class="mono">{{ row.perUser }}</b>
+            <b class="mono">{{ num1(row.perUser) }}</b>
           </template>
         </el-table-column>
         <el-table-column label="占比" width="100">
-          <template #default="{ row }"><span class="mono">{{ row.percent }}%</span></template>
+          <template #default="{ row }"><span class="mono">{{ pct(row.percent) }}</span></template>
         </el-table-column>
         <el-table-column label="读数" width="150">
           <template #default="{ row }">
@@ -207,7 +296,7 @@ function exportReport() {
         <span>/</span>
         <b class="mono">{{ deptSum.questions.toLocaleString() }} 提问</b>
         <span>/</span>
-        <b class="mono">{{ overview?.avgPerUser }} 人均</b>
+        <b class="mono">{{ num1(overview?.avgPerUser) }} 人均</b>
         <span>/</span>
         <b class="mono">100.0%</b>
       </div>
@@ -217,7 +306,7 @@ function exportReport() {
         <span>
           <b>提问数高 + 人均低</b> → 人多但用得浅（推广到了但没形成习惯），对策是提升使用频率；
           <b>提问数低 + 人均高</b> → 用得深但没推开（少数人的工具），对策是扩大覆盖面。
-          示例中研发中心（45.6% 但人均 17.2）与销售中心（人均 20.7 但活跃率仅 35%）正是这两种典型。
+          上表「读数」列就是按这条规则判的。
         </span>
       </div>
     </el-card>
@@ -226,13 +315,14 @@ function exportReport() {
     <el-card shadow="never" class="mt-12">
       <template #header>
         <div class="card-head-row">
-          <h3><el-icon><UserFilled /></el-icon> 活跃用户 TOP{{ topUsers.length }}</h3>
+          <h3><el-icon><UserFilled /></el-icon> 活跃用户 TOP{{ topUsers.length }}<span class="hint">（共 {{ topTotal }} 人）</span></h3>
           <span class="hint">提问多 ≠ 用得好：提问多 + 分低说明他总在问知识库答不上来的问题</span>
         </div>
       </template>
 
+      <div v-if="topUsers.length === 0" class="hint">本窗口内还没有人提问。</div>
       <div class="user-grid">
-        <div v-for="(u, i) in topUsers" :key="u.name" class="user-card" :class="{ warn: u.avgTopScore < 0.7 }">
+        <div v-for="(u, i) in topUsers" :key="u.name" class="user-card" :class="{ warn: isWarn(u.avgTopScore) }">
           <div class="uc-head">
             <span class="uc-rank">{{ i + 1 }}</span>
             <div>
@@ -246,7 +336,7 @@ function exportReport() {
           </div>
           <div class="uc-score">
             <span class="tiny muted">平均 Top1</span>
-            <b class="mono" :class="scoreClass(u.avgTopScore)">{{ u.avgTopScore }}</b>
+            <b class="mono" :class="scoreTone(u.avgTopScore)">{{ u.avgTopScore === null ? DASH : u.avgTopScore.toFixed(3) }}</b>
           </div>
         </div>
       </div>
@@ -254,8 +344,10 @@ function exportReport() {
       <div class="guide-note">
         <el-icon><InfoFilled /></el-icon>
         <span>
-          <b>「提问多 + 相似度低」</b>（如刘强 43 次 / 0.68）说明他总在问知识库答不上来的问题——可能不是内容缺失，而是<b>他不知道该去哪查</b>，可单独观察甚至给个使用引导。
-          反之「提问多 + 分高」是典型的重度满意用户，<b>适合做推广案例</b>。用户维度统计仅对管理员开放，且不展示具体提问内容。
+          <b>「提问多 + 相似度低」</b>说明他总在问知识库答不上来的问题——可能不是内容缺失，而是<b>他不知道该去哪查</b>，可单独观察甚至给个使用引导。
+          反之「提问多 + 分高」是典型的重度满意用户，<b>适合做推广案例</b>。
+          ⚠️ 「平均 Top1」的分母**只含有分数的行**（空召回不进）—— 该用户全是空召回时显示 <b>—</b>，
+          那是<b>没测到</b>，不是"分低"。用户维度统计仅对管理员开放，且不展示具体提问内容。
         </span>
       </div>
     </el-card>
@@ -565,5 +657,10 @@ function exportReport() {
 }
 .uc-score b.low {
   color: var(--el-color-danger);
+}
+/* 🔴 「没测到」既不绿也不红 —— 给它一个**中性**色。染色等于下结论，
+   而"这个用户全是空召回"与"他的分数低"是两句相反的话（见 scoreTone 的注释）。 */
+.uc-score b.unknown {
+  color: var(--el-text-color-secondary);
 }
 </style>

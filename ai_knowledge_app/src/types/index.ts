@@ -1034,15 +1034,23 @@ export interface KbQualityRanking {
 export interface UsageOverview {
   activeUsers: number
   totalUsers: number
-  activeRate: number
+  /**
+   * 活跃率（百分数，一位小数）。
+   *
+   * 🔴 **可为 `null`** —— 分母（总用户数）为 0 时**算不出来**，后端如实回 `null`。
+   * 页面必须显示 `—` 而不是 0：`0%` 会被读成「一个人都没用过」，
+   * 而真相是「这条比率没有分母」。
+   */
+  activeRate: number | null
   totalQuestions: number
-  /** 人均提问（使用深度） */
-  avgPerUser: number
+  /** 人均提问（使用深度）。**可为 null**（没有活跃用户时） */
+  avgPerUser: number | null
   coveredDepts: number
   totalDepts: number
-  workdayAvg: number
-  weekendAvg: number
-  dailyAvg: number
+  /** 工作日/周末/日均。**均可为 null**（窗口内该类型的天数为 0 时） */
+  workdayAvg: number | null
+  weekendAvg: number | null
+  dailyAvg: number | null
 }
 
 /** 趋势点（颜色承载信息：周末灰、今天浅） */
@@ -1060,15 +1068,18 @@ export interface DeptUsage {
   activeUsers: number
   totalUsers: number
   questions: number
-  perUser: number
-  percent: number
+  /** 人均。**可为 null**（该部门没有活跃用户时） */
+  perUser: number | null
+  /** 占比（百分数）。**可为 null**（窗口内一次提问都没有时）。各行之和**恰好 100.0** */
+  percent: number | null
 }
 
 /** 知识库热度 */
 export interface KbHeat {
   kbName: string
   questions: number
-  percent: number
+  /** 占比（百分数）。同名行的分母是**含「其他」的提问总数**；可为 null */
+  percent: number | null
 }
 
 /** 活跃用户排行（提问多 ≠ 用得好） */
@@ -1076,7 +1087,15 @@ export interface ActiveUserStat {
   name: string
   dept: string
   questions: number
-  avgTopScore: number
+  /**
+   * 平均 Top1。
+   *
+   * 🔴 **可为 `null`** —— 该用户窗口内**没有一行有分数**（全是空召回）时算不出来。
+   * ⚠️ 判断时**不能用 `avgTopScore < 0.7`**：JS 里 `null < 0.7` 是 `true`
+   * ⇒ 每一个"没有分数"的人都会被标成「分低」，而那是一个**关于内容的结论**，
+   * 与"没测到"是两件事（`S8-M10-B` 定的「判不了必须与判否分开报」）。
+   */
+  avgTopScore: number | null
 }
 
 // ==================== 通用（通知中心 / 回收站 / 错误页） ====================

@@ -215,10 +215,22 @@ export const opsApi = {
     http.get<KbQualityRanking>('/ops/retrieval/kb-quality', query),
 
   // ---- 21 使用统计 ----
-  usageOverview: () => http.get<UsageOverview>('/ops/usage/overview', { range: '7d' }),
-  trend: () => http.get<{ list: TrendPoint[]; total: number }>('/ops/usage/trend', { range: '7d', granularity: 'day' }),
-  byDept: () => http.get<{ list: DeptUsage[]; active: number; users: number; questions: number }>('/ops/usage/by-dept', { range: '7d' }),
-  byKb: () => http.get<{ list: KbHeat[]; questions: number }>('/ops/usage/by-kb', { range: '7d' }),
+  // 🔴 五个方法**都收 `range`**（`S8-M10-E` 接真时改的）。
+  //    改之前四个把 `range: '7d'` **写死**、页面也从不传 —— 于是右上角那个
+  //    「近 7 天 / 近 30 天 / 近 90 天」下拉框**换了也不生效**，
+  //    而页面上的数**看着完全正常**（它确实是一份正确的 7 天统计）。
+  //    这正是本仓点名的「页面显示已切换、实际仍打旧端点」那一类假交互。
+  usageOverview: (query?: { range?: string }) =>
+    http.get<UsageOverview>('/ops/usage/overview', query),
+  trend: (query?: { range?: string; granularity?: string }) =>
+    http.get<{ list: TrendPoint[]; total: number }>('/ops/usage/trend', { granularity: 'day', ...query }),
+  byDept: (query?: { range?: string }) =>
+    http.get<{ list: DeptUsage[]; active: number; users: number; questions: number }>('/ops/usage/by-dept', query),
+  byKb: (query?: { range?: string }) =>
+    http.get<{ list: KbHeat[]; questions: number; othersQuestions: number; othersPercent: number | null }>(
+      '/ops/usage/by-kb',
+      query,
+    ),
   topUsers: (query?: { range?: string; limit?: number }) =>
     http.get<{ list: ActiveUserStat[]; total: number }>('/ops/usage/top-users', query),
 }

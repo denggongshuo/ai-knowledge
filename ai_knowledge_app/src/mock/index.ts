@@ -1851,8 +1851,18 @@ register('GET', '/api/ops/usage/by-dept', (_req, res) => {
 })
 
 register('GET', '/api/ops/usage/by-kb', (_req, res) => {
-  const questions = mockKbHeat.reduce((s, k) => s + k.questions, 0)
-  json(res, 0, { list: mockKbHeat, questions })
+  // 🔴 `list` **不含「其他」**（后端契约：跨库提问单独回）——mock 若把它混在 list 里，
+  // 页面在 mock 模式下会把「其他」画成一行普通库，而真后端下那一行来自 othersQuestions，
+  // 两边的**行数不一样** ⇒ 页面级判据在 mock 下绿、在真后端下红（或反过来）。
+  const list = mockKbHeat.filter((k) => k.kbName !== '其他')
+  const others = mockKbHeat.find((k) => k.kbName === '其他')
+  const questions = list.reduce((s, k) => s + k.questions, 0)
+  json(res, 0, {
+    list,
+    questions,
+    othersQuestions: others?.questions ?? 0,
+    othersPercent: others?.percent ?? null,
+  })
 })
 
 register('GET', '/api/ops/usage/top-users', (_req, res, ctx) => {
