@@ -93,8 +93,9 @@ class UserAdminFlowTest extends ApiTestSupport {
         // 后端比 mock 树多一个 doc:recycle（回收站管理，V1 刻意单列的不可逆动作权限）：
         // 文档 8 叶（mock 树漏了它）、系统管理 21 叶。前端多渲染一个可勾选项，无害超集。
         // ⚠️ 权限树节点的字段是 label（部门树才是 name），别复用 byName
+        // ⚠️ `S7-M06-B` 加了 `doc:update`（修改文档属性）⇒ 文档组 **8 → 9 叶**
         Map<String, Object> doc = byLabel(tree, "文档");
-        assertThat((List<?>) doc.get("children")).hasSize(8);
+        assertThat((List<?>) doc.get("children")).hasSize(9);
         Map<String, Object> system = byLabel(tree, "系统管理");
         // 16 → 18：`V32` 往这一组加了两个 ops 码（`ops:qa:view`/`ops:qa:handle`），
         // 与 `audit:view`/`audit:export` 同组 —— 运营分析页与审计日志是同一类"全站视角的管理页"；
