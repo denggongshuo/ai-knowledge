@@ -137,3 +137,40 @@ export function reportPrecondition(diag, script) {
   }
   return diag
 }
+
+/**
+ * 断言「这次跑的是 **mock 模式**」—— 给那些**用写死 token 注入登录态**的闸用。
+ *
+ * <h3>为什么这算「前置不满足」而不是「断言失败」</h3>
+ * <p>这类闸（`render-check` / `layout-check`）往 `localStorage` 里塞的是
+ * **写死的 `mock_selftest_token`** —— 那个 token 只有 mock 层认。
+ * 于是在**真后端模式**下：每个受保护路由都被守卫弹回登录页 ⇒
+ * **18 条一起红，而红不是代码**（`S6-M11` 实测：同一份代码 mock 模式 25/25、真后端 7/25）。
+ *
+ * <p>⚠️ `#226` 的教训在这里的落点是：**上一版的前置自检报的是"通过"** ——
+ * 它只判了"服务在不在 / 是不是这个前端 / 哪个模式"，而**没有判"这个模式成立不成立"**。
+ * 一条看不出"红是环境还是代码"的闸会被忽略，而被忽略的闸等于没有。
+ *
+ * <p>所以：`reportPrecondition` 管"服务在不在"，本函数管"**配置成不成立**"。
+ * 两者的退出码同一个（{@link EXIT_PRECONDITION}），因为对使用者来说
+ * "一条路由都别跑、先修环境"是同一个结论。
+ *
+ * @param {{mode:string}} diag {@link probeDevServer} 的结果
+ * @param {string} script 脚本名（打印用）
+ */
+export function requireMockMode(diag, script) {
+  if (diag.mode !== 'real') {
+    return
+  }
+  console.error(`\n✗ ${script}：**前置不满足**（exit ${EXIT_PRECONDITION}）—— 它只在 mock 模式下成立\n`)
+  console.error('  • 它用**写死的 `mock_selftest_token`** 注入登录态，那个 token 只有 mock 层认；')
+  console.error('    当前 dev server 是 **真后端模式** ⇒ 每个受保护路由都会被弹回登录页。')
+  console.error('  • 结果会是「十几条一起红」—— **而红不是代码**（S6-M11 实测：同一份代码')
+  console.error('    mock 模式 25/25、真后端 7/25）。一条跑出来没法解释的红，不如一条都不跑。')
+  console.error('')
+  console.error('  下一步（二选一）：')
+  console.error('    ① 用 **mock 模式**起 dev server（**不带** `VITE_USE_MOCK=false`）再跑本闸；')
+  console.error('    ② 真后端模式的验证交给 `console-check.mjs` / `e2e-*.mjs` —— 它们用真登录换 token。')
+  console.error('')
+  process.exit(EXIT_PRECONDITION)
+}

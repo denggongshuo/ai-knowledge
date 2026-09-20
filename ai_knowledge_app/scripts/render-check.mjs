@@ -26,7 +26,7 @@ import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { ROUTES, NO_SHELL } from './lib/routes.mjs'
-import { probeDevServer, reportPrecondition } from './lib/dev-server.mjs'
+import { probeDevServer, reportPrecondition, requireMockMode } from './lib/dev-server.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
@@ -95,7 +95,10 @@ let failed = 0
 // 🔴 **前置自检** —— 在跑任何路由之前，先说清"我打的是哪个 server、它跑在哪个模式"。
 // 前置不满足 → **exit 2**（与"路由断言失败"的 exit 1 **分开**，让调用方一眼分得清
 // 「环境没准备好」与「页面真的坏了」）。理由见 `lib/dev-server.mjs` 的模块头注。
-reportPrecondition(await probeDevServer(BASE), 'render-check')
+const diag = reportPrecondition(await probeDevServer(BASE), 'render-check')
+// `S6-M11` §9-⑯：**光判"服务在不在"不够**。本脚本用写死的 `mock_selftest_token`，
+// 在真后端模式下必然十几条一起红 —— 那种红没有解释价值，所以在这里就停下（exit 2）。
+requireMockMode(diag, 'render-check')
 
 for (const r of ROUTES) {
   const url = r.public ? `${BASE}/#${r.path}` : `${BASE}/_selfcheck.html?to=${r.path}`

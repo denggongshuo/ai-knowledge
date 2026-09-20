@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { probeDevServer, reportPrecondition } from './lib/dev-server.mjs'
+import { probeDevServer, reportPrecondition, requireMockMode } from './lib/dev-server.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
@@ -114,7 +114,9 @@ let failed = 0
 // 🔴 **前置自检**（同 `render-check.mjs`）：前置不满足 → **exit 2**，一条路由都不跑。
 // 理由：本脚本上一批报过 **4/4 全红**而根因未查明 —— 一个"量高度"的判据在
 // 「页面根本没挂载」时会给出 `未渲染`，与「高度链真的断了」**长得一模一样**（`#226`）。
-reportPrecondition(await probeDevServer(BASE), 'layout-check')
+const layoutDiag = reportPrecondition(await probeDevServer(BASE), 'layout-check')
+// 与 render-check 同一个前提（写死的 mock token）—— 见 requireMockMode 的 javadoc
+requireMockMode(layoutDiag, 'layout-check')
 
 console.log(`${pad('ROUTE', 16)} ${pad('mainH', 7)} ${pad('viewH', 7)} ${pad('pageH', 7)} ${pad('溢出', 6)} STATUS`)
 console.log('-'.repeat(70))
