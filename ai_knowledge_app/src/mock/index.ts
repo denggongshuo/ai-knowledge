@@ -647,7 +647,9 @@ register('GET', '/api/doc/tasks/:taskId', (_req, res, ctx) => {
 register('POST', '/api/doc/:id/reindex', async (req, res, ctx) => {
   void req
   await delay(400)
-  json(res, 0, { docId: Number(ctx.params.id), taskId: `task_${Date.now()}`, status: 'RUNNING' })
+  // `status` 与真后端、以及库级重建（`10-接口约定汇总.md` §5 那条「`status` 恒为 ACCEPTED」）对齐：
+  // 此刻作业**刚入队、还没被 worker 领取**，报 `RUNNING` 是一句关于执行状态的谎
+  json(res, 0, { docId: Number(ctx.params.id), taskId: `task_${Date.now()}`, status: 'ACCEPTED' })
 })
 
 /** 批量删除必须在 :id 之前注册（3 段路径冲突） */
@@ -1611,11 +1613,14 @@ register('GET', '/api/doc/:id/chunks/:parentId', (_req, res) => {
 register('PATCH', '/api/doc/:id/attributes', async (req, res, ctx) => {
   await delay(400)
   const body = ctx.body as { secretLevel?: string; kbId?: number; tags?: string[] }
+  // `tags` 本版本**不支持**：真后端会明确回业务错，mock 必须**同样拒绝** ——
+  // 否则 mock 模式下页面看着能存，切到真后端立刻失败，而那正是"mock 与真后端不一致"的老坑
+  if (body.tags != null) return json(res, 10030, null, '本版本不支持修改文档的内容标签：标签的归属表还没建（T-609）')
   json(res, 0, {
     saved: true,
     docId: Number(ctx.params.id),
+    // 移动知识库才触发重建（需求 §6.7：属性修改立即生效，移动知识库除外）
     needReindex: body.kbId != null,
-    attributes: body,
   })
 })
 

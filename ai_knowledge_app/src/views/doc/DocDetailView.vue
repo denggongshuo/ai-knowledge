@@ -40,7 +40,14 @@ const newTag = ref('')
 /** 本页加载时失败的端点（**按端点降级**：一个坏了不该让整页什么都不显示）。 */
 const loadErrors = ref<string[]>([])
 
-onMounted(async () => {
+/**
+ * 加载本页全部数据。
+ *
+ * <p>⚠️ 抽成独立函数而不是只写在 `onMounted` 里：**保存成功后要复用它**
+ * （`saveAttr`）—— 移动知识库之后库名变了、密级下限也变了，页面必须重新取一次
+ * 而不是拿旧值继续渲染。
+ */
+async function load() {
   loading.value = true
   // ⚠️ 原先是 `Promise.all` 且**没有 catch** —— 五个请求里任何一个失败
   // （`/doc/{id}/versions` 还没实现、文档不存在、后端没起）都会让整页空白，
@@ -82,45 +89,63 @@ onMounted(async () => {
   }
   loadErrors.value = failed
   loading.value = false
+}
+
+onMounted(load)
+
+/**
+ * 密级下拉的可选项：**只能提高**（`I-6` / `G7-3`）。
+ *
+ * ⚠️ 下限取的是**当前生效密级**（`meta.securityLevel` = `max(文档, 库)`），**不是**库级：
+ * 当文档自己已经比库更严时，按库级切会让用户看到一个"能把它降下来"的选项，
+ * 而服务端会拒 —— 用户拿到的是一句他无法理解的失败。前端把不可选项**根本不列出来**，
+ * 与需求 §6.7「密级下拉的选项**过滤掉了低于知识库密级的选项**」同一条口径。
+ */
+const secretOptions = computed(() => {
+  const floor = meta.value?.securityLevel ?? 'INTERNAL'
+  return SECRET_ORDER.slice(SECRET_ORDER.indexOf(floor))
 })
 
-/** 密级只能提高，不能低于知识库密级 */
-const secretOptions = computed(() => {
-  const min = meta.value?.kbSecurityLevel ?? 'INTERNAL'
-  const minIdx = SECRET_ORDER.indexOf(min)
-  return SECRET_ORDER.slice(minIdx)
-})
+/**
+ * 选项文案。需求 §6.7：「密级下拉标注「**内部（继承知识库）**」，让用户知道当前值来自哪里」。
+ *
+ * ⚠️ 「继承」只标在**当前生效值**上，判据是 `ownSecurityLevel === null`（文档**未覆盖**）——
+ * **不是**"值恰好等于库级"：用户主动把文档设成与库相同的值，与"它继承自库"是两回事。
+ * 两者在数据上分得很清（`sys_document.secret_level` 是不是 NULL），页面上不该混起来。
+ */
+function optionLabel(l: SecretLevel) {
+  const m = meta.value
+  if (!m) return SECRET_LABEL[l]
+  return m.ownSecurityLevel === null && l === m.securityLevel
+    ? `${SECRET_LABEL[l]}（继承知识库）`
+    : SECRET_LABEL[l]
+}
 
 const kbChanged = computed(() => meta.value != null && targetKbId.value !== meta.value.kbId)
 /**
- * ⚠️ `meta.tags` 可能是 `null`（= **未落库**，不是"没有标签"）——
- * 直接 `.join()` 会抛异常。空数组与 `null` 在这里都用 `?? []` 收起：
- * 这一条只回答"用户改没改"，不回答"服务端有没有这个能力"。
+ * ⚠️ `meta.tags` 可能是 `null`（= **未落库**，不是"没有标签"）。
+ * 🔴 **`tags` 不参与"改没改"的判定** —— 本批明确不支持改标签（见 `TAGS_UNSUPPORTED_REASON`），
+ * 把它算进来只会让保存按钮在没有可保存内容时亮着，点下去只得到一句拒绝。
  */
 const attrDirty = computed(
-  () => meta.value != null && (secretLevel.value !== meta.value.securityLevel || kbChanged.value
-    || tags.value.join() !== (meta.value.tags ?? []).join()),
+  () => meta.value != null && (secretLevel.value !== meta.value.securityLevel || kbChanged.value),
 )
 /**
- * 属性保存（`PATCH /doc/{id}/attributes`）**本版本不可用** —— 它的两个半边都缺前置：
- * 「移动知识库」要单篇重建（`T-610`）、「密级只能提高」（`I-6`）要改检索侧的密级过滤，
- * 否则"提高密级"在检索上无效（越权可见）。二者与 `T-601` 合成 `S7-M06-B`。
- *
- * ⚠️ 按钮**置灰并给原因**，而不是让用户点了之后弹一个"保存成功"（那是假成功）。
+ * `tags` 在本版本**不可编辑** —— 文档级内容标签**没有归属表**（`T-609`，`IndexEnhancer` 的
+ * javadoc 自己写着）。⚠️ 与"按钮置灰要给原因"同一条纪律：**不能改就明确禁用并说明**，
+ * 不要让用户填完一屏标签、点保存才被告知不支持。
  */
-const ATTR_SAVE_BLOCKED_REASON = '本版本不支持修改文档属性：移动知识库需要单篇重建、密级提高需要检索侧同步过滤，两者与 T-601 同批交付。'
+const TAGS_UNSUPPORTED_REASON = '本版本不支持修改内容标签：标签的归属表还没建（T-609）。密级与所属知识库可以正常保存。'
 
-function addTag() {
-  const v = newTag.value.trim()
-  if (!v) return
-  if (tags.value.includes(v)) return ElMessage.warning('标签已存在')
-  if (tags.value.length >= 8) return ElMessage.warning('建议控制在 3~8 个，过多会稀释过滤效果')
-  tags.value.push(v)
-  newTag.value = ''
-}
-function removeTag(t: string) {
-  tags.value = tags.value.filter((x) => x !== t)
-}
+/**
+ * ⚠️ 这里原先有 `addTag()` / `removeTag()`，本批**删掉了**它们。
+ *
+ * <p>与上一批删 `saveAttr()` 同一条纪律（**死代码不是起点，是诱饵**）：标签编辑器已经
+ * 禁用（理由见 `TAGS_UNSUPPORTED_REASON`），留一对"还在、还能调"的函数，下一个人接
+ * `T-609` 时最可能的动作是**只把控件解禁** —— 而后端的归属表还没建。
+ *
+ * <p>`T-609` 那批照着写即可：需求 §6.7 的约束是「输入后回车添加」+「建议控制在 3~8 个」。
+ */
 
 function sizeText(b: number) {
   return b / 1024 / 1024 >= 1 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${(b / 1024).toFixed(0)} KB`
@@ -158,16 +183,43 @@ async function reindex() {
   ElMessage.success('已发起重新索引，用于修复解析失败的文档')
 }
 /**
- * ⚠️ 这里**原先有** `saveAttr()`，本批**删掉了**它。
+ * 保存属性（`PATCH /doc/{id}/attributes` · `T-601`）。
  *
- * <p>删而不是留着：保存按钮已置灰（理由见 {@link ATTR_SAVE_BLOCKED_REASON}），
- * 留一个"还在、还能调"的函数，下一个人接 `T-601` 时最可能的动作是**只把按钮解禁**
- * ——而那时后端的两个前置（单篇重建 / 检索侧密级过滤）还没落地，于是"点保存 → 弹成功 →
- * 刷新没变"这条最难查的形态就回来了。**死代码不是起点，是诱饵。**
+ * <p>响应里的 `needReindex` = **本次触发了重建索引**（也就是移动了知识库）——
+ * 需求 §6.7 的两句：「属性修改后**立即生效，无需重建索引**；**移动知识库除外**」。
+ * 所以提示文案分两种，不合并成一句"保存成功"。
  *
- * <p>它当时那段「移动知识库」确认弹窗的文案在 `T-601` 立据点（需求 `06:712`
- * 「移动后需重建索引（复用 16 页的变更确认弹窗）」）—— 那批照着写即可。
+ * <p>⚠️ **只发生变化的字段才发**：服务端把"什么都没变"也当正常请求处理（幂等、不写库），
+ * 但每次无脑全量发会让那次"改没改"的判定永远为真，审计与日志上就看不出真实动作。
  */
+async function saveAttr() {
+  const m = meta.value
+  if (!m) return
+  const moving = kbChanged.value
+  if (moving) {
+    const target = kbOptions.value.find((k) => k.id === targetKbId.value)
+    await ElMessageBox.confirm(
+      `将本文档移动到「${target?.name ?? targetKbId.value}」。\n`
+      + '移动会触发重建索引：分片会重新向量化到目标知识库的分区，期间本文档暂时不可检索。\n'
+      + '⚠️ 目标知识库的密级不能低于本文档当前生效的密级 —— 否则换个库就能把机密文档降级（I-6）。',
+      '移动知识库',
+      { type: 'warning' },
+    )
+  }
+  try {
+    const res = await docApi.saveAttributes(docId.value, {
+      secretLevel: secretLevel.value !== m.securityLevel ? secretLevel.value : undefined,
+      kbId: moving ? targetKbId.value : undefined,
+    })
+    ElMessage.success(res.needReindex ? '已保存；知识库已变更，正在重建索引' : '已保存（立即生效，无需重建索引）')
+    await load()
+  } catch (e) {
+    // 服务端会给出**可行动**的原因（密级只能提高 / 目标库权限不足 / 目标库密级更低），
+    // 原样透出比吞掉换成"保存失败"有用得多
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
+}
+
 function discard() {
   if (!meta.value) return
   secretLevel.value = meta.value.securityLevel
@@ -278,7 +330,7 @@ async function removeDoc() {
               <div class="two">
                 <el-form-item label="密级">
                   <el-select v-model="secretLevel" style="width: 100%">
-                    <el-option v-for="l in secretOptions" :key="l" :label="l === meta.kbSecurityLevel ? `${SECRET_LABEL[l]}（继承知识库）` : SECRET_LABEL[l]" :value="l" />
+                    <el-option v-for="l in secretOptions" :key="l" :label="optionLabel(l)" :value="l" />
                   </el-select>
                   <div class="hint">可单独提高，不能低于知识库密级</div>
                 </el-form-item>
@@ -286,27 +338,29 @@ async function removeDoc() {
                   <el-select v-model="targetKbId" style="width: 100%">
                     <el-option v-for="k in kbOptions" :key="k.id" :label="k.name" :value="k.id" />
                   </el-select>
-                  <div class="hint" :class="{ warn: kbChanged }">{{ kbChanged ? '移动后需重建索引' : '移动后需重建索引' }}</div>
+                  <!-- 需求 §6.7：「移动知识库前弹出变更确认（复用 16 页）」+「移动后需重建索引」 -->
+                  <div class="hint" :class="{ warn: kbChanged }">
+                    {{ kbChanged ? '已改动：保存时会确认，并触发重建索引' : '改动后才需重建索引（改密级不需要）' }}
+                  </div>
                 </el-form-item>
               </div>
 
               <el-form-item label="内容标签">
+                <!--
+                  ⚠️ **禁用而不是"能点但不保存"**：文档级内容标签至今没有归属表
+                  （`IndexEnhancer` 的 javadoc 自己写着这一条）。让用户填完再告诉他存不上，
+                  与"按钮置灰要给原因"是同一条纪律的反面 —— 不能改就该一开始就说清。
+                  ⚠️ 下面那段"还没有落库表"的说明**保留**：禁用是对本版本的事实陈述，不是待办。
+                -->
                 <div class="tag-input-row">
-                  <el-input v-model="newTag" placeholder="输入后回车添加标签" @keyup.enter="addTag" />
-                  <el-button :icon="Plus" @click="addTag">添加</el-button>
+                  <el-input v-model="newTag" placeholder="输入后回车添加标签" disabled :title="TAGS_UNSUPPORTED_REASON" />
+                  <el-button :icon="Plus" disabled>添加</el-button>
                 </div>
                 <div class="chip-row mt-8">
-                  <el-tag v-for="t in tags" :key="t" closable @close="removeTag(t)">{{ t }}</el-tag>
+                  <el-tag v-for="t in tags" :key="t">{{ t }}</el-tag>
                   <span v-if="!tags.length" class="hint">暂无标签</span>
                 </div>
-                <!--
-                  ⚠️ 如实说明"标签还没有落点"。文档级内容标签至今没有归属表
-                  （`IndexEnhancer` 的 javadoc 自己写着这一条），所以这里编辑的标签
-                  **存不下来** —— 说清楚比让用户以为存上了强。
-                -->
-                <div class="hint warn">
-                  内容标签本版本还没有落库表（大模型已能抽取，缺的是归属）⇒ 这里的编辑暂不保存。
-                </div>
+                <div class="hint warn">{{ TAGS_UNSUPPORTED_REASON }}</div>
               </el-form-item>
 
               <div class="sec-title mt-16"><el-icon><Collection /></el-icon><b>文档信息</b></div>
@@ -521,16 +575,16 @@ async function removeDoc() {
         <span class="sb-left">
           <el-icon><InfoFilled /></el-icon>
           <!--
-            ⚠️ 这段话在**本版本是对的**：属性保存整体不可用（见下方按钮的 disabled 理由）。
-            不说清就会出现"点了保存、弹了成功、刷新后没变"——那正是最难查的一类假成功。
+            ⚠️ 这两句是需求 §6.7 的口径原文：**属性修改后立即生效、无需重建索引；移动知识库除外**。
+            分两句写而不是合成"保存后生效"：用户最需要知道的就是"这次改动要不要等重建"。
           -->
-          <span class="tiny muted">{{ ATTR_SAVE_BLOCKED_REASON }}</span>
+          <span class="tiny muted">
+            密级修改立即生效，无需重建索引；移动知识库会触发重建（保存时会再次确认）。
+          </span>
         </span>
         <div class="sb-actions">
           <el-button :disabled="!attrDirty" @click="discard">取消</el-button>
-          <el-tooltip :content="ATTR_SAVE_BLOCKED_REASON" placement="top">
-            <span><el-button type="primary" disabled>保存属性</el-button></span>
-          </el-tooltip>
+          <el-button type="primary" :disabled="!attrDirty" @click="saveAttr">保存属性</el-button>
         </div>
       </div>
     </el-card>

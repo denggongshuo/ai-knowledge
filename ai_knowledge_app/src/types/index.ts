@@ -723,8 +723,23 @@ export interface DocMeta extends DocInfo {
   downVotes: number | null
   /** 最近索引时刻；**从没跑过解析任务时为 `null`** */
   lastIndexAt: string | null
-  /** 知识库级密级（文档密级不可低于此） */
+  /**
+   * **当前生效**的密级 = `max(文档密级, 库密级)`（不变量 `I-6`）。
+   *
+   * ⚠️ 它就是上一条 `securityLevel`；这里把它和下面两个的关系写清楚：
+   * 生效值是**算出来的**，不是单独存的一列。密级下拉的**下限**取的正是它。
+   */
+  securityLevel: SecretLevel
+  /** 所属知识库的密级（文档密级不可低于此） */
   kbSecurityLevel: SecretLevel
+  /**
+   * 文档**自己**的密级；**`null` = 未覆盖（继承知识库）**。
+   *
+   * ⚠️ 它与 `kbSecurityLevel` 的关系**不能靠"值相等"推断**：用户主动把文档设成
+   * 与库相同的值，和"它继承自库"是两回事 —— 数据上分得很清（`sys_document.secret_level`
+   * 是不是 NULL）。需求 §6.7 要的「内部（**继承知识库**）」标注只用它判断。
+   */
+  ownSecurityLevel: SecretLevel | null
   /**
    * 内容标签（大模型生成，可人工修正）。
    *

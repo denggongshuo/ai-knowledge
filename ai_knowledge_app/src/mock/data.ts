@@ -542,10 +542,17 @@ export function docMetaOf(docId: number): DocMeta {
     tableParsed: isWhitepaper ? 11 : 4,
     imageTotal: isWhitepaper ? 8 : 3,
     imageParsed: isWhitepaper ? 8 : 3,
-    citations: isWhitepaper ? 37 : 12,
-    downVotes: isWhitepaper ? 2 : 0,
+    // ⚠️ 这两个数在真后端**恒为 null**（`cited` 列写入方恒写 null，属 `T-804`）。
+    // 原先 mock 给的是 37/12 与 2/0 —— 那是一份后端**产不出来**的数据：同一份
+    // `DocDetailView.vue` 在 mock 下走「37 次问答引用」那一支、在真后端下走「未采集」，
+    // 于是"页面上看着对"这件事在两种模式下指的不是一回事。
+    // 改成 null 与真后端对齐（`S7-M06-B` §3.1 步 7）。
+    citations: null,
+    downVotes: null,
     lastIndexAt: '2026-09-11 14:34:20',
     kbSecurityLevel: 'INTERNAL',
+    /** `null` = 文档**未覆盖**、密级继承知识库 ⇒ 页面标注「内部（继承知识库）」（需求 §6.7） */
+    ownSecurityLevel: null,
     tags: isWhitepaper ? ['产品架构', '接口鉴权', '检索策略', '错误码规范'] : ['技术规范', '架构设计'],
   }
 }
