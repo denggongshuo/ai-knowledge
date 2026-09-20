@@ -402,6 +402,8 @@ function indexStatusOf(path) {
 const indexRows = existsSync(INDEX) ? indexStatusOf(INDEX) : new Map()
 /** 回填清单里**不是路径**的条目（模式，如 `.workbuddy/memory/<日期>.md`）—— 报出来，不静默丢。 */
 const skipped = []
+/** 被「点名判定」放行的条目数（**报出来**，不静默）。 */
+let adjudicatedCount = 0
 
 for (const f of onDisk) {
   const path = resolve(PLAN_DIR, f)
@@ -429,6 +431,15 @@ for (const f of onDisk) {
   }
 
   // ---- L4a · 回填清单里勾了的，必须真的被这批改过 ----
+  // 🔴 **点名判定口**（与 L1 的「门禁号旁注」同一机制、同一理由）：历史漏项是**事实**，
+  //    改掉会毁证据；而**一条永远在叫的闸会被忽略**（本仓硬口径）。
+  //    ⇒ 计划文件里写一行 `> L4a 已判定：\`<文件>\` —— <理由>`，**必须点名**逐个文件，
+  //      只在该文件内生效。没点名的一律照报。
+  const adjudicated = new Set()
+  for (const line of text.split('\n')) {
+    const m = /^\s*>\s*L4a\s*已判定[：:]\s*(.+)$/.exec(line)
+    if (m) for (const t of m[1].matchAll(/`([^`]+\.md)`/g)) adjudicated.add(t[1].replace(/\\/g, '/'))
+  }
   const checked = [...text.matchAll(/^\s*-\s*\[x\][^\n]*?`([^`]+\.md)`/gm)].map((m) => m[1])
   if (checked.length === 0) continue
   const touched = filesTouchedBy(path)
@@ -442,6 +453,10 @@ for (const f of onDisk) {
     //    而 git 只认正斜杠 ⇒ 不归一化的话反斜杠那批会被当成"不是路径"**静默跳过** ——
     //    闸于是漏掉一半输入，而它自己看着是绿的（这正是本仓那条"闸的输入为空"的形态）。
     const target = raw.replace(/\\/g, '/')
+    if (adjudicated.has(target)) {
+      adjudicatedCount++
+      continue
+    }
     // 清单里有些条目是**模式**而不是路径（`.workbuddy/memory/<日期>.md`）——
     // 对它们无从做 git 对账。判据是"仓库里到底有没有这个文件"，
     // 而不是"它看起来像不像路径"（后者只能靠猜）。
@@ -460,6 +475,9 @@ for (const f of onDisk) {
   }
 }
 if (indexRows.size > 0) notes.push(`L4 索引状态列：读了 ${indexRows.size} 行 · 回填清单勾选项已逐条对 git`)
+if (adjudicatedCount > 0) {
+  notes.push(`L4a 有 ${adjudicatedCount} 条走了**点名判定**（计划文件里写了 \`> L4a 已判定\` 的声明行）`)
+}
 if (skipped.length > 0) {
   notes.push(`L4a 跳过 ${skipped.length} 条**不是路径**的清单项（模式而非文件）：`
     + `${[...new Set(skipped)].join(' · ')}`)
