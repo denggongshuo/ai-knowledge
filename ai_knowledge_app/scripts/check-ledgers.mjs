@@ -183,7 +183,22 @@ function isAfterAcceptance(line) {
 }
 
 for (const file of planFiles) {
-  const lines = readFileSync(resolve(PLAN_DIR, file), 'utf8').split(/\r?\n/)
+  const text = readFileSync(resolve(PLAN_DIR, file), 'utf8')
+  const lines = text.split(/\r?\n/)
+  /**
+   * 🔴 **已声明订正的文件**：`S8-M10-A`（2026-09-20）起支持的**唯一**一个"豁免口"。
+   *
+   * 由来：`S6-M09-B` 那一批把**自定编号**当门禁号写进了判据表，而正文**刻意不改**
+   * （当时的记法是事实，改掉会毁掉"那一批到底以为什么"的证据）⇒ 它会被永远报出来。
+   * 而**一条永远在报的闸会被忽略，被忽略的闸等于没有**（本仓已定过这条）。
+   *
+   * 判法：文件里出现一行显式的「门禁号订正」说明 ⇒ 该文件的**同名不同义**降级为
+   * **一条汇总说明**（仍然打印，仍然算"有这回事"，但不再计入不一致）。
+   * ⚠️ 只降级这一类；「引用了排期里不存在的门禁号」**照报** —— 那是另一回事。
+   * ⚠️ 别拿它当消音器：声明行会**原样打印在输出里**，人手加一行"订正"来消音是看得见的。
+   */
+  const annotated = /门禁号订正/.test(text)
+  let annotatedMismatch = 0
   let inAcceptance = false
   lines.forEach((line, i) => {
     if (isAcceptanceHeading(line)) inAcceptance = true
@@ -229,11 +244,19 @@ for (const file of planFiles) {
     //    松到只剩"完全说的不是一回事"才报 —— 而那正是本批要抓的形态。
     const namePart = authoritative.split(' ')[0]
     if (coverage(claimed, namePart) === 0 && coverage(claimed, authoritative) === 0) {
+      if (annotated) {
+        annotatedMismatch++
+        return
+      }
       problems.push(`L1 ${file}:${i + 1} **同名不同义**：${id}\n`
         + `       排期里说的是：${authoritative.slice(0, 90)}\n`
         + `       这里写的是  ：${claimed.slice(0, 90)}`)
     }
   })
+  if (annotatedMismatch > 0) {
+    notes.push(`L1 ${file}：该文件已声明「门禁号订正」⇒ 其中 ${annotatedMismatch} 处同名不同义`
+      + '按**订正记录**处理（不再计入不一致）。⚠️ 声明行本身请留在文件里，别删')
+  }
 }
 
 // ---------------------------------------------------------------------------

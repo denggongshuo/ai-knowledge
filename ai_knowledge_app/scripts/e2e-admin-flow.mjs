@@ -9,7 +9,7 @@
  * 断言看业务 code 不看 HTTP 码），覆盖 M02 的三页 + M09 的一页：
  * <ol>
  *   <li><b>用户管理</b> `/system/user` —— 部门树 + 用户列表来自真后端（128 人 / 分页 10 行 / admin 首行）；</li>
- *   <li><b>角色管理</b> `/system/role` —— 5 角色 + 权限树 total=38；</li>
+ *   <li><b>角色管理</b> `/system/role` —— 5 角色 + 权限树 total=40（`S8-M10-A` 加了两个 ops 码，原 38）；</li>
  *   <li><b>授权管理</b> `/system/grant` —— 12×5 矩阵 + 8 库授权列表；并在矩阵上做一次
  *       「改档 → 保存 → 还原 → 保存」的**真实写入**，证明写侧接口与审计打点接通（G2-3/G2-4/G2-9）。</li>
  *   <li><b>模型配置</b> `/system/model`（`S6-M09-C`）—— 四条**反面**判据：本版本把
@@ -295,7 +295,10 @@ async function main() {
     check(roleData.total === 5, '角色列表 total=5（后端）', `total=${roleData.total}`)
     check(roleData.list?.[0]?.code === 'SUPER_ADMIN', '首行 SUPER_ADMIN', `首行=${roleData.list?.[0]?.code}`)
     const permTotal = JSON.parse(permEntry.body ?? '{}').data?.total
-    check(permTotal === 38, '权限树 total=38（G2-2）', `total=${permTotal}`)
+    // ⚠️ 这个数是**权限点的总数**，会随新增权限码而变 —— 改它的时候顺手问一句
+    // "新加的两个码授给了谁"（`S8-M10-A` 的 `ops:qa:view`/`ops:qa:handle` 见 `V32`：
+    // KB_ADMIN 两个都有、AUDITOR 只有读）。38 → 40 就是那一次。
+    check(permTotal === 40, '权限树 total=40（G2-2）', `total=${permTotal}`)
     const shot2 = await send('Page.captureScreenshot', { format: 'png' })
     writeFileSync(`${OUT_DIR}/role.png`, Buffer.from(shot2.data, 'base64'))
 
