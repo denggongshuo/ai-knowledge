@@ -1798,14 +1798,31 @@ register('GET', '/api/ops/retrieval/overview', (_req, res) => {
 })
 
 register('GET', '/api/ops/retrieval/pipeline', (_req, res) => {
-  const retrievalSide = mockPipeline.slice(0, 5).reduce((s, p) => s + p.costMs, 0)
-  const total = retrievalSide + (mockPipeline[5]?.costMs ?? 0)
-  json(res, 0, { list: mockPipeline, retrievalSideMs: retrievalSide, totalMs: total })
+  // 检索侧 = 需求 §2.2 那 5 项（= 除「可见范围」「表格回表」「LLM 生成」之外的段）
+  const sideStages = ['查询解析', 'Embedding', '向量召回', 'BM25 召回', 'RRF 融合', 'Rerank']
+  const cost = (name: string) => mockPipeline.find((p) => p.name === name)?.costMs ?? 0
+  const retrievalSideMs = sideStages.reduce((s, n) => s + cost(n), 0)
+  const generationMs = cost('LLM 生成')
+  // 其他 = 可见范围 + 表格回表 + 未归段（与真实后端同口径）
+  const otherMs = cost('可见范围') + cost('表格回表')
+  const totalMs = retrievalSideMs + generationMs + otherMs
+  json(res, 0, {
+    list: mockPipeline,
+    pipelineRows: 1284,
+    skippedNoGeneration: 0,
+    retrievalSideMs,
+    generationMs,
+    otherMs,
+    totalMs,
+  })
 })
 
 register('GET', '/api/ops/retrieval/score-distribution', (_req, res) => {
-  const count = mockScoreDistribution.reduce((s, b) => s + b.count, 0)
-  json(res, 0, { list: mockScoreDistribution, total: count })
+  const total = mockScoreDistribution.reduce((s, b) => s + b.count, 0)
+  const unscored = mockScoreDistribution
+    .filter((b) => b.label === '无法定档')
+    .reduce((s, b) => s + b.count, 0)
+  json(res, 0, { list: mockScoreDistribution, total, unscored, noRerank: 0, emptyRecall: 0 })
 })
 
 register('GET', '/api/ops/retrieval/rerank-effect', (_req, res) => {
@@ -1814,7 +1831,7 @@ register('GET', '/api/ops/retrieval/rerank-effect', (_req, res) => {
 
 register('GET', '/api/ops/retrieval/kb-quality', (_req, res) => {
   const questions = mockKbQuality.reduce((s, k) => s + k.questions, 0)
-  json(res, 0, { list: mockKbQuality, questions })
+  json(res, 0, { list: mockKbQuality, questions, othersQuestions: 0 })
 })
 
 register('GET', '/api/ops/usage/overview', (_req, res) => {

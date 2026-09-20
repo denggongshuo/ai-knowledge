@@ -1,5 +1,5 @@
 import { http, chatStream, type SSEHandlers } from './request'
-import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQuality, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, PipelineStage, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RoleInfo, ScoreBucket, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
+import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
 
 /** 认证接口 */
 export const authApi = {
@@ -201,12 +201,18 @@ export const opsApi = {
     http.post<{ taskId: string; status: string; note: string }>('/ops/qa/export', body),
 
   // ---- 20 检索质量分析 ----
-  retrievalOverview: () => http.get<RetrievalOverview>('/ops/retrieval/overview', { range: '7d' }),
-  pipeline: () =>
-    http.get<{ list: PipelineStage[]; retrievalSideMs: number; totalMs: number }>('/ops/retrieval/pipeline', { range: '7d' }),
-  scoreDistribution: () => http.get<{ list: ScoreBucket[]; total: number }>('/ops/retrieval/score-distribution', { range: '7d' }),
-  rerankEffect: () => http.get<RerankEffect>('/ops/retrieval/rerank-effect', { range: '7d' }),
-  kbQuality: () => http.get<{ list: KbQuality[]; questions: number }>('/ops/retrieval/kb-quality', { range: '7d' }),
+  // ⚠️ 五个方法**都要吃 `range`**：页面上是同一个下拉框，页 11 那批就是因为
+  // `loadFeedback()` 不传 range 而让"统计卡 7 天、榜单 7 天"变成两个不同的窗口。
+  retrievalOverview: (query?: { range?: string }) =>
+    http.get<RetrievalOverview>('/ops/retrieval/overview', query),
+  pipeline: (query?: { range?: string }) =>
+    http.get<RetrievalPipeline>('/ops/retrieval/pipeline', query),
+  scoreDistribution: (query?: { range?: string }) =>
+    http.get<ScoreDistribution>('/ops/retrieval/score-distribution', query),
+  rerankEffect: (query?: { range?: string }) =>
+    http.get<RerankEffect>('/ops/retrieval/rerank-effect', query),
+  kbQuality: (query?: { range?: string }) =>
+    http.get<KbQualityRanking>('/ops/retrieval/kb-quality', query),
 
   // ---- 21 使用统计 ----
   usageOverview: () => http.get<UsageOverview>('/ops/usage/overview', { range: '7d' }),

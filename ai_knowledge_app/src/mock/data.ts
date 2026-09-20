@@ -725,29 +725,48 @@ export const mockFeedbackStats: FeedbackStats = {
 
 // ---------------- 20 检索质量分析 ----------------
 export const mockRetrievalOverview: RetrievalOverview = {
+  totalQuestions: 1284,
+  comparableQuestions: 1284,
+  noRerankQuestions: 0,
+  emptyRecallQuestions: 0,
   avgTopScore: 0.71,
   afterTop1HitRate: 81,
   rerankGain: 18,
   avgCitedChunks: 3.2,
+  // 与 `V2` 种子的 `retrieval.miss-threshold` 同值
+  missThreshold: 0.35,
 }
 
-/** 检索链路耗时分解（检索侧 12+86+34+8+288 = 428ms；全链路 428+1240 = 1668ms） */
+/**
+ * 链路九段（段名与 `ChatWireMapper.stages()` 逐字一致）。
+ *
+ * ⚠️ 需求 §2.2 的「关注指标」列里**只有两项有采集点**（去重后候选数 / 重排前后命中率差），
+ * 其余四个后端没有数据源 ⇒ 与真实后端一样填 `null`（页面显示 `—`），
+ * **不留** 96.4% / 88.2% 这类看起来像真的示例值。
+ *
+ * 检索侧 = 12 + 30 + 56 + 34 + 8 + 288 = 428ms；生成 1240ms；其他 0 ⇒ 全链路 1668ms。
+ */
 export const mockPipeline: PipelineStage[] = [
-  { name: '查询理解', costMs: 12, metric: '改写成功率', metricValue: '96.4%', action: '调整 HyQ 生成提示词' },
-  { name: '向量召回', costMs: 86, metric: 'Top20 内命中率', metricValue: '88.2%', action: '调 chunkSize / 换嵌入模型' },
-  { name: '关键词召回', costMs: 34, metric: '精确匹配命中率', metricValue: '71.5%', action: '优化分词与标识符保护' },
-  { name: 'RRF 融合', costMs: 8, metric: '去重后候选数', metricValue: '32.4', action: '调整融合权重' },
-  { name: 'Rerank 重排', costMs: 288, metric: '重排前后命中率差', metricValue: '+18pp', action: '换重排模型 / 调候选数' },
-  { name: '生成答案', costMs: 1240, metric: '首字延迟 / 引用采纳率', metricValue: '420ms / 78%', action: '调 prompt 与上下文长度' },
+  { name: '可见范围', costMs: 0, metric: null, metricValue: null, action: null },
+  { name: '查询解析', costMs: 12, metric: '改写成功率', metricValue: null, action: '调整 HyQ 生成提示词' },
+  { name: 'Embedding', costMs: 30, metric: null, metricValue: null, action: null },
+  { name: '向量召回', costMs: 56, metric: 'Top20 内命中率', metricValue: null, action: '调 chunkSize / 换嵌入模型' },
+  { name: 'BM25 召回', costMs: 34, metric: '精确匹配命中率', metricValue: null, action: '优化分词与标识符保护' },
+  { name: 'RRF 融合', costMs: 8, metric: '去重后候选数', metricValue: '26', action: '调整融合权重' },
+  { name: 'Rerank', costMs: 288, metric: '重排前后命中率差', metricValue: '+18pp', action: '切换重排模型 / 调候选数' },
+  { name: '表格回表', costMs: 0, metric: null, metricValue: null, action: null },
+  { name: 'LLM 生成', costMs: 1240, metric: '首字延迟 / 引用采纳率', metricValue: null, action: '调 prompt 与上下文长度' },
 ]
 
-/** Top1 相似度分布（五档，合计 1284） */
+/** Top1 相似度分布（需求五档 + 「无法定档」，合计 1284） */
 export const mockScoreDistribution: ScoreBucket[] = [
   { label: '优秀', range: '0.80 ~ 1.00', count: 514, percent: 40.0 },
   { label: '良好', range: '0.60 ~ 0.80', count: 398, percent: 31.0 },
   { label: '一般', range: '0.40 ~ 0.60', count: 231, percent: 18.0 },
   { label: '边缘', range: '0.35 ~ 0.40', count: 33, percent: 2.6, danger: true },
   { label: '未命中', range: '< 0.35', count: 108, percent: 8.4, danger: true },
+  // 空召回（没有 Top1）+ 未重排（分数不同量纲）—— 这两类装不进上面五档
+  { label: '无法定档', range: '—', count: 0, percent: 0, danger: true },
 ]
 
 export const mockRerankEffect: RerankEffect = {
@@ -755,15 +774,17 @@ export const mockRerankEffect: RerankEffect = {
   afterTop1HitRate: 81,
   gainPercent: 18,
   avgLatencyMs: 288,
+  covered: 1284,
+  comparable: 1284,
 }
 
 /** 各知识库检索质量排行（提问数合计 ≤ 1284，未列出的归入其他） */
 export const mockKbQuality: KbQuality[] = [
-  { kbName: '产品技术文档库', questions: 486, avgTopScore: 0.78, missRate: 4.2, trend: 'STABLE', issue: '表格密集 · 1 张表格未识别' },
-  { kbName: '客户合同库', questions: 238, avgTopScore: 0.62, missRate: 14.3, trend: 'DOWN', issue: '跨页表格多 · 索引未完成（274/316）' },
-  { kbName: '人力资源制度库', questions: 212, avgTopScore: 0.74, missRate: 6.1, trend: 'STABLE', issue: '—' },
-  { kbName: '运维故障知识库', questions: 164, avgTopScore: 0.71, missRate: 7.8, trend: 'STABLE', issue: '—' },
-  { kbName: '外部培训资料库', questions: 84, avgTopScore: 0.58, missRate: 19.0, trend: 'DOWN', issue: '扫描件为主 · OCR 质量差' },
+  { kbId: null, kbName: '产品技术文档库', questions: 486, avgTopScore: 0.78, missRate: 4.2, trend: 'STABLE', issue: '表格密集 · 1 张表格未识别' },
+  { kbId: null, kbName: '客户合同库', questions: 238, avgTopScore: 0.62, missRate: 14.3, trend: 'DOWN', issue: '跨页表格多 · 索引未完成（274/316）' },
+  { kbId: null, kbName: '人力资源制度库', questions: 212, avgTopScore: 0.74, missRate: 6.1, trend: 'STABLE', issue: '—' },
+  { kbId: null, kbName: '运维故障知识库', questions: 164, avgTopScore: 0.71, missRate: 7.8, trend: 'STABLE', issue: '—' },
+  { kbId: null, kbName: '外部培训资料库', questions: 84, avgTopScore: 0.58, missRate: 19.0, trend: 'DOWN', issue: '扫描件为主 · OCR 质量差' },
 ]
 
 // ---------------- 21 使用统计 ----------------

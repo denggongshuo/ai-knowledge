@@ -906,49 +906,128 @@ export interface ReplayResult {
   note: string
 }
 
-/** 检索链路阶段 */
+/**
+ * 检索链路的一个阶段。
+ *
+ * ⚠️ `metric` / `metricValue` / `action` 都可为 `null`：需求 §2.2「关注指标」列里
+ * **只有「去重后候选数」和「重排前后命中率差」有采集点**，其余四个后端没有数据源
+ * ⇒ 如实发 `null`，页面显示 `—`（**不许填 0，也不许填 mock 的示例值**）。
+ */
 export interface PipelineStage {
   name: string
   costMs: number
-  metric: string
-  metricValue: string
-  action: string
+  metric: string | null
+  metricValue: string | null
+  action: string | null
 }
 
-/** 分数档位（五档色阶） */
+/**
+ * 链路耗时分解的响应。
+ *
+ * 🔴 三段相加恰等于全链路：`retrievalSideMs + generationMs + otherMs === totalMs`。
+ * 需求 §2.2 那 5 项里**不含「可见范围」与「表格回表」**，可它们是真花的钱 ⇒
+ * 由 `otherMs` 承载（不给它的话差额没有任何一栏显示）。
+ *
+ * ⚠️ 整表只算在 `llm_generation_millis` 非空的行上（空召回不调模型）——
+ * `skippedNoGeneration` 是被排除的行数，页面要说明，否则读者会以为它是全量的。
+ */
+export interface RetrievalPipeline {
+  list: PipelineStage[]
+  pipelineRows: number
+  skippedNoGeneration: number
+  retrievalSideMs: number
+  generationMs: number
+  otherMs: number
+  totalMs: number
+}
+
+/** 分数档位（需求五档 + 本批补的「无法定档」） */
 export interface ScoreBucket {
   label: string
   range: string
   count: number
   percent: number
-  /** 危险档位（边缘 / 未命中） */
+  /** 危险档位（边缘 / 未命中 / 无法定档） */
   danger?: boolean
 }
 
-/** 检索质量四指标 */
+/**
+ * 分数分布的响应。
+ *
+ * 🔴 需求 §2.8 的「五档合计 = 提问总数」**在有空召回时不可能成立**
+ * （空召回的行 `top1_score` 是 `NULL`，落不进任何一档）⇒ 补了第 6 档「无法定档」，
+ * 并把它的两个成因分开给：`noRerank`（没重排，分数与档位不同量纲）与
+ * `emptyRecall`（重排了但没召回到）。合成一个数会让"配置问题"与"覆盖问题"看着像同一件事。
+ */
+export interface ScoreDistribution {
+  list: ScoreBucket[]
+  total: number
+  unscored: number
+  noRerank: number
+  emptyRecall: number
+}
+
+/**
+ * 检索质量四指标。
+ *
+ * ⚠️ 四个数**都可为 `null`** —— `null` = **数据不足**（没有可比的行），不是 0。
+ * 全是 0 会被读成"一条都没命中"，而真相是"没有数据"（需求 §2.8 最后一条点名要的）。
+ */
 export interface RetrievalOverview {
-  avgTopScore: number
-  afterTop1HitRate: number
-  rerankGain: number
-  avgCitedChunks: number
+  totalQuestions: number
+  /** 可比集：重排过且有 Top1 的行 —— 下面几个比率/均值都在这一批上算 */
+  comparableQuestions: number
+  /** 未重排（分数是融合分，与判定线不同量纲，**不参与**任何比率） */
+  noRerankQuestions: number
+  /** 重排了但空召回（没有 Top1） */
+  emptyRecallQuestions: number
+  avgTopScore: number | null
+  afterTop1HitRate: number | null
+  rerankGain: number | null
+  avgCitedChunks: number | null
+  missThreshold: number
 }
 
-/** Rerank 效果验证（收益 vs 代价） */
+/**
+ * Rerank 效果验证（收益 vs 代价）。
+ *
+ * 🔴 前后两个比率的分母是**同一个子集**（`covered`：重排前那条也拿到了重排分的行）——
+ * 只有同一批行上的差才是"重排带来的提升"。`covered / comparable` 就是覆盖率，
+ * 页面**必须**显示它：否则这两个数看起来是全量的。
+ */
 export interface RerankEffect {
-  beforeTop1HitRate: number
-  afterTop1HitRate: number
-  gainPercent: number
-  avgLatencyMs: number
+  beforeTop1HitRate: number | null
+  afterTop1HitRate: number | null
+  gainPercent: number | null
+  avgLatencyMs: number | null
+  /** 有「重排前」分数的行数（两个比率的共同分母） */
+  covered: number
+  /** 可比集行数（重排过且有 Top1） */
+  comparable: number
 }
 
-/** 各知识库检索质量 */
+/**
+ * 各知识库检索质量。
+ *
+ * ⚠️ `trend` 里的 `UNKNOWN` 是**样本不足**，不是"稳定"（页面文案要区分）；
+ * `issue` 本批**恒为 `null`** —— 「主要问题」要靠文档质量列 / 解析问题表，
+ * 与检索打点是两张表的事 ⇒ 后端不猜。
+ */
 export interface KbQuality {
+  kbId: number | null
   kbName: string
   questions: number
-  avgTopScore: number
-  missRate: number
-  trend: 'STABLE' | 'DOWN'
-  issue: string
+  avgTopScore: number | null
+  missRate: number | null
+  trend: 'STABLE' | 'UP' | 'DOWN' | 'UNKNOWN'
+  issue: string | null
+}
+
+/** 各知识库质量排行的响应 */
+export interface KbQualityRanking {
+  list: KbQuality[]
+  questions: number
+  othersQuestions: number
 }
 
 /** 使用统计四指标 */
