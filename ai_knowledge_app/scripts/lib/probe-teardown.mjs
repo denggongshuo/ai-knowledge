@@ -46,8 +46,19 @@ const PARTITION_SEP = '_g'
 /** MinIO 桶在容器内的挂载点（`docker exec kb-minio` 里的路径）。 */
 const MINIO_ROOT = '/data/rag-documents'
 
-/** 覆盖率闸扫描的列 —— 三个都是「外键式归属列」，能间接枚举出会被探针写脏的表。 */
-const SCOPE_COLUMNS = ['kb_id', 'doc_id', 'user_id']
+/**
+ * 覆盖率闸扫描的列**模式** —— 三个都是「外键式归属列」，能间接枚举出会被探针写脏的表。
+ *
+ * <p>🔴 `T-O15`（2026-09-20）：原来是**精确相等**（`in ('kb_id','doc_id','user_id')`），
+ * 于是**换个列名就能从闸下面走过去** —— `target_user_id` / `last_user_id` / `owner_user_id`
+ * 都带归属语义却一个都扫不到。`V31` 的头注点名警告过这个形状，
+ * 而 `S8-M10-A` 的 `sys_qa_miss.last_user_id` 是一个**真的需要这么命名**的例子
+ * （聚合行，叫 `user_id` 是用名字撒谎）⇒ 与其靠"记得手工登记"，不如让闸自己长眼睛。
+ *
+ * <p>⚠️ 两边必须一致：Java 侧 `ProbeArtifactCoverageTest.SCOPE_PATTERNS`。
+ * 两份登记表靠 `ProbeArtifactCoverageTest` 对账 —— 模式不一致会让对账失去意义。
+ */
+const SCOPE_PATTERNS = ['%kb_id%', '%doc_id%', '%user_id%']
 
 /**
  * 归属列 → 它指向的**父表**。用来数「无主残留」（指向一个已不存在的父行）。
@@ -195,6 +206,19 @@ export const USER_ARTIFACTS = [
       + '而本表按 `user_id in (...)` 删 ⇒ **广播行删不掉**。'
       + '本批的唯一产出方是异步任务终态、总带 owner ⇒ 不产广播行；'
       + '收尾判据里有一条「user_id is null 的行数为 0」盯着它' },
+
+  // ---- S8-M10-A 新增（未命中清单）：`T-A00` 的沉淀池 ----
+  // 🔴 归属列叫 `last_user_id`（**最近**提问人）而不是 `user_id` —— 因为它是**聚合行**：
+  //    一行可能对应好几个提问人，叫 user_id 是用名字撒谎。
+  // ⚠️ 代价：覆盖率闸扫的是**精确等于** `user_id` 的列名 ⇒ **闸看不见本表**。
+  //    所以这一行是**手工**登记的，不是被闸逼出来的 —— 正是 `V31` 头注警告的那个形状
+  //    （换个列名就能躲开闸）。这里没有躲的意思：登记是主动的，理由也写在这里。
+  // ⚠️ 顺序：**必须先于 `sys_user`**（顺序即执行顺序）。
+  { id: 'sql:sys_qa_miss', kind: 'sql-user', table: 'sys_qa_miss', via: 'subquery',
+    deleteSql: 'delete from sys_qa_miss where last_user_id in ({userIds});',
+    countSql: 'select count(*) from sys_qa_miss where last_user_id in ({userIds});',
+    why: '未命中池（T-A00）。按 `last_user_id` 删。⚠️ 真实用户提问沉淀出来的行**不该被清** ——'
+      + '这里删的是探针账号名下的那些（`via: subquery` 走的是探针用户 id 列表）' },
 
   { id: 'sql:sys_user', kind: 'sql-user', table: 'sys_user', via: 'username', why: '用户主表' },
   {
@@ -446,7 +470,7 @@ export function assertArtifactCoverage() {
   const raw = mysqlScalar(
     `select table_name, group_concat(distinct column_name order by column_name) ` +
     `from information_schema.columns ` +
-    `where table_schema = database() and column_name in (${SCOPE_COLUMNS.map((c) => `'${c}'`).join(',')}) ` +
+    `where table_schema = database() and (${SCOPE_PATTERNS.map((p) => `column_name like '${p}'`).join(' or ')}) ` +
     `group by table_name order by table_name;`,
   )
   const registered = new Set([
@@ -463,7 +487,7 @@ export function assertArtifactCoverage() {
 
   if (unknown.length > 0) {
     throw new Error(
-      `产物覆盖率闸未通过：以下表带 ${SCOPE_COLUMNS.join('/')} 列但**未登记** —— ${unknown.join(' · ')}。`
+      `产物覆盖率闸未通过：以下表带 ${SCOPE_PATTERNS.join(' / ')} 之类的归属列但**未登记** —— ${unknown.join(' · ')}。`
       + '处置：到 ai_knowledge_app/scripts/lib/probe-teardown.mjs 的 KB_ARTIFACTS / USER_ARTIFACTS '
       + '加一行；若它本就不该被清（例：只增不删的日志表），加到 OUT_OF_SCOPE 并**写明理由**。'
       + `（已登记 ${registered.size} 张 / 显式豁免 ${exempt.size} 张）`,
@@ -563,6 +587,25 @@ function minioKeysOf(code) {
  *
  * @returns {number} 删掉的通知行数
  */
+/**
+ * 无主未命中问题（`T-A00` · `S8-M10-A` 新增）。
+ *
+ * <p>与 `sweepOrphanNotices` 同一条来历：`MissSink` 接线之后，**凡是走真 HTTP 提问
+ * 且被判未命中的脚本都会往池子里写** —— 而那是打点那条路旁路写的，不在任何脚本的清理代码里。
+ *
+ * <p>⚠️ 归属只有 `last_user_id` 这一条线索（列名**不是** `user_id`，因为它是聚合行），
+ * 所以覆盖率闸看不见这张表 —— 它靠的是 `USER_ARTIFACTS` 里的**手工登记**。
+ * ⚠️ **顺序**：排在用户族清理**之后**（人先没了，行才变无主）。
+ */
+export function sweepOrphanMisses() {
+  const before = mysqlCount('select count(*) from sys_qa_miss;')
+  mysqlScalar(
+    'delete from sys_qa_miss where last_user_id is not null'
+    + ' and last_user_id not in (select id from sys_user);',
+  )
+  return before - mysqlCount('select count(*) from sys_qa_miss;')
+}
+
 export function sweepOrphanNotices() {
   const before = mysqlCount('select count(*) from sys_notice;')
   mysqlScalar(
@@ -617,11 +660,14 @@ export async function teardownKbProbe(code) {
   //    ④ 刚把任务行删掉，通知**在这一刻才变成**无主。顺序反了要等下一轮才扫得到。
   const noticesRemoved = sweepOrphanNotices()
 
+  // ④.6 无主未命中问题（`T-A00` 的外溢面）—— 与 ④.5 同理由、同顺序要求。
+  const missesRemoved = sweepOrphanMisses()
+
   // ⑤ 残留自检 —— 独立观测点
   const residue = await findKbProbeResidue(code, { ids, minioKeys, quiesceTimedOut: !!quiesce.timedOut })
   return {
     code, ids, minioKeys,
-    removed: { minio: minioRemoved, sql: '见 residue', notices: noticesRemoved },
+    removed: { minio: minioRemoved, sql: '见 residue', notices: noticesRemoved, misses: missesRemoved },
     residue, quiesce,
   }
 }

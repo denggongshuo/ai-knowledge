@@ -32,17 +32,34 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ProbeArtifactCoverageTest extends ApiTestSupport {
 
-    /** 归属列 —— 与脚本侧 `SCOPE_COLUMNS` 保持一致（那边在 `probe-teardown.mjs`）。 */
-    private static final List<String> SCOPE_COLUMNS = List.of("kb_id", "doc_id", "user_id");
+    /**
+     * 归属列的匹配模式 —— 与脚本侧 `SCOPE_PATTERNS` 保持一致（那边在 `probe-teardown.mjs`）。
+     *
+     * <h3>🔴 `T-O15`（2026-09-20）：从**精确相等**改成**包含**</h3>
+     * <p>原来扫的是 `column_name in ('kb_id','doc_id','user_id')` —— 精确匹配。
+     * 于是**换个列名就能从闸下面走过去**：`target_user_id` / `last_user_id` /
+     * `owner_user_id` 都带归属语义，却一个都不在扫描集里。
+     * `V31` 的头注释点名警告过这个形状（「叫 `target_user_id` 就能躲开覆盖率闸」），
+     * 而 `S8-M10-A` 的 `sys_qa_miss` 又正是一个**真的需要这么命名**的例子
+     * （它是聚合行，`last_user_id` = 最近提问人，叫 `user_id` 是用名字撒谎）——
+     * ⇒ 与其每次都靠"记得手工登记"，不如让闸自己长眼睛。
+     *
+     * <p>⚠️ 放宽的代价是**可能多扫到不相干的表**（误报）。实测当时全库只多出
+     * `sys_qa_miss`（已登记）与 `sys_retrieval_trace.kb_ids`（本就登记过），
+     * 没有误报。真出现误报时**登记或豁免它**，别把模式改回精确匹配。
+     */
+    private static final List<String> SCOPE_PATTERNS = List.of("%kb_id%", "%doc_id%", "%user_id%");
 
     /** 扫出"带归属列"的表。这**就是**闸的输入 —— 权威来源是数据库，不是谁的记忆。 */
     private Set<String> scannedTables() {
-        String in = SCOPE_COLUMNS.stream().map(c -> "?").collect(java.util.stream.Collectors.joining(","));
+        String where = SCOPE_PATTERNS.stream()
+                .map(p -> "column_name like ?")
+                .collect(java.util.stream.Collectors.joining(" or "));
         List<String> names = jdbc.queryForList(
                 "select distinct table_name from information_schema.columns "
-                        + "where table_schema = database() and column_name in (" + in + ") "
+                        + "where table_schema = database() and (" + where + ") "
                         + "order by table_name",
-                String.class, SCOPE_COLUMNS.toArray());
+                String.class, SCOPE_PATTERNS.toArray());
         return new LinkedHashSet<>(names);
     }
 
@@ -61,6 +78,38 @@ class ProbeArtifactCoverageTest extends ApiTestSupport {
                         + "若它本就不该被清，加到 EXEMPT 并**写明理由**。"
                         + "⚠️ 上一次漏的是 sys_async_task，实测代价是 76 行/轮的无主残留")
                 .isEmpty();
+    }
+
+    @Test
+    @DisplayName("T-O15：换个列名也躲不开闸（`target_user_id` / `last_user_id` 都要被扫到）")
+    void renamedOwnershipColumnIsStillCaught() {
+        // ① 模式本身不能被悄悄窄回去 —— 否则这条闸又退回"精确匹配"，
+        //    而"谁把模式改了"没有任何现象
+        assertThat(SCOPE_PATTERNS)
+                .as("归属列的匹配模式被改了。若是有意收窄，请同时说明为什么"
+                        + "「换个列名就躲开」这件事不再要紧")
+                .containsExactly("%kb_id%", "%doc_id%", "%user_id%");
+
+        // ② 用**真库真 LIKE 语义**验一遍几个改名写法。
+        //    ⚠️ 这里刻意不建临时表去端到端验：MySQL 的 DDL 是隐式提交的，
+        //    建表会**污染同一次跑批里别的类**（覆盖率闸那一瞬间会看到一张未登记的表）。
+        //    跑在真 SQL 引擎上的 LIKE 语义 + 上面那条模式断言，两条合起来足够。
+        assertThat(matchesScope("target_user_id")).as("V31 头注点名的那个躲法").isTrue();
+        assertThat(matchesScope("last_user_id")).as("sys_qa_miss 的列（T-O15 的由来）").isTrue();
+        assertThat(matchesScope("owner_user_id")).isTrue();
+        assertThat(matchesScope("kb_ids")).as("sys_retrieval_trace 的逗号串列").isTrue();
+        assertThat(matchesScope("operator_id")).as("只是长得像，别把无关列也拉进来").isFalse();
+    }
+
+    /** 用真库的 `LIKE` 判一个列名会不会被闸扫到（模式语义由 DB 决定，不由我复述）。 */
+    private boolean matchesScope(String columnName) {
+        String where = SCOPE_PATTERNS.stream()
+                .map(p -> "? like ?")
+                .collect(java.util.stream.Collectors.joining(" or "));
+        Object[] args = SCOPE_PATTERNS.stream()
+                .flatMap(p -> java.util.stream.Stream.of(columnName, p))
+                .toArray();
+        return Boolean.TRUE.equals(jdbc.queryForObject("select (" + where + ")", Boolean.class, args));
     }
 
     @Test
