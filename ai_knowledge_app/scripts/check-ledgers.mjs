@@ -186,7 +186,18 @@ for (const file of planFiles) {
   const text = readFileSync(resolve(PLAN_DIR, file), 'utf8')
   const lines = text.split(/\r?\n/)
   /**
-   * 🔴 **已声明订正的文件**：`S8-M10-A`（2026-09-20）起支持的**唯一**一个"豁免口"。
+   * 🔴 **两个"豁免口"，都不许当消音器用**（第二个是 `T-O18` 2026-09-20 加的）：
+   * <ol>
+   *   <li>{@code 门禁号订正}（整份文件豁免）—— 见下；</li>
+   *   <li>{@code 门禁号旁注：G3-3 / G3-8}（**点名**豁免）—— 见 {@link curated}。</li>
+   * </ol>
+   * 为什么需要第二个：L1 的判法只能看出"表述与排期那一行的文字重叠为零"，
+   * 而**一个门禁常常有几个侧面**（口径 / 运行时 / 前半 / 后半）。那些行不是错号，
+   * 逐条判定为"接受"之后就**没有地方记**，于是每批开工都再报一遍 ——
+   * 而一条永远在报的闸会被忽略，被忽略的闸等于没有（本仓已定过这条）。
+   *
+   * <hr>
+   * 🔴 **已声明订正的文件**（第一个口子）：`S8-M10-A`（2026-09-20）起支持。
    *
    * 由来：`S6-M09-B` 那一批把**自定编号**当门禁号写进了判据表，而正文**刻意不改**
    * （当时的记法是事实，改掉会毁掉"那一批到底以为什么"的证据）⇒ 它会被永远报出来。
@@ -199,6 +210,30 @@ for (const file of planFiles) {
    */
   const annotated = /门禁号订正/.test(text)
   let annotatedMismatch = 0
+
+  /**
+   * 🔴 **已点名的「同名不同义」判定**（`T-O18` · 2026-09-20 起）。
+   *
+   * 与上一个口子的区别：`门禁号订正` 是**整份文件**豁免，而这个要求**把门禁号点出来**，
+   * 且只对该文件里**那几个号**生效。
+   *
+   * 由来（`2026-09-16-S3-D.md` 的三条）：一个门禁常常有**几个侧面**
+   * （`G3-3` = 前半 `needReindex` / 字段集同源 / 后半「未重建前检索不变」；
+   * `G3-8` = 口径侧 / 运行时侧面），而本脚本的判法只能看出"表述与排期的文字重叠为零"。
+   * 那三条**不是错号**（同一门禁的不同侧面），判定为**接受**；
+   * 但没有记录判定的地方 ⇒ 它们每批都会再报一遍，
+   * 而**一条永远在报的闸会被忽略，被忽略的闸等于没有**（上一批刚定过这条）。
+   *
+   * ⚠️ 它仍然不是消音器：① 必须**点名**门禁号（不点名 = 不生效）；
+   * ② 只降级「同名不同义」这一类（引用了不存在的号**照报**）；
+   * ③ 只在该文件内生效；④ 声明行会原样打印在输出里，加一行来消音是看得见的。
+   */
+  const curated = new Set(
+    [...text.matchAll(/门禁号旁注[：:]?[^\n]*/g)]
+      .flatMap((m) => [...m[0].matchAll(/G\d+-\d+/g)].map((g) => g[0])),
+  )
+  let curatedMismatch = 0
+
   let inAcceptance = false
   lines.forEach((line, i) => {
     if (isAcceptanceHeading(line)) inAcceptance = true
@@ -248,6 +283,10 @@ for (const file of planFiles) {
         annotatedMismatch++
         return
       }
+      if (curated.has(id)) {
+        curatedMismatch++
+        return
+      }
       problems.push(`L1 ${file}:${i + 1} **同名不同义**：${id}\n`
         + `       排期里说的是：${authoritative.slice(0, 90)}\n`
         + `       这里写的是  ：${claimed.slice(0, 90)}`)
@@ -256,6 +295,11 @@ for (const file of planFiles) {
   if (annotatedMismatch > 0) {
     notes.push(`L1 ${file}：该文件已声明「门禁号订正」⇒ 其中 ${annotatedMismatch} 处同名不同义`
       + '按**订正记录**处理（不再计入不一致）。⚠️ 声明行本身请留在文件里，别删')
+  }
+  if (curatedMismatch > 0) {
+    notes.push(`L1 ${file}：${curatedMismatch} 处同名不同义落在**已点名判定**的号上`
+      + `（${[...curated].join(' / ')}）—— 按"同一门禁的另一侧面，已判定接受"处理。`
+      + '⚠️ 声明行本身请留在文件里，别删')
   }
 }
 

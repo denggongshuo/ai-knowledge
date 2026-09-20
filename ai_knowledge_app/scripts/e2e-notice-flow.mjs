@@ -355,16 +355,31 @@ async function main() {
     const navNotice = await evaluate(`window.__n.navBadge('消息通知')`)
     check(navNotice === '' || Number(navNotice) === counts.unread,
       '侧边导航「消息通知」角标 = 未读数（不是写死的 5）', `角标=${navNotice} 未读=${counts.unread}`)
+
+    // 🔴 这两条在本批（`S8-M10-B`）**订正过** —— 它们原来是按 `S6-M11` 的口径写的
+    //   （「问答运营」角标"已销，不假装"、「待我处理」不含未命中那一项），
+    //   而 `T-A00`（`S8-M10-A`）把那个源接上了 ⇒ 旧断言在**池子为空**时恒绿、
+    //   在池子里有东西时**断言的正好是错的那一边**。本批 E2E 把待办数压到 0 时才暴露。
+    //   现在改成对两端都成立、且两端都不空的形状：拿库里的真实待办数当基准。
+    const pendingMisses = Number(mysqlScalar(
+      "select count(*) from sys_qa_miss where status in ('PENDING', 'IN_LIST');"))
     const navOps = await evaluate(`window.__n.navBadge('问答运营')`)
-    check(navOps === '', '🔴 「问答运营」角标已销（它的源属 S8，不假装）', `角标=${navOps || '(无)'}`)
+    check(pendingMisses === 0 ? navOps === '' : Number(navOps) === pendingMisses,
+      '侧边导航「问答运营」角标 = 真实待办数（源已接上：S8-M10-A）',
+      `角标=${navOps || '(无)'} 库里待办=${pendingMisses}`)
+
     check(await evaluate(`!!document.querySelector('.bell-badge')`) || counts.unread === 0,
       '顶栏铃铛角标存在（未读 > 0 时）', `未读=${counts.unread}`)
 
-    // ==================== 4. 「待我处理」只出有源的那半 ====================
+    // ==================== 4. 「待我处理」：有源的类目**有才发** ====================
+    // ⚠️ 「缺席 ≡ 0」是这一栏的口径（`NoticeService#pending` 的注释写明了）——
+    //    所以判据必须分两端写，不能只断言"键里没有 miss"（那就成了空断言）。
     const pendList = JSON.parse(pendEntry.body ?? '{}').data?.list ?? []
     const keys = pendList.map((p) => p.key)
-    check(!keys.includes('miss'),
-      '🔴 待我处理**不含**「未命中问题」那一项（不发 ≠ 发 0 —— 见计划 §1.2）', `keys=${keys.join('|') || '(空)'}`)
+    const missEntry = pendList.find((p) => p.key === 'miss')
+    check(pendingMisses === 0 ? !keys.includes('miss') : Number(missEntry?.count) === pendingMisses,
+      '「待我处理」的未命中项与库里待办数一致（有才发；缺席 ≡ 0）',
+      `keys=${keys.join('|') || '(空)'} 库里=${pendingMisses}`)
 
     // ==================== 5. 标已读走通真写接口 ====================
     const beforeUnread = counts.unread

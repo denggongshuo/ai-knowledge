@@ -53,7 +53,18 @@ export const ROUTES = [
   { path: '/system/user', expect: /class="page-title"[^>]*>用户管理/, label: '用户管理' },
   { path: '/system/role', expect: /class="page-title"[^>]*>角色管理/, label: '角色管理' },
   { path: '/system/grant', expect: /class="page-title"[^>]*>授权管理/, label: '授权管理' },
-  { path: '/system/model', expect: /class="page-title"[^>]*>模型配置/, label: '模型配置' },
+  // 🔴 `G6-6`（费用三态）的**前端那一半** —— 本批（`T-O17`）把门禁号钉在这里。
+  // 三个 lookahead 分别要求：①已经计价的模型有金额；②`NONE`（本地部署）显示"不计 API 费用"；
+  // ③未配单价的显示"—"（**不是 ¥0** —— 那会被读成"这个模型免费"）。三者缺一，这条转红。
+  // 夹具来源：`mock/data.ts:1161` 的 `mockUsageByModel` 三态都造了，`unpricedCount` = 1。
+  {
+    path: '/system/model',
+    // ⚠️ **必须以 `^` 锚定**：不带锚点时 JS 会对**每一个起始位置**各跑一遍这四个
+    // `[\s\S]*` 前瞻 ⇒ 复杂度 O(n²)。实测这份 DOM 有几 MB，未锚定的版本一次 test
+    // 要几十秒（本批先写成未锚定，证伪脚本直接卡死才发现）。锚定后只在位置 0 跑一次。
+    expect: /^(?=[\s\S]*class="page-title"[^>]*>模型配置)(?=[\s\S]*本地部署 · 不计 API 费用)(?=[\s\S]*cost-unknown)(?=[\s\S]*含 1 个模型未配置单价)/,
+    label: '模型配置（含费用三态）',
+  },
   { path: '/system/audit', expect: /class="page-title"[^>]*>审计日志/, label: '审计日志' },
   { path: '/403', expect: /class="err-title"[^>]*>你没有访问该页面的权限/, label: '403 无权访问' },
   { path: '/500', expect: /class="err-title"[^>]*>服务端发生异常/, label: '500 服务异常' },
