@@ -234,6 +234,27 @@ export const USER_ARTIFACTS = [
       + '⚠️ 它同时是**覆盖率闸的盲区**（闸扫的是"带归属列的表"，本表不属于那一类）——'
       + '台账记在 Java 侧 `ProbeArtifacts.NO_OWNERSHIP_COLUMN`，本条的登记正是那个台账逼出来的',
   },
+  {
+    // 🔴 **它有 `kb_id` 列，但那列不是归属、是分组维度** —— 所以 `via: 'kb_id'` 那条路
+    // 在这里**会漏掉大半**：哨兵 `kb_id = 0` 表示"跨库提问"，而当前链路上
+    // **每次提问都覆盖全部可见库** ⇒ 绝大多数行的 `kb_id` 就是 0。
+    // 按日期清才是对的，而且它是**缓存**（源是 `sys_retrieval_trace`，可整体重算）
+    // ⇒ 清它没有信息损失 —— 与 `sys_model_usage` 那条"清掉就真没了"性质相反。
+    id: 'sql:sys_ops_retrieval_daily', kind: 'sql-date', table: 'sys_ops_retrieval_daily', via: 'date',
+    deleteSql: 'delete from sys_ops_retrieval_daily where stat_date >= curdate() - interval 7 day;',
+    countSql: 'select count(*) from sys_ops_retrieval_daily where stat_date >= curdate() - interval 7 day;',
+    why: '检索质量按天汇总（T-A04 预计算）。窗口 7 天与各用例类的 `clearTraceWindow` 同口径'
+      + '——**打点删哪一段，缓存就跟着删哪一段，缓存不能比事实活得久**。'
+      + '⚠️ 它与 Java 侧 `ProbeCleanup#sweepProbePrecompute` 必须**逐字同一条 SQL**：'
+      + '两侧对账只管表名在不在，管不了窗口取几天，那一层靠这条注释与人工复核',
+  },
+  {
+    id: 'sql:sys_ops_usage_daily', kind: 'sql-date', table: 'sys_ops_usage_daily', via: 'date',
+    deleteSql: 'delete from sys_ops_usage_daily where stat_date >= curdate() - interval 7 day;',
+    countSql: 'select count(*) from sys_ops_usage_daily where stat_date >= curdate() - interval 7 day;',
+    why: '使用统计按天汇总（T-A04 预计算）。`user_id` 同理是分组维度且有哨兵 0（无归属提问），'
+      + '按人删不掉；它是缓存，按日期清没有信息损失',
+  },
 ]
 
 /**
@@ -777,6 +798,16 @@ const USER_SCOPED = [
     entry: USER_ARTIFACTS.find((a) => a.id === 'sql:sys_qa_miss'),
     why: '未命中池：按 `last_user_id` 清。⚠️ 种子账号名下的池子行**只可能是本脚本造的**'
       + '（真实用户提问沉淀的行挂在真实用户 id 上）',
+  },
+  {
+    entry: USER_ARTIFACTS.find((a) => a.id === 'sql:sys_ops_retrieval_daily'),
+    why: '检索质量按天汇总（`T-A04`）：按日期清。对种子账号安全的理由比 `sys_model_usage` **更强** ——'
+      + '它是**纯缓存**（源是 `sys_retrieval_trace`，整张删掉都能重算出来）'
+      + '⇒ 清它**没有信息损失**，也不碰账号的任何能力（`sys_user_role` 不在射程里）',
+  },
+  {
+    entry: USER_ARTIFACTS.find((a) => a.id === 'sql:sys_ops_usage_daily'),
+    why: '使用统计按天汇总（`T-A04`）：同上 —— 纯缓存，按日期清，无信息损失',
   },
 ].filter((x) => x.entry)
 

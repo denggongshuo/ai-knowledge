@@ -177,6 +177,18 @@ window.__m = {
 let edge
 let kbId
 let sessionFloor = 0
+/**
+ * 🔴 **本轮到底问没问过** —— 收尾的守卫看**它**，不看 `sessionFloor` 的值。
+ *
+ * 由来（`T-O19` 剩半，`S8-M10-D` 现场定位）：水位线取 `coalesce(max(id), 0)`，
+ * 而 **表为空时它就是 0** —— 而“表为空”正是本仓**基线干净时的常态**（每批收尾都把会话族清空）。
+ * 于是 `if (sessionFloor)` 把“干净的起点”误判成“没有活要干”，**整段清理被跳过**，
+ * 而那恰恰是在干净环境里**必然发生**的（脏环境里反而不发生 ⇒ 偶发得像环境问题）。
+ *
+ * ⚠️ `sessionFloor` 的**值**仍然是对的（`delete ... where session_id > floor` 用它当阈值），
+ * 错的是**拿它当守卫** —— 守卫要问“本轮做没做事”，不是“我抓到的那个值是多少”。
+ */
+let askedThisRun = false
 /** 本轮提问**精确**的会话 id（不靠水位线 —— 见 `S8-M10-B` 那次"水位线以下没人认领"的教训）。 */
 const sessionIds = new Set()
 /** 本轮造出来的导出任务 id（收尾要精确删任务行 + 通知行 + 桶里那个对象）。 */
@@ -226,6 +238,7 @@ async function main() {
   check(lastStatus === 'READY', `文档已就绪（状态 ${lastStatus}）`)
 
   // ---------- ④ 同一句话问两次（只差标点）→ 高频榜应当只有一行、次数 2 ----------
+  askedThisRun = true
   sessionFloor = mysqlCount('select coalesce(max(id), 0) from sys_chat_session;')
   const first = await askSse(Q_PLAIN)
   const second = await askSse(Q_MARK)
@@ -448,7 +461,7 @@ async function cleanupProbe() {
     mysqlScalar(`delete from sys_chat_message where session_id in (${list});`)
     mysqlScalar(`delete from sys_chat_session where id in (${list});`)
   }
-  if (sessionFloor) {
+  if (askedThisRun) {
     mysqlScalar(`delete from sys_retrieval_trace_chunk where trace_id in `
       + `(select trace_id from sys_retrieval_trace where session_id > ${sessionFloor});`)
     mysqlScalar(`delete from sys_retrieval_trace where session_id > ${sessionFloor};`)

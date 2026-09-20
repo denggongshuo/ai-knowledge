@@ -167,6 +167,18 @@ let missKeys = []
 /** 问答那四张表的水位线（提问会自己开一个会话，见 ④）。 */
 let sessionFloor = 0
 /**
+ * 🔴 **本轮到底问没问过** —— 收尾的守卫看**它**，不看 `sessionFloor` 的值。
+ *
+ * 由来（`T-O19` 剩半，`S8-M10-D` 现场定位）：水位线取 `coalesce(max(id), 0)`，
+ * 而 **表为空时它就是 0** —— 而“表为空”正是本仓**基线干净时的常态**（每批收尾都把会话族清空）。
+ * 于是 `if (sessionFloor)` 把“干净的起点”误判成“没有活要干”，**整段清理被跳过**，
+ * 而那恰恰是在干净环境里**必然发生**的（脏环境里反而不发生 ⇒ 偶发得像环境问题）。
+ *
+ * ⚠️ `sessionFloor` 的**值**仍然是对的（`delete ... where session_id > floor` 用它当阈值），
+ * 错的是**拿它当守卫** —— 守卫要问“本轮做没做事”，不是“我抓到的那个值是多少”。
+ */
+let askedThisRun = false
+/**
  * 探针账号（**种子超管**）的 id。
  *
  * <p>⚠️ 不能调 `teardownUserProbe` —— 它会把账号本身删掉，而这是**种子**账号。
@@ -224,6 +236,7 @@ async function main() {
   // ---------- ④ 问一个"库里根本没有"的问题 → 沉淀 ----------
   // ⚠️ 先记水位线：这一次提问会**自己开一个会话**，会话/消息/打点四张表都要收尾。
   //    提问人是种子超管（`admin`），归属还在 ⇒ 谁也不会替他清。
+  askedThisRun = true
   sessionFloor = mysqlCount('select coalesce(max(id), 0) from sys_chat_session;')
   await askSse(MISS_QUESTION)
 
@@ -452,7 +465,7 @@ main()
       }
     }
     // 会话 / 消息 / 打点（含明细）—— 同样是超管名下的，没人替本脚本清
-    if (sessionFloor) {
+    if (askedThisRun) {
       try {
         mysqlScalar(`delete from sys_retrieval_trace_chunk where trace_id in `
           + `(select trace_id from sys_retrieval_trace where session_id > ${sessionFloor});`)
