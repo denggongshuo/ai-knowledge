@@ -73,7 +73,7 @@ public class RetrievalTraceWriter {
                scope_millis, recall_millis, fuse_millis, table_millis,
                recall_top_k, recall_threshold, rerank_top_k, rerank_enabled, table_weight,
                miss_threshold, low_score_warn, rerank_applied, rerank_note, degrade_note,
-               miss_flag, top1_score, chunk_count)
+               miss_flag, rerank_before_top1, top1_score, chunk_count)
             values
               (:traceId, :userId, :sessionId, :messageId, :queryText,
                :mode, :kbIds, :kbCount, :docScopeCount, :docScopeFallback,
@@ -83,7 +83,7 @@ public class RetrievalTraceWriter {
                :scopeMillis, :recallMillis, :fuseMillis, :tableMillis,
                :recallTopK, :recallThreshold, :rerankTopK, :rerankEnabled, :tableWeight,
                :missThreshold, :lowScoreWarn, :rerankApplied, :rerankNote, :degradeNote,
-               :missFlag, :top1Score, :chunkCount)
+               :missFlag, :rerankBeforeTop1, :top1Score, :chunkCount)
             """;
 
     private static final String INSERT_CHUNK = """
@@ -146,6 +146,9 @@ public class RetrievalTraceWriter {
                     .setParameter("rerankNote", nullToEmpty(trace.rerankNote()))
                     .setParameter("degradeNote", nullToEmpty(trace.degradeNote()))
                     .setParameter("missFlag", trace.miss())
+                    // 可空：未重排 ⇒ null；重排了但重排前那条没进 top_n ⇒ 也 null。
+                    // **不用 0 顶替**（"没测到"与"得了 0 分"是两件事，与 top1 同一条口径）
+                    .setParameter("rerankBeforeTop1", trace.rerankBeforeTop1())
                     .setParameter("top1Score", top1(chunks))
                     .setParameter("chunkCount", chunks.size());
             insert.executeUpdate();

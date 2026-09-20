@@ -133,6 +133,14 @@ public class RetrievalService {
         // ---------- ⑤ 精排（可降级）----------
         RerankOutcome rerank = rerank(trimmed, fused, params);
 
+        // 重排前的 Top1（`T-A03`）：融合池 rank-1 那条**在重排结果里**拿到的分
+        // （= `rerank.chunks()` 里 `fusionRank == 1` 那条的 `rerankScore`）。
+        // ⚠️ 取的是**重排出口**而不是最终 `chunks`：⑤.5 的回表 / HyQ 回落会换内容与实例，
+        // 而"重排前是多少"不该取决于后面那几步。
+        // 重排前那条未进重排 `top_n` 时**取不到** ⇒ null（覆盖率由端点单独报，
+        // 见 `V35` 的列注释：NULL 有两种含义，靠 `rerank_applied` 区分）。
+        Double rerankBeforeTop1 = rerankBeforeTop1(rerank.chunks());
+
         // ---------- ⑤.5 表格回表（T-705 · G5-6）----------
         // 位置在精排**之后**，两个理由：
         //   ① 窗口要"命中哪一行"，而命中哪几条是精排 + 裁剪才定下来的 —— 放前面会为
@@ -161,7 +169,7 @@ public class RetrievalService {
                 params.recallTopK(), params.recallThreshold(), params.rerankTopK(),
                 params.rerankEnabled(), params.tableWeight(), params.missThreshold(),
                 params.lowScoreWarn(), rerank.applied(), rerank.note(),
-                degradeNote, rerank.miss(chunks, params), chunks);
+                degradeNote, rerankBeforeTop1, rerank.miss(chunks, params), chunks);
 
         log.info("[检索] 完成：query={} 库数={} 可见文档={} 向量={} BM25={} 融合={} 返回={} "
                         + "重排={} 回表={} 未命中={} 耗时={}ms（范围 {} + 召回 {} + 融合 {} + 重排 {} + 回表 {}）",
@@ -394,7 +402,7 @@ public class RetrievalService {
                 scope.docScopeCount(), scope.docFallback(),
                 0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, 0L, 0L, 0L, elapsed(start),
                 0, 0d, 0, false, 0d, 0d, 0d, false, note, "",
-                false, List.of());
+                null, false, List.of());
         return new RetrievalResult(List.of(), trace, scope.kbIds().size());
     }
 
@@ -408,6 +416,33 @@ public class RetrievalService {
      */
     private static long tableWindowCount(List<RetrievedChunk> chunks) {
         return chunks.stream().filter(c -> c.tableContext() != null).count();
+    }
+
+    /**
+     * 重排前 Top1 的**重排分**（`T-A03`）—— 融合池 rank-1 那条在重排结果里拿到的分。
+     *
+     * <p>取**重排分**而不是融合分：只有与 `top1_score` 同一把尺，两侧命中率才比得出
+     * 「净提升」；融合分是 RRF 量级（≈0.016），与判定线 0.35 不同量纲
+     * （见 `V35` 的列注释与 {@code RetrievalTraceWriter#top1} 的量纲警告）。
+     *
+     * <p>实现上**不另存一个字段**：`RetrievedChunk` 本来就带着 `fusionRank`（融合名次）
+     * 与 `rerankScore`（那条拿到的重排分），而 `toChunks` 已经把它们都填好了 ——
+     * 派生即可，与 {@link #tableWindowCount} 同一条纪律（能派生的就不必存）。
+     *
+     * <p>**取不到就返回 {@code null}**：重排前那条没进重排结果的 `top_n`
+     * （客户端只返回 `top_n` 条，见 {@code RerankClient#rerank}）⇒ 它的重排分**未知**。
+     * 未重排时 `rerankScore` 恒 null，同样落到这里。⚠️ 两种 NULL 靠 `rerank_applied` 区分，
+     * **不许**用 0 顶替 —— 那会把"没测到"说成"重排前得了 0 分"。
+     */
+    private static Double rerankBeforeTop1(List<RetrievedChunk> chunks) {
+        // ⚠️ 必须是 `findFirst().map(...)` 而不是 `map(...).findFirst()` ——
+        // 后者在**映射结果为 null** 时直接抛 NPE（`Stream#findFirst` 不接受 null 元素），
+        // 而"融合池 rank-1 没进重排结果"恰恰就是那个 null 的情形（重排开着的每一次都可能撞上）。
+        return chunks.stream()
+                .filter(c -> c.fusionRank() == 1)
+                .findFirst()
+                .map(RetrievedChunk::rerankScore)
+                .orElse(null);
     }
 
     private static long elapsed(long startNanos) {

@@ -53,6 +53,13 @@ import java.util.List;
  * @param degradeNote       检索方式**降级**的说明（`T-709`，如"该库正在重建索引"）；
  *                          没有降级时为空串。⚠️ {@link #mode()} 记的是**降级之后**实际用的方式，
  *                          降级前的那一个只在这段文字里 —— 见 {@link #degraded()}
+ * @param rerankBeforeTop1  **重排前**名次第 1 的那条候选，在重排结果里拿到的分（`T-A03`）。
+ *                          存**重排分**而不是融合分：只有与 {@code top1_score} **同一把尺**，
+ *                          两次命中率才比得出「净提升」；存融合分（RRF 量级 ≈0.016）会与
+ *                          {@code missThreshold}(0.35) 不同量纲，那个差值就是个假数。
+ *                          ⚠️ 可空，且 NULL 有**两种**含义，靠 {@link #rerankApplied()} 区分：
+ *                          未重排；或重排前那条没进重排结果的 {@code top_n}（重排分**未知**）
+ *                          ⇒ 消费方**必须**把覆盖数单独报出来，否则是在偏向高分的子集上算
  * @param miss              是否判定未命中。⚠️ **只在 {@code rerankApplied=true} 时才有意义** ——
  *                          未重排时分数是融合分，与 {@code missThreshold} 不同量纲，恒为 {@code false}
  * @param chunks            本次返回的分片。**与 {@link RetrievalResult#chunks()} 是同一个
@@ -87,6 +94,7 @@ public record RetrievalTrace(String query,
                              boolean rerankApplied,
                              String rerankNote,
                              String degradeNote,
+                             Double rerankBeforeTop1,
                              boolean miss,
                              List<RetrievedChunk> chunks) {
 
@@ -120,6 +128,6 @@ public record RetrievalTrace(String query,
                 vectorSearchMillis, bm25Millis, fuseMillis,
                 rerankMillis, tableMillis, totalMillis, recallTopK, recallThreshold, rerankTopK,
                 rerankEnabled, tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote,
-                degradeNote, miss, newChunks);
+                degradeNote, rerankBeforeTop1, miss, newChunks);
     }
 }
