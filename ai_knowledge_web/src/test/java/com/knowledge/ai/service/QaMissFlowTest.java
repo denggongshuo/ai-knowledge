@@ -177,6 +177,8 @@ class QaMissFlowTest extends ApiTestSupport {
         assertThat(get("/api/ops/qa/misses", user.token()).status())
                 .as("普通用户不该看到全站的提问原文").isEqualTo(403);
         assertThat(get("/api/ops/qa/overview", user.token()).status()).isEqualTo(403);
+        assertThat(call("POST", "/api/ops/qa/misses/" + id + "/replay", Map.of(), user.token()).status())
+                .isEqualTo(403);
 
         Actor auditor = userWithRole("opsqa.auditor", "AUDITOR");
         assertThat(get("/api/ops/qa/misses", auditor.token()).code())
@@ -184,6 +186,10 @@ class QaMissFlowTest extends ApiTestSupport {
         assertThat(call("PATCH", "/api/ops/qa/misses/" + id, Map.of("status", "IGNORED"), auditor.token()).status())
                 .as("但**不能改** —— 这正是把读/写拆成两个权限码的意义；"
                         + "合成一个码的话这条边界永远证伪不了")
+                .isEqualTo(403);
+        assertThat(call("POST", "/api/ops/qa/misses/" + id + "/replay", Map.of(), auditor.token()).status())
+                .as("`T-A01` 的重放会**改状态**，所以同样归 handle 那一侧 —— "
+                        + "只读角色点不动它（这条同时也是「接口真的挂上了」的接线判据）")
                 .isEqualTo(403);
 
         assertThat(get("/api/ops/qa/misses", token).code()).as("KB_ADMIN 两个码都有").isZero();
