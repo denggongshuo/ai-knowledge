@@ -342,15 +342,33 @@ export function minioStillPresent(rawObjectKeys) {
  * @param userIds 用户 id 集合（**必须在删 `sys_user` 之前抓**，与其它归属 id 同理）
  */
 export function minioKeysOfUserPrefix(userIds) {
+  return minioKeysOfPathUserPrefix('chat-attachments/', userIds)
+}
+
+/**
+ * 任意 `{前缀}{userId}/…` 形状下的对象名（`T-O19` 提取）。
+ *
+ * <p>由来：`ops-export/`（`T-A02` 新增）与 `audit-export/` 一样是**路径即归属**，
+ * 而 `e2e-ops-qa-stats` 真跑一次导出就会在桶里落一个对象 —— 它必须自己收，
+ * 否则那个对象要等下一次 `mvn test` 的 Java 侧兜底才被扫走
+ * （而"会造行的脚本自己不清"正是 `T-O19` 记的那个形状）。
+ *
+ * <p>⚠️ 为什么把 `chat-attachments/` 那版**改成委托**而不是复制一份：
+ * 两份 `ls | 拼串` 的代码一定会漂（`MSYS_NO_PATHCONV` 那条坑只会在其中一份上被踩到）。
+ *
+ * @param prefix  带斜杠的前缀，如 `ops-export/`
+ * @param userIds 用户 id 集合（**必须在删 `sys_user` 之前抓**）
+ */
+export function minioKeysOfPathUserPrefix(prefix, userIds) {
   const ids = normalizeKeys(userIds)
   const keys = []
   for (const id of ids) {
     const out = spawnSync('bash', ['-c',
       `MSYS_NO_PATHCONV=1 docker exec kb-minio sh -c `
-      + `"ls -1 '${MINIO_ROOT}/chat-attachments/${id}' 2>/dev/null"`,
+      + `"ls -1 '${MINIO_ROOT}/${prefix}${id}' 2>/dev/null"`,
     ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
     for (const name of out.split('\n').map((s) => s.trim()).filter(Boolean)) {
-      keys.push(`chat-attachments/${id}/${name}`)
+      keys.push(`${prefix}${id}/${name}`)
     }
   }
   return keys
@@ -720,6 +738,123 @@ export function teardownUserProbe(prefix) {
 export function userIdsOf(prefix) {
   return normalizeKeys(mysqlScalar(`select id from sys_user where username like '${prefix}%';`))
 }
+
+// ---------------------------------------------------------------------------
+// 🔴 只清**归属行**，不动账号本身（`T-O19` · 2026-09-20）
+// ---------------------------------------------------------------------------
+
+/**
+ * 可以做"只清行、不动账号"的那几项 —— **手写白名单，不从登记表推导**。
+ *
+ * <h3>🔴 为什么是白名单而不是 `USER_ARTIFACTS.filter(via in ...)`</h3>
+ * <p><b>第一版就是从登记表推导的，当天就出了事故</b>：推导出来的射程包含
+ * `sql:sys_user_role`（`via: 'user'`）⇒ `delete from sys_user_role where user_id = 1`
+ * —— 把**种子超管 `admin` 的角色删光了**，下一个 E2E 立刻报「建库：无操作权限」
+ * （`10020`），而现象像"权限配错了"。
+ *
+ * <p>根因是**两份清单的用途不同**，而它们的形状看起来一样：
+ * <ul>
+ *   <li>{@link USER_ARTIFACTS} 服务的是「**这个探针账号马上就要被删掉**」——
+ *       那时连 `sys_user_role` 一起清是**对的**（人都不在了，留着授权是脏数据）；</li>
+ *   <li>本函数服务的是「**这个账号还要继续用**」（`e2e-*` 用的是**种子**超管）——
+ *       同样的表清掉就是**破坏**。授权表尤其：删掉它账号就变哑巴。</li>
+ * </ul>
+ * ⇒ **射程必须逐条表态**，而"能推导"正是它危险的地方（推导会把新登记项自动吸收进来，
+ * 包括那些不该吸收的）。这与本仓 `ProbeArtifacts.NO_OWNERSHIP_COLUMN` 台账同一条纪律：
+ * **新增产物必须过一次人的判断。**
+ *
+ * <p>本名单里每一项都写清楚"为什么它对种子账号也是安全的"。
+ */
+const USER_SCOPED = [
+  {
+    // 聚合表（行数上界 = 天数 × 模型数 × 用途数，不随调用次数增长），
+    // 且**一个归属列都没有** ⇒ 只能按日期清。对种子账号同样安全：它清的是"用量统计"，
+    // 不是账号的任何能力。⚠️ 代价是当天的真实用量一并清掉（`#184` 已登记）。
+    entry: USER_ARTIFACTS.find((a) => a.id === 'sql:sys_model_usage'),
+    why: '模型用量：按日期清，聚合表，不碰账号能力',
+  },
+  {
+    entry: USER_ARTIFACTS.find((a) => a.id === 'sql:sys_qa_miss'),
+    why: '未命中池：按 `last_user_id` 清。⚠️ 种子账号名下的池子行**只可能是本脚本造的**'
+      + '（真实用户提问沉淀的行挂在真实用户 id 上）',
+  },
+].filter((x) => x.entry)
+
+/**
+ * 清这几张表里挂在 {@code userId} 名下的行，**不动 `sys_user`，也不动任何授权行**。
+ *
+ * <h3>它存在的理由（`T-O19`）</h3>
+ * <p>本仓有三个 E2E 脚本**自己做清理**（`e2e-chat-flow` / `e2e-ops-miss-flow` /
+ * `e2e-ops-replay-flow` / 以及本批新增的 `e2e-ops-qa-stats`）：它们按**会话 / 打点水位线**
+ * 清会话族。而 `sys_model_usage`（按日期）与 `sys_qa_miss`（按 `last_user_id`）
+ * **只登记在 `USER_ARTIFACTS` 里** ⇒ 它们**一行都清不到**。
+ * <p>🔴 而**恰恰是这些脚本在造那些行**：`e2e-chat-flow` 是唯一真读
+ * `sum(calls) from sys_model_usage` 的脚本（也就是说它真的在写这张表），
+ * 而它真提问 ⇒ 未命中时 `MissSink` 会往池子里写行。
+ * ⇒ **清理函数存在、调用方存在，但"会造行的脚本"不在调用方里** ——
+ * 这是「清理必须走必走路径」的**第四种形态**，前三种是 `#186`（`step()` 一抛就不执行）·
+ * `#187`（`await` 的返回值被丢）· 本仓验证脚本的 `process.exit()` 早退。
+ *
+ * <p><b>为什么不直接调 {@link teardownUserProbe}</b>：那个函数会把**账号本身**删掉，
+ * 而这些脚本用的是**种子超管**账号 —— 调它等于把种子删了。
+ *
+ * @param userId 要清的账号 id
+ * @return 实际执行的 SQL（供脚本打印，便于"这次到底清了什么"可追溯）
+ */
+export function purgeUserScopedArtifacts(userId) {
+  const id = Number(userId)
+  if (!id) {
+    return ''
+  }
+  // 🔴 **给未来的自己上一道闸**：授权表绝不该出现在这个射程里。
+  // 加了它就意味着"清一次探针残留"会把一个**还在用**的账号变成哑巴 ——
+  // 而现象（接口报「无操作权限」`10020`）看起来像权限配错了，不像清理的锅。
+  // ⇒ 与其靠注释提醒，不如让它在**执行前**就炸（本仓对"只写 javadoc 拦不住"有判例）。
+  const forbidden = USER_SCOPED.filter(({ entry }) => entry.table === 'sys_user_role')
+  if (forbidden.length) {
+    throw new Error(
+      'purgeUserScopedArtifacts 的射程里出现了 sys_user_role —— 那会把账号的授权删掉，'
+        + '而被清的账号**还要继续用**（脚本用的是种子账号）。见本函数的 javadoc：'
+        + '第一版从登记表推导射程时正是这么出的事故。',
+    )
+  }
+  const sql = USER_SCOPED.map(({ entry }) => {
+    if (entry.via === 'date') {
+      return entry.deleteSql
+    }
+    return entry.deleteSql.replaceAll('{userIds}', String(id))
+  }).reduce((acc, s) => acc + s, '')
+  if (sql) {
+    mysqlScalar(sql)
+  }
+  return sql
+}
+
+/**
+ * 上面那几项的**残留计数**（独立观测点：不看清理命令的返回值）。
+ *
+ * <p>🔴 **只数「能归属到人」的那些**：`sys_model_usage` **一个归属列都没有**
+ * （它的 `why` 里写着这件事），所以它**结构上数不出"是谁造的"** ——
+ * 拿它的当日行数当残留会让每一个有真实用量的日子都报红。
+ * 不数它，并在返回值里**显式说明**（静默少一类正是这个仓库反复吃亏的形状）。
+ */
+export function countUserScopedArtifacts(userId) {
+  const id = Number(userId)
+  if (!id) {
+    return { rows: 0, attributable: [], notAttributable: [] }
+  }
+  const attributable = USER_SCOPED.filter(({ entry }) => entry.via !== 'date')
+  const notAttributable = USER_SCOPED.filter(({ entry }) => entry.via === 'date')
+  const rows = attributable
+    .map(({ entry }) => Number(mysqlScalar(entry.countSql.replaceAll('{userIds}', String(id)))) || 0)
+    .reduce((acc, n) => acc + n, 0)
+  return {
+    rows,
+    attributable: attributable.map(({ entry }) => entry.table),
+    notAttributable: notAttributable.map(({ entry }) => entry.table),
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // 闸 ②：残留自检（**独立观测点**，不信清理命令的返回值）

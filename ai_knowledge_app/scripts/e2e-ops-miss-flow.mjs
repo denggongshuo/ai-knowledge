@@ -40,7 +40,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { mysqlScalar, mysqlCount, teardownKbProbe } from './lib/probe-teardown.mjs'
+import { mysqlScalar, mysqlCount, teardownKbProbe, purgeUserScopedArtifacts } from './lib/probe-teardown.mjs'
 
 const arg = (name, fallback) => (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
 const BASE = arg('base', 'http://localhost:5174')
@@ -166,11 +166,21 @@ let kbId
 let missKeys = []
 /** 问答那四张表的水位线（提问会自己开一个会话，见 ④）。 */
 let sessionFloor = 0
+/**
+ * 探针账号（**种子超管**）的 id。
+ *
+ * <p>⚠️ 不能调 `teardownUserProbe` —— 它会把账号本身删掉，而这是**种子**账号。
+ * 所以只清「按 id / 按日期归属」的那几张表（见 `purgeUserScopedArtifacts` 的 javadoc）。
+ */
+let loginUserId = 0
 
 async function main() {
   // ---------- ① 登录 ----------
   const login = await api('/auth/login', { method: 'POST', body: { ...PROBE, remember: true } })
-  token = bizOk(login, '登录').accessToken
+  const loginData = bizOk(login, '登录')
+  token = loginData.accessToken
+  // 记下 id：收尾要清「按人归属、而会话水位线够不着」的那几张表（`T-O19`）
+  loginUserId = Number(loginData.user?.id ?? 0)
   check(!!token, '登录成功（种子超管）')
 
   // ---------- ② 建探针库 ----------
@@ -449,7 +459,10 @@ main()
         mysqlScalar(`delete from sys_retrieval_trace where session_id > ${sessionFloor};`)
         mysqlScalar(`delete from sys_chat_message where session_id > ${sessionFloor};`)
         mysqlScalar(`delete from sys_chat_session where id > ${sessionFloor};`)
-        observe('会话四张表收尾', `水位线 ${sessionFloor}`)
+        // 🔵 `T-O19`：会话水位线**够不着**的那几张（用量按日期 / 池子按人）——
+        // 本脚本真提问 ⇒ 既写打点也（未命中时）写池子、真调模型 ⇒ 写用量
+        purgeUserScopedArtifacts(loginUserId)
+        observe('会话四张表收尾', `水位线 ${sessionFloor} · 另清用户族(按 id)`)
       } catch (e) {
         observe('⚠️ 会话收尾失败', e.message)
       }

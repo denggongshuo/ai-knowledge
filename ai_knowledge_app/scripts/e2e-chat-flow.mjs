@@ -48,6 +48,8 @@ import {
   describeKbResidue,
   minioKeysOfUserPrefix,
   minioRemove,
+  purgeUserScopedArtifacts,
+  countUserScopedArtifacts,
 } from './lib/probe-teardown.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -785,10 +787,11 @@ async function main() {
   //    `finally` **无条件**调用（`#186`：`step()` 失败会 rethrow，所以"清理是一个 step"
   //    等于"中途失败就不清理"）。这里再调一次是**有意的幂等重复** —— 见该函数的 javadoc。
   await step('收尾：清理探针库与会话行', async () => {
-    const { residue, left } = await cleanupProbe()
+    const { residue, left, sessionScoped, unclaimed, unclaimedNote } = await cleanupProbe()
     check(kbResidueClean(residue), `探针库仍有残留：${describeKbResidue(residue)}`)
-    check(left === 0, `仍残留 ${left} 行会话族数据（含问答附件）`)
-    return `探针库已清（${describeKbResidue(residue)}）· 会话族残留 ${left} 行`
+    check(left === 0, `仍残留 ${left} 行（会话族 ${sessionScoped} + 用户族够不着的那几张 ${unclaimed.rows}）`)
+    return `探针库已清（${describeKbResidue(residue)}）· 会话族残留 ${sessionScoped} 行`
+      + ` · 用户族可归属残留 ${unclaimed.rows} 行${unclaimedNote}`
   })
 }
 
@@ -874,7 +877,21 @@ async function cleanupProbe() {
         ),
       )
     : 0
-  return { residue: r.residue, left }
+
+  // 🔴 `T-O19`：会话水位线**够不着**的那两张表（`sys_model_usage` 按日期 / `sys_qa_miss` 按人）。
+  // 它们只登记在 `probe-teardown` 的 `USER_ARTIFACTS` 里，而**本脚本恰恰在造那些行**
+  // （真提问 ⇒ 未命中时 `MissSink` 写池子；真调模型 ⇒ 写用量）——
+  // 「清理函数存在、调用方存在，但会造行的脚本不在调用方里」。
+  // ⚠️ 走登记表推导出来的清理，不手写表名 —— 新增一项时自动进来。
+  purgeUserScopedArtifacts(loginUserId)
+  const unclaimed = loginUserId > 0 ? countUserScopedArtifacts(loginUserId) : { rows: 0, notAttributable: [] }
+  const sessionScoped = left
+  const total = sessionScoped + unclaimed.rows
+  // ⚠️ 数不到的如实写在返回值里（`sys_model_usage` 没有归属列 ⇒ 结构上判不出"是谁造的"）
+  const unclaimedNote = unclaimed.notAttributable.length
+    ? `· 另有 ${unclaimed.notAttributable.map((a) => a.table).join('/')} 无法按人归属（按日期整体清）`
+    : ''
+  return { residue: r.residue, left: total, sessionScoped, unclaimed, unclaimedNote }
 }
 
 // ---------------------------------------------------------------- 启动/收尾
