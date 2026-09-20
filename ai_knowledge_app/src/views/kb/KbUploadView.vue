@@ -43,6 +43,21 @@ const acceptStr = ACCEPT.map((e) => `.${e}`).join(',')
 const MAX_SIZE = 100 * 1024 * 1024
 const MAX_COUNT = 20
 
+/**
+ * 补录备注（`T-A01` · 需求 `08` §1.4 步 2）。
+ *
+ * 从问答运营页点「补文档」跳过来时，URL 上带着 `?note=<那条未命中问题的原文>` ——
+ * 把它预填进这一栏，上传时随表单一起发（`FormData` 的 `remark` 字段），
+ * 后端落进 `sys_document.remark`。
+ *
+ * 🔴 **它不只是给人看的一句备注**：问答运营页的「重放验证」靠它认出
+ * "这篇文档是为哪条未命中补录的"（后端拿它与池子里的问句按同一个归一化比对）。
+ * 所以这一栏被改掉，重放就会说"没命中补录文档"—— 下面那句提示就是为此写的。
+ */
+const supplementNote = ref(typeof route.query.note === 'string' ? route.query.note : '')
+/** 是否处于"补录"语境。用独立的布尔量：用户清空备注后提示卡片不该跟着消失。 */
+const supplementContext = ref(supplementNote.value.trim().length > 0)
+
 const timers = new Set<ReturnType<typeof setInterval>>()
 let failedOnce = false
 
@@ -208,6 +223,10 @@ async function runItem(item: UploadItem) {
     if (!file) throw new Error('no file')
     const form = new FormData()
     form.append('file', file)
+    // 补录备注（有才发）：`?note=` 带过来的那条未命中问题原文。后端落 `sys_document.remark`，
+    // 「重放验证」靠它认这篇 —— 见 `supplementNote` 的注释
+    const note = supplementNote.value.trim()
+    if (note) form.append('remark', note)
     const up = await kbApi.uploadDoc(kbId.value, form, (p) => {
       item.percent = p
     })
@@ -527,6 +546,36 @@ function gotoIssue() {
     <div class="split">
       <!-- 左：上传区 -->
       <div>
+        <!--
+          补录备注 —— 只有从问答运营页「补文档」跳过来（URL 带 `?note=`）才有。
+          ⚠️ 提示里那句"改掉它就认不出来了"是**真的**：后端拿它做重放验证的关联键。
+        -->
+        <el-card v-if="supplementContext" shadow="never" class="supplement-card">
+          <template #header>
+            <div class="card-head-row">
+              <div class="row-inline">
+                <h3>补录备注</h3>
+                <el-tag size="small" type="warning">本次上传是为一条未命中问题补录</el-tag>
+              </div>
+              <el-button size="small" text type="primary" @click="router.push('/ops/qa')">
+                返回问答运营
+              </el-button>
+            </div>
+          </template>
+          <el-input
+            v-model="supplementNote"
+            type="textarea"
+            :rows="2"
+            maxlength="500"
+            show-word-limit
+            placeholder="这条备注会随文档一起存下来"
+          />
+          <p class="supplement-hint">
+            上传后请回问答运营页点「重放验证」—— 后端靠这条备注认出<b>刚补录的是哪一篇</b>。
+            改掉它就认不出来了（而现象只是"没命中补录文档"，看不出是备注的锅）。
+          </p>
+        </el-card>
+
         <el-card shadow="never">
           <el-upload
             ref="uploadRef"
@@ -813,6 +862,17 @@ function gotoIssue() {
 }
 .kb-name {
   color: var(--el-color-primary);
+}
+/* 补录备注卡片（`T-A01`）：左侧一道暖色边，让"这次上传带了语境"一眼可见 */
+.supplement-card {
+  margin-bottom: 16px;
+  border-left: 3px solid var(--el-color-warning);
+}
+.supplement-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--el-text-color-secondary);
 }
 .head-actions {
   display: flex;

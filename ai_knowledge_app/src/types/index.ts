@@ -495,6 +495,25 @@ export interface RetrievalConfig {
 }
 
 /** 知识库创建 / 配置表单（步骤 ①~③ 的完整载荷） */
+/**
+ * 只读的嵌入模型信息（`kbApi.presets()` / `kbApi.config()` 的 `embedding` 字段）。
+ *
+ * <h3>为什么要有这个命名类型（`#225` · `T-O16`）</h3>
+ * 同一个四字段形状原来在 `api/index.ts` 里内联了**两遍**、在 `KbDetailView` /
+ * `KbCreateView` 里各自又写了一遍初值 —— 四处各说各的。收成一处之后，
+ * 「后端加了字段前端没跟上」这类漂移只会在**一个**地方露头。
+ *
+ * ⚠️ `dimension` 是**集合的维度**（后端 `MilvusConstants.DIMENSION`），
+ * 不是"模型自称的维度"。两者不一致时写入会在 Milvus 侧显式失败 ——
+ * 这正是本版本「不支持换嵌入模型」的技术原因（`T-906`）。
+ */
+export interface EmbeddingInfo {
+  model: string
+  dimension: number
+  norm: string
+  locked: boolean
+}
+
 export interface KbConfigForm {
   name: string
   /** kb_ 前缀 + 业务语义，创建后不可修改 */
@@ -846,11 +865,26 @@ export interface FeedbackStats {
 
 /** 重放验证结果（闭环第 4 步：命门） */
 export interface ReplayResult {
-  before: number
-  after: number
+  /** 补录前的最高相似度；⚠️ 可空：旧行没有记录到这个数（此时判定不成立） */
+  before: number | null
+  /** 本次重放的 Top1；⚠️ 可空：**一条都没召回**（不是 0 分） */
+  after: number | null
+  /** 分数是否提升（after > before） */
   improved: boolean
-  /** 新召回的确实是刚补录的那篇文档 */
+  /**
+   * **Top1** 是不是刚补录的那篇。
+   * ⚠️ 不是"召回列表里有没有它" —— 补录那篇挂在第二名时，达标的分其实是别人给的
+   */
   hitSupplementedDoc: boolean
+  /**
+   * 判定结论。🔴 **不能只看 `status`**：`NOT_RESOLVED`（判过了、没通过）与
+   * `BLOCKED`（压根判不了：还没补录 / 索引没建好）都是 `PENDING`，
+   * 而页面对这两件事的展示完全不同。
+   */
+  verdict: 'RESOLVED' | 'NOT_RESOLVED' | 'BLOCKED'
+  /** 重放后该行的**实际**状态（后端权威值，前端不再自己推断） */
+  status: MissStatus
+  /** 一句话依据，或"为什么判不了"。用来告诉用户下一步该做什么 */
   note: string
 }
 

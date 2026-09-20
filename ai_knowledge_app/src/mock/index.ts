@@ -63,7 +63,7 @@ import {
   mockVlImpact,
   mockChatSessions,
 } from './data'
-import type { RetrievalTrace, KbConfigForm, KnowledgeBase, ModelConfigItem, ModelType } from '../types/index.ts'
+import type { RetrievalTrace, KbConfigForm, KnowledgeBase, ModelConfigItem, ModelType, MissStatus } from '../types/index.ts'
 
 /**
  * Mock 中间件 —— Vite dev-server 插件
@@ -1711,33 +1711,70 @@ register('PATCH', '/api/ops/qa/misses/:id', async (req, res, ctx) => {
   json(res, 0, { id, status, pending: pendingCount })
 })
 
-/** 重放验证（闭环第 4 步）：同时校验分数提升 + 召回的是补录文档 */
+/**
+ * 待办态（与后端 `MissStatus#countsAsPending()` **同一口径**）：`PENDING` 与 `IN_LIST` 都算。
+ *
+ * <p>写成函数而不是内联比较：内联时 TS 会把上面那个三元的类型收窄成三个字面量，
+ * 于是 `=== 'IN_LIST'` 被判成"永假比较"而报错 —— 而那条分支是**真的**。
+ * 收成一处也免得日后改了待办口径只改一半。
+ */
+function countsAsPending(status: MissStatus): boolean {
+  return status === 'PENDING' || status === 'IN_LIST'
+}
+
+/**
+ * 重放验证（闭环第 4 步）：同时校验分数提升 + **Top1 是**刚补录那篇。
+ *
+ * <h3>⚠️ 与真后端的口径必须逐字一致</h3>
+ * 判定结论是 `verdict` 三态（`RESOLVED` / `NOT_RESOLVED` / `BLOCKED`），
+ * 而 `status` 是重放后该行的**实际**状态 —— 两个都给，因为
+ * 「判过了没通过」与「压根判不了」的 `status` 都是 `PENDING`（见 `ReplayResult` 的注释）。
+ * mock 若只模仿"通过/不通过"，mock 模式下就永远看不见 `BLOCKED` 那一档，
+ * 而它恰恰是页面上最需要说清的一种情形。
+ */
 register('POST', '/api/ops/qa/misses/:id/replay', async (req, res, ctx) => {
   void req
   await delay(900)
   const id = Number(ctx.params.id)
   const target = missStore.find((m) => m.id === id)
-  const before = target?.topScore ?? 0.3
-  const improved = Math.random() > 0.25
-  const after = improved ? Math.min(0.92, before + 0.35 + Math.random() * 0.15) : before + 0.02
+  const before = target?.topScore ?? null
+
+  // ① 判不了：没有可比的前分（旧行）
+  if (before == null) {
+    json(res, 0, {
+      before: null,
+      after: null,
+      improved: false,
+      hitSupplementedDoc: false,
+      verdict: 'BLOCKED',
+      status: target?.status ?? 'PENDING',
+      note: '这条问题没有记录到「补录前」的相似度，没有对比就下不了结论，所以这次不作判定',
+    })
+    return
+  }
+
+  const passed = Math.random() > 0.25
+  const hit = passed
+  const after = passed ? Math.min(0.92, before + 0.35 + Math.random() * 0.15) : before + 0.02
+  const improved = after > before
+  const next = target?.status === 'IGNORED' ? 'IGNORED' : passed ? 'RESOLVED' : 'PENDING'
   if (target) {
-    const wasPending = target.status === 'PENDING'
-    if (improved) {
-      if (wasPending) pendingCount = Math.max(0, pendingCount - 1)
-      target.status = 'RESOLVED'
-      target.scoreAfter = Number(after.toFixed(2))
-    } else {
-      target.status = 'PENDING'
+    if (countsAsPending(target.status) && !countsAsPending(next)) {
+      pendingCount = Math.max(0, pendingCount - 1)
     }
+    target.status = next
+    target.scoreAfter = Number(after.toFixed(2))
   }
   json(res, 0, {
     before,
     after: Number(after.toFixed(2)),
     improved,
-    hitSupplementedDoc: improved,
-    note: improved
-      ? '召回分提升且命中的是刚补录的文档，可标记已解决'
-      : '分数未达标或召回的不是补录文档，已退回待处理',
+    hitSupplementedDoc: hit,
+    verdict: passed ? 'RESOLVED' : 'NOT_RESOLVED',
+    status: next,
+    note: passed
+      ? '召回分达标且 Top1 正是刚补录的文档 —— 已自动关闭'
+      : '召回分未达标，或最高分那一条不是补录的文档，已退回待处理',
   })
 })
 

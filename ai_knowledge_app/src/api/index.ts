@@ -1,61 +1,5 @@
 import { http, chatStream, type SSEHandlers } from './request'
-import type {
-  ActiveUserStat,
-  ApiResponse,
-  AttachmentUploadResult,
-  AuditLog,
-  AuditLogDetail,
-  ChatSessionItem,
-  ChunkInfo,
-  ChunkStat,
-  DeptUsage,
-  DocMeta,
-  DocVersion,
-  DownloadRecord,
-  DownloadTask,
-  EmbeddingImpact,
-  FeedbackStats,
-  IndexTask,
-  KbConfigForm,
-  KbDocRow,
-  KbHeat,
-  KbQuality,
-  KnowledgeBase,
-  MissQuestion,
-  MissStatus,
-  ModelConfigItem,
-  ModelConfigResponse,
-  ModelOption,
-  ModelType,
-  ModelUsage,
-  NoticeCounts,
-  NoticeItem,
-  NoticeSetting,
-  NoticeType,
-  PageResult,
-  ParentChunkRelation,
-  ParseConfigView,
-  ParseIssue,
-  PendingItem,
-  PermissionNode,
-  PipelineStage,
-  QaOverview,
-  RecycleItem,
-  ReindexImpact,
-  ReplayResult,
-  RetrievalOverview,
-  RerankEffect,
-  RoleInfo,
-  ScoreBucket,
-  SplitPresetDef,
-  StorageQuota,
-  TocItem,
-  TopQuestion,
-  TrendPoint,
-  UsageOverview,
-  UserInfo,
-  VlImpact,
-} from '@/types'
+import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQuality, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, PipelineStage, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RoleInfo, ScoreBucket, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
 
 /** 认证接口 */
 export const authApi = {
@@ -116,7 +60,7 @@ export const kbApi = {
     http.get<{
       presets: SplitPresetDef[]
       defaults: KbConfigForm
-      embedding: { model: string; dimension: number; norm: string; locked: boolean }
+      embedding: EmbeddingInfo
       vlModel: { name: string; enabled: boolean; appliedAt: string }
     }>('/kb/presets'),
   /** 知识库配置（设置页） */
@@ -148,7 +92,7 @@ export const kbApi = {
       updatedAt: string
       visibleRoles: string[]
       config: KbConfigForm
-      embedding: { model: string; dimension: number; norm: string; locked: boolean }
+      embedding: EmbeddingInfo
       vlModel: { name: string; enabled: boolean; appliedAt: string }
       presetOptions: SplitPresetDef[]
     }>(`/kb/${id}/config`),

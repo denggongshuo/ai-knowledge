@@ -115,27 +115,57 @@ async function batchSet(status: MissStatus) {
   selected.value = []
 }
 
-/** 闭环第 4 步：重放验证（同时校验分数提升 + 召回的是补录文档） */
+/**
+ * 闭环第 4 步：重放验证（跑后端 `POST /ops/qa/misses/{id}/replay`）。
+ *
+ * <h3>🔴 状态由**后端**给，前端不推断</h3>
+ * 原来这里写的是 `item.status = res.improved ? 'RESOLVED' : 'PENDING'` —— 两个错：
+ * ① 需求 §1.4 步 5 的判据是「分数**达标**自动关闭」，不是"涨了就算"；
+ * ② 「判不了」（补录文档还在解析、或压根没补录）这一档**不改状态**，
+ *    `improved` 是 false，于是它会被显示成"未通过"—— 而那是**一个关于内容的错误结论**。
+ * 现在 `status` / `verdict` 都取后端回话。
+ */
 async function replay(item: MissQuestion) {
   const res = await opsApi.replayMiss(item.id)
-  item.status = res.improved ? 'RESOLVED' : 'PENDING'
-  if (res.improved) item.scoreAfter = res.after
-  await loadOverview()
+  // 重新拉列表：状态、`补录前 → 补录后` 都在服务端，本地改一份迟早与它对不上
+  await Promise.all([loadMisses(), loadOverview()])
+
+  const score = (v: number | null) => (v == null ? '—' : v.toFixed(6))
+  const title =
+    res.verdict === 'RESOLVED'
+      ? '重放验证通过，已自动关闭'
+      : res.verdict === 'BLOCKED'
+        ? '这次重放判不了'
+        : '重放验证未通过'
   ElMessageBox.alert(
-    `召回分：${res.before} → ${res.after}（${res.improved ? '提升' : '未达标'}）
+    `召回分：${score(res.before)} → ${score(res.after)}
 是否命中刚补录的文档：${res.hitSupplementedDoc ? '是' : '否'}
+当前状态：${MISS_STATUS[res.status]?.text ?? res.status}
+
 ${res.note}`,
-    res.improved ? '重放验证通过，已自动关闭' : '重放验证未通过',
-    { type: res.improved ? 'success' : 'warning', confirmButtonText: '知道了' },
+    title,
+    { type: res.verdict === 'RESOLVED' ? 'success' : 'warning', confirmButtonText: '知道了' },
   )
 }
 
-/** 闭环第 2 步：一键补文档，问题文本作为补录备注带入 */
+/**
+ * 闭环第 2 步：一键补文档，**问题文本作为补录备注带入**（需求 §1.4 步 2）。
+ *
+ * <h3>🔴 为什么"横跨多库"这一路必须把 note 一起带走</h3>
+ * `kbName` 是那一行**涉及的知识库名**（后端 `kb_ids` 逗号串的显示名，可能是「A、B、C」）。
+ * 库里查不到对应 id 时（跨多库、或那个库已删）就只能跳知识库列表让用户自己选目标库 ——
+ * 而这一步原来**把 note 丢了**：上传页收不到问题原文，重放验证就永远认不出"刚补录的是哪一篇"。
+ * 于是闭环卡在第 2 步与第 4 步之间，**而现象只是"重放说没命中补录文档"**。
+ * ⇒ 现在把 note 挂在 `/kb` 的 query 上，由库列表透传到那一条「上传文档」入口。
+ *
+ * ⚠️ 顺带说明为什么**不**"默认补到第一个库"：`kb_ids` 记的是**检索覆盖了哪些库**，
+ * 不是"答案该在哪个库"——挑一个替用户决定，会让补录落到一个他自己都没选的库上。
+ */
 function supplement(item: MissQuestion) {
   const kbId = kbMap.value[item.kbName]
   if (!kbId) {
-    router.push('/kb')
-    ElMessage.info('已跳转知识库列表，请选择目标库上传补录文档')
+    router.push({ path: '/kb', query: { note: item.question } })
+    ElMessage.info('已跳转知识库列表，请选择目标库上传补录文档（问题原文已随行带入）')
     return
   }
   router.push({ path: `/kb/${kbId}/upload`, query: { note: item.question } })
