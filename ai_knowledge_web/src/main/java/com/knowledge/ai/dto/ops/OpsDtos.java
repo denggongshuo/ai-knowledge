@@ -146,4 +146,119 @@ public final class OpsDtos {
                              int pending,
                              double missThreshold) {
     }
+
+    /**
+     * 高频问题榜的一行（`T-A02` · 需求 `08` §1.5）。
+     *
+     * @param question     该组**最近一次**的**原始问法**。🔴 需求 §1.10 逐字要求
+     *                     「用户问题**保持原始问法**，未被改写」⇒ 这里**不是**
+     *                     `MissKeyNormalizer.normalize()` 的结果（那是聚合键，人是读不懂的）
+     * @param count        该组的**提问次数**
+     * @param avgTopScore  该组**有分数行**的平均 Top1；⚠️ 一条都没拿到过分时为 {@code null}
+     *                     —— 前端显示 `—`。**不能用 0 顶替**：0 会被读成"召回质量极差"，
+     *                     而事实是"这些提问一条都没召回上来"（`#169` 的同一条口径）
+     *
+     * <h4>🔴 「次数」是**归一化聚合**，不是语义聚合</h4>
+     * <p>「同一问法的不同写法」必然合并（`怎么配？` ≡ `怎么配` ≡ `怎么配`），
+     * 而「意思一样但问法不同」**不合并** —— 那是 `R-6` 的语义聚合，阈值无语料可校准，
+     * 用户 2026-09-20 已裁定挂起（`G8-2` 的挂起半边）。页面必须写明这一句，
+     * 否则「次数 12」会被读成"有 12 个人问过同一个问题"。
+     */
+    public record TopQuestion(String question, long count, Double avgTopScore) {
+    }
+
+    /**
+     * 高频问题榜的响应。
+     *
+     * <p>⚠️ {@code total} 是**归一化合并之后的组数**，与清单页那个 `total` 不是同一种东西：
+     * 那边数的是未命中**行**，这边数的是问法的**种类**。两者都不等于"提问次数合计" ——
+     * 需要那个数时看 `list` 里各行各的 `count`。
+     */
+    public record TopQuestionsResponse(List<TopQuestion> list, int total) {
+    }
+
+    /**
+     * 点踩归因里的一档。
+     *
+     * @param reason  原因文案 —— 取自 {@link com.knowledge.ai.core.enums.ChatFeedbackReason}
+     *                的**落库值**（就是中文标签本身，见该枚举「为什么不存代号」）
+     * @param count   该原因的次数
+     * @param percent 占比（%，保留一位小数）= `count / negativeTotal`
+     */
+    public record FeedbackReason(String reason, long count, double percent) {
+    }
+
+    /**
+     * 点踩原因归因（`T-A02` · 需求 `08` §1.6）。
+     *
+     * <h4>🔴 为什么有 {@code unreasoned} 这个字段 —— 需求 §1.10 那条等式不成立</h4>
+     * <p>需求 §1.10 的验收要点写着「**点踩原因次数合计 = 统计的负反馈总数**」。
+     * 而需求 §6.8 自己写的是「点踩时**可选**原因」⇒ `ChatFeedbackService#submit`
+     * 允许 `unlike` **不带原因**（`reason.isEmpty()` 直接通过，落库为 `NULL`）。
+     * ⇒ **只要库里有一行"点踩但没填原因"，那条等式就永远不成立。**
+     * <p>这与 `S8-M10-A` 逮到的另一条（「清单总条数 = 未命中提问数」）是**同一个形状**：
+     * 需求把一个"差一个量"的等式写成了勾选框。处置照同一判例 ——
+     * **两个数都如实给**，<b>不挑一个"好看"的</b>：
+     * <ul>
+     *   <li>{@code negativeTotal} = 负反馈**总数**（含没填原因的）；</li>
+     *   <li>{@code reasons} = 按原因分档（**只含填了原因的**）；</li>
+     *   <li>{@code unreasoned} = 其中**没填原因**的条数；</li>
+     *   <li>⇒ `sum(reasons[].count) + unreasoned == negativeTotal` **真的成立**，
+     *       而且这个等式是**跨两条独立查询**验的（不是 `sum` 推出来的 —— 见
+     *       `QaOpsRepository#feedbackCounts` 的注释：推出来的等式会变成空断言）。</li>
+     * </ul>
+     *
+     * @param negativeTotal 负反馈**总数**（窗口内 `feedback = 'unlike'` 的行数）
+     * @param negativeRate  负反馈率（%，保留一位小数）= `negativeTotal / 窗口内提问总数`。
+     *                      ⚠️ 分母是**提问总数**（`sys_retrieval_trace` 的行数），
+     *                      与 `QaOverview#totalQuestions` **同一个口径** —— 需求 §1.6 原话
+     *                      「负反馈率 = 负反馈数 ÷ **提问总数**」（它的示例是 `28 ÷ 1284`）
+     * @param threshold     需求 §1.6 点名要对比的阈值（%）。**写死的常量**：
+     *                      需求那一行给的就是 5，它不是可配置项（`sys_setting` 里没有它）
+     * @param unreasoned    点踩但没填原因的条数（见上）
+     * @param reasons       按原因分档。⚠️ **闭集那 5 条逐条都在**（缺的补 0）——
+     *                      否则"这个原因的次数是 0"与"这个原因不存在"长得一模一样
+     */
+    public record FeedbackStats(long negativeTotal,
+                                double negativeRate,
+                                double threshold,
+                                long unreasoned,
+                                List<FeedbackReason> reasons) {
+    }
+
+    /**
+     * `POST /ops/qa/export` 的入参。
+     *
+     * <h4>🔴 为什么筛选条件要**从请求里拿**，而不是"导出全部"</h4>
+     * <p>需求 §1.7 写的是「导出报表 | 字段与表格列保持一致」—— 用户看到的是**筛过的**
+     * 那张表（状态 / 知识库 / 关键词三个筛选器）。导出全部的话，用户拿到的与他看到的
+     * 不是同一批数据，而报表的用途恰恰是"周会汇报我看到的那张表"。
+     * <p>这与审计导出的取舍逐字相同（`AuditQueryService#exportCsv` 的注释：
+     * 「**筛选条件原样带走**：这既是用户预期，也是数据外带面的控制」）——
+     * 本仓在这条上是同一条纪律，不是本批新发明的。
+     *
+     * <p>⚠️ `kbId` 收 **String**，与 `GET /ops/qa/misses` 同因：前端「全部」发的是字面量
+     * `all`。声明成 `Long` 会在参数绑定阶段就抛错，而现象是"页面空着"。
+     *
+     * @param status  状态筛选（`PENDING`/`IN_LIST`/`RESOLVED`/`IGNORED`）；空或 `all` = 不筛
+     * @param kbId    知识库筛选；空或 `all` = 不筛
+     * @param keyword 问题原文关键词；空 = 不筛
+     */
+    public record ExportRequest(String status, String kbId, String keyword) {
+    }
+
+    /**
+     * 导出任务受理回话。
+     *
+     * <p>三个字段与前端 `api/index.ts` 的 `qaExport` 泛型、以及 `mock/index.ts` 的同名分支
+     * **逐字一致**（本批是"把后端补上"，不是重新设计契约）。
+     *
+     * @param status 调度层的**真值**（`AsyncTaskStatus` 的枚举名，即 `PENDING`），
+     *               ⚠️ **不是** mock 那个字面量 `QUEUED` —— 理由见 `AuditExportService#submit`
+     *               的注释：同一个 `taskId` 在两次请求里不能有两种状态词
+     * @param note   给用户看的一句话。⚠️ 前端**应当显示它**而不是自己写死一句 ——
+     *               否则"后端说不支持"与"后端说已提交"在前端长得一样
+     */
+    public record ExportAccepted(String taskId, String status, String note) {
+    }
 }

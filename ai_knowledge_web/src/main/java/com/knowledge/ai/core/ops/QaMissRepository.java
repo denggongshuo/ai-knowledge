@@ -146,6 +146,25 @@ public class QaMissRepository {
         return scalar("select count(*) from sys_qa_miss m" + filter.where(), filter.params());
     }
 
+    /**
+     * 导出用：**全部**匹配行（无分页），排序与 {@link #findPage} 一致。
+     *
+     * <p>🔴 **多取一行，用来判断"是不是超限"** —— 调用方给的 {@code cap} 是上限，
+     * 返回 {@code cap + 1} 行就说明还有更多。这样避免"再发一条 count 查询"，
+     * 也避免"先数后取"两次之间数据变了导致的自相矛盾。
+     * <p>⚠️ 调用方**必须**检查 `size() > cap` 并**明确拒绝**（报出实际条数与上限），
+     * **不能静默截断** —— 一份少了行的报表看起来是完整的，
+     * 而"上周明明有 12 条怎么只导出了 10 条"没人查得出来（与审计导出同一条口径）。
+     */
+    public List<Row> findAll(MissStatus status, Long kbId, String keyword, int cap) {
+        Filter filter = filter(status, kbId, keyword);
+        String sql = SELECT_ROW + filter.where()
+                + " order by m.ask_count desc, m.last_ask_at desc, m.id desc limit :cap";
+        Map<String, Object> params = new HashMap<>(filter.params());
+        params.put("cap", cap + 1);
+        return query(sql, params);
+    }
+
     /** 这些行的**提问次数合计** —— 见类注释「两个计数不是一回事」。 */
     public long sumAskCount(MissStatus status, Long kbId, String keyword) {
         Filter filter = filter(status, kbId, keyword);

@@ -52,6 +52,12 @@ public class NoticePublisher {
      */
     private static final String TYPE_AUDIT_EXPORT = "audit-export";
 
+    /**
+     * 运营报表导出（`T-A02`）。⚠️ 与 {@code OpsExportService.TASK_TYPE} **逐字一致**
+     * —— 那两处是同一个协议的两端，改一处必须改另一处（用例 `OpsExportFlowTest` 钉住了它）。
+     */
+    private static final String TYPE_OPS_EXPORT = "ops-export";
+
     private static final String TYPE_DOC_UPLOAD = "doc-upload";
 
     private static final String TYPE_KB_REINDEX = "KB_REINDEX";
@@ -118,11 +124,18 @@ public class NoticePublisher {
         Long docId = coord.docId();
         return switch (coord.type() == null ? "" : coord.type()) {
             case TYPE_AUDIT_EXPORT -> done
-                    ? exportDone(result)
+                    ? exportDone("审计导出完成", "去审计页", "/audit", result)
                     // 导出失败对用户是"想要的 CSV 没拿到" —— 归 ALERT（需求 §2.2 的「任务中断」）
                     : new NoticePayload(NoticeType.ALERT, "审计导出失败",
                             "导出任务未完成：" + reason(errorMsg) + "。可调整筛选条件后重新导出。",
                             List.of(NoticeAction.primary("重新导出", "/audit")), true, false);
+
+            // 运营报表导出（`T-A02`）。走与审计导出**同一段** fileUrl 处理 —— 见 exportDone
+            case TYPE_OPS_EXPORT -> done
+                    ? exportDone("运营报表导出完成", "回运营页", "/ops/qa", result)
+                    : new NoticePayload(NoticeType.ALERT, "运营报表导出失败",
+                            "导出任务未完成：" + reason(errorMsg) + "。可调整筛选条件后重新导出。",
+                            List.of(NoticeAction.primary("重新导出", "/ops/qa")), true, false);
 
             case TYPE_DOC_UPLOAD -> done
                     ? new NoticePayload(NoticeType.UPLOAD, "解析完成",
@@ -159,19 +172,27 @@ public class NoticePublisher {
     /**
      * 导出成功 —— 🔴 **这条是本类存在理由的证明**：它要的是 `result` 里的 `fileUrl`，
      * 而那个东西**只在这一层拿得到**（`sys_async_task.result` 不持久化）。
+     *
+     * <p>两个导出（审计件 `T-304` / 运营报表 `T-A02`）共用这一段：
+     * "`fileUrl` 有就用它当按钮、没有就退回页面入口"这条规则**只该有一份** ——
+     * 各写一份的话，一边记得处理 `fileUrl` 为空、另一边忘，现象是"通知里有个点不动的按钮"。
+     * 所以标题与兜底入口做成参数，**规则本身不复制**。
+     *
+     * @param fallbackLabel / {@code fallbackPath}：`fileUrl` 缺失时退回去的入口
      */
-    private NoticePayload exportDone(Object result) {
+    private NoticePayload exportDone(String title, String fallbackLabel, String fallbackPath,
+                                     Object result) {
         String fileUrl = stringField(result, "fileUrl");
         Long rows = longField(result, "rows");
         String detail = rows == null ? "" : "共 " + rows + " 行。";
         if (fileUrl == null || fileUrl.isBlank()) {
-            // 结果里没有地址（不该发生）—— 不能给一个点不动的按钮，退回"去审计页"
-            log.warn("导出任务完成但结果里没有 fileUrl，通知退回审计页入口");
-            return new NoticePayload(NoticeType.SYSTEM, "审计导出完成",
-                    "导出文件已生成，" + detail + "请到审计页重新导出获取下载地址。",
-                    List.of(NoticeAction.primary("去审计页", "/audit")), false, true);
+            // 结果里没有地址（不该发生）—— 不能给一个点不动的按钮
+            log.warn("导出任务完成但结果里没有 fileUrl，通知退回页面入口：title={}", title);
+            return new NoticePayload(NoticeType.SYSTEM, title,
+                    "导出文件已生成，" + detail + "请到页面重新导出获取下载地址。",
+                    List.of(NoticeAction.primary(fallbackLabel, fallbackPath)), false, true);
         }
-        return new NoticePayload(NoticeType.SYSTEM, "审计导出完成",
+        return new NoticePayload(NoticeType.SYSTEM, title,
                 "导出文件已生成，" + detail + "下载地址有时效，请尽快下载。",
                 List.of(NoticeAction.primary("下载导出文件", fileUrl)), false, true);
     }
