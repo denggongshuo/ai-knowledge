@@ -364,11 +364,19 @@ public class DocDetailService {
      * <p>底表是 {@code sys_async_task}（**没有独立的 index-task 表**），
      * 按 {@code type = 'doc-parse'} 且 {@code doc_id} 过滤、新→旧。
      *
-     * <p><b>{@code status} 与后端状态机一对一</b>：{@code PENDING/RUNNING/DONE/FAILED}
-     * → {@code PENDING/RUNNING/SUCCESS/FAILED}（只有 {@code DONE} 因为"成功"才改名）。
-     * ⚠️ mock 与前端类型里原本还有一个 {@code INFO} —— 它在本仓**没有任何定义**
+     * <p><b>{@code status} 原样下发 {@code AsyncTaskStatus}</b>（{@code PENDING/RUNNING/
+     * DONE/FAILED}），**不在这一层改名**。
+     *
+     * <p>🔴 本批第一版在这里做了 {@code DONE → SUCCESS} 的映射，**随后撤掉了** ——
+     * 理由不是"哪个词更好看"，而是：一旦在 API 边界改名，这个取值就**再也不可能
+     * 三方逐字相等**，`check-enums.mjs` 的取值登记表就覆盖不了它（它只能比"三方一致"），
+     * 于是后端/前端/mock 三份词表又回到"靠人同步"。不改名时三者相同，
+     * 那条闸能机械地盯住它。
+     *
+     * <p>⚠️ mock 与前端类型里原本还有一个 {@code INFO} —— 它在本仓**没有任何定义**
      * （既不在 {@code AsyncTaskStatus} 里，CSS 里也没有 {@code .dot.info}，那一行的圆点
-     * 本来就是裸的）⇒ 本批把这个取值收回，类型与状态机对齐。
+     * 本来就是裸的）⇒ 本批把这个取值收回。{@code DONE} 也是本仓既有词汇
+     * （{@code DownloadStatus} 就是 {@code PACKING/DONE/EXPIRED/FAILED}）。
      *
      * <p><b>{@code durationSec}</b> = {@code finished_at - locked_at}：这张表**没有
      * started_at**，{@code locked_at} 是"被 worker 领取"的时刻，是最接近执行起点的那个事实。
@@ -397,7 +405,7 @@ public class DocDetailService {
             list.add(new DocDtos.IndexTaskRow(
                     (String) r[0],
                     r[1] == null ? "" : (String) r[1],
-                    uiStatus((String) r[2]),
+                    (String) r[2],
                     time(r[3]),
                     chunkTotal <= 0 ? null : chunkTotal,
                     duration,
@@ -479,11 +487,6 @@ public class DocDetailService {
         Query query = entityManager.createNativeQuery(sql);
         params.forEach(query::setParameter);
         return ((Number) query.getSingleResult()).longValue();
-    }
-
-    /** `DONE` 才是"成功"；其余三名与后端状态机同名（见 {@link #indexTasks}）。 */
-    private static String uiStatus(String dbStatus) {
-        return "DONE".equals(dbStatus) ? "SUCCESS" : (dbStatus == null ? "" : dbStatus);
     }
 
     private static Long durationSec(Object lockedAt, Object finishedAt) {

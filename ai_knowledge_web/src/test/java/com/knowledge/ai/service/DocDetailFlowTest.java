@@ -318,7 +318,7 @@ class DocDetailFlowTest extends ApiTestSupport {
         // 索引任务的 version 同一根因（不是"这份任务没有版本"）
         List<Map<String, Object>> tasks = listOf(get("/api/doc/" + docId + "/index-tasks", adminToken).data("$.list"));
         assertThat(tasks).isNotEmpty();
-        assertThat(taskOf(tasks, "SUCCESS")).containsEntry("version", null);
+        assertThat(taskOf(tasks, "DONE")).containsEntry("version", null);
     }
 
     // ==================================================================
@@ -411,7 +411,7 @@ class DocDetailFlowTest extends ApiTestSupport {
         // 顺序是"新 → 旧"：这一条与上面那条"两条 created_at 不同"的夹具注释是一对
         assertThat(list.get(0)).as("最新的一条在最前").containsEntry("status", "RUNNING");
 
-        Map<String, Object> done = taskOf(list, "SUCCESS");
+        Map<String, Object> done = taskOf(list, "DONE");
         assertThat(num(done, "durationSec")).as("探针任务跑了 74 秒").isEqualTo(74);
         assertThat(num(done, "chunkCount")).isEqualTo(8);
 
