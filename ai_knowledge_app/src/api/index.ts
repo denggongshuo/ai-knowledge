@@ -190,8 +190,15 @@ export const opsApi = {
   replayMiss: (id: number) => http.post<ReplayResult>(`/ops/qa/misses/${id}/replay`),
   topQuestions: (query?: { range?: string; limit?: number }) =>
     http.get<{ list: TopQuestion[]; total: number }>('/ops/qa/top-questions', query),
-  feedbackStats: () => http.get<FeedbackStats>('/ops/qa/feedback-stats'),
-  qaExport: () => http.post<{ taskId: string; status: string; note: string }>('/ops/qa/export'),
+  feedbackStats: (query?: { range?: string }) => http.get<FeedbackStats>('/ops/qa/feedback-stats', query),
+  /**
+   * 导出运营报表（异步，完成后走通知中心）。
+   *
+   * ⚠️ **筛选条件要发过去**：导出的是"页面上筛出来的那张表"，不是全表 ——
+   * 需求 §1.7 那句「字段与表格列保持一致」的落点就在这（后端 `OpsDtos.ExportRequest`）。
+   */
+  qaExport: (body?: { status?: string; kbId?: string; keyword?: string }) =>
+    http.post<{ taskId: string; status: string; note: string }>('/ops/qa/export', body),
 
   // ---- 20 检索质量分析 ----
   retrievalOverview: () => http.get<RetrievalOverview>('/ops/retrieval/overview', { range: '7d' }),

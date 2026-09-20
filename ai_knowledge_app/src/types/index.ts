@@ -842,11 +842,18 @@ export interface QaOverview {
   missThreshold: number
 }
 
-/** 高频问题（真实问法是校准 HyQ 的语料） */
+/**
+ * 高频问题（真实问法是校准 HyQ 的语料）。
+ *
+ * ⚠️ `count` 是**归一化聚合**的次数：同一问法的不同写法必然合并
+ * （`怎么配？` ≡ `怎么配`），而「意思一样但问法不同」**不合并**
+ * —— 那是 `R-6` 的语义聚合，阈值无语料可校准、已判定挂起（后端 `G8-2` 的挂起半边）。
+ */
 export interface TopQuestion {
   question: string
   count: number
-  avgTopScore: number
+  /** 该组**有分数行**的平均 Top1；⚠️ **可空**：一条都没拿到过分时后端给 `null`（页面显示 `—`）—— 用 0 顶替会被读成「召回质量极差」 */
+  avgTopScore: number | null
 }
 
 /** 点踩原因归因 */
@@ -856,10 +863,21 @@ export interface FeedbackReason {
   percent: number
 }
 
+/**
+ * 点踩原因归因。
+ *
+ * 🔴 **三个数合起来才对得上**：`reasons` 合计 + `unreasoned` = `negativeTotal`。
+ * 因为点踩时原因**可不填**（需求 `07` §6.8 写的是"可选"），所以需求 §1.10 那条
+ * 「点踩原因次数合计 = 负反馈总数」在有这种行时**不可能成立** ——
+ * 后端把三个数都如实给了，页面必须一起显示，不能只显示前两个。
+ */
 export interface FeedbackStats {
   negativeTotal: number
   negativeRate: number
+  /** 需求 §1.6 点名要对比的阈值（%）；后端给常量，不是可配置项 */
   threshold: number
+  /** 点踩但**没填原因**的条数（`feedback_reason` 为空的那些） */
+  unreasoned: number
   reasons: FeedbackReason[]
 }
 

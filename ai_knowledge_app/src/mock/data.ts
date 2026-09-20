@@ -698,16 +698,27 @@ export const mockTopQuestions: TopQuestion[] = [
   { question: '未命中问题怎么闭环？', count: 19, avgTopScore: 0.76 },
 ]
 
-/** 点踩原因归因（负反馈率 2.2% vs 阈值 5%；前两项合计 75%） */
+/**
+ * 点踩原因归因（负反馈率 2.2% vs 阈值 5%；前两项合计 75%）。
+ *
+ * 🔴 **原因文案取需求那一份**：需求 `07` §6.8 与《01-示例数据字典》§7.11 都写的是
+ * 「回答太**啰嗦**」「引用**来源不对**」，而后端 `ChatFeedbackReason` 与它们逐字一致。
+ * 这里原先写的是「回答太**笼统**」「引用**不相关**」—— 四方里三方一致、只有 mock 独自漂着。
+ * 由来见 `#164`；机器对账见 `T-O20`（`scripts/check-enums.mjs`）。
+ *
+ * ⚠️ `unreasoned` 不是凑数的：点踩时原因**可不填**（需求 §6.8「可选」），
+ * 那部分既不属于任何原因、也不能丢 —— 三个数合起来才等于 `negativeTotal`。
+ */
 export const mockFeedbackStats: FeedbackStats = {
   negativeTotal: 28,
   negativeRate: 2.2,
   threshold: 5,
+  unreasoned: 0,
   reasons: [
     { reason: '答案不准确', count: 12, percent: 42.9 },
     { reason: '没找到相关内容', count: 9, percent: 32.1 },
-    { reason: '回答太笼统', count: 4, percent: 14.3 },
-    { reason: '引用不相关', count: 2, percent: 7.1 },
+    { reason: '回答太啰嗦', count: 4, percent: 14.3 },
+    { reason: '引用来源不对', count: 2, percent: 7.1 },
     { reason: '其他', count: 1, percent: 3.6 },
   ],
 }

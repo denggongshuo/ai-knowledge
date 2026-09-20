@@ -35,9 +35,6 @@ const misses = ref<MissQuestion[]>([])
 const missTotal = ref(0)
 const topQuestions = ref<TopQuestion[]>([])
 const feedback = ref<FeedbackStats | null>(null)
-/** 这两栏的后端接口属 `T-A02`（本批不交付）—— 用来把"没交付"与"没有数据"分开。 */
-const topNotDelivered = ref(false)
-const feedbackNotDelivered = ref(false)
 
 const selected = ref<MissQuestion[]>([])
 const statusFilter = ref('all')
@@ -71,21 +68,17 @@ async function loadMisses() {
   missTotal.value = res.total
 }
 async function loadTop() {
-  try {
-    const res = await opsApi.topQuestions({ range: range.value, limit: 20 })
-    topQuestions.value = res.list
-  } catch {
-    // 后端还没实现（属 `T-A02`）—— **区分「没交付」与「没有数据」**：
-    // 不区分的话，这一栏空着会被读成"确实没有高频问题"，而事实是这个数字还没地方取
-    topNotDelivered.value = true
-  }
+  const res = await opsApi.topQuestions({ range: range.value, limit: 20 })
+  topQuestions.value = res.list
 }
 async function loadFeedback() {
-  try {
-    feedback.value = await opsApi.feedbackStats()
-  } catch {
-    feedbackNotDelivered.value = true
-  }
+  // ⚠️ `range` 要发给它 —— 这一栏原先不传（后端默认 7 天），
+  // 于是"时间范围"下拉只影响榜单，两个卡片说的不是同一个窗口
+  feedback.value = await opsApi.feedbackStats({ range: range.value })
+}
+/** 时间范围变化 ⇒ **两栏一起重拉**（一个下拉管一页，别只刷新其中一栏）。 */
+function reloadStats() {
+  void Promise.all([loadTop(), loadFeedback()])
 }
 
 /** 状态标签（模板中避免用 any 索引 Record） */
@@ -94,7 +87,40 @@ function missTag(status: MissStatus) {
 }
 
 const maxTopCount = computed(() => Math.max(...topQuestions.value.map((t) => t.count), 1))
+
+/**
+ * 归因三项的构成 —— 🔴 **三个数一起读才对得上**。
+ *
+ * 需求 §1.10 的验收要点写着「点踩原因次数合计 = 统计的负反馈总数」，而需求 §6.8 又说
+ * 点踩时原因是**可选**的 ⇒ 只要有一行"点踩但没填原因"，那条等式就**永远不成立**。
+ * 后端把三个数都如实给了（`reasons` / `unreasoned` / `negativeTotal`），
+ * 页面必须**一起显示**：只显示前两个的话，用户会以为系统的账对不上，而错的是那句验收要点。
+ */
 const negativeTop = computed(() => (feedback.value?.reasons ?? []).reduce((s, r) => s + r.count, 0))
+const unreasoned = computed(() => feedback.value?.unreasoned ?? 0)
+const unreasonedPercent = computed(() =>
+  feedback.value && feedback.value.negativeTotal > 0
+    ? Math.round((unreasoned.value * 1000) / feedback.value.negativeTotal) / 10
+    : 0,
+)
+
+/** 需求 §1.6 的结论落点：前两个原因合计占多少（原文是"合计占 75%，最值得投入"）。 */
+const topTwoShare = computed(() => {
+  const f = feedback.value
+  if (!f || f.negativeTotal === 0) return null
+  const first2 = ['答案不准确', '没找到相关内容']
+  const sum = f.reasons.filter((r) => first2.includes(r.reason)).reduce((s, r) => s + r.count, 0)
+  return Math.round((sum * 1000) / f.negativeTotal) / 10
+})
+
+/** 空召回的那一组没有均分（后端给 `null`）—— 显示 `—`，**不显示 `0`**。 */
+function scoreText(v: number | null) {
+  return v == null ? '—' : v.toFixed(3)
+}
+/** 条形图的降权阈值：没分数时**不算低**（不知道，不是差）。 */
+function scoreLow(v: number | null) {
+  return v != null && v < 0.7
+}
 
 // ---------------- 状态流转 ----------------
 async function setStatus(item: MissQuestion, status: MissStatus) {
@@ -171,13 +197,42 @@ function supplement(item: MissQuestion) {
   router.push({ path: `/kb/${kbId}/upload`, query: { note: item.question } })
 }
 
+/**
+ * 需求 §1.5 的「用这些真实问法重新生成 HyQ」入口 —— 🔴 **本版本不交付**。
+ *
+ * 原实现弹的是 `ElMessage.success('已提交…任务，完成后通过通知中心提醒')`，
+ * 而它**一个请求都没发**（承 `T-908`「不返回假 taskId」的判例：假启动比没有入口更糟，
+ * 因为它让人以为已经做了）。真重跑要动检索语料重建（属 `T-910`/`T-710`），
+ * 而需求那一行写的是「**建议**提供」—— 所以这里**如实说明**，不假装。
+ */
 function regenerateHyq() {
-  ElMessage.success('已提交「用真实问法重新生成 HyQ」任务，完成后通过通知中心提醒')
+  ElMessageBox.alert(
+    `这一栏的真实问法确实可以当语料用，但「一键重跑 HyQ」本版本**未交付** ——
+它要连带重建已入库文档的假设问句（属 T-910 / T-710 的范围）。
+
+现在能做的是：把这一栏导出成报表（右上角「导出报表」），
+交给人或外部流程去用。`,
+    '未交付的功能',
+    { type: 'info', confirmButtonText: '知道了' },
+  )
 }
 
+/**
+ * 导出运营报表（需求 §1.7 / §1.8）。
+ *
+ * ⚠️ **筛选条件要一起发**：导出的是页面上筛出来的那张表。
+ * 原来这里只调 `qaExport()` 不带参数 —— 后端会把**全部**清单导出去，
+ * 于是用户拿到的与他在页面上看到的不是同一批数据（而报表的用途正是"汇报我看到的那张表"）。
+ * ⚠️ 提示语用**后端回的 `note`** 而不是前端写死一句：写死的话，
+ * "后端说不支持"与"后端说已提交"在前端**长得一模一样**。
+ */
 async function exportReport() {
-  await opsApi.qaExport()
-  ElMessage.success('导出任务已创建，完成后通过通知中心提醒')
+  const res = await opsApi.qaExport({
+    status: statusFilter.value,
+    kbId: kbFilter.value,
+    keyword: keyword.value || undefined,
+  })
+  ElMessage.success(res.note || '导出任务已创建，完成后通过通知中心提醒')
 }
 </script>
 
@@ -189,7 +244,7 @@ async function exportReport() {
         <p class="page-desc">哪些问题没答好 → 沉淀成清单，驱动补内容（知识库唯一能自我演进的机制）</p>
       </div>
       <div class="head-actions">
-        <el-select v-model="range" style="width: 130px" @change="loadTop">
+        <el-select v-model="range" style="width: 130px" @change="reloadStats">
           <el-option label="近 7 天" value="7d" />
           <el-option label="近 30 天" value="30d" />
           <el-option label="近 90 天" value="90d" />
@@ -321,36 +376,38 @@ async function exportReport() {
         <el-tab-pane name="top">
           <template #label><span class="tab-l">高频问题榜</span></template>
 
-          <el-alert v-if="topNotDelivered" type="warning" :closable="false" show-icon class="mb-12">
-            <template #title>
-              <span class="alert-text">本版本未交付这一栏（后端接口属 <b>T-A02</b>）—— 空着<b>不是</b>「没有高频问题」。</span>
-            </template>
-          </el-alert>
-
           <div class="card-head-row mb-12">
             <div class="hint">正面看：确认主流需求优先保证质量；<b>反向看（更有价值）</b>：真实问法是校准 HyQ 生成提示词的语料——分数偏低说明 HyQ 与用户实际问法有偏差。</div>
             <el-button :icon="MagicStick" @click="regenerateHyq">用这些真实问法重新生成 HyQ</el-button>
           </div>
 
+          <el-alert type="info" :closable="false" show-icon class="mb-12">
+            <template #title>
+              <span class="alert-text">
+                「次数」是<b>归一化聚合</b>的次数——同一问法的不同写法必然合并（<b>怎么配？</b> ≡ <b>怎么配</b>），
+                而<b>意思一样但问法不同</b>的不合并（那要语义聚类，阈值暂无真实语料可校准，已挂起）。
+                ⇒ 读作「这条问法被问了几次」，不是「有几个人问了同一个意思」。
+              </span>
+            </template>
+          </el-alert>
+
+          <div v-if="!topQuestions.length" class="empty-hint">
+            这段时间窗里没有提问打点 —— <b>不是</b>「没有高频问题」，而是还没有数据。
+          </div>
+
           <div v-for="t in topQuestions" :key="t.question" class="top-row">
             <div class="tr-q">{{ t.question }}</div>
             <div class="tr-bar">
-              <i :style="{ width: (t.count / maxTopCount) * 100 + '%' }" :class="{ low: t.avgTopScore < 0.7 }" />
+              <i :style="{ width: (t.count / maxTopCount) * 100 + '%' }" :class="{ low: scoreLow(t.avgTopScore) }" />
             </div>
             <span class="tr-count mono">{{ t.count }}</span>
-            <span class="tr-score mono" :class="{ low: t.avgTopScore < 0.7 }">Top1 {{ t.avgTopScore }}</span>
+            <span class="tr-score mono" :class="{ low: scoreLow(t.avgTopScore) }">Top1 {{ scoreText(t.avgTopScore) }}</span>
           </div>
         </el-tab-pane>
 
         <!-- ==================== 点踩原因归因 ==================== -->
         <el-tab-pane name="feedback">
           <template #label><span class="tab-l">点踩原因归因</span></template>
-
-          <el-alert v-if="feedbackNotDelivered" type="warning" :closable="false" show-icon class="mb-12">
-            <template #title>
-              <span class="alert-text">本版本未交付这一栏（后端接口属 <b>T-A02</b>）—— 空着<b>不是</b>「没有人点踩」。</span>
-            </template>
-          </el-alert>
 
           <div v-if="feedback" class="fb-top">
             <div class="fb-rate">
@@ -362,7 +419,10 @@ async function exportReport() {
             </div>
             <div class="fb-note">
               <el-icon><InfoFilled /></el-icon>
-              <span>「答案不准确」+「没找到相关内容」合计占 <b>75%</b>，是两个最值得投入优化的方向。</span>
+              <span v-if="topTwoShare != null">
+                「答案不准确」+「没找到相关内容」合计占 <b>{{ topTwoShare }}%</b>，是两个最值得投入优化的方向。
+              </span>
+              <span v-else>这段时间窗里还没有点踩 —— 占比算不出来（不是 0%）。</span>
             </div>
           </div>
 
@@ -372,7 +432,20 @@ async function exportReport() {
               <div class="fb-bar"><i :style="{ width: r.percent + '%' }" /></div>
               <span class="fb-val mono">{{ r.count }} 次 · {{ r.percent }}%</span>
             </div>
-            <div class="hint mt-8">原因次数合计 {{ negativeTop }} = 负反馈总数 {{ feedback.negativeTotal }}（校验口径）</div>
+            <!--
+              🔴 未填原因那一行**必须显示**：点踩时原因可不填（需求 §6.8"可选"），
+              那部分不属于任何原因、也不能丢 —— 少了它，下面那行"合计 = 总数"就对不上，
+              而用户会以为系统的账错了（真正错的是需求 §1.10 那句验收要点）
+            -->
+            <div v-if="unreasoned > 0" class="fb-row">
+              <span class="fb-label">（点踩未填原因）</span>
+              <div class="fb-bar"><i class="muted-bar" :style="{ width: unreasonedPercent + '%' }" /></div>
+              <span class="fb-val mono">{{ unreasoned }} 次 · {{ unreasonedPercent }}%</span>
+            </div>
+            <div class="hint mt-8">
+              校验口径：原因合计 {{ negativeTop }} + 未填原因 {{ unreasoned }} = 负反馈总数
+              {{ feedback.negativeTotal }}
+            </div>
           </div>
         </el-tab-pane>
       </el-tabs>
@@ -697,6 +770,19 @@ async function exportReport() {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   flex: none;
+}
+/* 「点踩未填原因」那一行：与"某个原因"区分开 —— 它不是一个原因，是**没有原因** */
+.fb-bar i.muted-bar {
+  background: var(--el-border-color-darker);
+}
+
+/* 空态提示：说清"是没数据"而不是"是零" */
+.empty-hint {
+  padding: 16px 12px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-lighter);
+  border-radius: 4px;
 }
 
 /* 闭环 */
