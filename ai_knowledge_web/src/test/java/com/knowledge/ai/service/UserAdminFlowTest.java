@@ -86,7 +86,8 @@ class UserAdminFlowTest extends ApiTestSupport {
         //   · `ops:usage:users:view` → **一个人都不授**（`top-users`，只靠超管通配）。
         // ⇒ 边界依旧可证伪，而且**证明它的正是页 11 那个 token**：同一个 AUDITOR
         // 打四个聚合端点 200、打 `top-users` 403。这是"拆两个码"而不是"复用一个码"的全部理由。
-        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(43L);
+        // `S7-M06-B`（`T-601`）加了第 **44** 个码 `doc:update`（修改文档属性）⇒ 43 → 44
+        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(44L);
         List<Map<String, Object>> tree = resp.data("$.tree");
         assertThat(tree).hasSize(4);
         // 后端比 mock 树多一个 doc:recycle（回收站管理，V1 刻意单列的不可逆动作权限）：
@@ -116,7 +117,9 @@ class UserAdminFlowTest extends ApiTestSupport {
                 .filter(r -> "SUPER_ADMIN".equals(r.get("code"))).findFirst().orElseThrow();
         // 派生字段是页面在渲染的（S1 同型坑：缺了列空白）
         assertThat(superAdmin.get("dataScopeLabel")).isEqualTo("全部数据");
-        assertThat(((Number) superAdmin.get("permissionCount")).longValue()).isEqualTo(38L);
+        // 同上一处：`S7-M06-B` 的第 44 个码把超管展开数从 38 抬到 **39**
+        // （`.total` 数的是**全部码含通配**，这里是**超管实际持有**的那些）
+        assertThat(((Number) superAdmin.get("permissionCount")).longValue()).isEqualTo(39L);
         // V6 预置后：admin + lin.gong + emp001 = 3（《01》§2.1）
         assertThat(((Number) superAdmin.get("memberCount")).longValue()).isEqualTo(3L);
         assertThat((Boolean) superAdmin.get("builtin")).isTrue();

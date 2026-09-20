@@ -376,8 +376,11 @@ class UserFlowTest extends ApiTestSupport {
                 .assertOk("超管权限")
                 .data("$.codes");
 
-        assertEquals(38, adminCodes.size(),
-                "超管必须展开成 38 个码（页面上要按域分组列出），实际 " + adminCodes.size() + " 个");
+        // ⚠️ 这个数**每加一个权限码就要 +1**（`S7-M06-B` 加了第 44 个 `doc:update` ⇒ 38 → 39）。
+        //    它与 `UserAdminFlowTest` 的 `$.total` / `permissionCount` 是**同一件事的三处快照**，
+        //    三处不同步时红的第一条不一定是最该看的那个。
+        assertEquals(39, adminCodes.size(),
+                "超管必须展开成 39 个码（页面上要按域分组列出），实际 " + adminCodes.size() + " 个");
         assertEquals(Set.copyOf(PermissionCode.allCodes()), Set.copyOf(adminCodes));
         assertFalse(adminCodes.contains(PermissionCode.WILDCARD),
                 "这是展示视图，返回 * 会让那一页只剩一个标签");
