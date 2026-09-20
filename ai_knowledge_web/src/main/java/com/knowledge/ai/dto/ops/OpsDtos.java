@@ -65,6 +65,55 @@ public final class OpsDtos {
     }
 
     /**
+     * 重放验证的回话（`T-A01` · 需求 `08` §1.8 与 §1.4 步 4）。
+     *
+     * <h3>字段名的来源</h3>
+     * <p>前五个字段**逐字对齐前端 `types/index.ts` 的 `ReplayResult`**（那个类型在本批之前
+     * 就写好了，`OpsQaView.replay()` 与 `mock/index.ts:1715` 都按它实现）——
+     * 本批是"把后端补上"，不是重新设计契约。{@code status} 是本批**新增**的那一个，
+     * 理由见下。
+     *
+     * <h3>🔴 为什么多一个 {@code status}（而不是让前端自己推断）</h3>
+     * <p>前端原来写的是 `item.status = res.improved ? 'RESOLVED' : 'PENDING'`，
+     * 而需求 §1.4 步 5 的判据是「**分数达标**自动关闭，未达标退回待处理」——
+     * 两回事（涨了却没到判定线，那个问题实际仍答不上来）。
+     * 本批把判定放在后端之后，前端**不再有推断的余地**：状态是权威结论，
+     * 而且「前置未就绪」（补录文档还在解析中 / 没有可比的补录前分）这一档
+     * **不改状态**，前端**推断不出来**。
+     *
+     * @param before             补录前的最高相似度（取自池子的 {@code max_top_score}，**记录值**）。
+     *                           ⚠️ 可为 {@code null}（旧行没有这个数），此时**判定不成立**、
+     *                           {@code status} 原样返回
+     * @param after              本次重放的 Top1；{@code null} = **一条都没召回**
+     *                           （"没有 Top1"与"Top1 是 0 分"是两件事，见 `RetrievalTraceWriter#top1`）
+     * @param improved           {@code after > before}（**分数是否提升**）
+     * @param hitSupplementedDoc {@code Top1} 是不是**刚补录那篇**（需求 §1.4 步 4 的第二条校验）。
+     *                           ⚠️ 不是"召回列表里有没有它" —— 补录那篇挂在第二名时，
+     *                           达标的分其实是别人给的，那正是这一条要防的
+     * @param verdict            **判定结论**：{@code RESOLVED}（达标且命中，已自动关闭）/
+     *                           {@code NOT_RESOLVED}（判过了、没通过，已退回待处理）/
+     *                           {@code BLOCKED}（**判不了** —— 补录文档没就绪 / 没有可比的前分，
+     *                           状态**未改**）
+     * @param status             重放后该行的**实际**状态（权威值）
+     * @param note               一句话说明这次判定的依据，或"为什么判不了"。**必须具体**：
+     *                           它要能回答"我该去做什么"（`G4-3` 的同一条纪律）
+     *
+     * <h4>🔴 为什么 {@code verdict} 与 {@code status} 不能合并成一个</h4>
+     * <p>`status` 单独**区分不了**「判过了、没通过（退回待处理）」与「压根判不了（状态不动）」
+     * —— 两者都是 {@code PENDING}。而页面对这两件事的展示完全不同：前者是"这次补录没管用"，
+     * 后者是"你还没补录 / 索引还没建好"。与"闸的退出码分档"是同一条纪律：
+     * **判不了要和判否分开报**，否则前者会被当成后者处理，而两者的下一步动作相反。
+     */
+    public record ReplayResult(Double before,
+                               Double after,
+                               boolean improved,
+                               boolean hitSupplementedDoc,
+                               String verdict,
+                               String status,
+                               String note) {
+    }
+
+    /**
      * 改状态的回话。
      *
      * <p>{@code pending} 必带：前端 `OpsQaView.vue:91` 改完状态**直接拿它刷新统计卡**

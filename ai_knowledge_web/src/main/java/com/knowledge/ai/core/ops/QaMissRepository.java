@@ -58,6 +58,16 @@ public class QaMissRepository {
     public record TraceStats(long totalQuestions, long missed, Double avgTopScore) {
     }
 
+    /**
+     * 一篇**为某条未命中补录的**文档（`T-A01` · `V34` 的 `remark`）。
+     *
+     * @param status 文档状态（{@code DocStatus} 名）。重放的前置自检要看它 ——
+     *               补录文档还没 {@code READY} 就去重放，会得到"未达标"这个**错误的结论**，
+     *               而它与"补的文档确实没用"长得一模一样
+     */
+    public record SupplementedDoc(long docId, String title, String status, String errorMsg) {
+    }
+
     private static final String SELECT_ROW = """
             select m.id, m.question, m.ask_count, m.last_ask_at, m.last_user_id, m.max_top_score,
                    m.score_after, m.status, m.ignored_by, m.kb_ids,
@@ -170,6 +180,70 @@ public class QaMissRepository {
                         """)
                 .setParameter("status", status.name())
                 .setParameter("uid", ignoredBy)
+                .setParameter("now", now)
+                .setParameter("id", id)
+                .executeUpdate();
+    }
+
+    // ==================== 重放验证（`T-A01`）====================
+
+    /**
+     * 找出为某条未命中**补录**的文档（`V34` 的 `remark` 承载问题原文）。
+     *
+     * <h3>为什么在 Java 侧比对，而不是一条 SQL join</h3>
+     * <p>关联键是 {@link MissKeyNormalizer#keyOf}（NFKC → 去标点 → 小写 → SHA-256），
+     * 那是**Java 函数，进不了 SQL**。所以先取"有备注的文档"，再在内存里算键比对。
+     * 扫描面只有**补录产出的那几行**（普通上传 {@code remark} 恒 {@code NULL}），
+     * 所以这个"全表扫"实际是几十行量级 —— `V34` 的注释里写了为什么因此不加索引。
+     *
+     * <h3>为什么不按知识库缩小范围</h3>
+     * <p>运营页的「补文档」在**清单行跨多个知识库**时会退化成"跳知识库列表让用户自己选"
+     * （{@code OpsQaView.supplement()} 的既有分支）—— 那时补录的文档**可能落在任何库里**。
+     * 按库筛会漏掉那一半。而多算几篇无害：命中与否最终由"召回到了没有"决定，
+     * 检索本身只召回提问人**可见**的库（`RetrievalScope`）。
+     *
+     * <p>{@code deleted_at is null}：软删掉的补录文档不算 —— 它已经不在检索范围里了，
+     * 拿它去判"命中"会永远判否，而那与"还没补录"应该是两回事。
+     */
+    public List<SupplementedDoc> supplementedDocs(String remarkKey) {
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select id, title, status, error_msg, remark from sys_document "
+                                + "where remark is not null and deleted_at is null")
+                .getResultList();
+        List<SupplementedDoc> result = new ArrayList<>();
+        for (Object[] r : rows) {
+            if (!remarkKey.equals(MissKeyNormalizer.keyOf((String) r[4]))) {
+                continue;
+            }
+            result.add(new SupplementedDoc(((Number) r[0]).longValue(), (String) r[1],
+                    (String) r[2], (String) r[3]));
+        }
+        return result;
+    }
+
+    /**
+     * 写重放结论：`score_after` + 状态 + `resolved_at`。
+     *
+     * <p>⚠️ <b>只动这三样</b>：{@code ignored_by}/{@code ignored_at} 不碰
+     * （"它曾经被谁放弃过"是下一次判断的依据，见 {@link #updateStatus}）；
+     * {@code ask_count} / {@code last_ask_at} / {@code max_top_score} 也不碰 ——
+     * **重放不是一次提问**，它是针对某一次沉淀结论的复核（本批 §3.4 假设 5/6）。
+     *
+     * <p>`resolved_at` 的处置与 {@link #updateStatus} **同一条规则**：只在 RESOLVED 时写，
+     * 离开 RESOLVED 时清空。⚠️ 那条规则因此在 SQL 里出现了两次 —— 复制规则是漂移的开始，
+     * 所以另有判据钉住它：{@code QaMissReplayFlowTest} 断言
+     * 「{@code resolved_at} 非空 ⟺ 状态是 {@code RESOLVED}」（含"先解决再退回"那一路）。
+     * 光靠注释对齐两处 SQL，迟早会漏（本仓已复现多次）。
+     */
+    @Transactional
+    public int markReplayed(long id, MissStatus status, Double scoreAfter, LocalDateTime now) {
+        return entityManager.createNativeQuery(
+                        "update sys_qa_miss set status = :status, score_after = :score, "
+                                + "resolved_at = case when :status = 'RESOLVED' then :now else null end, "
+                                + "updated_at = :now where id = :id")
+                .setParameter("status", status.name())
+                .setParameter("score", scoreAfter == null ? null : BigDecimal.valueOf(scoreAfter))
                 .setParameter("now", now)
                 .setParameter("id", id)
                 .executeUpdate();

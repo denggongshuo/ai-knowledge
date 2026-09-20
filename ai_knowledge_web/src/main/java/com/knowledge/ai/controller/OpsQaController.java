@@ -5,17 +5,23 @@ import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.dto.ops.OpsDtos;
 import com.knowledge.ai.service.QaMissService;
+import com.knowledge.ai.service.ReplayService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 运营分析 —— 问答运营页（需求 `08` §1.8 的三条端点，`T-A00`）。
+ * 运营分析 —— 问答运营页（需求 `08` §1.8 的端点；`T-A00` 落三条，`T-A01` 补上重放验证）。
+ *
+ * <p>已交付：{@code GET /misses} · {@code PATCH /misses/{id}} · {@code GET /overview}（`T-A00`）·
+ * {@code POST /misses/{id}/replay}（`T-A01`）。尚未交付（`T-A02`）：高频问题榜 /
+ * 点踩归因 / 导出。
  *
  * <h3>🔴 权限：读 `ops:qa:view` · 写 `ops:qa:handle`（本批新增的两个码）</h3>
  * <p>需求 `G8-9` 说这一页「**仅管理员可见**」。落到权限码上就是这两个 ——
@@ -43,6 +49,8 @@ import org.springframework.web.bind.annotation.RestController;
 public class OpsQaController {
 
     private final QaMissService qaMissService;
+
+    private final ReplayService replayService;
 
     /**
      * `GET /ops/qa/misses?status=&kbId=&keyword=&page=&size=` —— 未命中问题清单。
@@ -84,5 +92,22 @@ public class OpsQaController {
     @RequiresPerm("ops:qa:view")
     public ApiResponse<OpsDtos.QaOverview> overview(@RequestParam(required = false) String range) {
         return ApiResponse.ok(qaMissService.overview(range));
+    }
+
+    /**
+     * `POST /ops/qa/misses/{id}/replay` —— 重放验证（`T-A01` · 需求 §1.8 与 §1.4 步 4）。
+     *
+     * <p>权限用 {@code ops:qa:handle}（不是 {@code view}）：它会**改状态**。
+     * 于是审计员那半边边界继续成立 —— 同一个 AUDITOR token，
+     * `GET /ops/qa/misses` 200 而本接口 403（`G8-9`）。
+     *
+     * <p>⚠️ 用 {@link LoginUserContext#require()} 而不是 {@code requireUserId()}：
+     * 重放要**以原提问人的身份构造一个登录用户**去跑检索，而"操作人"是提问人已注销时的
+     * 兜底身份 —— 那需要一个完整的 {@code LoginUser}，不只是一个 id。
+     */
+    @PostMapping("/misses/{id}/replay")
+    @RequiresPerm("ops:qa:handle")
+    public ApiResponse<OpsDtos.ReplayResult> replay(@PathVariable long id) {
+        return ApiResponse.ok(replayService.replay(id, LoginUserContext.require()));
     }
 }

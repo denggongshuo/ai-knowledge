@@ -205,16 +205,39 @@ public class RetrievalTraceWriter {
      * 否则会把两种量纲画进同一张图。这与 {@link RetrievedChunk#scoreKind()} 是同一条纪律。
      *
      * <p>一条都没召回时返回 {@code null} —— "没有 Top1"与"Top1 是 0 分"是两件事。
+     *
+     * <p><b>公开</b>（`T-A01` 起，原为包内可见）—— 现在有**三处**要用它，
+     * 且必须是**同一个算法**，否则三个数（打点 `top1_score` / 池子 `max_top_score` /
+     * 重放 `score_after`）会在同一个页面上互相对不上，而每一处看着都合理：
+     * <ol>
+     *   <li>{@link #write} —— 打点行的 {@code top1_score}；</li>
+     *   <li>{@link MissSink} —— 池子的 {@code max_top_score}；</li>
+     *   <li>{@code ReplayService} —— 重放后的 {@code score_after}。
+     *       🔴 尤其不能在那里另写一次：重放的全部意义就是"和补录前用**同一把尺**量"，
+     *       尺子换了，"提升了"这个结论就不成立</li>
+     * </ol>
      */
+    public static Double top1(List<RetrievedChunk> chunks) {
+        RetrievedChunk top = top(chunks);
+        return top == null ? null : top.score();
+    }
+
     /**
-     * 名次最靠前那条的分（`T-707` · `I-14`）。**包内可见** ——
-     * {@link MissSink} 用它给池子算"最高相似度"，两处必须是**同一个算法**，
-     * 否则池子里的数与打点里的数对不上，而两边看着都合理。
+     * 名次最靠前**那一条**（{@link #top1} 取的就是它的分）。
+     *
+     * <p>为什么要把"那一条"也公开（`T-A01`）：重放验证要同时回答两件事 ——
+     * **分是多少**与**这个分是谁给的**。「命中的是不是刚补录那篇」不能问"召回列表里有没有它"
+     * （补录的文档排在第二名也算有），而要问"**Top1 是不是它**"：
+     * 达标与命中必须落在**同一条**上，两条判据才自洽 ——
+     * 否则「别的文档把分抬上去、补录那篇挂在第二」会被判成已解决，
+     * 而那正是需求 §1.4 的注点名要防的（「否则可能只是别的文档碰巧被召回」）。
+     *
+     * <p>`top1` 与它**共用同一个选择器**（不各写一遍 `min(rank)`）——
+     * 分与"谁的分"必须永远指同一条。
      */
-    static Double top1(List<RetrievedChunk> chunks) {
+    public static RetrievedChunk top(List<RetrievedChunk> chunks) {
         return chunks.stream()
                 .min(Comparator.comparingInt(RetrievedChunk::rank))
-                .map(RetrievedChunk::score)
                 .orElse(null);
     }
 
