@@ -98,6 +98,20 @@ public class SysDocument {
     private String parsePath;
 
     /**
+     * 补录备注（`V34` · `T-A01` · 需求 `08` §1.4 步 2）。
+     *
+     * <p>从问答运营页点「补文档」跳上传页时，把那条**未命中问题的原文**带进来填在这里。
+     * 因此它不只是给人看的一句话 —— 它同时是**重放验证的关联键**：
+     * 重放要判断「新召回的确实是刚补录那篇」，就靠
+     * {@code MissKeyNormalizer.keyOf(remark)} 与池子里那条的键比对。
+     *
+     * <p>⚠️ 正常上传（不是从运营页来的）恒为 {@code null} —— 那是**真值**：
+     * 这篇文档不是为某条未命中补录的。别拿空串顶替（空串会归一化成一个合法但无意义的键）。
+     */
+    @Column(name = "remark", length = 500)
+    private String remark;
+
+    /**
      * 状态机（《03》§4.2）。
      *
      * <p>用 {@link DocStatus} 枚举 + {@code @Enumerated(STRING)}，与前端

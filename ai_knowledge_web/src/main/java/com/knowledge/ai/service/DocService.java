@@ -71,6 +71,9 @@ public class DocService {
     /** 文档列表每页上限（前端不传 size 时用它）。 */
     private static final int DEFAULT_PAGE_SIZE = 20;
 
+    /** 与 `sys_document.remark` 的列宽一致（`V34`）—— 超长必须在这里截，不能交给 SQL。 */
+    private static final int MAX_REMARK_LEN = 500;
+
     private final EntityManager entityManager;
 
     private final DataScopeService dataScopeService;
@@ -166,13 +169,19 @@ public class DocService {
      * **新增审计点必须同步三处** —— ① 本注解 ② {@code AuditRiskPolicy.IMPLEMENTED} 登记
      * ③ {@code AuditCoverageFlowTest#expectedActions()} 的冻结清单（24 → 25）。
      *
+     * @param remark 补录备注（`V34` · `T-A01`）：从问答运营页点「补文档」跳来时，
+     *               前端把那条**未命中问题的原文**带上（需求 §1.4 步 2）。
+     *               普通上传传 {@code null}/空 ⇒ 落 {@code NULL}。
+     *               ⚠️ 它不只是给人看的 —— 重放验证靠它认出"哪几篇是为这条未命中补录的"
+     *               （见 `ReplayService`），所以**别做任何"顺手的"改写**（去空白可以，
+     *               别截断成摘要、别加前缀）
      * @return {@code {docId, taskId, name, kbId, chunkTotal=0}}；{@code chunkTotal} 恒 0
      *         —— 分片总数要解析完才知道（S4-B 起由任务体回填）
      */
     @Transactional
     @AuditLog(module = AuditModule.DOC, action = "上传文档", risk = RiskLevel.NORMAL,
             target = "'文档#' + #result.docId")
-    public DocDtos.UploadAccepted upload(long kbId, MultipartFile file) {
+    public DocDtos.UploadAccepted upload(long kbId, MultipartFile file, String remark) {
         LoginUser user = LoginUserContext.require();
         requireKbVisible(kbId);
         docStorage.validate(file);
@@ -182,6 +191,10 @@ public class DocService {
         String type = DocStorage.extensionOf(realName).toUpperCase(Locale.ROOT);
         long size = file.getSize();
         String md5 = md5Of(file);
+        // 补录备注（`V34`）：**在这里截**，不留给 SQL —— 超长会在严格模式下抛
+        // `Data too long`，而现象是"上传失败"，与"备注写长了"看不出关系。
+        // 空串按 NULL 落（空串会归一化成一个合法但无意义的关联键，见 DocRecordWriter#insert）
+        String note = normalizeRemark(remark);
 
         // ---- `T-O04` 步 4：宏检测必须在**请求线程**做完 ----
         // ⚠️ 与暂存同一个理由（见下面 `spillToTemp` 的注释）：`MultipartFile` 只在这次请求
@@ -191,7 +204,7 @@ public class DocService {
         Boolean hasMacro = ingestGuard.hasMacro(file, DocStorage.extensionOf(realName));
 
         long docId = recordWriter.insert(kbId, user.getUserId(), title, realName,
-                type.isEmpty() ? "UNKNOWN" : type, size, md5);
+                type.isEmpty() ? "UNKNOWN" : type, size, md5, note);
 
         // ⚠️ **必须在请求线程把字节定下来**（`S4-E1`）：`MultipartFile` 是请求作用域的，
         //    请求一结束容器就清掉它。转存跑在异步任务里，不落暂存就是**赌一个竞态**——
@@ -499,6 +512,34 @@ public class DocService {
     /** 文件名为空时给一个占位名（不是拒绝：某些客户端确实不发 filename）。 */
     private static String normalizeFileName(String fileName) {
         return (fileName == null || fileName.isBlank()) ? "未命名文件" : fileName.trim();
+    }
+
+    /**
+     * 补录备注（`V34`）：去首尾空白 → 空串归 {@code NULL} → 截到列宽上限。
+     *
+     * <p>⚠️ **只做这两件事，不做别的**：它是重放验证的**关联键**，
+     * 改写它（截成摘要、加个前缀、把换行拍平）都可能让键对不上 ——
+     * 而现象只是"重放说没命中补录文档"，看不出是这里的锅。
+     *
+     * <p>{@code substring(0, 500)} 会**切断代理对**（emoji）—— 切出来的孤立代理
+     * 发往 MySQL 是非法字符，整条 insert 失败。与 `MissSink#truncate` 同一条处理。
+     */
+    private static String normalizeRemark(String remark) {
+        if (remark == null) {
+            return null;
+        }
+        String trimmed = remark.strip();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.length() <= MAX_REMARK_LEN) {
+            return trimmed;
+        }
+        int end = MAX_REMARK_LEN;
+        if (Character.isHighSurrogate(trimmed.charAt(end - 1))) {
+            end--;
+        }
+        return trimmed.substring(0, end);
     }
 
     /**

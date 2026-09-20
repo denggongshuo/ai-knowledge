@@ -55,12 +55,18 @@ public class DocController {
      * 收 {@code @RequestPart} 反而会在某些客户端下报"不支持的内容类型"。
      *
      * <p>权限：{@code doc:upload}（38 个权限点之一，S0 已建）。
+     *
+     * <p>可选字段 {@code remark}（`V34` · `T-A01`）：从问答运营页点「补文档」跳来时，
+     * 前端把那条未命中问题的原文带进来（需求 §1.4 步 2「问题文本作为补录备注带入」）。
+     * ⚠️ 它**不是必填** —— 普通上传照样只发 {@code file}，行为与以前完全一致。
      */
     @PostMapping("/api/kb/{kbId}/doc/upload")
     @RequiresPerm("doc:upload")
     public ApiResponse<DocDtos.UploadAccepted> upload(@PathVariable long kbId,
-                                                      @RequestParam("file") MultipartFile file) {
-        return ApiResponse.ok(docService.upload(kbId, file));
+                                                      @RequestParam("file") MultipartFile file,
+                                                      @RequestParam(value = "remark", required = false)
+                                                      String remark) {
+        return ApiResponse.ok(docService.upload(kbId, file, remark));
     }
 
     /**

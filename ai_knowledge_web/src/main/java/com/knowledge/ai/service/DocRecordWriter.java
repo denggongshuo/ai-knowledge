@@ -65,18 +65,23 @@ public class DocRecordWriter {
      * Hibernate 的 {@code createNativeQuery(...).executeUpdate()} **不返回自增键**
      * （返回的是受影响行数）。用同一事务内可见性保证拿到刚插的那条 ——
      * 这也是本方法必须是独立的 {@code @Transactional}` 方法的原因之一。
+     *
+     * @param remark 补录备注（`V34`）：从问答运营页跳来的上传带**未命中问题原文**，
+     *               普通上传传 {@code null}。⛔ **不要在这里补空串** —— 空串会归一化成一个
+     *               合法但无意义的键，让"这篇文档属于哪条未命中"这个问题得到一个假答案。
+     *               长度上限由调用方（{@link DocService}）在**请求线程**截好，见那里的注释
      */
     @Transactional
     public long insert(long kbId, long ownerId, String title, String fileName, String type,
-                       long sizeBytes, String md5) {
+                       long sizeBytes, String md5, String remark) {
         LocalDateTime now = LocalDateTime.now();
         entityManager.createNativeQuery("""
                         insert into sys_document (kb_id, owner_id, title, file_name, type, size_bytes, md5,
                                                   storage_path, status, chunk_count,
                                                   table_total, table_parsed, image_total, image_parsed,
-                                                  created_at, updated_at)
+                                                  remark, created_at, updated_at)
                         values (:kbId, :ownerId, :title, :fileName, :type, :size, :md5,
-                                null, 'UPLOADED', 0, 0, 0, 0, 0, :now, :now)
+                                null, 'UPLOADED', 0, 0, 0, 0, 0, :remark, :now, :now)
                         """)
                 .setParameter("kbId", kbId)
                 .setParameter("ownerId", ownerId)
@@ -85,6 +90,7 @@ public class DocRecordWriter {
                 .setParameter("type", type)
                 .setParameter("size", sizeBytes)
                 .setParameter("md5", md5)
+                .setParameter("remark", remark)
                 .setParameter("now", now)
                 .executeUpdate();
 
