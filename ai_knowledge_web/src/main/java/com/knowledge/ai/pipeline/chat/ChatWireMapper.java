@@ -45,15 +45,15 @@ public class ChatWireMapper {
      * 所以改文案就等于改界面显示。前 6 个与 `mock/index.ts:249` 逐字一致
      * （前端是照 mock 开发的），后 3 个是本批新增的真实阶段。
      */
-    private static final String STAGE_SCOPE = "可见范围";
-    private static final String STAGE_QUERY = "查询解析";
-    private static final String STAGE_EMBED = "Embedding";
-    private static final String STAGE_VECTOR = "向量召回";
-    private static final String STAGE_BM25 = "BM25 召回";
-    private static final String STAGE_FUSE = "RRF 融合";
-    private static final String STAGE_RERANK = "Rerank";
-    private static final String STAGE_TABLE = "表格回表";
-    private static final String STAGE_LLM = "LLM 生成";
+    public static final String STAGE_SCOPE = "可见范围";
+    public static final String STAGE_QUERY = "查询解析";
+    public static final String STAGE_EMBED = "Embedding";
+    public static final String STAGE_VECTOR = "向量召回";
+    public static final String STAGE_BM25 = "BM25 召回";
+    public static final String STAGE_FUSE = "RRF 融合";
+    public static final String STAGE_RERANK = "Rerank";
+    public static final String STAGE_TABLE = "表格回表";
+    public static final String STAGE_LLM = "LLM 生成";
 
     @PersistenceContext
     private EntityManager entityManager;

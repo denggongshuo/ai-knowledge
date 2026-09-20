@@ -34,6 +34,18 @@ public final class TimeWindow {
         return LocalDateTime.now().minusDays(daysOf(range));
     }
 
+    /**
+     * 窗口的**中点** —— 页 20 的「质量走势」列拿它把窗口切成前半 / 后半
+     * （`T-A03`）：「稳定偏低」与「持续下降」的区别就在这两半的差上，
+     * 没有它就只能看一个总均值，而"一直很差"和"最近刚变差"在那个数上**长得一样**。
+     *
+     * <p>⚠️ 与 {@link #from} 各自取一次 `now`，两者之间有**毫秒级**偏差 ——
+     * 对"前半 / 后半"这种天级切分无影响，故不为此改 {@link #from} 的签名。
+     */
+    public static LocalDateTime mid(String range) {
+        return LocalDateTime.now().minusDays(Math.max(1, daysOf(range) / 2));
+    }
+
     static int daysOf(String range) {
         if (range == null || range.isBlank()) {
             return DEFAULT_DAYS;
