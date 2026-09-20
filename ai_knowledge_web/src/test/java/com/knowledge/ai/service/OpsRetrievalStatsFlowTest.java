@@ -465,11 +465,32 @@ class OpsRetrievalStatsFlowTest extends ApiTestSupport {
     }
 
     /** 清 7 天窗口内的打点（与 `QaMissFlowTest` / `OpsQaStatsFlowTest` 同一个口径）。 */
+    /**
+     * 清 7 天窗口内的打点，**并且清掉按天汇总表的对应天**（`T-A04` 之后本类必须加这一步）。
+     *
+     * <h3>🔴 为什么这个类的清理要多清两张表 —— 全量跑批当场逮到的</h3>
+     * <p>`S8-M10-E` 之后，本类读的五个端点**不再实时扫打点表**，改读按天汇总表
+     * （`sys_ops_retrieval_daily`）。而那张表的失效判据是**日期覆盖**（`min/max(stat_date)`），
+     * **不是"源变了没有"** —— 于是本类这种「直接 delete 打点行、再插一批新的」的用法
+     * 会读到**上一批数据的残影**：汇总行还在，而打点已经换了。
+     *
+     * <p>现象恰好落在 `kbQualityTrendNeedsSamplesAndFollowsMissRate` 上：它后半段
+     * 清空后只插一行、期望走势是 `UNKNOWN`（两半区样本都不足），而实际得到 `DOWN`
+     * —— 因为前半区那 6 行"全达标"与后半区那 6 行"全未命中"还留在汇总表里。
+     * ⚠️ **它看起来很像个产品缺陷，其实是一条清理没跟上新增产物**
+     * （与 `#130` 那一族同形，但更隐蔽：不是"留下了行"，而是"**留下了旧数**"）。
+     *
+     * <p>生产侧不受影响：打点是**只增**的，没有谁会在一段窗口内删掉它
+     * （留存清理属于 `T-306` 那条线，且远在窗口之外）。
+     */
     private void clearTraceWindow() {
         jdbc.update("delete from sys_retrieval_trace_chunk where trace_id in "
                         + "(select trace_id from sys_retrieval_trace where created_at >= ?)",
                 LocalDateTime.now().minusDays(7));
         jdbc.update("delete from sys_retrieval_trace where created_at >= ?",
                 LocalDateTime.now().minusDays(7));
+        // 汇总表是**缓存**：打点删了它必须跟着删，否则读侧读的是旧数（见 javadoc）
+        jdbc.update("delete from sys_ops_retrieval_daily where stat_date >= curdate() - interval 7 day");
+        jdbc.update("delete from sys_ops_usage_daily where stat_date >= curdate() - interval 7 day");
     }
 }

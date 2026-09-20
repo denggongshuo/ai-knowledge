@@ -320,6 +320,42 @@ public final class ProbeCleanup {
     }
 
     /**
+     * **预计算汇总表的兜底**（`T-A04`）—— 按日期清掉探针窗口内的行。
+     *
+     * <h3>为什么是"按日期"而不是"按归属列"</h3>
+     * <p>两张表都**有**归属形状的列（`kb_id` / `user_id`），所以覆盖率闸会把它们扫出来
+     * （实测：没登记时闸当场点名这两张表）。但那两列在这里**是分组维度、不是归属**：
+     * <ul>
+     *   <li>`kb_id` 有哨兵 `0` = 「跨库提问」——**绝大多数行都是 0**
+     *       （实测：每次提问覆盖全部可见库）⇒ 按 `kb_id` 删只删得掉单库那几行，
+     *       剩下的**恰恰是最主要的那些**；</li>
+     *   <li>`user_id` 有哨兵 `0` = 「无归属提问」，同理。</li>
+     * </ul>
+     * <p>⇒ 若闸的推断是"有 user_id 就能按人删"，那在这里**是错的**。
+     * 这件事本身就是本仓那条硬口径的一次现身：**闸的射程必须与它的声明一致**
+     * （它声明的是"带归属列的表都要登记"，而它实际给出的是"这张表带归属列"——
+     * 后者不足以推出前者）。
+     *
+     * <h3>为什么敢一把清掉</h3>
+     * <p>它们是**缓存**：源是 `sys_retrieval_trace`，整张删掉都能由
+     * {@link com.knowledge.ai.service.OpsPrecomputeService} 重算出来
+     * （这也是 `T-A04` 敢做预计算的前提）。所以清它**没有信息损失** ——
+     * 与 `sys_model_usage` 那条"清掉就真的没了"（它是原始采集点）**性质相反**。
+     *
+     * <p>窗口取 7 天：与各用例类的 `clearTraceWindow` 同一个口径
+     * （打点删哪一段，缓存就跟着删哪一段 —— **缓存不能比事实活得久**）。
+     *
+     * @return 删掉的行数
+     */
+    public static int sweepProbePrecompute(JdbcTemplate jdbc) {
+        int removed = jdbc.update(
+                "delete from sys_ops_retrieval_daily where stat_date >= curdate() - interval 7 day");
+        removed += jdbc.update(
+                "delete from sys_ops_usage_daily where stat_date >= curdate() - interval 7 day");
+        return removed;
+    }
+
+    /**
      * **MinIO 对象的兜底**（`T-O10`，用户 2026-09-18 裁定收进 O 目录）——
      * 扫四个前缀下的**无主对象**并删掉。
      *

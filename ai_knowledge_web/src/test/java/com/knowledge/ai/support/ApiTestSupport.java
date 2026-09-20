@@ -175,6 +175,11 @@ public abstract class ApiTestSupport {
         // 唯一可用且有意义的维度是**日期**（它是按天聚合的）。理由与代价写在
         // `ProbeCleanup#sweepProbeUsage` 的 javadoc 里，台账在 `ProbeArtifacts.NO_OWNERSHIP_COLUMN`。
         ProbeCleanup.sweepProbeUsage(jdbc);
+        // `T-A04`：两张**预计算汇总表**（检索质量 / 使用统计）。它们是**缓存**——
+        // 源是 `sys_retrieval_trace`，整张删掉也能重算 ⇒ 按日期一把清没有信息损失。
+        // ⚠️ 它们**有** `kb_id`/`user_id` 列（所以覆盖率闸会扫到），但那两列是**分组维度**
+        // 且有哨兵 0，按它们删会漏掉大半 —— 理由写在 `ProbeCleanup#sweepProbePrecompute`。
+        ProbeCleanup.sweepProbePrecompute(jdbc);
         // `T-O10`：**对象那一侧的兜底**（此前只有"每个类各自删自己造的那些"）。
         // 与上面两条**同一个问法**、同一处调用 —— 分开放会各自演化。
         // ⚠️ 本调用用**默认时间下限**（盖过"先落桶、后落行"那个窗口），

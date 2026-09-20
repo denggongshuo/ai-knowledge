@@ -37,6 +37,18 @@ public final class ProbeArtifacts {
      * <p>值写的是**怎么清的**，不是"已登记"三个字 —— 没理由的登记等于把闸关掉。
      */
     public static final Map<String, String> REGISTERED = Map.ofEntries(
+            Map.entry("sys_ops_retrieval_daily",
+                    "检索质量按天汇总（T-A04 预计算）。🔴 **按日期清**（`stat_date >= curdate() - 7 day`，"
+                            + "与 `clearTraceWindow` 同一个窗口），见 `ProbeCleanup#sweepProbePrecompute`。"
+                            + "⚠️ 它有 `kb_id` 列，所以被覆盖率闸扫到 —— 但那列**是分组维度、不是归属**"
+                            + "（哨兵 0 = 跨库提问那种不属于任何单库的行），"
+                            + "**按它删会漏掉大半**（真实的跨库行 `kb_id` 全是 0）。"
+                            + "⚠️ 它是**缓存**：源是 `sys_retrieval_trace`，整张删掉也能重算出来 ⇒ "
+                            + "清它没有信息损失，这也正是敢按日期一把清的理由"),
+            Map.entry("sys_ops_usage_daily",
+                    "使用统计按天汇总（T-A04 预计算）。同上：**按日期清**，理由同上一行。"
+                            + "⚠️ `user_id` 那一列同理是**分组维度**且有哨兵 0（打点里 user_id 为 NULL 的行）——"
+                            + "它按人删不掉，但按日期可以"),
             Map.entry("sys_kb", "探针库主表。按 code 删（它自己没有 kb_id，是别人指向它）"),
             Map.entry("sys_document", "文档行。按 kb_id 删，**必须先于 sys_kb**"),
             Map.entry("sys_chunk", "分片。按 kb_id 删"),

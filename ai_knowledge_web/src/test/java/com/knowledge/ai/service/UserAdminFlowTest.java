@@ -71,7 +71,7 @@ class UserAdminFlowTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("G2-2 权限树：total=41、4 大分组、系统管理 19 叶、叶子 id 即权限码")
+    @DisplayName("G2-2 权限树：total=43、4 大分组、系统管理 21 叶、叶子 id 即权限码")
     void permissionTree() {
         var resp = get("/api/permissions/tree", token).assertOk("权限树");
         // ⚠️ 这个数是**权限点的总数**，会随新增权限码而变 —— 改它的时候顺手问一句
@@ -80,19 +80,27 @@ class UserAdminFlowTest extends ApiTestSupport {
         // （靠 `PermissionQueryRepository` 的 `*` 通配），**一条 `sys_role_permission` 都没插** ——
         // 因为 `AUDITOR` 有 `ops:qa:view` 而没有它 ⇒ 同一个 token 页 11 是 200、页 20 是 403，
         // 这条边界**可证伪**。若两个码射程完全相同，新加的那个就是谁也区分不出的空码（`#153`/`#168`）。
-        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(41L);
+        // 🔴 **41 → 43**（`S8-M10-E`）：`V36` 给页 21 加**两个**码，理由是需求 §3.7 把这一页
+        // 的可见性**分了两层**（「用户维度统计仅对管理员开放」= 维度级限制）：
+        //   · `ops:usage:view` → 授给 **AUDITOR**（聚合四端点）；
+        //   · `ops:usage:users:view` → **一个人都不授**（`top-users`，只靠超管通配）。
+        // ⇒ 边界依旧可证伪，而且**证明它的正是页 11 那个 token**：同一个 AUDITOR
+        // 打四个聚合端点 200、打 `top-users` 403。这是"拆两个码"而不是"复用一个码"的全部理由。
+        assertThat(((Number) resp.data("$.total")).longValue()).isEqualTo(43L);
         List<Map<String, Object>> tree = resp.data("$.tree");
         assertThat(tree).hasSize(4);
         // 后端比 mock 树多一个 doc:recycle（回收站管理，V1 刻意单列的不可逆动作权限）：
-        // 文档 8 叶（mock 树漏了它）、系统管理 19 叶。前端多渲染一个可勾选项，无害超集。
+        // 文档 8 叶（mock 树漏了它）、系统管理 21 叶。前端多渲染一个可勾选项，无害超集。
         // ⚠️ 权限树节点的字段是 label（部门树才是 name），别复用 byName
         Map<String, Object> doc = byLabel(tree, "文档");
         assertThat((List<?>) doc.get("children")).hasSize(8);
         Map<String, Object> system = byLabel(tree, "系统管理");
         // 16 → 18：`V32` 往这一组加了两个 ops 码（`ops:qa:view`/`ops:qa:handle`），
         // 与 `audit:view`/`audit:export` 同组 —— 运营分析页与审计日志是同一类"全站视角的管理页"；
-        // 18 → 19：`V35` 的 `ops:retrieval:view` 同理（页 20 检索质量分析也是全站视角）
-        assertThat((List<?>) system.get("children")).hasSize(19);
+        // 18 → 19：`V35` 的 `ops:retrieval:view` 同理（页 20 检索质量分析也是全站视角）；
+        // 19 → 21：`V36` 的 `ops:usage:view` + `ops:usage:users:view`（页 21 使用统计，
+        // 同样归「系统管理」这一组）
+        assertThat((List<?>) system.get("children")).hasSize(21);
         // 叶子 id == code（前端勾选树按 id→code 映射，两者相等才不会错位）
         Map<String, Object> first = ((List<Map<String, Object>>) doc.get("children")).getFirst();
         assertThat(first.get("id")).isEqualTo(first.get("code"));
