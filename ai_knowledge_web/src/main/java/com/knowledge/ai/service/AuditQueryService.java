@@ -3,6 +3,7 @@ package com.knowledge.ai.service;
 import com.knowledge.ai.core.audit.AuditChange;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.text.Csv;
 import com.knowledge.ai.dto.audit.AuditDtos;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -322,18 +323,18 @@ public class AuditQueryService {
         for (Object raw : dataQuery.getResultList()) {
             Object[] row = (Object[]) raw;
             AuditDtos.LogRow r = toRow(row);
-            csv.append(csvCell(r.time())).append(',')
-                    .append(csvCell(r.operator())).append(',')
-                    .append(csvCell(r.operatorName())).append(',')
-                    .append(csvCell(r.module())).append(',')
-                    .append(csvCell(r.action())).append(',')
-                    .append(csvCell(r.riskLevel())).append(',')
-                    .append(csvCell(r.target())).append(',')
-                    .append(csvCell(r.ip())).append(',')
-                    .append(csvCell(r.result())).append(',')
-                    .append(csvCell(r.failReason())).append(',')
-                    .append(csvCell(renderChanges((String) row[11]))).append(',')
-                    .append(csvCell((String) row[12])).append("\r\n");
+            csv.append(Csv.cell(r.time())).append(',')
+                    .append(Csv.cell(r.operator())).append(',')
+                    .append(Csv.cell(r.operatorName())).append(',')
+                    .append(Csv.cell(r.module())).append(',')
+                    .append(Csv.cell(r.action())).append(',')
+                    .append(Csv.cell(r.riskLevel())).append(',')
+                    .append(Csv.cell(r.target())).append(',')
+                    .append(Csv.cell(r.ip())).append(',')
+                    .append(Csv.cell(r.result())).append(',')
+                    .append(Csv.cell(r.failReason())).append(',')
+                    .append(Csv.cell(renderChanges((String) row[11]))).append(',')
+                    .append(Csv.cell((String) row[12])).append("\r\n");
         }
         return csv.toString();
     }
@@ -361,29 +362,6 @@ public class AuditQueryService {
 
     /** 单次导出的行数上限。超限要求收窄条件，而不是静默截断。 */
     private static final long EXPORT_MAX_ROWS = 50_000;
-
-    /**
-     * CSV 单元格转义（RFC 4180）。
-     *
-     * <p>必须处理的三种字符：逗号、双引号、换行。审计日志的 {@code target}
-     * （知识库名 / 文件名）完全可能带逗号 —— 不转义会让**列整体错位**，
-     * 看起来像"导出的时候字段对不上"，实际是 CSV 本身不合法。
-     *
-     * <p>手写而不是引 commons-csv：本仓已有先例（{@code UserAdminService#importUsers}
-     * 选了 CSV 而非 poi-ooxml，省 15MB 依赖），再引一个库等于让仓库里出现
-     * 第二种 CSV 写法，将来两边转义规则不一致更难查。约 6 行。
-     */
-    private static String csvCell(String value) {
-        if (value == null || value.isEmpty()) {
-            return "";
-        }
-        boolean needsQuote = value.indexOf(',') >= 0 || value.indexOf('"') >= 0
-                || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0;
-        if (!needsQuote) {
-            return value;
-        }
-        return '"' + value.replace("\"", "\"\"") + '"';
-    }
 
     // ==================================================================
     // 私有

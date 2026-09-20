@@ -4,6 +4,7 @@ import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.ops.MissStatus;
 import com.knowledge.ai.core.ops.QaMissRepository;
+import com.knowledge.ai.core.ops.TimeWindow;
 import com.knowledge.ai.core.setting.SystemSettingService;
 import com.knowledge.ai.core.setting.SystemSettings;
 import com.knowledge.ai.dto.ops.OpsDtos;
@@ -44,8 +45,13 @@ public class QaMissService {
 
     private static final int MAX_SIZE = 100;
 
-    /** 与通知列表同一格式（`NoticeService.TIME`）—— 一个页面里两种时间格式最扎眼。 */
-    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+    /**
+     * 与通知列表同一格式（`NoticeService.TIME`）—— 一个页面里两种时间格式最扎眼。
+     *
+     * <p>⚠️ 包级可见：`OpsExportService` 的导出报表要显示「最近提问」的同一个格式
+     * —— 页面上 `2026-09-20 14:30` 而 CSV 里 `2026-09-20T14:30:12` 会被当成"导出错了"。
+     */
+    static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
     private final QaMissRepository qaMissRepository;
 
@@ -115,7 +121,7 @@ public class QaMissService {
      * @param range 时间窗，形如 `7d` / `30d`；空 = 7 天
      */
     public OpsDtos.QaOverview overview(String range) {
-        LocalDateTime from = LocalDateTime.now().minusDays(daysOf(range));
+        LocalDateTime from = TimeWindow.from(range);
         QaMissRepository.TraceStats stats = qaMissRepository.traceStats(from);
 
         double rate = stats.totalQuestions() == 0
@@ -148,7 +154,7 @@ public class QaMissService {
      * 错误发生在进控制器之前 ⇒ 返回的是 Spring 的 400 而不是我们的响应体，
      * 而现象是"页面空着"，与"接口没实现"分不开。见 `OpsQaController#misses`。
      */
-    private static Long parseKbId(String kbId) {
+    static Long parseKbId(String kbId) {
         if (kbId == null || kbId.isBlank() || "all".equalsIgnoreCase(kbId.trim())) {
             return null;
         }
@@ -159,24 +165,14 @@ public class QaMissService {
         }
     }
 
-    private static int daysOf(String range) {
-        if (range == null || range.isBlank()) {
-            return 7;
-        }
-        String trimmed = range.trim();
-        if (!trimmed.endsWith("d")) {
-            throw new BizException(ErrorCode.PARAM_INVALID, "时间范围格式应为 7d / 30d，收到：" + range);
-        }
-        try {
-            int days = Integer.parseInt(trimmed.substring(0, trimmed.length() - 1));
-            // 夹取而不是拒绝：与 `rerankTopK` 越界的处置一致（口径写死，不制造新错误码）
-            return Math.max(1, Math.min(days, 365));
-        } catch (NumberFormatException ex) {
-            throw new BizException(ErrorCode.PARAM_INVALID, "时间范围格式应为 7d / 30d，收到：" + range);
-        }
-    }
-
-    private Map<Long, String> kbNamesOf(List<QaMissRepository.Row> rows) {
+    /**
+     * 这些行涉及的知识库 id → 显示名。
+     *
+     * <p>⚠️ **包级可见**（不是 `private`）：`OpsExportService` 的导出报表要显示同一列
+     * 「涉及知识库」，而"`kb_ids` 是逗号串、要按 id 批量取名字"这条规则**只该有一份**
+     * —— 各写一份的后果是同一行在页面上显示三个库、在 CSV 里显示一个，而两边都"看起来对"。
+     */
+    Map<Long, String> kbNamesOf(List<QaMissRepository.Row> rows) {
         LinkedHashSet<Long> ids = new LinkedHashSet<>();
         for (QaMissRepository.Row row : rows) {
             ids.addAll(parseIds(row.kbIds()));
@@ -191,7 +187,7 @@ public class QaMissService {
      * 只显示一个会让人以为"问题出在那个库"。一个都解不出（库被删了）时给空串，
      * 不编一个名字出来。
      */
-    private static String namesOf(String kbIds, Map<Long, String> names) {
+    static String namesOf(String kbIds, Map<Long, String> names) {
         List<Long> ids = parseIds(kbIds);
         LinkedHashSet<String> resolved = new LinkedHashSet<>();
         for (Long id : ids) {
