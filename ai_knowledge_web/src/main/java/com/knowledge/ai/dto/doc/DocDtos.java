@@ -145,4 +145,188 @@ public final class DocDtos {
      */
     public record ParseIssuePage(List<ParseIssueRow> list, long total) {
     }
+
+    // ==================== T-600 · 文档元信息（详情页 / 预览页共用） ====================
+
+    /**
+     * 文档元信息（对齐前端 {@code DocMeta}，{@code types/index.ts:693}）= {@code DocInfo} + 治理与统计字段。
+     *
+     * <h3>🔴 四个字段**故意**为 {@code null}，且它们**不是**"没有数据"</h3>
+     * <p>本批是纯只读批，这四个字段的**采集方/落库方在本仓都还不存在**。返回 {@code 0}
+     * 或空数组会把"从没采过"说成"确实是 0" —— 而那是**一句关于内容的断言**（`D-2`：
+     * 打点后补 = 数据永久缺失）。故一律 {@code null}，前端渲染成「未采集」而不是「0 次」：
+     * <ul>
+     *   <li>{@code citations} / {@code downVotes} —— 根因是 {@code sys_retrieval_trace_chunk.cited}
+     *       的写入方**恒写 null**（{@code RetrievalTraceWriter.java:89-94}），而"哪些块真被答案引用了"
+     *       正是 {@code T-804} 要采的东西。**同一根因**，所以两个字段一起为 null；</li>
+     *   <li>{@code version} —— 版本机制整块不存在（无 `sys_doc_version` 表、`sys_document` 无该列）。
+     *       ⚠️ 不要拿 {@code sys_document.parse_version} 顶替：那是**解析器指纹**（`V20` 的注释
+     *       明写"≠ 文档版本"），语义不同。归属 `T-606`~`T-608`；</li>
+     *   <li>{@code tags} —— 文档级内容标签**没有归属表**（{@code IndexEnhancer} 的类 javadoc
+     *       自己写着「标签至今没有归属表」）。归属「标签归属」那次裁定 + `T-609`。</li>
+     * </ul>
+     *
+     * @param fileDesc       如「PDF（原生文本，非扫描件）」—— 由 {@code type} + {@code pagesWithText} 派生，
+     *                       不是数据库里的列
+     * @param lastIndexAt    最近一次解析任务完成时刻；**没有索引任务过时为 {@code null}**
+     *                       （不是空串：空串在前端会被渲染成一个空白的"最近索引"）
+     * @param securityLevel  **当前生效**的密级 = 文档级与库级取上界。⚠️ 本批没有文档级密级列
+     *                       （`I-6` 的落地是 `S7-M06-B`），所以现在恒等于 {@code kbSecurityLevel} ——
+     *                       这不是"忘了做"，见 {@code S7-M06-A} §1-#10
+     * @param citations      见上，恒 {@code null}
+     * @param downVotes      见上，恒 {@code null}
+     * @param version        见上，恒 {@code null}
+     * @param tags           见上，恒 {@code null}
+     */
+    public record DocMetaView(long id, long kbId, String kbName, String title, String path, String type,
+                             long size, int pageCount, long chunkCount, String status,
+                             String securityLevel, String owner, String uploadedAt, String version,
+                             String fileDesc, String department, String md5, String storagePath,
+                             long tableTotal, long tableParsed, Long imageTotal, Long imageParsed,
+                             Long citations, Long downVotes, String lastIndexAt,
+                             String kbSecurityLevel, List<String> tags) {
+    }
+
+    // ==================== T-602 · 目录树 ====================
+
+    /**
+     * 目录项（对齐前端 {@code TocItem}，{@code types/index.ts:762}）。
+     *
+     * <p><b>{@code id} 是分片 id 的字符串形式</b>（{@code String.valueOf(sys_chunk.id)}）——
+     * 契约里它的类型是 {@code string}，而 mock 用的是 {@code 'h3'}/{@code 'h2-1'} 这类
+     * **层级引用串**。本批取真 id，理由：前端点目录要**滚到那个标题块**
+     * （需求 §4.6 的联动），只有一个真 id 能定位到块；引用串定位不了任何东西。
+     *
+     * @param level 标题层级 = 该 HEADING 块 {@code title_path} 按 {@code " > "} 分出的段数
+     *              （分隔符复用 {@code ChunkingService.TITLE_PATH_SEPARATOR}，不另写字面量）
+     */
+    public record TocItem(String id, String label, int level) {
+    }
+
+    public record TocView(List<TocItem> list) {
+    }
+
+    // ==================== T-603 · 分片列表 + 分片统计 ====================
+
+    /**
+     * 分片行（对齐前端 {@code ChunkInfo}，{@code types/index.ts:108}）。
+     *
+     * <p><b>{@code tokens} 是派生的，不是列</b>：{@code sys_chunk} 没有 token 计数列，
+     * 而切分窗口本来就是按 token 量的 ⇒ 复用 {@code ChunkingOptions#estimateTokens}
+     * （{@code IdentifierTokenizer#windowTokens}，`T-506`）。⚠️ 它与**真实嵌入模型的
+     * tokenizer 有偏差**（那是模型私有、本仓无从复现），需要精确值的地方应显式用自己的
+     * tokenizer —— 这与"分片窗口用哪个口径"是同一个口径，不是新引入的近似。
+     *
+     * @param index        文档内阅读顺序（{@code order_no}，1 起）
+     * @param parentId     顶层块为 {@code null}；子块指向 {@code blockType = TABLE} 的父块。
+     *                     ⚠️ **禁止用 `0` 表示"无父块"**（见 {@code SysChunk#parentId} 的 javadoc）
+     */
+    public record ChunkRow(long id, long docId, String docTitle, String titlePath, String blockType,
+                           int index, String content, int tokens, Long parentId, Long childrenCount) {
+    }
+
+    /**
+     * 分片统计（对齐前端 {@code ChunkStat}，{@code types/index.ts:741}）。
+     *
+     * <h3>🔴 {@code total} = **顶层块数**，四个桶的合计恒等于它（`G7-2`）</h3>
+     * <p>表格子块（{@code parent_id is not null}）**不进任何一个桶、也不进 {@code total}**，
+     * 而是单独走 {@code tableSubBlocks}。于是：
+     * <pre>
+     *   text + table + image + summary == total          （桶内自洽）
+     *   total + tableSubBlocks          == 全表行数       （没有一行掉在地上）
+     * </pre>
+     * <b>两条都要断言</b>：只断言第一条时，「把 {@code total} 改小」就能假绿（`汇总.md` §5
+     * 那条「A 的合计 = B 先问三句」）。
+     *
+     * <p>口径与 {@code sys_document.chunk_count} 同源（那里也只计顶层块）——
+     * 所以详情页两处显示的"分片数"不会打架。
+     *
+     * @param image            图片块数；**可空**（`T-512` 之前落的旧文档没有 IMAGE 块，
+     *                         与 {@code ChunkInfo.blockType} 的枚举演进同源）
+     * @param tableSubBlocks   表格子块数（**不属于**上面四个桶）
+     * @param avgTokens        **分母与 {@code total} 同源**（顶层块）——分母与分子不同源时，
+     *                         两个数说的不是一批行。空文档（{@code total = 0}）为 {@code null}
+     *                         而不是 0（「判不了与判否分开报」）
+     * @param titlePathCoverage 标题路径覆盖率（%）：{@code title_path} 非空的**顶层块** ÷ 顶层块。
+     *                         ⚠️ 只算顶层块：表格子块**继承父块的 {@code title_path}**
+     *                         （{@code ChunkingService#appendTable} 父子传同一个），
+     *                         把它们算进来会让一篇含大表的文档"覆盖率虚高"
+     */
+    public record ChunkStat(long total, long text, long table, long summary, Long image,
+                            long tableSubBlocks, Double avgTokens, double titlePathCoverage) {
+    }
+
+    /**
+     * 分片列表分页体（对齐《10》§14：{@code { list, total, stat }}）。
+     *
+     * <p>{@code total} = **过滤后**的条数（带 {@code type} 时是那一档的条数），
+     * 与 {@code stat.total} 不是一回事 —— 后者是不带过滤的全量顶层块数。
+     */
+    public record ChunkPage(List<ChunkRow> list, long total, ChunkStat stat) {
+    }
+
+    // ==================== T-604 · 父块 + 全部子块（`G7-1`） ====================
+
+    /**
+     * 父子块关系（`G7-1`：**父块完整内容 + 全部子块**）。
+     *
+     * <h3>🔴 相对《10》§14 的契约差异：多了 {@code children[]}，去掉了 {@code child}</h3>
+     * <p>原契约是 {@code { child: {ref, content}, parent: {...} }} —— 而 `G7-1` 的原文要求
+     * 「返回父块完整内容 + **全部**子块」，**一个 {@code child} 表达不了"全部"**。
+     * 那个形状是 mock 的产物（mock 里恰好只有一个子块，历史上看不出来）。
+     * 本批按门禁改：{@code children[]} + {@code total}；{@code child} **移除**
+     * （它的原始用途是"检索命中场景显示命中的那一个子块"，而检索详情面板用的是
+     * 打点里的 {@code trace.chunks}，从不调本接口 ⇒ 没有真实消费方会被破坏）。
+     *
+     * <h3>⚠️ {@code rows} 与 {@code returnedRows} 的口径</h3>
+     * <p>{@code rows} = **数据行数（不含表头）**，与 {@code TableWindow.Window#totalRows} 同口径
+     * （也即"子块数与数据行一一对应"那条前提的同一批行）。
+     * <b>本页返回整表</b>（{@code returnedRows == rows}）：需求 §4.5 对这一页的措辞就是
+     * 「N 行 × M 列**全部返回**」，而"命中行 ± 窗口"的裁剪只属于**检索回表**
+     * （{@code TableWindow}，`T-705`）—— 这一页是用户自己点进来看的，没有命中行。
+     *
+     * @param parent  父块；{@code ref} 形如 {@code T-03}（{@code T-} + 两位 {@code order_no}）
+     * @param children 全部子块（行式文本），按 {@code order_no} 升序
+     * @param total   {@code children.size()} 的显式副本（前端不必再算，也让"全部"可断言）
+     */
+    public record ParentChunkView(ParentBlock parent, List<ChildBlock> children, long total) {
+
+        /**
+         * @param ref       表格块引用号（{@code T-} + 两位 {@code order_no}）—— 需求 §4.5 的展示形态
+         * @param title     **表标题**（Markdown 里的 {@code **…**} 前导行）；没有为空串。
+         *                  ⚠️ **刻意不回落成"所属章节"**：那样同一个字段会指两件事。
+         *                  所属章节走 {@code titlePath}，页面上怎么显示是前端的事
+         * @param titlePath 所属章节（标题路径）
+         * @param rows      数据行数（不含表头）；父块内容不是管道表时为 0
+         * @param cols      列数
+         * @param returnedRows 本次**实际返回**的数据行数（本页恒等于 {@code rows}）
+         */
+        public record ParentBlock(long id, int orderNo, String ref, String title, String titlePath,
+                                  int rows, int cols, int returnedRows, String content) {
+        }
+
+        /** @param ref 形如 {@code T-03-002}（父块 ref + 三位子块序号） */
+        public record ChildBlock(long id, int orderNo, String ref, String content) {
+        }
+    }
+
+    // ==================== T-605 · 索引任务记录 ====================
+
+    /**
+     * 索引任务行（对齐前端 {@code IndexTask}）。
+     *
+     * <p>{@code durationSec} 由 {@code finished_at - locked_at} 派生（{@code sys_async_task}
+     * **没有 started_at**，{@code locked_at} 是"被领取执行"的时刻，是最接近的起点）。
+     * 未完成时为 {@code null}。
+     *
+     * @param version **恒 {@code null}** —— 同 {@link DocMetaView} 的 {@code version}：
+     *                那不是"这份任务没有版本"，而是**没有该来源**。不要拿 {@code parse_version}
+     *                顶替（语义不同）
+     */
+    public record IndexTaskRow(String id, String stage, String status, String at,
+                               Long chunkCount, Long durationSec, String detail, String version) {
+    }
+
+    public record IndexTaskPage(List<IndexTaskRow> list, long total) {
+    }
 }

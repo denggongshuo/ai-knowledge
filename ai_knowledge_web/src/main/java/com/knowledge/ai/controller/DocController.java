@@ -3,6 +3,7 @@ package com.knowledge.ai.controller;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.dto.doc.DocDtos;
+import com.knowledge.ai.service.DocDetailService;
 import com.knowledge.ai.service.DocService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -44,6 +45,8 @@ import org.springframework.web.multipart.MultipartFile;
 public class DocController {
 
     private final DocService docService;
+
+    private final DocDetailService docDetailService;
 
     /**
      * {@code POST /api/kb/{kbId}/doc/upload} —— 上传文档。
@@ -124,5 +127,87 @@ public class DocController {
     @RequiresPerm("kb:list")
     public ApiResponse<DocDtos.ParseIssuePage> parseIssues(@PathVariable long kbId) {
         return ApiResponse.ok(docService.parseIssues(kbId));
+    }
+
+    // ==================================================================
+    // S7 · M06 · 阶段 A：文档详情 / 预览页的**只读**读侧（`T-600`/`T-602`/`T-603`/`T-604`/`T-605`）
+    // ==================================================================
+
+    /**
+     * {@code GET /api/doc/{id}} —— 文档元信息（详情页与预览页共用）。
+     *
+     * <p>权限码 {@code doc:detail}：这一页是"管"侧（可改属性、可回滚版本），
+     * 与预览页的 {@code doc:preview} 分开 —— 两者的可见范围本来就不同。
+     */
+    @GetMapping("/api/doc/{id}")
+    @RequiresPerm("doc:detail")
+    public ApiResponse<DocDtos.DocMetaView> meta(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docDetailService.meta(docId));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/toc} —— 目录树（左栏，需求 §4.2）。
+     *
+     * <p>参数一律写成 {@code @PathVariable("id") long docId}（六条同一个写法）：
+     * 路径变量的名字是 {@code id}、而局部变量叫 {@code docId}，显式写出来就不会有人
+     * 以为这两条挂的不是同一个东西。
+     */
+    @GetMapping("/api/doc/{id}/toc")
+    @RequiresPerm("doc:preview")
+    public ApiResponse<DocDtos.TocView> toc(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docDetailService.toc(docId));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/chunks?type=&page=&size=} —— 分片列表（右栏卡片流）。
+     *
+     * <p>{@code type} 的闭集是 {@code all/text/table/image/summary}（需求 §4.4 的四个展示分组 + 全部）；
+     * 闭集之外显式报 {@code 10030}，**不静默当成 all**。
+     */
+    @GetMapping("/api/doc/{id}/chunks")
+    @RequiresPerm("doc:preview")
+    public ApiResponse<DocDtos.ChunkPage> chunks(@PathVariable("id") long docId,
+                                                 @RequestParam(required = false) String type,
+                                                 @RequestParam(required = false) Integer page,
+                                                 @RequestParam(required = false) Integer size) {
+        return ApiResponse.ok(docDetailService.chunks(docId, type, page, size));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/chunk-stat} —— 分片统计（详情页的三张统计卡 + `G7-2`）。
+     *
+     * <p>与分片列表**分开两个端点**（《10》§6 的既有约定）：列表带过滤、统计不带 ——
+     * 详情页要的是"这篇文档总共有多少个什么块"，与用户此刻筛了哪一档无关。
+     */
+    @GetMapping("/api/doc/{id}/chunk-stat")
+    @RequiresPerm("doc:preview")
+    public ApiResponse<DocDtos.ChunkStat> chunkStat(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docDetailService.statOf(docId));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/chunks/{parentId}} —— 父块完整内容 + **全部**子块（`G7-1`）。
+     *
+     * <p>⚠️ 这条路径与 {@code chunks} 是**两层**关系：{@code parentId} 必须是**父块**
+     * （{@code chunk_type = 'TABLE' 且 parent_id is null}）的真实 id；传子块 id、
+     * 传非表格块、传 {@code 0} 都会得到明确的业务错（理由见 {@code DocDetailService#parentChunk}）。
+     */
+    @GetMapping("/api/doc/{id}/chunks/{parentId}")
+    @RequiresPerm("doc:preview")
+    public ApiResponse<DocDtos.ParentChunkView> parentChunk(@PathVariable("id") long docId,
+                                                           @PathVariable long parentId) {
+        return ApiResponse.ok(docDetailService.parentChunk(docId, parentId));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/index-tasks} —— 该文档的解析/索引任务记录（详情页「版本历史」Tab 的上半）。
+     *
+     * <p>权限码取 {@code doc:detail} 而不是 {@code doc:reindex}：这一条是**看历史**，
+     * 不是"重建"。重建权限（{@code doc:reindex}）守的是写侧那条端点（`T-610`，本批不做）。
+     */
+    @GetMapping("/api/doc/{id}/index-tasks")
+    @RequiresPerm("doc:detail")
+    public ApiResponse<DocDtos.IndexTaskPage> indexTasks(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docDetailService.indexTasks(docId));
     }
 }

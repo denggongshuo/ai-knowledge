@@ -47,8 +47,15 @@ public class ChunkingService {
      */
     private static final List<String> SEPARATORS = List.of("\n\n", "\n", "。", "；", "，", " ");
 
-    /** 标题路径的层级连接符（D-5 §1.1 的示例 {@code 3. 接口设计 > 3.1 鉴权流程}）。 */
-    static final String TITLE_PATH_SEPARATOR = " > ";
+    /**
+     * 标题路径的层级连接符（D-5 §1.1 的示例 {@code 3. 接口设计 > 3.1 鉴权流程}）。
+     *
+     * <p>⚠️ 它是 {@code public} 的，因为**读侧也要用同一个字面量**：`T-602` 的目录树
+     * 要从 {@code title_path} 的分段数推出标题层级（{@code DocDetailService#toc}）。
+     * 那边若自己再写一次 {@code " > "}，两个常量就有分叉的一天 ——
+     * 而分叉的表现是"目录树层级与检索侧过滤不一致"，很难查。
+     */
+    public static final String TITLE_PATH_SEPARATOR = " > ";
 
     /**
      * 把解析产物切成块。
