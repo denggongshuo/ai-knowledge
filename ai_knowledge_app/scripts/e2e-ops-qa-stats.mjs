@@ -557,11 +557,14 @@ try {
   try {
     const { residue, left } = await cleanupProbe()
     const clean = left === 0 && kbResidueClean(residue)
-    console.log(`${clean ? '✓' : '✗'} 收尾清理 · 残留 ${left} 行 · 探针库 ${describeKbResidue(residue)}`)
-    if (!clean) process.exitCode = 1
+    // 🔴 `T-O21`：**写成 `check()` 而不是 `console.log` + `exitCode`** ——
+    // 后者虽然也让退出码变 1，但它**不进 `steps`**，于是汇总行照旧打印
+    // 「22/22 通过」，而真正红的只有下面那一行独立日志。
+    // 「全绿 + 一行容易被划过去的 ✗」正是这条要消灭的形态。
+    check(clean, 'T-O21：清理确实执行了（残留 = 0 是**断言**，不是日志）',
+      `残留 ${left} 行 · 探针库 ${describeKbResidue(residue)}`)
   } catch (e) {
-    console.log(`✗ 收尾清理抛错：${e.message}`)
-    process.exitCode = 1
+    check(false, 'T-O21：收尾清理抛错', e.message)
   }
   try {
     if (ws) ws.close()

@@ -40,7 +40,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { mysqlScalar, mysqlCount, teardownKbProbe, purgeUserScopedArtifacts } from './lib/probe-teardown.mjs'
+import { mysqlScalar, mysqlCount, teardownKbProbe, purgeUserScopedArtifacts, kbResidueClean, describeKbResidue } from './lib/probe-teardown.mjs'
 
 const arg = (name, fallback) => (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
 const BASE = arg('base', 'http://localhost:5174')
@@ -447,9 +447,11 @@ main()
   })
   .finally(async () => {
     // 收尾必须走 finally：**中途任何一步抛错都要清干净**（#186 那条教训）
+    let kbResidue = null
     try {
       if (kbId) {
         const r = await teardownKbProbe(KB_CODE)
+        kbResidue = r.residue
         // `residue.sql` 是个对象（各表的残留计数），直接插进模板串会打成 `[object Object]`
         observe('探针库收尾', `MinIO ${r.removed.minio} · 池子 ${r.removed.misses ?? 0} · 残留 ${JSON.stringify(r.residue?.sql ?? {})}`)
       }
@@ -479,6 +481,26 @@ main()
       } catch (e) {
         observe('⚠️ 会话收尾失败', e.message)
       }
+    }
+    // 🔴 `T-O21`：**清理执行与否必须是断言，不是日志**。
+    // 反例是实测过的（`S8-M10-E` 证伪 `T-O19` 时）：把守卫换回旧写法，脚本报
+    // 「21/21 通过」却留下 1 会话 + 2 消息 —— 「全绿」与「干净」被当成了同一件事。
+    // 判据只认**本轮精确知道的范围**（探针库族 + 水位线以上的会话族 + 本轮记下的池子行），
+    // 而且是**独立观测点**：再查一次库，不看上面那些 delete 的返回值。
+    try {
+      const sessionLeft = askedThisRun
+        ? mysqlCount(`select (select count(*) from sys_chat_session where id > ${sessionFloor}) `
+          + `+ (select count(*) from sys_chat_message where session_id > ${sessionFloor}) `
+          + `+ (select count(*) from sys_retrieval_trace where session_id > ${sessionFloor})`)
+        : 0
+      const missLeft = missKeys.length
+        ? mysqlCount(`select count(*) from sys_qa_miss where id in (${missKeys.join(',')})`)
+        : 0
+      const clean = sessionLeft === 0 && missLeft === 0 && (!kbResidue || kbResidueClean(kbResidue))
+      check(clean, 'T-O21：清理确实执行了（残留 = 0 是**断言**，不是日志）',
+        `会话族 ${sessionLeft} · 池子 ${missLeft} · 探针库 ${kbResidue ? describeKbResidue(kbResidue) : '未建'}`)
+    } catch (e) {
+      check(false, 'T-O21：残留自检自身抛错', e.message)
     }
     try {
       if (ws) ws.close()
