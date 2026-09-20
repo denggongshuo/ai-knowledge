@@ -95,7 +95,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = describer.describe(List.of(block));
 
-        assertThat(caller.callCount).as("**一次 VL 都不该调** —— 那正是过滤存在的理由").isZero();
+        assertThat(caller.callCount.get()).as("**一次 VL 都不该调** —— 那正是过滤存在的理由").isZero();
         assertThat(result.skipped()).isEqualTo(1);
         assertThat(result.failed()).isZero();
         assertThat(result.issues()).singleElement()
@@ -116,7 +116,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = describer.describe(List.of(first, second));
 
-        assertThat(caller.callCount).as("同一个 md5 只调一次 —— 需求点名的理由就是'公司 logo 这类图'")
+        assertThat(caller.callCount.get()).as("同一个 md5 只调一次 —— 需求点名的理由就是'公司 logo 这类图'")
                 .isEqualTo(1);
         assertThat(result.described()).isEqualTo(1);
         assertThat(result.skipped()).isEqualTo(1);
@@ -174,7 +174,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = describer.describe(List.of(block));
 
-        assertThat(caller.callCount)
+        assertThat(caller.callCount.get())
                 .as("必须真的调了两次 —— 只调一次说明重试没接上")
                 .isEqualTo(2);
         assertThat(result.failed())
@@ -196,7 +196,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = describer.describe(List.of(block));
 
-        assertThat(caller.callCount)
+        assertThat(caller.callCount.get())
                 .as("重试上限 1 ⇒ 总共 2 次").isEqualTo(2);
         assertThat(result.failed()).isEqualTo(1);
         assertThat(result.issues()).singleElement()
@@ -218,7 +218,7 @@ class DocumentImageDescriberTest {
         DocumentImageDescriber.Result result = describer.describe(blocks);
 
         assertThat(result.described()).isEqualTo(3);
-        assertThat(caller.callCount)
+        assertThat(caller.callCount.get())
                 .as("🔴 这张锚值是必需的：把重试写成「每张都先试两次」照样能让上面那条用例绿，"
                         + "而它会让**正常路径的调用次数翻倍** —— 那是每分钟都在烧的钱")
                 .isEqualTo(3);
@@ -236,7 +236,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = noRetry.describe(List.of(block));
 
-        assertThat(caller.callCount).isEqualTo(1);
+        assertThat(caller.callCount.get()).isEqualTo(1);
         assertThat(result.failed())
                 .as("关掉重试之后行为与 `S6-M05-C2` 之前**逐字一致** —— 这是回退开关")
                 .isEqualTo(1);
@@ -275,7 +275,7 @@ class DocumentImageDescriberTest {
         DocumentImageDescriber.Result result = off.describe(blocks);
 
         assertThat(result.blocks()).as("原样返回 —— 图片块仍带题注进索引，只是没有描述").isSameAs(blocks);
-        assertThat(caller.callCount).isZero();
+        assertThat(caller.callCount.get()).isZero();
         assertThat(result.issues())
                 .as("关掉是'这个环境没开'，不是'这张图理解不了' —— 不留 issue")
                 .isEmpty();
@@ -299,7 +299,7 @@ class DocumentImageDescriberTest {
 
         DocumentImageDescriber.Result result = describer.describe(blocks);
 
-        assertThat(caller.callCount)
+        assertThat(caller.callCount.get())
                 .as("同一 md5 只允许调一次 —— 并行之后这条只能靠「派发前分诊」保证")
                 .isEqualTo(1);
         assertThat(result.described()).isEqualTo(1);
@@ -457,17 +457,30 @@ class DocumentImageDescriberTest {
          * 而后者才是生产里的实际形态（`S6-M05-C2` §8.12：同一批图第一轮全失败、第三轮全过）。
          */
         int failFirst;
-        int callCount;
+        /**
+         * 🔴 **必须是原子的**（2026-09-20 修）：`VisionDescriber` 用
+         * `Executors.newVirtualThreadPerTaskExecutor()` **并行**描述多张图
+         * （见其 `VisionDescriber.java:144`），而 `int++` 是多线程下的读-改-写 ⇒
+         * **会丢增量**。实测形态：全量跑批里偶发一次 `callCount == 2` 而
+         * `described() == 3`（"三张都描述了却只调了两次模型" —— 不可能的事），
+         * 单独跑同一个类 **3/3 全绿**（负载不同 ⇒ 时序不同）。
+         * ⇒ 这是**用例自己的竞态**，不是产品缺陷；而它的现象恰好长得像
+         * "重试把成功路径的调用吞了一次"，正是这条判据要抓的东西 ⇒ 必须修。
+         */
+        final java.util.concurrent.atomic.AtomicInteger callCount =
+                new java.util.concurrent.atomic.AtomicInteger();
         final VisionModelRef model = new VisionModelRef("4", "Qwen/Qwen3-VL-8B-Instruct");
 
         @Override
         public VisionRaw call(String prompt, byte[] image, String presignedUrl, String mime) {
-            callCount++;
+            // 先自增再取回自己那一次的序号 —— 判断"第几次"必须用**自己这次**的值，
+            // 读全局值会让并发下两张图拿到同一个序号（失败注入就错位了）
+            int nth = callCount.incrementAndGet();
             if (failWith != null) {
                 throw failWith;
             }
-            if (callCount <= failFirst) {
-                throw new IllegalStateException("偶发失败（第 " + callCount + " 次调用）");
+            if (nth <= failFirst) {
+                throw new IllegalStateException("偶发失败（第 " + nth + " 次调用）");
             }
             return VisionRaw.of(raw);
         }
