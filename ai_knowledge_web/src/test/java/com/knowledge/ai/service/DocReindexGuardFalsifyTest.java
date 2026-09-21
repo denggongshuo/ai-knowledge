@@ -21,7 +21,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * `G7-15` —— **「移动知识库」的代复核必须真的接线**（销 `plan/汇总.md` §3 的 `#211`）。
+ * **判据 14**（销 `plan/汇总.md` §3 的 `#211`）—— **「移动知识库」的代复核必须真的接线**。
+ *
+ * <p>⚠️ 它**不是一个独立的门禁号**：它验的是 `G7-4`（移动知识库）实现里的一段接线。
+ * ⚠️ 立据时我把它写成了一个**自造的门禁号**（那个号在排期里不存在）——
+ * 被 `check-ledgers` 的 L1 当场逗到（见计划 §9：**违规自身要留痕**）。
+ * （见计划 §9：违规自身要留痕）。
  *
  * <h2>为什么这条判据此前不存在，以及它为什么值钱</h2>
  * <p>`S7-M06-B` 的 {@code DocReindexService#moveToKb} **确实**传了
@@ -64,7 +69,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>真正的竞态（"复核通过之后、写入之前"那一段窗口）在单线程用例里造不出来，
  * 与 `#210` 那族同一条限制。如实写在这里，免得下一个人以为这条判据覆盖了并发。
  */
-@DisplayName("G7-15 · 移动知识库的代复核接线（销 #211）")
+@DisplayName("判据 14 · 移动知识库的代复核接线（销 #211 · 属 G7-4）")
 @TestPropertySource(properties = "m05.vectorize.enabled=true")
 class DocReindexGuardFalsifyTest extends ApiTestSupport {
 
@@ -136,7 +141,7 @@ class DocReindexGuardFalsifyTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("G7-15：代已变 ⇒ 复核拦下写入，且文档**留在 INDEXING**（不是 FAILED）")
+    @DisplayName("判据 14：代已变 ⇒ 复核拦下写入，且文档**留在 INDEXING**（不是 FAILED）")
     void guardBlocksWriteWhenGenerationChanged() {
         boolean blocked = moveAndSeeIfBlocked();
 
@@ -168,7 +173,7 @@ class DocReindexGuardFalsifyTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("G7-15 的正向对照：代**没变**时移动正常走完（否则上面那条可能是「永远失败」）")
+    @DisplayName("判据 14 的正向对照：代**没变**时移动正常走完（否则上面那条可能是「永远失败」）")
     void withoutGenerationChangeTheMoveSucceeds() {
         BUMPED.set(1); // 让 spy 不再改代
 
