@@ -43,6 +43,7 @@ import {
   sweepAbandonedKbProbes,
   kbResidueClean,
   describeKbResidue,
+  purgeUserScopedArtifacts,
 } from './lib/probe-teardown.mjs'
 import { solidPng, selfTest } from './lib/test-image.mjs'
 import { probeDevServer, reportPrecondition, EXIT_PRECONDITION } from './lib/dev-server.mjs'
@@ -321,9 +322,29 @@ async function main() {
   })
   await send('DOM.setFileInputFiles', { files: [attachmentFixture], objectId: handle.result.objectId })
   await waitFor(`document.querySelectorAll('.pending-item').length > 0`, { timeout: 30000, label: '待发送区出现缩略图' })
-  check(true, '真文件已塞进上传入口（待发送区出现缩略图）')
+  // 🔴 **必须等上传真的完成**（`stage` 摘掉、`progress >= 100`）再点发送 ——
+  //    `send()` 的第二道闸是 `attachments.some(a => a.stage === 'UPLOADING')`，
+  //    它见 `UPLOADING` 就弹「图片仍在上传，请稍候」并 **return，一个请求都不发**（`#176` 的机制）。
+  //    ⚠️ 第一版只等了"缩略图出现"（`.pending-item` 存在）就点了 ——
+  //    而那个几毫是**瞬间**的，于是点了一个被拦下的发送：页面看着正常、接口一个都没发。
+  await waitFor(`(() => {
+      const item = document.querySelector('.pending-item')
+      if (!item) return false
+      return item.textContent.includes('待发送')
+  })()`, { timeout: 60000, label: '附件上传完成（文案变成「待发送」）' })
+  check(true, '真文件已传完（待发送区文案已是「待发送」）')
 
   // ---------- ⑦ 真提问 ----------
+  // 🔴 **必须先记下"当前有几个 AI 气泡"**：欢迎语（`WELCOME`）**本身就是一条
+  //    `ai-bubble` + `msg-foot` + 非 streaming + 有内容** ⇒ 后面任何 `waitFor('.msg-foot')`
+  //    都会**在真答案到来之前就返回**，于是所有断言都跑在一个还没答完的页面上（全部为 0）。
+  //    这是 `#160`（选到不可见的孪生元素）的同一形状：**元素已经在那儿了，只是不是我要的那一个**。
+  //    第一版就是这么红的：报告里 12 条断言全 0，而实际上后面几秒答案到了、面板也渲染了。
+  // 第一次提问前的消息表水位线 —— 后面"只对该轮生效"那条断言要用它圈本脚本自己造的那几行
+  const messageFloor = mysqlCount('select coalesce(max(id), 0) from sys_chat_message;')
+  const aiBubblesBefore = await evaluate(`document.querySelectorAll('.bubble.ai-bubble').length`)
+  observe('提问前已有的 AI 气泡数', `${aiBubblesBefore}（其中一个是欢迎语）`)
+
   await evaluate(`(() => {
     const ta = document.querySelector('.chat-input textarea')
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
@@ -333,9 +354,14 @@ async function main() {
   })()`)
   await sleep(300)
   await clickReal('.chat-input button.el-button--primary')
-  await waitFor(`document.querySelectorAll('.bubble.ai-bubble').length > 0`, { timeout: 20000, label: 'AI 气泡出现' })
-  // 等生成结束（`.msg-foot` 只在 `!streaming && content` 时渲染）
-  await waitFor(`document.querySelectorAll('.msg-foot').length > 0`, { timeout: 180000, label: '生成结束（页脚出现）' })
+  await waitFor(`document.querySelectorAll('.bubble.ai-bubble').length > ${aiBubblesBefore}`,
+    { timeout: 20000, label: '**新**的 AI 气泡出现（不是欢迎语）' })
+  // 等生成结束：`.msg-foot` 只在 `!streaming && content` 时渲染，且必须落在**新那条**上
+  await waitFor(`(() => {
+      const bs = [...document.querySelectorAll('.bubble.ai-bubble')]
+      const last = bs[bs.length - 1]
+      return !!last && !last.querySelector('.cursor-blink') && !!last.querySelector('.msg-foot')
+  })()`, { timeout: 180000, label: '生成结束（最后一条气泡的页脚出现）' })
   check(chatWrites.some((r) => r.url.includes('/chat/completions')), '页面上的提问**真的发了** `POST /chat/completions`',
     chatWrites.map((r) => `${r.url}=${r.status}`).join(' · ') || '(一个都没发)')
 
@@ -345,8 +371,10 @@ async function main() {
   observe('本轮会话 id', `sessionId=${sessionId}`)
 
   // ---------- ⑧ `T-804`：行内角标可点 + 面板定位 ----------
-  const markerCount = await evaluate(`document.querySelectorAll('.inline-cit').length`)
-  const citationCount = await evaluate(`document.querySelectorAll('.cit-row .cit-tag').length`)
+  // 🔴 全部限定在**最后一条** AI 气泡里 —— 欢迎语与真答案是同一组选择器的孪生元素
+  const LAST = `[...document.querySelectorAll('.bubble.ai-bubble')].pop()`
+  const markerCount = await evaluate(`${LAST}.querySelectorAll('.inline-cit').length`)
+  const citationCount = await evaluate(`${LAST}.querySelectorAll('.cit-row .cit-tag').length`)
   check(citationCount > 0,
     '🔴 引用来源卡片渲染出来了（来自 `done.citations` —— `T-804` 之前它是拿 `chunks` 按 `i+1` 拼的）',
     `卡片=${citationCount} 张 · 正文里可点角标=${markerCount} 个`)
@@ -355,19 +383,19 @@ async function main() {
     `角标=${markerCount}`)
 
   const clicked = await evaluate(`(() => {
-    const el = document.querySelector('.inline-cit')
+    const el = ${LAST}.querySelector('.inline-cit')
     if (!el) return null
     el.click()
     return true
   })()`)
   check(clicked === true, '角标可点（`onAnswerClick` 的事件委托接到了）')
   await sleep(500)
-  const flashed = await evaluate(`document.querySelectorAll('.tp-cite-flash').length`)
+  const flashed = await evaluate(`${LAST}.querySelectorAll('.tp-cite-flash').length`)
   check(flashed > 0,
     '🔴 点角标 ⇒ 检索详情面板**滚动定位**到对应分片（需求 07 §6.6 第二行）',
     `被高亮的面板行=${flashed}`)
   const flashIsCited = await evaluate(`(() => {
-    const row = document.querySelector('.tp-cite-flash')
+    const row = ${LAST}.querySelector('.tp-cite-flash')
     if (!row) return null
     return !!row.querySelector('.tp-cited')
   })()`)
@@ -383,13 +411,24 @@ async function main() {
   check(citedOne > 0,
     '🔴 `cited = 1` 有行（角标解析真的落库了 —— 此前这一列**恒 NULL**）',
     `cited=1 有 ${citedOne} 条 / 明细共 ${detailTotal} 条 / cited is null 有 ${citedNull} 条`)
-  check(citedOne < detailTotal || citedNull > 0,
-    '🔴 `cited` 不是"全标 1"（"被引用"与"喂给模型"是两份不同的清单）',
-    `1 的条数 ${citedOne} < 明细总数 ${detailTotal}（或存在 null 行 ${citedNull}）`)
+  // 🔴 不能用"存在 `cited = 0` 的行"来证伪"全标 1" ——
+  //    模型在本场景下**确实引用了全部 5 条**（参考资料就那么几段），
+  //    那么"全标 1"与"真实引用"在这一轮里**结果相同** —— 判据是空的。
+  //    真正能区分它们的是**两个数据源对账**：页面上的引用卡片数（= `done.citations`）
+  //    必须**不大于**明细总数，且两者同时非零。"全标 1"会让卡片数等于明细总数而看不出区别，
+  //    但**它会在后端用例里被逐条抳掉**（`ChatStreamFlowTest#citedComesFromAnswerMarkers...`，
+  //    那边构造了"只引用第 2 条而喂了 3 条"的场景）。
+  //    本脚本只断言"两边都有东西且不矛盾"。
+  check(citedOne > 0 && citedOne <= detailTotal,
+    '🔴 `cited = 1` 的条数不超过明细总数（两个数据源不矛盾）',
+    `cited=1 ${citedOne} ≤ 明细总数 ${detailTotal}（cited is null ${citedNull}）`)
+  check(citationCount === citedOne,
+    '🔴 页面上的引用卡片数 **逐个等于** `cited = 1` 的条数（端到端同源）',
+    `卡片=${citationCount} · cited=1 的行=${citedOne}`)
 
   // ---------- ⑩ 点引用卡片里的文档名 ⇒ 预览页带 `?chunk=` 且真的定位 ----------
   const popupUrl = await evaluate(`(() => {
-    const title = document.querySelector('.tp-cite-title-clickable')
+    const title = ${LAST}.querySelector('.tp-cite-title-clickable')
     if (!title) return null
     // 拦下 window.open：**本脚本要断言的是 URL**，而新标签页在 CDP 里另开一个 target，
     // 断言它要再连一次 WebSocket —— 代价大于收益，且拦下来看到的 URL 与它逐字相同
@@ -405,12 +444,23 @@ async function main() {
     `URL=${popupUrl ?? '(没打开)'}`)
 
   if (popupUrl) {
-    await goto(popupUrl)
+    // ⚠️ `router.resolve()` 返回的是 `#/doc/...` 这种**相对 hash 地址** ——
+    //    `Page.navigate` 要绝对地址，直接喂它会报 `Cannot navigate to invalid URL`
+    //    （第一版就是这么中断的，而那个报错看起来像"链接坏了"）
+    await goto(`${BASE}/${String(popupUrl).replace(/^\//, '')}`)
     await waitFor(`!!document.querySelector('.page-title')`, { timeout: 20000, label: '预览页挂载' })
+    // ⚠️ **不能看 `.flash`**：它 900ms 就被移除了（`scrollToChunk` 里的 `setTimeout`），
+    //    而 `waitFor` 的轮询间隔是 150ms —— 两者相差不多，**报警取决于调度**。
+    //    第一版就是这么报的（`最后一次求值：null`，而页面上其实定位到了）。
+    //    → 改看**选中态**（`active` 类 + `data-chunk-id`），它一直在。
+    // ⚠️ 看**右栏的分片卡片**（`.chunk-item`），不看 `.para.parsed` ——
+    //    后者只在「解析后」视图下渲染，而默认是「原文」视图 ⇒ 选择器根本命中不到（第二版就是这么报的）。
+    //    右栏那张卡片**始终**在，且它同样按 `selectedChunkId` 算 `active` ——
+    //    两处是同一个状态的两个视图，所以看哪个都行，看那个总在的。
     const selected = await waitFor(`(() => {
-      const el = document.querySelector('.flash')
-      return el ? el.getAttribute('data-chunk') : null
-    })()`, { timeout: 15000, label: '预览页定位到分片（`.flash` 类）' })
+      const el = document.querySelector('.chunk-item.active[data-chunk-id]')
+      return el ? el.getAttribute('data-chunk-id') : null
+    })()`, { timeout: 15000, label: '预览页选中了对应分片（`.chunk-item.active`）' })
     const wantedChunk = String(popupUrl).split('chunk=')[1]?.split('&')[0]
     check(String(selected) === String(wantedChunk),
       '🔴 预览页**真的定位到了那一片**（不是"只是打开了页面"—— 两者在截图上长得一样）',
@@ -420,12 +470,12 @@ async function main() {
   // ---------- ⑪ `T-806`：`vision=false` ⇒ 按钮置灰且带原因 ----------
   await goto(`${BASE}/#/chat`)
   await waitFor(`document.querySelectorAll('.msg-foot').length > 0`, { timeout: 20000, label: '问答页仍挂着上一轮' })
-  const denied = await evaluate(`(() => {
-    const btns = [...document.querySelectorAll('.mf-actions button')]
-    const b = btns.find((x) => x.textContent.includes('直接读原图'))
+  const readBtn = `(() => {
+    const b = ${LAST}.querySelector('.mf-actions button')
     if (!b) return null
     return { disabled: b.disabled || b.classList.contains('is-disabled'), title: b.getAttribute('title') ?? '' }
-  })()`)
+  })()`
+  const denied = await evaluate(readBtn)
   check(denied && denied.disabled === true,
     '🔴 `vision=false` 时「直接读原图」**置灰**（需求 09 §4.7「否则按钮置灰并说明原因」）',
     `disabled=${denied?.disabled} title="${denied?.title}"`)
@@ -437,31 +487,62 @@ async function main() {
   // ⚠️ `ModelConfigSpec#version` 取自 `updated_at` 的毫秒值，而它是客户端缓存的 key 之一 ——
   //    只改 `capabilities` 而不动 `updated_at`，注册中心仍拿旧 spec（页面看着改了、行为没变）
   mysqlScalar(`update sys_model_config set updated_at = now() where id = ${chatModelId};`)
+  // 🔴 重载后**必须重新传图 + 重新提问** ——
+  //    `ChatView` 的消息在内存里，**不持久化**：重载之后就只剩欢迎语。
+  //    而「直接读原图」的按钮挂在**带图的那条消息**上（`v-if="m.attachments?.length"`）
+  //    ⇒ 不重新提问的话，`.mf-actions button` 取到的是「复制」而不是它。
+  //    第二版就是这么报的：`disabled=true title=""` —— 两个值都对不上「直接读原图」
+  //    （它的 disabled 跟能力走、title 在能用时是空串；而「复制」的 disabled 跟消息状态走、没有 title）。
   await send('Page.reload')
-  await waitFor(`document.querySelectorAll('.msg-foot').length > 0`, { timeout: 25000, label: '重载后仍能取到模型能力' })
-  const enabled = await evaluate(`(() => {
-    const btns = [...document.querySelectorAll('.mf-actions button')]
-    const b = btns.find((x) => x.textContent.includes('直接读原图'))
-    if (!b) return null
-    return { disabled: b.disabled || b.classList.contains('is-disabled'), title: b.getAttribute('title') ?? '' }
+  await waitFor(`!!document.querySelector('.chat-input')`, { timeout: 25000, label: '重载后问答页挂载' })
+  await waitFor(`!!document.querySelector('.chat-input input[type="file"]')`, { timeout: 15000, label: '重载后上传入口存在' })
+  const handle2 = await send('Runtime.evaluate', {
+    expression: `document.querySelector('.chat-input input[type="file"]')`,
+  })
+  await send('DOM.setFileInputFiles', { files: [attachmentFixture], objectId: handle2.result.objectId })
+  await waitFor(`(() => {
+      const item = document.querySelector('.pending-item')
+      return !!item && item.textContent.includes('待发送')
+  })()`, { timeout: 60000, label: '重载后附件上传完成' })
+  const bubbles2 = await evaluate(`document.querySelectorAll('.bubble.ai-bubble').length`)
+  await evaluate(`(() => {
+    const ta = document.querySelector('.chat-input textarea')
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
+    setter.call(ta, ${JSON.stringify(MAGIC + ' 又是多少？')})
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+    return true
   })()`)
+  await sleep(300)
+  await clickReal('.chat-input button.el-button--primary')
+  await waitFor(`(() => {
+      const bs = [...document.querySelectorAll('.bubble.ai-bubble')]
+      const last = bs[bs.length - 1]
+      return bs.length > ${bubbles2} && !!last && !last.querySelector('.cursor-blink') && !!last.querySelector('.msg-foot')
+  })()`, { timeout: 180000, label: '重载后的第二轮生成结束' })
+
+  const enabled = await evaluate(readBtn)
   check(enabled && enabled.disabled === false,
     '🔴 `vision=true` 时按钮**可点**（能力闸跟着配置走 —— 不是写死的）',
     `disabled=${enabled?.disabled} title="${enabled?.title}"`)
 
-  const roundsBefore = mysqlCount('select count(*) from sys_chat_message;')
-  await clickReal('.mf-actions button')
-  await waitFor(`document.querySelectorAll('.mf-vision').length > 0`, { timeout: 180000, label: '页脚出现「已读原图」' })
+  // 点**最后一条**气泡里的那个按钮
+  await evaluate(`${LAST}.querySelector('.mf-actions button').click()`)
+  await sleep(400)
+  await waitFor(`!!${LAST}.querySelector('.mf-vision')`, { timeout: 180000, label: '页脚出现「已读原图」' })
   check(true, '🔴 点「直接读原图」⇒ 消息页脚出现「已读原图」（需求 07 §6.12）')
 
-  const usedVisionRows = mysqlCount('select count(*) from sys_chat_message where used_vision = 1;')
-  const usedVisionZero = mysqlCount(`select count(*) from sys_chat_message where used_vision = 0 and id > ${roundsBefore - 2};`)
+  const usedVisionRows = mysqlCount(
+    `select count(*) from sys_chat_message where used_vision = 1 and id > ${messageFloor};`)
+  const usedVisionZero = mysqlCount(
+    `select count(*) from sys_chat_message where used_vision = 0 and id > ${messageFloor};`)
   check(usedVisionRows >= 1,
     '🔴 `sys_chat_message.used_vision = 1` 真的落库了（需求 09 §4.7 的「记录」那一行）',
     `used_vision=1 的行 ${usedVisionRows} 条`)
   check(usedVisionZero >= 1,
-    '🔴 **只对该轮生效**：同一会话上一轮仍是 `0`（会话级的话上一轮会被覆盖成 1，'
-      + '而「用描述 vs 用原图」的对比就做不出来了）',
+    '🔴 **只对该轮生效**：同一页面上的另一轮仍是 `0`（若写成会话级的值，'
+      + '两轮会被拉平成同一个数 —— 而「用描述 vs 用原图」的对比就做不出来了）。'
+      + '⚠️ 严格的"同会话两轮"由后端用例逐条断言（`usedVisionIsPersistedPerRound`，'
+      + '它断言了 `containsExactly(1, 0)`）—— 页面上前端**不传 `sessionId`**，每次发送都开新会话',
     `used_vision=0 的行 ${usedVisionZero} 条`)
 
   // ---------- ⑬ 无未捕获异常 ----------
@@ -538,6 +619,21 @@ run()
       }
     } catch (e) {
       check(false, '收尾：会话族精确清理抛错', e.message)
+    }
+
+    // 🔴 **用户族**（`T-O19` 的口径）：本脚本真传了一张图 ⇒ 造了一行
+    //    `sys_chat_attachment` + 桶里一个 `chat-attachments/` 对象。
+    //    而它不属任何探针库 ⇒ `teardownKbProbe` 一行都碰不到它。
+    //    第一版就是这么漏的：探针库族报 0，而附件族剩 1 行。
+    try {
+      purgeUserScopedArtifacts(1)
+      // ⚠️ `purgeUserScopedArtifacts` 的射程**不含** `sys_chat_attachment`
+      //    （它的 `USER_SCOPED` 白名单里只有四张聚合/池子表），
+      //    而本脚本真传了一张图 ⇒ 必须自己删那一行。
+      //    桶里的对象由 `ProbeCleanup` 的 `chat-attachments/` 前缀兜底收走（`T-O10`）。
+      mysqlScalar('delete from sys_chat_attachment where user_id = 1;')
+    } catch (e) {
+      check(false, '收尾：用户族清理抛错', e.message)
     }
 
     let clean = false

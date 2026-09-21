@@ -726,8 +726,14 @@ export function sweepOrphanChatFamily() {
 export async function sweepAbandonedKbProbes(prefixes) {
   const where = prefixes.map((p) => `code like '${p}%'`).join(' or ')
   if (!where) return []
+  // 🔴 **`group_concat` 一行都没匹配到时返回 SQL NULL**，而 `mysql -N` 把它打成
+  //    **字面量字符串 `"NULL"`** ⇒ 下面的 `.filter(Boolean)` 会把它当成一个**真实的库 code** 留下来
+  //    ⇒ 收尾日志打出「收掉上一轮留下的探针库 — 1 个：NULL」（本批实测就是这么打的）。
+  //    后果不重（`teardownKbProbe('NULL')` 一行也删不到），但它**让台账与事实脱钩** ——
+  //    而那正是本仓反复吃亏的那个形状（另一处 `normalizeKeys` 就滤了 `'NULL'`，
+  //    两处口径不一致正是漏洞的来源）
   const csv = String(mysqlScalar(`select group_concat(code) from sys_kb where ${where};`) || '')
-  const codes = csv.split(',').map((s) => s.trim()).filter(Boolean)
+  const codes = csv.split(',').map((s) => s.trim()).filter((s) => s && s !== 'NULL')
   for (const code of codes) {
     await teardownKbProbe(code)
   }
