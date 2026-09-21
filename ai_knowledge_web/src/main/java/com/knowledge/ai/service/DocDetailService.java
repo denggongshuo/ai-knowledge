@@ -103,6 +103,7 @@ public class DocDetailService {
                                (select max(t.finished_at) from sys_async_task t
                                  where t.doc_id = d.id and t.type = 'doc-parse' and t.status = 'DONE'),
                                d.secret_level,
+                               d.version_no,
                                -- `T-804`：这篇文档的分片被答案**实际引用**过多少次。
                                -- 只数 `cited = 1` 的行 —— `cited is null`（本批之前的行）**不算数**：
                                -- 那是"没采集"，不是"没被引用"。两者差一个量级
@@ -122,7 +123,7 @@ public class DocDetailService {
         long pagesWithText = num(r[20]);
         String kbLevel = (String) r[10];
         String ownLevel = (String) r[22];
-        long citedCount = num(r[23]);
+        long citedCount = num(r[24]);
         // 🔴 生效密级 = max(文档级, 库级) —— 在 **Java 侧**算，且只走这一个方法。
         //    ⚠️ 不要改成 SQL 的 greatest()：密级名按字母序与密级序**错位**
         //    （greatest('INTERNAL','CONFIDENTIAL') 返回 'INTERNAL'）⇒ 判断做反，
@@ -135,7 +136,8 @@ public class DocDetailService {
                 num(r[0]), num(r[1]), (String) r[2], (String) r[3], (String) r[4], type,
                 num(r[6]), (int) pagesTotal, num(r[8]), (String) r[9],
                 effectiveLevel,
-                r[11] == null ? "—" : (String) r[11], time(r[12]), null,
+                r[11] == null ? "—" : (String) r[11], time(r[12]),
+                "v" + num(r[23]),
                 fileDesc(type, pagesTotal, pagesWithText), (String) r[19],
                 (String) r[13], (String) r[14],
                 num(r[15]), num(r[16]), num(r[17]), num(r[18]),

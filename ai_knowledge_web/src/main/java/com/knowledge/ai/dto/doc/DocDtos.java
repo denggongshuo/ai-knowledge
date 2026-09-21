@@ -151,10 +151,12 @@ public final class DocDtos {
     /**
      * 文档元信息（对齐前端 {@code DocMeta}，{@code types/index.ts:693}）= {@code DocInfo} + 治理与统计字段。
      *
-     * <h3>🔴 四个字段**故意**为 {@code null}，且它们**不是**"没有数据"</h3>
+     * <h3>🔴 原始四个「未采集」字段，如今只剩两个仍故意为 {@code null}</h3>
      * <p>`S7-M06-A` 时这四个字段的**采集方/落库方在本仓都还不存在**。返回 {@code 0}
      * 或空数组会把"从没采过"说成"确实是 0" —— 而那是**一句关于内容的断言**（`D-2`：
-     * 打点后补 = 数据永久缺失）。故当时一律 {@code null}，前端渲染成「未采集」而不是「0 次」：
+     * 打点后补 = 数据永久缺失）。故当时一律 {@code null}，前端渲染成「未采集」而不是「0 次」。
+     * 其后逐批转真（`S7-M06-C` 转 {@code citations}、`S7-M06-D` 转 {@code version}）——
+     * 每一条"为什么还是 {@code null}"都**必须各自成立**，不能因为别人转真就顺手一起填：
      * <ul>
      *   <li>🆕 {@code citations} —— **`S7-M06-C` 起转真**：`T-804` 让
      *       {@code sys_retrieval_trace_chunk.cited} 由答案角标解析而来，本列 = 该文档的
@@ -165,9 +167,11 @@ public final class DocDtos {
      *       它要的是"这篇文档的答案被点踩几次"，是 {@code sys_chat_message.feedback}
      *       × {@code trace_id} × {@code doc_id} 的**跨表口径**。`T-804` 只解决了"被引用"，
      *       没解决"被点踩" ⇒ 两个字段**没有同一根因**，一起转真会让两条判据看起来像一条；</li>
-     *   <li>{@code version} —— 版本机制整块不存在（无 `sys_doc_version` 表、`sys_document` 无该列）。
-     *       ⚠️ 不要拿 {@code sys_document.parse_version} 顶替：那是**解析器指纹**（`V20` 的注释
-     *       明写"≠ 文档版本"），语义不同。归属 `T-606`~`T-608`；</li>
+     *   <li>🆕 {@code version} —— **`S7-M06-D` 起转真**：`V39` 给 {@code sys_document} 加了
+     *       {@code version_no}（+ {@code doc_group_id} / {@code is_current}），本字段
+     *       = {@code "v" + version_no}，与版本列表 / 回滚接口**同源同格式**。
+     *       ⚠️ 仍**不要**拿 {@code sys_document.parse_version} 顶替：那是**解析器指纹**
+     *       （`V20` 的注释明写"≠ 文档版本"），语义不同；</li>
      *   <li>{@code tags} —— 文档级内容标签**没有归属表**（{@code IndexEnhancer} 的类 javadoc
      *       自己写着「标签至今没有归属表」）。归属「标签归属」那次裁定 + `T-609`。</li>
      * </ul>
@@ -189,7 +193,7 @@ public final class DocDtos {
      * @param citations         该文档的分片被答案**实际引用**过的次数（`T-804` 起为真值）。
      *                          ⚠️ 只数 `cited = 1`，所以它**不覆盖**本批之前的历史提问
      * @param downVotes         见上，恒 {@code null}（**与 `citations` 不是同一根因**）
-     * @param version           见上，恒 {@code null}
+     * @param version           {@code "v" + version_no}（`S7-M06-D` 起为真值，见上）
      * @param tags              见上，恒 {@code null}
      */
     public record DocMetaView(long id, long kbId, String kbName, String title, String path, String type,
@@ -392,5 +396,110 @@ public final class DocDtos {
      * 报 {@code RUNNING} 是一句关于执行状态的谎（与 `10:708` 给库级那条登记的值一致）。
      */
     public record DocReindexAccepted(long docId, String taskId, String status) {
+    }
+
+    // ==================== T-606 · 版本列表（S7-M06-D · G7-5） ====================
+
+    /**
+     * 单个版本行（对齐前端 {@code DocVersion}，{@code types/index.ts:777}）。
+     *
+     * <p>🔴 一个版本 = 一条 {@code sys_document} 行（版本模型的选型见 `V39` 头注 + 计划 §5）。
+     * 同一 {@code doc_group_id} 下的多行按 {@code version_no} 降序排出，**恰有一行** {@code current=true}
+     * —— 正常态下它也是版本号最高的那一行，但"是当前版本"与"版本号最高"是两件事
+     * （回滚失败留下的作废行会让两者分家，见 {@code hasNewer} 一条）。
+     *
+     * @param version    展示版本号，形如 {@code v3}（= {@code "v" + version_no}）。⚠️ 前端 `rollback`
+     *                   把它原样回传，服务端解析回 {@code version_no}（见 {@code DocVersionService#parseVersion}）
+     * @param size       该版本的文件字节数（{@code size_bytes}）
+     * @param chunkCount 该版本的分片数（{@code chunk_count}）
+     * @param owner      该版本的上传人（真名，取不到回退用户名 / "未知"）
+     * @param at         该版本的上传时刻（{@code created_at}，格式化）
+     * @param current    是否当前版本（{@code is_current}）—— 前端据它**隐藏「回滚」按钮**（§6.7）
+     * @param note       版本备注；取 {@code remark}（补录备注）或 {@code null}。⚠️ 不伪造 ——
+     *                   没有备注就是 {@code null}，前端不显示（不是显示空串）
+     * @param hasNewer   同组是否存在**更高版本号**的行（需求 §6.4「已有更新版本」标记）。
+     *                   ⚠️ 原来是"当前版本恒 {@code false}"，**实测被推翻**：回滚失败会留下
+     *                   一行版本号更高但已作废的残骸（{@code DocVersionService#abandon}），
+     *                   此时当前版本的 {@code hasNewer} **就是 true**。判据钉在
+     *                   {@code DocVersionFlowTest#abandonedVersionIsNotReportedAsCurrent}
+     */
+    public record DocVersionRow(String version, long size, long chunkCount, String owner,
+                               String at, boolean current, String note, boolean hasNewer) {
+    }
+
+    /**
+     * 版本列表体（对齐前端 {@code docApi.versionList}，`api/index.ts:147`：
+     * {@code { current: string, list: DocVersion[] }}）。
+     *
+     * @param current 当前版本号（取**带 {@code is_current=1} 的那一行**，不是 {@code max(version_no)}
+     *                —— 回滚失败会留下版本号更高的作废行，用 max 会把它报成当前版本；
+     *                见 {@code DocVersionService#list}）——前端标题栏直接用
+     * @param list    全组版本，**按 version_no 降序**（当前版本在最前）
+     */
+    public record DocVersionList(String current, List<DocVersionRow> list) {
+    }
+
+    // ==================== T-607 · 版本对比（仅元数据 · §6.8 文本 diff 预留） ====================
+
+    /**
+     * 版本对比结果（`GET /doc/{id}/versions/{v}/diff?against={v2}`）。
+     *
+     * <p>🔴 **v1 只做元数据对比**（需求 §6.8 逐字：「不做版本内容的在线 diff 高亮对比 ——
+     * v1 只做元数据对比 + 文本 diff 接口预留」）。所以本结构给两个版本的**可比元数据对照**，
+     * 而 {@link #textDiff} **恒为 {@code null}**（接口预留，不是"这次没算出来"）。
+     *
+     * @param left     基准版本的元数据（URL 里的 {@code {v}}）
+     * @param right    对比版本的元数据（query 里的 {@code against={v2}}）
+     * @param textDiff **恒 {@code null}** —— §6.8 明确 v1 不做文本 diff。留字段是为了"接口预留"，
+     *                 让将来接文本 diff 时**契约不变**（前端已能识别 {@code null} = 不展示 diff 区）
+     */
+    public record VersionDiff(VersionMeta left, VersionMeta right, String textDiff) {
+
+        /**
+         * 一个版本的可比元数据。
+         *
+         * @param version    版本号 {@code v{n}}
+         * @param size       文件字节数
+         * @param chunkCount 分片数
+         * @param tableTotal 表格总数（元数据对比里最能看出"内容变没变"的一项）
+         * @param owner      上传人
+         * @param at         上传时刻
+         */
+        public record VersionMeta(String version, long size, long chunkCount, long tableTotal,
+                                  String owner, String at) {
+        }
+    }
+
+    // ==================== T-608 · 回滚（G7-6） ====================
+
+    /**
+     * 回滚结果（对齐前端 {@code docApi.rollback}，`api/index.ts:148`：
+     * {@code { docId, version, rolledBack, note }}）。
+     *
+     * <p>🔴 回滚**不改写历史**（需求 §6.4「建议保留一条新版本记录而不是改写历史，保证可追溯」）：
+     * 回到 {@code v1} 会**新增**一条版本（内容复制自 {@code v1}、{@code is_current=1}），
+     * 旧的当前版本翻 {@code is_current=0} 并清其向量。历史问答的引用锚定在
+     * {@code sys_retrieval_trace_chunk}，回滚**一个字节都不动那张表** ⇒ 引用不变（`G7-6`）。
+     *
+     * @param docId      **新版本**的 doc id（不是被回滚到的那个旧 id）
+     * @param version    新版本的版本号（{@code "v" + newVersionNo}）
+     * @param rolledBack 恒 {@code true}（失败走异常，不用这个字段表达失败）
+     * @param note       给用户看的一句话（如"已回滚到 v1（保留新版本记录，可追溯）"）
+     */
+    public record RollbackResult(long docId, String version, boolean rolledBack, String note) {
+    }
+
+    /**
+     * 回滚请求体（对齐前端 {@code docApi.rollback}，`api/index.ts:148~149`：
+     * {@code http.post(..., { version })}）。
+     *
+     * <p>⚠️ 版本号走**请求体**而不是路径 —— 前端就是这么发的（{@code DocDetailView.vue:237}）。
+     * 改成路径参数会让前端那行代码静默失效（后端收到空 body ⇒ 报"请指定版本号"，
+     * 而现象是"点了回滚没反应"）。
+     *
+     * @param version 目标版本号，形如 {@code v2}（也接受 {@code 2}，见
+     *                {@code DocVersionService#parseVersion}）
+     */
+    public record RollbackRequest(String version) {
     }
 }

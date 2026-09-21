@@ -7,6 +7,7 @@ import com.knowledge.ai.service.DocAttributeService;
 import com.knowledge.ai.service.DocDetailService;
 import com.knowledge.ai.service.DocReindexService;
 import com.knowledge.ai.service.DocService;
+import com.knowledge.ai.service.DocVersionService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,6 +19,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
 
 /**
  * M05 文档管线 · 阶段 A 的对外接口（`T-500` / `T-501` / `T-509` / `T-510`）。
@@ -54,6 +57,8 @@ public class DocController {
     private final DocAttributeService docAttributeService;
 
     private final DocReindexService docReindexService;
+
+    private final DocVersionService docVersionService;
 
     /**
      * {@code POST /api/kb/{kbId}/doc/upload} —— 上传文档。
@@ -204,6 +209,66 @@ public class DocController {
     public ApiResponse<DocDtos.ParentChunkView> parentChunk(@PathVariable("id") long docId,
                                                            @PathVariable long parentId) {
         return ApiResponse.ok(docDetailService.parentChunk(docId, parentId));
+    }
+
+    // ==================================================================
+    // S7 · M06 · 阶段 D：版本历史（`T-606`/`T-607`/`T-608`/`T-609`）
+    // ==================================================================
+
+    /**
+     * {@code GET /api/doc/{id}/versions} —— 版本列表（版本 Tab 的表格）。
+     *
+     * <p>权限码 {@code doc:detail}（与元信息同一个）：版本列表是"管"侧的一栏，
+     * 与预览页的 {@code doc:preview} 分开 —— 与 {@link #meta(long)} 同一条理由。
+     *
+     * <p>⚠️ 入参是**组内任意一版**的 doc id：页面按 id 打开某一版时也要看得到它的兄弟版本。
+     */
+    @GetMapping("/api/doc/{id}/versions")
+    @RequiresPerm("doc:detail")
+    public ApiResponse<DocDtos.DocVersionList> versions(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docVersionService.list(docId));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/versions/{v}/diff?against={v2}} —— 版本对比（**仅元数据**）。
+     *
+     * <p>🔴 {@code textDiff} 恒 {@code null}：需求 §6.8 逐字写「v1 只做元数据对比 +
+     * 文本 diff 接口预留」。{@code against} 留空 = 与当前版本比。
+     */
+    @GetMapping("/api/doc/{id}/versions/{v}/diff")
+    @RequiresPerm("doc:detail")
+    public ApiResponse<DocDtos.VersionDiff> versionDiff(@PathVariable("id") long docId,
+                                                        @PathVariable("v") String version,
+                                                        @RequestParam(required = false) String against) {
+        return ApiResponse.ok(docVersionService.diff(docId, version, against));
+    }
+
+    /**
+     * {@code POST /api/doc/{id}/rollback} —— 回滚到某一版（`G7-6`）。
+     *
+     * <p>⚠️ 版本号在**请求体**里（{@code {version}}），不是路径参数 —— 前端的
+     * {@code docApi.rollback} 就是这么发的（见 {@code DocDtos.RollbackRequest} 的注释）。
+     *
+     * <p>权限码 {@code doc:update}：回滚是"管理这篇文档"的动作，与属性修改同属一类
+     * （计划 §3.4 假设 6）。审计由服务层的 {@code @AuditLog} 落「文档 / 版本回滚」。
+     */
+    @PostMapping("/api/doc/{id}/rollback")
+    @RequiresPerm("doc:update")
+    public ApiResponse<DocDtos.RollbackResult> rollback(@PathVariable("id") long docId,
+                                                        @RequestBody DocDtos.RollbackRequest request) {
+        return ApiResponse.ok(docVersionService.rollback(docId, request == null ? null : request.version()));
+    }
+
+    /**
+     * {@code GET /api/doc/{id}/tags} —— 文档级内容标签（`T-609`，**契约保留、最小实现**）。
+     *
+     * <p>⚠️ 恒回空数组，且这是**如实**而不是缺陷：文档级标签至今没有归属表（计划 §3.4 假设 4）。
+     * 可见性判定照旧先走一遍 —— 空数组不该成为"这个 id 存不存在"的探测器。
+     */
+    @GetMapping("/api/doc/{id}/tags")
+    @RequiresPerm("doc:detail")
+    public ApiResponse<List<String>> tags(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docVersionService.tags(docId));
     }
 
     /**

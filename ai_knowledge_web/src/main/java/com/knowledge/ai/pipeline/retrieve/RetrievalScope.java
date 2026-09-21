@@ -233,6 +233,7 @@ public class RetrievalScope {
         List<Number> rows = entityManager.createNativeQuery("""
                         select d.id from sys_document d
                          where d.kb_id in (:kbIds) and d.deleted_at is null
+                           and d.is_current = 1
                            and (d.secret_level is null or d.secret_level in (:secretLevels))
                          order by d.id
                         """)

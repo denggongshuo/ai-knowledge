@@ -1,5 +1,5 @@
 import { http, chatStream, type SSEHandlers } from './request'
-import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
+import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DocVersionDiff, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
 
 /** 认证接口 */
 export const authApi = {
@@ -147,6 +147,16 @@ export const docApi = {
   versionList: (id: number | string) => http.get<{ current: string; list: DocVersion[] }>(`/doc/${id}/versions`),
   rollback: (id: number | string, version: string) =>
     http.post<{ docId: number; version: string; rolledBack: boolean; note: string }>(`/doc/${id}/rollback`, { version }),
+  /**
+   * 版本对比（`T-607` · **仅元数据**）。
+   *
+   * ⚠️ `against` 留空 = 与**当前版本**比（这是后端语义，不是"没指定就不比"）。
+   * `against` 与 `version` 相同会被后端拒（`10030`「和自己是同一个版本，无需对比」）——
+   * 页面因此不给当前版本行渲染「对比」以外的动作，也不允许拿它当对照。
+   * 响应里的 `textDiff` 恒 `null`：需求 §6.8 只要求元数据对比，文本 diff 接口预留。
+   */
+  diff: (id: number | string, version: string, against?: string) =>
+    http.get<DocVersionDiff>(`/doc/${id}/versions/${version}/diff`, { against }),
   indexTasks: (id: number | string) => http.get<{ list: IndexTask[]; total: number }>(`/doc/${id}/index-tasks`),
   chunkStat: (id: number | string) => http.get<ChunkStat>(`/doc/${id}/chunk-stat`),
   toc: (id: number | string) => http.get<{ list: TocItem[] }>(`/doc/${id}/toc`),

@@ -1580,6 +1580,43 @@ register('GET', '/api/doc/:id/versions', (_req, res) => {
   json(res, 0, { current: 'v3', list: mockDocVersions })
 })
 
+/**
+ * 版本对比（**仅元数据** · `T-607` / 需求 §6.8）。
+ *
+ * <h3>为什么这条要单独写一段注释</h3>
+ * <p>它是被 `scripts/audit-api.mjs` 的 ① 档抓出来的：「前端调用了、但 mock 未实现（会导致
+ * 运行时报错，必须补）」。也就是 `DocDetailView` 的「对比」按钮在 **mock 模式**下会 404 ——
+ * 而 mock 模式正是页面级自检（`render-check` / `layout-check`）跑的那个模式，
+ * 于是那几条闸会红在"接口没接上"而不是"界面坏了"。
+ *
+ * <p>三条与真后端对齐的语义（少一条都会变成"看起来能跑"的假实现）：
+ * <ol>
+ *   <li>{@code against} 留空 ⇒ 与**当前版本**比（后端语义，不是"没指定就不比"）；</li>
+ *   <li>指定了不存在的版本 ⇒ `10030`（后端 `parseVersion` / `findByVersion` 都拒）；</li>
+ *   <li>拿自己跟自己比 ⇒ `10030`「和自己是同一个版本，无需对比」——
+ *       **回一份全等数据看起来就像"两版没有差别"**，那是一句没有依据的断言；</li>
+ * </ol>
+ * 且 {@code textDiff} 恒 `null`：需求 §6.8 只要求元数据对比，文本 diff 接口预留。
+ * ⚠️ mock 这里也**不能**编一份假的正文差异出来 —— 那会让前端那段"本版只比元数据"
+ * 的说明文案与它所依据的事实对不上。
+ */
+register('GET', '/api/doc/:id/versions/:version/diff', (_req, res, ctx) => {
+  const pick = (v?: string) => mockDocVersions.find((x) => x.version === v)
+  const left = pick(ctx.params.version)
+  if (!left) return json(res, 10030, null, `版本 ${ctx.params.version} 不存在`)
+  const current = mockDocVersions.find((x) => x.current)?.version ?? ''
+  // 留空 = 与当前版本比（`??` 只兜 undefined，空串按后端口径也当"没指定"）
+  const against = String(ctx.query.against ?? '') || current
+  const right = pick(against)
+  if (!right) return json(res, 10030, null, `对照版本 ${against} 不存在`)
+  if (right.version === left.version) return json(res, 10030, null, `${left.version} 与对照版本是同一个版本，无需对比`)
+  json(res, 0, {
+    left: { version: left.version, size: left.size, chunkCount: left.chunkCount, tableTotal: 0, owner: left.owner, at: left.at },
+    right: { version: right.version, size: right.size, chunkCount: right.chunkCount, tableTotal: 0, owner: right.owner, at: right.at },
+    textDiff: null,
+  })
+})
+
 register('POST', '/api/doc/:id/rollback', async (req, res, ctx) => {
   await delay(500)
   const version = String((ctx.body as { version?: string }).version ?? 'v2')

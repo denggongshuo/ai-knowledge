@@ -102,13 +102,20 @@ export interface DocInfo {
   owner: string
   uploadedAt: string
   /**
-   * 文档版本号。
+   * 文档版本号，形如 `v2`。
    *
-   * ⚠️ **真后端目前恒回 `null`（本版本没有该来源）** —— 版本机制整块未落地：
-   * 没有版本表、同名上传不归档，属 `T-606`~`T-608`。**不要**拿
-   * `sys_document.parse_version` 顶替：那是**解析器指纹**（`V20` 的注释明写
-   * 「≠ 文档版本」），一个说"谁解析的"、一个说"第几版"。
-   * ⚠️ mock 里给的 `'v3'` 是示例数据，不是能力声明。
+   * ✅ **`S7-M06-D` 起为真值**：`V39` 给 `sys_document` 加了 `version_no`，
+   * 本字段 = `"v" + version_no`，与 `versionList` / `diff` / `rollback` 的版本号
+   * **同源同格式**（`DocDetailService.meta` 与 `DocVersionService` 都这么拼）。
+   *
+   * ⚠️ **不要**拿 `sys_document.parse_version` 顶替：那是**解析器指纹**
+   * （`V20` 的注释明写「≠ 文档版本」），一个说"谁解析的"、一个说"第几版"。
+   *
+   * ⚠️ 类型保留 `| null` 是**读侧防御**，不是能力声明：真后端**恒回字符串** ——
+   * `DocDetailService#meta` 拼的是 `"v" + num(version_no)`，而 `num` 把 `NULL` 收成 `0`，
+   * 所以即便真出现脏数据，你拿到的是 **`"v0"`** 而不是 `null`（`V39` 那列本身也是 `NOT NULL`）。
+   * 而 `"v0"` 拿去回滚/对比会被 `parseVersion` 拒（`10030`「版本号「v0」无法识别」）——
+   * **那才是"没有版本号"的症状**。⇒ 别用 `!version` 判断"这篇文档没有版本"，它判不出来。
    */
   version: string | null
 }
@@ -786,6 +793,31 @@ export interface DocVersion {
   hasNewer?: boolean
 }
 
+/** 版本对比里的**一版**元数据（`GET /doc/{id}/versions/{v}/diff` 的 `left` / `right`）。 */
+export interface VersionMeta {
+  version: string
+  size: number
+  chunkCount: number
+  tableTotal: number
+  owner: string
+  at: string
+}
+
+/**
+ * 版本对比结果（需求 §6.8 · **v1 只做元数据对比**）。
+ *
+ * ⚠️ `textDiff` **恒 `null`**：需求 §6.8 逐字写「v1 只做元数据对比 + 文本 diff 接口预留」，
+ * 后端也如实恒回 `null`（`DocVersionService#diff` 的第三参）。
+ * ⇒ 页面上要说的是「**正文差异本版未做**」，**不是**「两版正文没有差别」——
+ * 后者是一句关于内容的断言，而现在没有任何数据支撑它。
+ */
+export interface DocVersionDiff {
+  left: VersionMeta
+  right: VersionMeta
+  /** 恒 `null`（接口预留）；**不要**用 `!textDiff` 推出"内容没变" */
+  textDiff: string | null
+}
+
 /** 索引任务记录 */
 export interface IndexTask {
   /**
@@ -798,7 +830,14 @@ export interface IndexTask {
   id: string
   stage: string
   at: string
-  /** ⚠️ 恒 `null`（同 `DocInfo.version`：版本机制未落地，不是"这份任务没有版本"） */
+  /**
+   * ⚠️ 恒 `null` —— **不是**"这份任务没有版本"，而是**没有该来源**：
+   * `sys_async_task` 上根本没有版本列，后端 `DocDtos.IndexTaskView` 的 javadoc 写着这一条。
+   *
+   * 🔴 与同名的 `DocInfo.version` **不是一回事**：后者自 `S7-M06-D` 起是**真值**
+   * （`"v" + sys_document.version_no`）。两者同名纯属巧合 —— 一个说"这次任务为哪一版跑的"
+   * （无处可取），一个说"这篇文档是第几版"（已落地）。别互相顶替。
+   */
   version: string | null
   /**
    * **原样**取后端状态机 `AsyncTaskStatus` 的四态（`PENDING/RUNNING/DONE/FAILED`），

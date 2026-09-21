@@ -223,6 +223,30 @@ public class SysDocument {
     @Column(name = "parse_version", length = 64)
     private String parseVersion;
 
+    /**
+     * 版本组（`V39` · `I-5` · `S7-M06-D`）—— 同名归档的多个版本共享同一组值。
+     *
+     * <p>判定键 {@code (kb_id, owner_id, file_name)}：同库、同人、同文件名再传一次 =
+     * 这一组的**新版本**（用户 2026-09-21 裁定"同名触发"）。存量回填 = 自身 {@code id}
+     * （各自独立成组）。⚠️ 列可空只为"加列先不写、随即回填"；回填后**逻辑上恒非空**。
+     */
+    @Column(name = "doc_group_id")
+    private Long docGroupId;
+
+    /** 组内版本号，1 起（`V39`）。同名归档 / 回滚时新行取 {@code max(version_no)+1}。 */
+    @Column(name = "version_no", nullable = false)
+    private Integer versionNo;
+
+    /**
+     * 是否当前版本（`V39` · `G7-5` 的落点）。
+     *
+     * <p>🔴 检索侧只放行 {@code is_current = 1}（{@code RetrievalScope#visibleDocIds} 的合取项）——
+     * 「上传新版本后旧版本不再被召回」。一个组内**恰有一行**为 {@code true}：
+     * 归档 / 回滚时旧当前行翻 {@code false}、新行置 {@code true}，并清旧行的 Milvus 向量。
+     */
+    @Column(name = "is_current", nullable = false)
+    private Boolean isCurrent;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 

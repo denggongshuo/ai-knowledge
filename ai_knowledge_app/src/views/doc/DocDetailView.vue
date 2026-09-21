@@ -13,7 +13,7 @@ import {
   Collection,
 } from '@element-plus/icons-vue'
 import { docApi, kbApi } from '@/api'
-import type { DocMeta, DocVersion, IndexTask, ChunkStat, SecretLevel } from '@/types'
+import type { DocMeta, DocVersion, DocVersionDiff, IndexTask, ChunkStat, SecretLevel } from '@/types'
 import { goBack } from '@/utils/nav'
 
 const route = useRoute()
@@ -228,19 +228,132 @@ function discard() {
   ElMessage.info('已放弃修改')
 }
 
+/**
+ * 版本回滚（`T-608` · `G7-6`）。
+ *
+ * <p>两处与"点一下调个接口"不同：
+ * <ol>
+ *   <li>**取消要吞掉**：`ElMessageBox.confirm` 在用户点"取消"/按 Esc 时是**抛异常**的
+ *       （`'cancel'` / `'close'`），原先没接 ⇒ 控制台一条未处理的 rejection，
+ *       而这**不是失败**，不该弹错。</li>
+ *   <li>**成功必须重新 `load()`**：回滚**不改写历史** —— 它新增一行版本
+ *       （`DocVersionService#rollback` 恒回一条新记录），把原当前版本翻成非当前。
+ *       不重取的话，页面上"当前"标记还挂在已经被归档的那一版上，版本列表也少一行。</li>
+ * </ol>
+ */
 async function rollback(v: DocVersion) {
-  await ElMessageBox.confirm(
-    `回滚到 ${v.version} 会将历史版本重新向量化并覆盖当前索引，但「历史问答的引用不会改变」。确认回滚？`,
-    '版本回滚',
-    { type: 'warning' },
-  )
-  await docApi.rollback(docId.value, v.version)
-  ElMessage.success(`已回滚到 ${v.version}（保留一条新版本记录，可追溯）`)
+  try {
+    await ElMessageBox.confirm(
+      `回滚到 ${v.version} 会将历史版本重新向量化并覆盖当前索引，但「历史问答的引用不会改变」。确认回滚？`,
+      '版本回滚',
+      { type: 'warning' },
+    )
+  } catch {
+    // 取消 —— 什么也不做，也**不报错**（用户不是失败了，是改主意了）
+    return
+  }
+  try {
+    const res = await docApi.rollback(docId.value, v.version)
+    // 提示里带**后端回的那一版**（`res.version` = 新版本号）而不是 `v.version`：
+    // 回滚产出的是**新的一行**，它有自己的版本号，两者通常不同
+    ElMessage.success(`已回到 ${v.version} 的内容：新增版本 ${res.version}（保留新记录，可追溯）`)
+    await load()
+  } catch (e) {
+    // 原样透出后端的话（"正在解析中，请等它跑完再回滚"/"该版本分片不可用"都比
+    // 一句笼统的"回滚失败"可行动）
+    ElMessage.error(e instanceof Error ? e.message : '回滚失败')
+  }
 }
 
-function compareVersion(v: DocVersion) {
-  ElMessage.info(`版本对比：${v.version} ↔ v3（v1 仅做元数据对比，文本 diff 接口已预留）`)
+// ==================================================================
+// 版本对比（T-607 · **仅元数据**）
+// ==================================================================
+
+const diffVisible = ref(false)
+const diffLoading = ref(false)
+const diffLeft = ref('')
+const diffRight = ref('')
+const diffResult = ref<DocVersionDiff | null>(null)
+const diffError = ref('')
+
+/** 版本列表里的版本号（按 version_no 降序，当前版本在最前）。 */
+const versionOptions = computed(() => versions.value.map((x) => x.version))
+
+/** 组里**至少两版**才谈得上对比。 */
+const canCompare = computed(() => versions.value.length >= 2)
+
+/** 与 `version` 不同的**最高**版本（列表降序 ⇒ `find` 拿到的就是它）。 */
+function otherThan(version: string) {
+  return versions.value.find((x) => x.version !== version)?.version ?? ''
 }
+
+/**
+ * 打开版本对比，默认配对 = 「点的那一版」↔「当前版本」。
+ *
+ * <p>点的是**当前版本**那一行时，对照换成组里的最高另一版 ——
+ * 因为 `version` 与 `against` 同版会被后端拒（`10030`「和自己是同一个版本，无需对比」），
+ * 那不是"没差别"，是一次**注定失败**的请求。
+ */
+function compareVersion(v: DocVersion) {
+  const current = versions.value.find((x) => x.current)?.version
+  const against = v.version === current ? otherThan(v.version) : (current ?? otherThan(v.version))
+  if (!against) {
+    // 正常走不到（按钮已按 canCompare 置灰），是**防御**：别开一个注定报错的框
+    ElMessage.warning('组里只有这一个版本，没有可比对的另一版。')
+    return
+  }
+  diffLeft.value = v.version
+  diffRight.value = against
+  diffResult.value = null
+  diffError.value = ''
+  diffVisible.value = true
+  void runDiff()
+}
+
+/**
+ * 调真接口取对比结果。
+ *
+ * <p>左右任一侧一改就**重取** —— 对比是"这两版之间"的事实，拿上一次的结果充数
+ * 会让对话框里显示的两版与下拉里选的两版对不上。
+ */
+async function runDiff() {
+  if (!diffLeft.value || !diffRight.value) return
+  if (diffLeft.value === diffRight.value) {
+    // 后端会拒。在前端先拦住并说清 —— 省一次注定失败的往返，也免得用户以为"对比坏了"
+    diffResult.value = null
+    diffError.value = '两侧选的是同一个版本，没法比 —— 请换一侧。'
+    return
+  }
+  diffLoading.value = true
+  diffError.value = ''
+  try {
+    diffResult.value = await docApi.diff(docId.value, diffLeft.value, diffRight.value)
+  } catch (e) {
+    diffResult.value = null
+    diffError.value = e instanceof Error ? e.message : '版本对比失败'
+  } finally {
+    diffLoading.value = false
+  }
+}
+
+/**
+ * 对比表的行 —— **只有元数据**（需求 §6.8）。
+ *
+ * ⚠️ 这里**没有**"正文差异"这一行，而且**不能**用 `textDiff === null` 推出一行
+ * 「正文没有变化」：那是后端**如实**表示"本版未做文本 diff"（接口预留），
+ * 不是一句关于内容的结论。编出这一行就是**一句没有数据支撑的事实断言**。
+ */
+const diffRows = computed(() => {
+  const d = diffResult.value
+  if (!d) return []
+  return [
+    { label: '大小', left: sizeText(d.left.size), right: sizeText(d.right.size) },
+    { label: '分片数', left: `${d.left.chunkCount}`, right: `${d.right.chunkCount}` },
+    { label: '表格块', left: `${d.left.tableTotal}`, right: `${d.right.tableTotal}` },
+    { label: '上传人', left: d.left.owner, right: d.right.owner },
+    { label: '上传时间', left: d.left.at, right: d.right.at },
+  ].map((r) => ({ ...r, changed: r.left !== r.right }))
+})
 
 async function removeDoc() {
   try {
@@ -453,15 +566,17 @@ async function removeDoc() {
         <el-tab-pane name="version">
           <template #label>版本历史<span class="tab-num">{{ versions.length }}</span></template>
           <!--
-            ⚠️ 本版本两件事都还没有：`GET /doc/{id}/versions` 未实现（`T-606`），
-            而"同名上传归档为新版本"的机制也不存在（没有版本表）。
-            ⇒ 说清楚，而不是渲染一张恒空的表（空表读起来像"这篇文档只有一个版本"）。
+            同名上传归档 / 版本对比 / 回滚都已接通（`T-606`~`T-608`）。
+            ⚠️ 对比**只做元数据**（需求 §6.8：v1 只做元数据对比 + 文本 diff 接口预留），
+            ⇒ 要在这里**说明白是哪一半没做**，而不是让用户点开一个没有"正文差异"的
+            对话框自己猜是不是坏了。
           -->
           <el-alert type="info" :closable="false" show-icon class="mb-12">
             <template #title>
               <span class="alert-text">
-                版本历史本版本尚未交付：同名上传归档、版本对比与回滚属后续批次。
-                现在每篇文档都只有一个版本。
+                同名上传会<b>归档</b>为新版本（<b>不覆盖旧版</b>），历史版本可回滚。
+                版本对比本版<b>只比元数据</b>（大小 / 分片 / 表格 / 上传人 / 时间）——
+                正文文本差异接口已预留、尚未实现。
               </span>
             </template>
           </el-alert>
@@ -482,14 +597,19 @@ async function removeDoc() {
             <el-table-column prop="note" label="说明" min-width="160" show-overflow-tooltip />
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text @click="compareVersion(row)">对比</el-button>
+                <!-- 只有一版时置灰：那一版只能跟自己比，后端会拒（10030） -->
+                <el-button size="small" text :disabled="!canCompare" @click="compareVersion(row)">对比</el-button>
+                <!-- 判据 13：**当前版本没有回滚按钮**（回滚到自己是空动作，后端也拒） -->
                 <el-button v-if="!row.current" size="small" text type="primary" @click="rollback(row)">回滚</el-button>
               </template>
             </el-table-column>
           </el-table>
           <el-alert type="warning" :closable="false" show-icon class="mt-12">
             <template #title>
-              <span class="alert-text">回滚会将该版本重新向量化并覆盖当前索引，<b>历史问答的引用不会改变</b>；当前版本无回滚按钮</span>
+              <span class="alert-text">
+                回滚<b>不改写历史</b>：它新增一条版本记录（版本数只增不减）、把该版本重新向量化并覆盖当前索引，
+                而<b>历史问答的引用不会改变</b>；当前版本行没有回滚按钮
+              </span>
             </template>
           </el-alert>
         </el-tab-pane>
@@ -588,6 +708,51 @@ async function removeDoc() {
         </div>
       </div>
     </el-card>
+
+    <!-- ============ 版本对比（`T-607` · **仅元数据**） ============ -->
+    <el-dialog v-model="diffVisible" title="版本对比（元数据）" width="560px">
+      <div class="diff-pick mb-12">
+        <el-select v-model="diffLeft" size="small" style="width: 130px" @change="runDiff">
+          <el-option v-for="o in versionOptions" :key="`l-${o}`" :label="o" :value="o" />
+        </el-select>
+        <span class="muted">↔</span>
+        <el-select v-model="diffRight" size="small" style="width: 130px" @change="runDiff">
+          <el-option v-for="o in versionOptions" :key="`r-${o}`" :label="o" :value="o" />
+        </el-select>
+      </div>
+
+      <el-alert v-if="diffError" type="warning" :closable="false" show-icon :title="diffError" class="mb-12" />
+
+      <div v-loading="diffLoading">
+        <el-table v-if="diffResult" :data="diffRows" border size="small">
+          <el-table-column prop="label" label="项目" width="100" />
+          <!-- 差异列标红：一眼看出**哪几项不同**，而不是让人逐格比对 -->
+          <el-table-column label="左" min-width="120">
+            <template #default="{ row }">
+              <span :class="{ 'diff-hit': row.changed }">{{ row.left }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="右" min-width="120">
+            <template #default="{ row }">
+              <span :class="{ 'diff-hit': row.changed }">{{ row.right }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <!--
+        🔴 这一句是**接口预留**的如实说明，不是"两版正文没差别"。
+        `textDiff` 恒 null（需求 §6.8），拿它推出"内容一样"就是一句没有数据支撑的断言。
+      -->
+      <el-alert type="info" :closable="false" show-icon class="mt-12">
+        <template #title>
+          <span class="alert-text">
+            本版<b>只比元数据</b>。正文文本差异（`textDiff`）接口已预留、尚未实现 ——
+            <b>这里没显示「正文差异」，不代表两版正文相同</b>。
+          </span>
+        </template>
+      </el-alert>
+    </el-dialog>
   </div>
 </template>
 
@@ -930,5 +1095,17 @@ async function removeDoc() {
 .sb-actions {
   display: flex;
   gap: 10px;
+}
+
+/* 版本对比对话框：左右版本选择器 */
+.diff-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+/* 差异项：标红而不是加"变了"一列 —— 少了逐格比对，也少了"哪一列是基准"的歧义 */
+.diff-hit {
+  color: var(--el-color-danger);
+  font-weight: 600;
 }
 </style>

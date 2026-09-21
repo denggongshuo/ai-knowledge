@@ -72,6 +72,32 @@ class RetrievalScopeFlowTest extends RetrievalFlowSupport {
     }
 
     @Test
+    @DisplayName("G7-5 · 旧版本（is_current=0）不再被召回 —— 去掉这个合取项即转红")
+    void archivedNonCurrentVersionIsNotRetrievable() {
+        long docId = insertDocWithChunks("归档探针", "这段正文属于一个即将被归档为旧版本的文档");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("归档探针", 1);
+
+        // 正对照：还是当前版本时必须搜得到，否则下面的"零召回"证明不了是 is_current 在挡
+        RetrievalResult before = retrievalService.search(reader(), "归档探针", List.of(kbId));
+        assertThat(before.chunks()).as("当前版本必须搜得到，否则本用例证明不了任何事").isNotEmpty();
+
+        // 同名上传归档时旧行翻 0（DocRecordWriter#insertVersioned 的 UPDATE）——
+        // 这里直接模拟那次翻转，只改 is_current，其它列都不动（向量也还在 Milvus 里）
+        jdbc.update("update sys_document set is_current = 0 where id = ?", docId);
+
+        RetrievalResult after = retrievalService.search(reader(), "归档探针", List.of(kbId));
+
+        // 🔴 向量并没有从 Milvus 删掉（seedVectors 写进去的还在）⇒ 若这里还能召回，
+        //    说明挡住它的**只**能是 RetrievalScope 里的 `is_current = 1` 合取项。
+        //    把那个合取项去掉，这一格立刻转红 —— 这正是 G7-5「旧版本不再被召回」的证据。
+        assertThat(after.chunks()).as("旧版本（is_current=0）必须零召回").isEmpty();
+        RetrievalScope.Scope scope = retrievalScope.resolve(reader(), List.of(kbId));
+        assertThat(scope.partitions()).as("可见文档已归 0 ⇒ 不给 Milvus 任何分区").isEmpty();
+        assertThat(scope.empty()).as("empty() 为真 ⇒ 调用方短路，根本不去连 Milvus").isTrue();
+    }
+
+    @Test
     @DisplayName("判据 12 · 重建切代之后，检索返回的是**新代**的内容")
     void afterGenerationSwitchRetrievalReadsTheNewGeneration() {
         // 第 1 代：文档内容里只有「旧代字样」

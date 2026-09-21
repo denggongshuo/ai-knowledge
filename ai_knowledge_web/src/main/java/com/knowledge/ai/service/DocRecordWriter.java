@@ -74,14 +74,68 @@ public class DocRecordWriter {
     @Transactional
     public long insert(long kbId, long ownerId, String title, String fileName, String type,
                        long sizeBytes, String md5, String remark) {
+        return insertVersioned(kbId, ownerId, title, fileName, type, sizeBytes, md5, remark).docId();
+    }
+
+    /**
+     * 建立上传版本，并把同库、同上传人、同文件名的旧当前版本归档。
+     *
+     * <p>MD5 不参与版本分组：它只用于上传前的提示与任务幂等。这样同名但内容不同的上传
+     * 与同内容的重复上传走同一条版本链，历史行、分片和引用 id 都保持不变。
+     */
+    @Transactional
+    public VersionInsert insertVersioned(long kbId, long ownerId, String title, String fileName, String type,
+                                         long sizeBytes, String md5, String remark) {
         LocalDateTime now = LocalDateTime.now();
+        // 同名并发上传必须串行决定「谁是上一版」。锁知识库这一行而不是依赖应用内锁：
+        // 多实例部署时 JVM 锁无效；而只查当前文档 `for update` 在首版（还没有行）时也锁不住空集。
+        entityManager.createNativeQuery("select id from sys_kb where id = :id for update")
+                .setParameter("id", kbId)
+                .getSingleResult();
+        @SuppressWarnings("unchecked")
+        List<Object[]> currentRows = entityManager.createNativeQuery("""
+                        select id, doc_group_id, index_generation
+                          from sys_document
+                         where kb_id = :kbId and owner_id = :ownerId and file_name = :fileName
+                           and deleted_at is null and is_current = 1
+                         order by id desc
+                         limit 1
+                        """)
+                .setParameter("kbId", kbId)
+                .setParameter("ownerId", ownerId)
+                .setParameter("fileName", fileName)
+                .getResultList();
+
+        long groupId;
+        int nextVersion;
+        Long previousDocId = null;
+        int previousGeneration = 0;
+        if (currentRows.isEmpty()) {
+            groupId = 0L;
+            nextVersion = 1;
+        } else {
+            Object[] row = currentRows.getFirst();
+            previousDocId = ((Number) row[0]).longValue();
+            groupId = row[1] == null ? previousDocId : ((Number) row[1]).longValue();
+            // 版本号取**组内 max(version_no) + 1**，不是"当前行的版本号 + 1" —— 见 nextVersionOf
+            nextVersion = nextVersionOf(groupId);
+            previousGeneration = row[2] == null ? 0 : ((Number) row[2]).intValue();
+            entityManager.createNativeQuery(
+                            "update sys_document set is_current = 0, updated_at = :now where id = :id")
+                    .setParameter("now", now)
+                    .setParameter("id", previousDocId)
+                    .executeUpdate();
+        }
+
         entityManager.createNativeQuery("""
                         insert into sys_document (kb_id, owner_id, title, file_name, type, size_bytes, md5,
                                                   storage_path, status, chunk_count,
                                                   table_total, table_parsed, image_total, image_parsed,
-                                                  remark, created_at, updated_at)
+                                                  remark, doc_group_id, version_no, is_current,
+                                                  created_at, updated_at)
                         values (:kbId, :ownerId, :title, :fileName, :type, :size, :md5,
-                                null, 'UPLOADED', 0, 0, 0, 0, 0, :remark, :now, :now)
+                                null, 'UPLOADED', 0, 0, 0, 0, 0, :remark,
+                                nullif(:groupId, 0), :versionNo, 1, :now, :now)
                         """)
                 .setParameter("kbId", kbId)
                 .setParameter("ownerId", ownerId)
@@ -91,21 +145,263 @@ public class DocRecordWriter {
                 .setParameter("size", sizeBytes)
                 .setParameter("md5", md5)
                 .setParameter("remark", remark)
+                .setParameter("groupId", groupId)
+                .setParameter("versionNo", nextVersion)
                 .setParameter("now", now)
                 .executeUpdate();
 
+        // 取 id 走「同库 / 同上传人 / 同文件名倒序取第一条」——不能拿 `created_at = :now` 去等值匹配：
+        // `LocalDateTime.now()` 带亚秒，而 `sys_document.created_at` 是无小数秒精度的 DATETIME，
+        // 写入时会截断到整秒 ⇒ 等值回查必然落空，表现为「文档记录写入失败」。刚插入的这条 id 最大，
+        // 倒序第一条就是它（同一事务内可见，与本方法必须是独立 @Transactional 同一个理由）。
         @SuppressWarnings("unchecked")
         List<Number> ids = entityManager.createNativeQuery(
-                        "select id from sys_document where kb_id = :kbId and owner_id = :ownerId and md5 = :md5 "
-                                + "order by id desc limit 1")
+                        "select id from sys_document where kb_id = :kbId and owner_id = :ownerId "
+                                + "and file_name = :fileName order by id desc limit 1")
                 .setParameter("kbId", kbId)
                 .setParameter("ownerId", ownerId)
-                .setParameter("md5", md5)
+                .setParameter("fileName", fileName)
                 .getResultList();
         if (ids.isEmpty()) {
             throw new BizException(ErrorCode.SYSTEM_ERROR, "文档记录写入失败，请重试");
         }
-        return ids.getFirst().longValue();
+        long docId = ids.getFirst().longValue();
+        if (groupId == 0L) {
+            groupId = docId;
+            entityManager.createNativeQuery("update sys_document set doc_group_id = :groupId where id = :id")
+                    .setParameter("groupId", groupId)
+                    .setParameter("id", docId)
+                    .executeUpdate();
+        }
+        return new VersionInsert(docId, previousDocId, previousGeneration, groupId, nextVersion);
+    }
+
+    /**
+     * 组内下一个版本号 = {@code max(version_no) + 1}。
+     *
+     * <p>🔴 **与 {@link #insertRollbackVersion} 是同一个口径**（那里也是 max+1）。两者曾经不一致：
+     * 上传路径取的是"当前行的版本号 + 1"，而"当前行"是 {@code is_current = 1} 的那一行 ——
+     * 于是**回滚失败留下的作废行**（版本号更高、{@code is_current = 0}，
+     * 见 {@code DocVersionService#abandon}）被跳过，下一次同名上传重新拿到同一个号：
+     * 组里出现**两个 v3**，而 {@code DocVersionService#findByVersion} 用的是
+     * {@code findFirst()} ⇒ 那个版本号指向哪一行**不确定**（谁在前取决于引擎给同值行的返回顺序）。
+     * 实测与判据在 {@code UploadArchiveFlowTest#reuploadAfterAbandonedRowKeepsVersionNumbersDistinct}。
+     *
+     * <p>⚠️ 不过滤 {@code deleted_at}：软删的版本仍占着它的号（从回收站恢复它时不该撞号），
+     * 这也与回滚路径一致 —— 两个写版本号的地方取同一个集合，才不会再分家。
+     */
+    private int nextVersionOf(long groupId) {
+        Number max = (Number) entityManager.createNativeQuery(
+                        "select coalesce(max(version_no), 0) from sys_document where doc_group_id = :groupId")
+                .setParameter("groupId", groupId)
+                .getSingleResult();
+        return max.intValue() + 1;
+    }
+
+    /** 新上传版本及其需要清理的旧向量分区。 */
+    public record VersionInsert(long docId, Long previousDocId, int previousGeneration,
+                                long groupId, int versionNo) {
+    }
+
+    /**
+     * 建一条**回滚版本**行（`T-608` · `G7-6`）—— 把 {@code targetDocId} 那一版的
+     * **文件与解析产物字段整行抄过来**，归入 {@code groupId}、取下一个版本号、置当前版本。
+     *
+     * <h3>🔴 为什么是"抄字段"而不是"改指向"</h3>
+     * <p>回滚**不改写历史**（需求 §6.4：「保留一条新版本记录而不是改写历史，保证可追溯」）。
+     * 让新版本复用旧版本的 {@code storage_path} / 分片，才是"内容回到 v1"；
+     * 而"把 v1 那行直接置回 current"会抹掉"v2 曾经存在过"这件事 —— 版本列表上
+     * v2 会凭空消失，而它可能正是某条历史问答引用的对象。
+     *
+     * <h3>为什么要在这儿锁知识库行</h3>
+     * <p>版本号取 {@code max(version_no) + 1}，两次并发回滚会算出**同一个**版本号
+     * （`V39` 的 {@code idx_doc_group} 是普通索引，拦不住重复）。
+     * 锁法与 {@link #insertVersioned} 相同：锁 {@code sys_kb} 那一行而不是靠应用内锁 ——
+     * 多实例部署时 JVM 锁无效。
+     *
+     * <p>⚠️ 状态置 {@code INDEXING} 而不是 {@code READY}：向量还没写（`G4-3` 的后半句）。
+     * 调用方写完向量才 {@link #markReady}。
+     *
+     * @param ownerId **触发回滚的人**，不是被回滚到的那个版本的原始上传人 ——
+     *                版本列表的「上传人」列要回答的是"这条版本记录是谁造的"
+     * @param remark  写进版本备注的一句话（如「回滚到 v1」），版本列表的「说明」列显示它。
+     *                传 {@code null} 表示不写备注（**不要传空串**，见 {@link #insert} 的注释）
+     */
+    @Transactional
+    public RollbackInsert insertRollbackVersion(long kbId, long targetDocId, long groupId,
+                                                long ownerId, String remark) {
+        LocalDateTime now = LocalDateTime.now();
+        entityManager.createNativeQuery("select id from sys_kb where id = :id for update")
+                .setParameter("id", kbId)
+                .getSingleResult();
+
+        Number maxVersion = (Number) entityManager.createNativeQuery(
+                        "select coalesce(max(version_no), 0) from sys_document where doc_group_id = :groupId")
+                .setParameter("groupId", groupId)
+                .getSingleResult();
+        int versionNo = maxVersion.intValue() + 1;
+
+        // 整行抄：文件与产物字段全部来自目标版本（内容回到那一版），
+        // 只有「归属 / 版本号 / 当前标记 / 状态 / 备注 / 时刻」是本行的新事实
+        entityManager.createNativeQuery("""
+                        insert into sys_document (kb_id, owner_id, title, file_name, type, size_bytes, md5,
+                                                  content_sha256, storage_path, parse_path, status,
+                                                  chunk_count, table_total, table_parsed,
+                                                  image_total, image_parsed,
+                                                  pages_total, pages_with_text, parse_version, chars,
+                                                  secret_level, doc_group_id, version_no, is_current,
+                                                  index_generation, remark, created_at, updated_at)
+                        select kb_id, :ownerId, title, file_name, type, size_bytes, md5,
+                               content_sha256, storage_path, parse_path, 'INDEXING',
+                               chunk_count, table_total, table_parsed,
+                               image_total, image_parsed,
+                               pages_total, pages_with_text, parse_version, chars,
+                               secret_level, :groupId, :versionNo, 1,
+                               0, :remark, :now, :now
+                          from sys_document where id = :targetDocId
+                        """)
+                .setParameter("ownerId", ownerId)
+                .setParameter("groupId", groupId)
+                .setParameter("versionNo", versionNo)
+                .setParameter("remark", remark)
+                .setParameter("now", now)
+                .setParameter("targetDocId", targetDocId)
+                .executeUpdate();
+
+        @SuppressWarnings("unchecked")
+        List<Number> ids = entityManager.createNativeQuery(
+                        "select id from sys_document where doc_group_id = :groupId and version_no = :versionNo")
+                .setParameter("groupId", groupId)
+                .setParameter("versionNo", versionNo)
+                .getResultList();
+        if (ids.isEmpty()) {
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "回滚版本写入失败，请重试");
+        }
+        return new RollbackInsert(ids.getFirst().longValue(), versionNo);
+    }
+
+    /** 回滚新建的版本行：新 doc id + 它的版本号。 */
+    public record RollbackInsert(long docId, int versionNo) {
+    }
+
+    /**
+     * 把一篇历史版本的分片**整批复制**到新版本行（`T-608` 的一步）。
+     *
+     * <p>复制字段与 {@link #replaceChunks} 落库的完全一致（含图片元数据与
+     * {@code is_boilerplate}/{@code is_decorative} 两列判定结果）—— 内容一个字没变，
+     * 重新判定只会在跨文档计数上得出与当初不同的答案，那不是"回滚"。
+     *
+     * <p>两趟写：第一趟落行（{@code parent_id}/{@code source_chunk_id} 先留空）并记下
+     * 旧 id → 新 id；第二趟按映射回填两个自引用列。一趟写做不到 —— 第一趟落父块时
+     * 子块还没 id，而两列都可能指向**后面**才落库的行（`replaceChunks` 的两趟是同一理由）。
+     *
+     * @return 复制的分片**总行数**（含表格子块，与 {@code chunk_count} 的口径不同）
+     */
+    @Transactional
+    public int copyChunks(long fromDocId, long toDocId, long kbId) {
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery("""
+                        select id, chunk_type, parent_id, source_chunk_id, title_path, raw_content,
+                               content_sha256, order_no, page_no, object_key, image_md5, vl_model_id,
+                               image_phash, is_boilerplate, is_decorative
+                          from sys_chunk where doc_id = :docId order by order_no
+                        """)
+                .setParameter("docId", fromDocId)
+                .getResultList();
+        if (rows.isEmpty()) {
+            // 目标版本没有分片 ⇒ 回滚回去只会得到"一篇没有内容的当前版本"。
+            // 不静默产出空索引（§3.4 假设 2 的处置），由调用方翻译成用户可读的拒绝
+            return 0;
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        Map<Long, Long> idMap = new HashMap<>(rows.size() * 2);
+        for (Object[] r : rows) {
+            long oldId = ((Number) r[0]).longValue();
+            int orderNo = ((Number) r[7]).intValue();
+            entityManager.createNativeQuery("""
+                            insert into sys_chunk (doc_id, kb_id, chunk_type, parent_id, source_chunk_id,
+                                                   title_path, raw_content, content_sha256, order_no,
+                                                   page_no, object_key, image_md5, vl_model_id,
+                                                   image_phash, is_boilerplate, is_decorative, created_at)
+                            values (:docId, :kbId, :chunkType, null, null,
+                                    :titlePath, :rawContent, :contentSha256, :orderNo,
+                                    :pageNo, :objectKey, :imageMd5, :vlModelId,
+                                    :imagePhash, :isBoilerplate, :isDecorative, :now)
+                            """)
+                    .setParameter("docId", toDocId)
+                    .setParameter("kbId", kbId)
+                    .setParameter("chunkType", r[1])
+                    .setParameter("titlePath", r[4])
+                    .setParameter("rawContent", r[5])
+                    .setParameter("contentSha256", r[6])
+                    .setParameter("orderNo", orderNo)
+                    .setParameter("pageNo", r[8])
+                    .setParameter("objectKey", r[9])
+                    .setParameter("imageMd5", r[10])
+                    .setParameter("vlModelId", r[11])
+                    .setParameter("imagePhash", r[12])
+                    .setParameter("isBoilerplate", r[13])
+                    .setParameter("isDecorative", r[14])
+                    .setParameter("now", now)
+                    .executeUpdate();
+
+            @SuppressWarnings("unchecked")
+            List<Number> newIds = entityManager.createNativeQuery(
+                            "select id from sys_chunk where doc_id = :docId and order_no = :orderNo")
+                    .setParameter("docId", toDocId)
+                    .setParameter("orderNo", orderNo)
+                    .getResultList();
+            if (newIds.isEmpty()) {
+                throw new BizException(ErrorCode.SYSTEM_ERROR, "回滚分片写入失败，请重试");
+            }
+            idMap.put(oldId, newIds.getFirst().longValue());
+        }
+
+        // 第二趟：自引用列按映射回填。⚠️ 映射里查不到 = 目标版本自身就是悬空的
+        // （`replaceChunks` 留下的孤儿），照实写 NULL 而不是抛 —— 抛会让整次回滚
+        // 因为一条*目标版本本来就坏*的引用而失败，而那条引用与"回到 v1 的内容"无关
+        for (Object[] r : rows) {
+            long oldId = ((Number) r[0]).longValue();
+            Long newParent = mapOrNull(idMap, r[2]);
+            Long newSource = mapOrNull(idMap, r[3]);
+            if (newParent == null && newSource == null) {
+                continue;
+            }
+            entityManager.createNativeQuery("""
+                            update sys_chunk set parent_id = :parentId, source_chunk_id = :sourceId
+                             where id = :id
+                            """)
+                    .setParameter("parentId", newParent)
+                    .setParameter("sourceId", newSource)
+                    .setParameter("id", idMap.get(oldId))
+                    .executeUpdate();
+        }
+
+        log.info("[版本回滚] 分片已复制：from={} to={} 行数={}", fromDocId, toDocId, rows.size());
+        return rows.size();
+    }
+
+    /** 旧 id → 新 id；查不到返回 {@code null}（悬空引用，照实写 NULL）。 */
+    private static Long mapOrNull(Map<Long, Long> idMap, Object raw) {
+        return raw == null ? null : idMap.get(((Number) raw).longValue());
+    }
+
+    /**
+     * 把一行的 {@code is_current} 翻成 0（归档为历史版本）。
+     *
+     * <p>单独一个方法而不是并进别的 update：它被**两条路**调用，语义完全不同 ——
+     * 成功路径翻的是**旧当前版本**（向量写完、新版本已就绪），失败路径翻的是
+     * **刚建的回滚版本**（向量没写进去，不能让一个空的"当前版本"顶掉还有内容的那一版）。
+     * 两者都只做同一件事：把这行移出"当前版本"。写两处会有分叉的那天。
+     */
+    @Transactional
+    public void markNotCurrent(long docId) {
+        entityManager.createNativeQuery(
+                        "update sys_document set is_current = 0, updated_at = :now where id = :id")
+                .setParameter("now", LocalDateTime.now())
+                .setParameter("id", docId)
+                .executeUpdate();
     }
 
     /** 转存成功后回写对象名。工作线程调用（`T-500` 的任务体第 3 步）。 */

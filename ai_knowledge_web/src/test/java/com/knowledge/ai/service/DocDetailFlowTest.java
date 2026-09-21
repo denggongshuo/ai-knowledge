@@ -303,14 +303,15 @@ class DocDetailFlowTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("判据 13（S7-M06-C 改写）：citations 转真；downVotes/version/tags **仍严格 null**")
+    @DisplayName("判据 13（S7-M06-D 改写）：citations/version 转真；downVotes/tags **仍严格 null**")
     void uncollectedFieldsAreNullNotZero() {
         Map<String, Object> meta = mapOf(get("/api/doc/" + docId, adminToken).data("$"));
 
         // 🔴 `S7-M06-A` 时这四个字段**一起**为 null，根因都是"没有采集方"。
-        //    `S7-M06-C` 的 `T-804` 让 `cited` 由答案角标解析而来 ⇒ `citations` 转真，
-        //    而**另外三个仍然没有采集方**。这条判据按新契约改写 —— 但**不是**把断言放宽：
-        //    它现在钉的是"**只有一个字段翻了**"，防止下一个人顺手把四个一起填 0。
+        //    `S7-M06-C` 的 `T-804` 让 `cited` 由答案角标解析而来 ⇒ `citations` 转真；
+        //    `S7-M06-D` 的 `V39` 加了 `version_no` ⇒ `version` 转真。**剩下两个仍无采集方**。
+        //    这条判据按新契约改写 —— 但**不是**把断言放宽：它钉的是"**只有该翻的翻了**"，
+        //    防止下一个人顺手把剩下两个也一起填 0。
         // ⚠️ 取出来是 `Integer`（JSON 反序列化的默认数字类型），所以比 `longValue()`
         // 而不是直接比 `0L` —— 后者会因为 `0L != 0`（装箱类型不同）而红，
         // 而那条红说的是"测试写法不对"，不是"契约不对"
@@ -319,12 +320,18 @@ class DocDetailFlowTest extends ApiTestSupport {
                         + "⚠️ 这里的 0 与 null 分别是「确实没被引用」与「还没采集」—— "
                         + "T-804 之后本字段有采集方了，所以 0 是诚实的那一个")
                 .isZero();
+        // `S7-M06-D`：`V39` 给存量文档回填 `version_no = 1` ⇒ 本探针文档是它自己那一组的 v1。
+        // 与版本列表 / 回滚接口**同源同格式**（`"v" + version_no`），不是另算一个值
+        assertThat((String) meta.get("version"))
+                .as("版本号转真（V39 之前是 null，根因是版本机制整块不存在）")
+                .isEqualTo("v1");
         // `0`/`''`/`[]`/`null` 全是 falsy —— falsy 断言会在"值错了"时照样绿（§5「缺席 ≡ 0」）
         assertThat(meta).containsEntry("downVotes", null);
-        assertThat(meta).containsEntry("version", null);
         assertThat(meta).containsEntry("tags", null);
 
-        // 索引任务的 version 同一根因（不是"这份任务没有版本"）
+        // 🔴 索引任务的 version **仍恒 null**，且根因没变（不是"这份任务没有版本"，是**没有该来源**）。
+        //    它与上面那个转真的 `DocMetaView.version` 是**两个字段** —— 这一格刻意留着，
+        //    防止"文档版本转真了就把任务行一起填上"（`DocDtos.IndexTaskRow` 的 javadoc 逐字写了这条）
         List<Map<String, Object>> tasks = listOf(get("/api/doc/" + docId + "/index-tasks", adminToken).data("$.list"));
         assertThat(tasks).isNotEmpty();
         assertThat(taskOf(tasks, "DONE")).containsEntry("version", null);

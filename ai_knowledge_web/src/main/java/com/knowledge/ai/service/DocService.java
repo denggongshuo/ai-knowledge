@@ -11,7 +11,9 @@ import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.storage.DocStorage;
+import com.knowledge.ai.core.constant.MilvusConstants;
 import com.knowledge.ai.dto.doc.DocDtos;
+import com.knowledge.ai.pipeline.vectorize.VectorWriter;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
 import lombok.RequiredArgsConstructor;
@@ -81,6 +83,8 @@ public class DocService {
     private final DocStorage docStorage;
 
     private final DocRecordWriter recordWriter;
+
+    private final VectorWriter vectorWriter;
 
     /** `T-O04` 步 4：宏检测（**请求线程**做，见 {@code upload} 里的注释）。 */
     private final com.knowledge.ai.core.storage.IngestGuard ingestGuard;
@@ -203,8 +207,15 @@ public class DocService {
         // 而那会被 `hasMacro` 的 catch 吞成 `null`（判不了），表现为 `has_macro` 永远是空。
         Boolean hasMacro = ingestGuard.hasMacro(file, DocStorage.extensionOf(realName));
 
-        long docId = recordWriter.insert(kbId, user.getUserId(), title, realName,
+        DocRecordWriter.VersionInsert version = recordWriter.insertVersioned(
+                kbId, user.getUserId(), title, realName,
                 type.isEmpty() ? "UNKNOWN" : type, size, md5, note);
+        long docId = version.docId();
+        if (version.previousDocId() != null && version.previousGeneration() > 0) {
+            vectorWriter.replaceDocument(
+                    MilvusConstants.partitionName(kbId, version.previousGeneration()),
+                    version.previousDocId(), List.of());
+        }
 
         // ⚠️ **必须在请求线程把字节定下来**（`S4-E1`）：`MultipartFile` 是请求作用域的，
         //    请求一结束容器就清掉它。转存跑在异步任务里，不落暂存就是**赌一个竞态**——
