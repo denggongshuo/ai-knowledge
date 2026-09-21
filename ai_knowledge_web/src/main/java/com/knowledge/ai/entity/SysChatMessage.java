@@ -105,6 +105,21 @@ public class SysChatMessage {
     @Column(name = "feedback_at")
     private LocalDateTime feedbackAt;
 
+    /**
+     * 本轮是否把原图直接传给了对话模型（`T-806` · 需求 `09` §4.7）。
+     *
+     * <h3>三态，不是两态</h3>
+     * <p>{@code null} = **未采集**（`V38` 之前的行），{@code 0} = 明确没走原图，
+     * {@code 1} = 明确走了。⚠️ 用 {@code Boolean} 而不是 {@code boolean}：
+     * 后者会把 {@code null} 静默读成 {@code false}，于是"没采集"在页面上变成
+     * 「没用原图」—— 一句关于内容的断言。与 `sys_chat_attachment.degraded` 同一条口径。
+     *
+     * <p>⚠️ **只对该轮生效**（§4.7 原文），不是会话级 —— 同一会话里两种链路可以交替出现，
+     * 而那一列存在的全部理由就是让两者的回答质量能分开看。
+     */
+    @Column(name = "used_vision")
+    private Boolean usedVision;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 }

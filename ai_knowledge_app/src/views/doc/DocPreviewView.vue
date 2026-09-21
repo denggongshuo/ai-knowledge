@@ -120,7 +120,15 @@ onMounted(async () => {
   if (c.status === 'fulfilled') {
     chunks.value = c.value.list
     stat.value = c.value.stat
-    selectedChunkId.value = chunks.value[0]?.id ?? null
+    // `T-804` · 需求 07 §6.6：从问答页点引用来源卡片跳过来时带 `?chunk={chunkId}`，
+    // 要**直接定位到那一片**，而不是停在第一篇。
+    // ⚠️ 只在这里定位一次（`onMounted`）—— 放进 `watch(route.query)` 会让用户在
+    // 预览页里手动切分片时被 query 拽回去（query 不会跟着他的手改）
+    const wanted = Number(route.query.chunk)
+    const hit = Number.isFinite(wanted) && wanted > 0
+      ? chunks.value.find((x) => x.id === wanted)
+      : undefined
+    selectedChunkId.value = hit?.id ?? chunks.value[0]?.id ?? null
   } else {
     failed.push('分片列表')
   }
@@ -136,7 +144,25 @@ onMounted(async () => {
   }
   loadErrors.value = failed
   loading.value = false
+
+  // `T-804` · 需求 07 §6.6 第三行：「点击引用来源卡片 → 打开文档预览页并**定位到该分片**」。
+  // ⚠️ 必须等到 `loading = false` **之后**（DOM 才渲染出来），而且要 `nextTick` ——
+  // 这一步是"定位"与"只是打开了页面"的全部区别，而两者在截图上**长得一样**
+  // （分片列表本来就展开着，用户不滚下去看不出来停在哪）。
+  if (selectedChunkId.value != null) {
+    await nextTick()
+    scrollToChunk(selectedChunkId.value, 'smooth')
+  }
 })
+
+/** 滚动到某个分片并闪一下。抽出来是因为 `selectChunk` 与「从问答页跳过来」都要它。 */
+function scrollToChunk(id: number, behavior: ScrollBehavior) {
+  const el = paperEl.value?.querySelector(`[data-chunk="${id}"]`)
+  if (!el) return
+  el.scrollIntoView({ behavior, block: 'center' })
+  el.classList.add('flash')
+  setTimeout(() => el.classList.remove('flash'), 900)
+}
 
 /**
  * 取某个表格块的父子块关系（`G7-1`）。
@@ -202,10 +228,7 @@ async function selectParagraph(p: { id: string; chunkIndex: number }) {
 async function selectChunk(c: ChunkInfo) {
   selectedChunkId.value = c.id
   await nextTick()
-  const el = paperEl.value?.querySelector(`[data-chunk="${c.id}"]`)
-  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  el?.classList.add('flash')
-  setTimeout(() => el?.classList.remove('flash'), 900)
+  scrollToChunk(c.id, 'smooth')
   await loadRelation(c)
 }
 

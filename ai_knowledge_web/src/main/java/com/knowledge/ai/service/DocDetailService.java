@@ -102,7 +102,12 @@ public class DocDetailService {
                                dep.name, d.pages_with_text,
                                (select max(t.finished_at) from sys_async_task t
                                  where t.doc_id = d.id and t.type = 'doc-parse' and t.status = 'DONE'),
-                               d.secret_level
+                               d.secret_level,
+                               -- `T-804`：这篇文档的分片被答案**实际引用**过多少次。
+                               -- 只数 `cited = 1` 的行 —— `cited is null`（本批之前的行）**不算数**：
+                               -- 那是"没采集"，不是"没被引用"。两者差一个量级
+                               (select count(*) from sys_retrieval_trace_chunk c
+                                 where c.doc_id = d.id and c.cited = 1)
                         from sys_document d
                         join sys_kb k on k.id = d.kb_id
                         left join sys_user u on u.id = d.owner_id
@@ -117,6 +122,7 @@ public class DocDetailService {
         long pagesWithText = num(r[20]);
         String kbLevel = (String) r[10];
         String ownLevel = (String) r[22];
+        long citedCount = num(r[23]);
         // 🔴 生效密级 = max(文档级, 库级) —— 在 **Java 侧**算，且只走这一个方法。
         //    ⚠️ 不要改成 SQL 的 greatest()：密级名按字母序与密级序**错位**
         //    （greatest('INTERNAL','CONFIDENTIAL') 返回 'INTERNAL'）⇒ 判断做反，
@@ -133,7 +139,11 @@ public class DocDetailService {
                 fileDesc(type, pagesTotal, pagesWithText), (String) r[19],
                 (String) r[13], (String) r[14],
                 num(r[15]), num(r[16]), num(r[17]), num(r[18]),
-                null, null, r[21] == null ? null : time(r[21]),
+                // `T-804`：引用次数转真。
+                // ⚠️ `downVotes` 仍然是 null —— 它要的是"这篇文档的答案被点踩几次"，
+                // 是 `sys_chat_message.feedback` × `trace_id` × `doc_id` 的**跨表口径**，
+                // 与本列（引用计数）不是同一件事。一起转真会让两条判据看起来像一条
+                citedCount, null, r[21] == null ? null : time(r[21]),
                 kbLevel, ownLevel, null);
     }
 

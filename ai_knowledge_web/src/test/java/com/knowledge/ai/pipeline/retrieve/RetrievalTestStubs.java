@@ -203,6 +203,20 @@ public class RetrievalTestStubs {
     /** 最后一次流式调用收到的提示词 —— 用来验"分片正文真的进了提示词"。 */
     public static volatile String LAST_PROMPT = "";
 
+    /**
+     * 最后一次流式调用收到的**原图张数**（`T-806`）。
+     *
+     * <p>为什么记张数而不是记字节：本批要验的是"**走没走原图这条路**"
+     * （`useVision` 的编排分支对不对），而字节内容属于 `RegistryStreamingChatCaller`
+     * 的职责（那边由真调用覆盖）。记字节会让断言变成"替我自己的搬运写测试"。
+     */
+    public static final java.util.concurrent.atomic.AtomicInteger LAST_IMAGES =
+            new java.util.concurrent.atomic.AtomicInteger(-1);
+
+    /** 上一次流式调用收到的原图（字节 + MIME）—— 要验 MIME 真的传下去时用。 */
+    public static volatile java.util.List<com.knowledge.ai.pipeline.chat.StreamingChatCaller.ChatImage>
+            LAST_IMAGE_DETAIL = java.util.List.of();
+
     /** 默认替身：回一段固定文本并按句切分，模拟真流式。 */
     private static final com.knowledge.ai.pipeline.chat.StreamingChatCaller DEFAULT_STREAM = canned(
             "这是替身模型的回答。它由两句话组成。");
@@ -215,6 +229,8 @@ public class RetrievalTestStubs {
         streamStub = DEFAULT_STREAM;
         STREAM_CALLS.set(0);
         LAST_PROMPT = "";
+        LAST_IMAGES.set(-1);
+        LAST_IMAGE_DETAIL = java.util.List.of();
     }
 
     /**
@@ -248,9 +264,32 @@ public class RetrievalTestStubs {
     @Bean
     @Primary
     com.knowledge.ai.pipeline.chat.StreamingChatCaller streamingChatCallerStub() {
-        return (prompt, onDelta) -> {
-            STREAM_CALLS.incrementAndGet();
-            return streamStub.stream(prompt, onDelta);
+        return new com.knowledge.ai.pipeline.chat.StreamingChatCaller() {
+
+            @Override
+            public Outcome stream(String prompt, java.util.function.Consumer<String> onDelta) {
+                STREAM_CALLS.incrementAndGet();
+                LAST_IMAGES.set(0);
+                LAST_IMAGE_DETAIL = java.util.List.of();
+                return streamStub.stream(prompt, onDelta);
+            }
+
+            /**
+             * `T-806`：**必须覆写它**，否则走的是接口默认实现 —— 那条路对带图的调用
+             * 直接抛 `UnsupportedOperationException`（刻意如此，见接口注释）。
+             *
+             * <p>覆写时**如实转发给 {@code streamStub} 的单参版本**（丢掉图）是**有意的**：
+             * 本层验的是编排分支，不是多模态传输本身。但要把收到的图记下来，
+             * 否则"这条路真的带了图"这件事在用例里**不可见** —— 而它正是整条兜底链路的意义。
+             */
+            @Override
+            public Outcome stream(String prompt, java.util.List<ChatImage> images,
+                                  java.util.function.Consumer<String> onDelta) {
+                STREAM_CALLS.incrementAndGet();
+                LAST_IMAGES.set(images == null ? 0 : images.size());
+                LAST_IMAGE_DETAIL = images == null ? java.util.List.of() : java.util.List.copyOf(images);
+                return streamStub.stream(prompt, onDelta);
+            }
         };
     }
 

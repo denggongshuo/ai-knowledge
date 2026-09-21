@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Promotion, Delete, FolderOpened, Timer, Connection, Picture, PictureFilled, InfoFilled, View, DocumentCopy, CaretTop, CaretBottom } from '@element-plus/icons-vue'
 import { chatStream, chatApi, sysApi } from '@/api'
@@ -19,6 +20,7 @@ const messages = ref<ChatMessage[]>([{ ...WELCOME }])
 const input = ref('')
 const sending = ref(false)
 const listRef = ref()
+const router = useRouter()
 
 // ---------------- 对话模型切换（V2） ----------------
 const models = ref<ModelOption[]>([])
@@ -275,6 +277,82 @@ function readOriginal(aiMsg: ChatMessage) {
   runStream(u.content, atts.map((a) => a.id), true, ai.id)
 }
 
+// ---------------- 引用定位（T-804 · 需求 07 §6.6） ----------------
+
+/** 每个 AI 消息的检索详情面板里，「第 rankNo 条」那个 DOM 节点。用于点角标时滚动过去。 */
+const chunkEls = ref<Record<string, HTMLElement>>({})
+
+function setChunkEl(msgId: string, rankNo: number, el: unknown) {
+  const key = `${msgId}#${rankNo}`
+  if (el instanceof HTMLElement) chunkEls.value[key] = el
+  else delete chunkEls.value[key]
+}
+
+/** 该名次的分片是否被答案**实际引用**过（用于面板上的「已引用」标记）。 */
+function isCited(m: ChatMessage, rankNo: number) {
+  return !!m.citations?.some((c) => c.rankNo === rankNo)
+}
+
+/**
+ * 把答案正文里的 `[n]` 渲染成**可点的角标**。
+ *
+ * <h3>🔴 为什么这里必须自己转义，不能用 `v-html` 直出 `m.content`</h3>
+ * <p>`m.content` 是**模型生成的文本**，而 `v-html` 不转义。直接塞进去等于让模型
+ * 往页面上写任意 HTML —— 一段 `<img onerror=...>` 就够。所以先转义、再只对
+ * **我们认得的角标**插标记（与 `CitationParser` 同一条正则形态）。
+ *
+ * <p>⚠️ 不认得的角标**原样留着**（不删、不改）—— 删掉会让正文与后端落库的那份不一致，
+ * 而"模型打了个越界角标"这件事应该**看得见**，不是被悄悄抹掉。
+ */
+function renderAnswer(m: ChatMessage) {
+  const escaped = m.content
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  return escaped.replace(/\[(\d{1,3})\]/g, (whole, digits: string) => {
+    const no = Number(digits)
+    const cited = m.citations?.some((c) => c.index === no)
+    // 只把**真的在引用清单里**的角标做成可点；其余原样（它可能是越界的）
+    return cited
+      ? `<span class="inline-cit" data-cit="${no}">${whole}</span>`
+      : whole
+  })
+}
+
+/** 点行内角标（或引用来源卡片）→ 检索详情面板滚动定位到对应分片。 */
+function locateCitation(m: ChatMessage, index: number) {
+  const cited = m.citations?.find((c) => c.index === index)
+  if (!cited) return
+  // 面板按**名次**排，所以要用 `rankNo` 而不是角标号去找节点 ——
+  // 两者可以不等（模型可能只引用名次 3 那条，而它在那句话里是 `[1]`）
+  const el = chunkEls.value[`${m.id}#${cited.rankNo}`]
+  if (!el) return
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  el.classList.add('tp-cite-flash')
+  window.setTimeout(() => el.classList.remove('tp-cite-flash'), 1200)
+}
+
+/**
+ * 正文里点角标 —— **事件委托**。
+ *
+ * <p>为什么不在 `renderAnswer` 里给每个角标写 `onclick`：那要往 `v-html` 里拼
+ * 内联脚本，而 `v-html` 的整段内容都是"不可信的模型输出"。事件委托让**唯一**
+ * 一段由我们生成的 HTML 只带 `data-cit` 属性，处理逻辑在 Vue 侧。
+ */
+function onAnswerClick(m: ChatMessage, e: MouseEvent) {
+  const target = e.target as HTMLElement | null
+  const attr = target?.getAttribute('data-cit')
+  if (!attr) return
+  const no = Number(attr)
+  if (Number.isFinite(no)) locateCitation(m, no)
+}
+
+/** 点引用来源卡片里的文档名 → 打开预览页并**定位到该分片**（需求 07 §6.6 第三行）。 */
+function openChunk(c: Citation) {
+  const url = router.resolve({ name: 'DocPreview', params: { id: c.docId }, query: { chunk: String(c.chunkId) } })
+  window.open(url.href, '_blank')
+}
+
 // ---------------- 反馈（T-807 / G5-14） ----------------
 
 /** 正在提交反馈的消息 id（挡住同一行的重复点击）。 */
@@ -335,6 +413,11 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
         if (!att) return
         if (data.stage === 'DESCRIBING') {
           att.stage = 'DESCRIBING'
+        } else if (data.stage === 'READING') {
+          // `T-806`：直接读原图 —— **不调 VL**。单独一个阶段而不复用
+          // `DESCRIBING`：后者告诉用户“等 40~60 秒”（真 VL 实测），
+          // 而这条路根本不会发生那件事
+          att.stage = 'READING'
         } else {
           att.stage = 'DONE'
           att.desc = data.desc
@@ -348,10 +431,17 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
         const m = current()
         if (!m) return
         m.trace = data.trace as RetrievalTrace
-        m.citations = (data.chunks as unknown[]).slice(0, 5).map((c, i) => {
+        // 🔴 `T-804`：这里**不再拼角标**。
+        // 旧写法是 `chunks.map((c, i) => ({ index: i + 1, ... }))` ——
+        // 它渲染的是「**系统找到了哪些材料**」（检索名次），
+        // 而不是「**答案真的引用了哪几条**」。一个没被引用的分片
+        // 也会显示成 `[1]`，而用户看不出来。
+        // 真正的引用由 `done.citations` 给（见 `onDone`）。
+        m.retrievedChunks = (data.chunks as unknown[]).slice(0, 5).map((c, i) => {
           const raw = c as { chunkId: number; docId: number; docTitle: string; score: number; source: 'vector' | 'bm25' | 'graph' }
           return {
             index: i + 1,
+            rankNo: i + 1,
             docId: raw.docId,
             docTitle: raw.docTitle ?? '未知文档',
             chunkId: raw.chunkId,
@@ -381,6 +471,9 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
           m.modelId = data.modelId ?? m.modelId
           m.modelName = data.modelName ?? m.modelName
           if (data.usedVision) m.usedVision = true
+          // `T-804`：答案**实际引用**的那几条。
+          // 空数组是真值（“这轮没引用任何资料”），不要用 `||` 吃掉它
+          if (Array.isArray(data.citations)) m.citations = data.citations
         }
         sending.value = false
         void scrollToBottom()
@@ -501,6 +594,11 @@ onMounted(async () => {
                     <span class="spinner"></span>
                     正在理解图片（{{ a.vlModelName ?? 'VL 模型' }}）…
                   </div>
+                  <!-- `T-806`：直接读原图 —— 不是“正在理解”，不该让用户等 VL -->
+                  <div v-else-if="a.stage === 'READING'" class="as-line describing">
+                    <span class="spinner"></span>
+                    正在把原图交给当前对话模型…
+                  </div>
                   <div v-else-if="a.stage === 'DONE'" class="as-done">
                     <div class="as-line">
                       <el-icon><PictureFilled /></el-icon>
@@ -519,9 +617,11 @@ onMounted(async () => {
                 </template>
               </div>
 
-              <pre class="ai-content">{{ m.content }}<span v-if="m.streaming" class="cursor-blink">▍</span></pre>
+              <!-- 答案正文（行内角标可点，`T-804` · 需求 07 §6.6） -->
+              <pre v-if="m.streaming" class="ai-content">{{ m.content }}<span class="cursor-blink">▍</span></pre>
+              <pre v-else class="ai-content" v-html="renderAnswer(m)" @click="onAnswerClick(m, $event)"></pre>
 
-              <!-- 引用角标行 -->
+              <!-- 引用来源卡片（= 答案**实际引用**的那几条） -->
               <div v-if="m.citations?.length" class="cit-row">
                 <el-tag
                   v-for="c in m.citations"
@@ -529,7 +629,8 @@ onMounted(async () => {
                   size="small"
                   :type="sourceColor(c.source) as any"
                   effect="light"
-                  class="cit-tag"
+                  class="cit-tag cit-tag-clickable"
+                  @click="locateCitation(m, c.index)"
                 >
                   [{{ c.index }}] {{ c.docTitle.slice(0, 12) }} · {{ (c.score * 100).toFixed(0) }}%
                 </el-tag>
@@ -551,10 +652,20 @@ onMounted(async () => {
                   </div>
                 </div>
                 <div class="tp-cites">
-                  <div v-for="c in m.citations" :key="c.index" class="tp-cite">
-                    <el-tag size="small" :type="sourceColor(c.source) as any" effect="plain">[{{ c.index }}]</el-tag>
-                    <span class="tp-cite-title">{{ c.docTitle }}</span>
+                  <!-- 面板列的是「检索找到了哪些材料」（按名次）—— 与上面那行
+                       「答案引用了哪几条」是**两份不同的清单**，故用两个数据源 -->
+                  <div
+                    v-for="c in m.retrievedChunks ?? []"
+                    :key="c.rankNo"
+                    :ref="(el) => setChunkEl(m.id, c.rankNo, el)"
+                    class="tp-cite"
+                  >
+                    <el-tag size="small" :type="sourceColor(c.source) as any" effect="plain">[{{ c.rankNo }}]</el-tag>
+                    <span class="tp-cite-title tp-cite-title-clickable" @click="openChunk(c)">{{ c.docTitle }}</span>
                     <span class="tp-cite-score">{{ (c.score * 100).toFixed(0) }}% · {{ sourceLabel(c.source) }}</span>
+                    <el-tag v-if="isCited(m, c.rankNo)" size="small" type="success" effect="plain" class="tp-cited">
+                      已引用
+                    </el-tag>
                   </div>
                 </div>
               </div>
@@ -1001,6 +1112,30 @@ onMounted(async () => {
 .cit-tag {
   cursor: pointer;
 }
+.cit-tag-clickable {
+  transition: box-shadow 0.15s;
+}
+.cit-tag-clickable:hover {
+  box-shadow: 0 0 0 2px var(--el-color-primary-light-7);
+}
+/* 行内角标（`T-804`）—— 与来源卡片是同一个数的两种入口：
+   卡片给"文档名 + 分数"，角标给"正文里的位置" */
+.inline-cit {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-size: 0.85em;
+  line-height: 1.5;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.inline-cit:hover {
+  background: var(--el-color-primary-light-7);
+}
 .trace-panel {
   margin-top: 12px;
   padding: 12px 14px;
@@ -1077,8 +1212,30 @@ onMounted(async () => {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.tp-cite-title-clickable {
+  cursor: pointer;
+}
+.tp-cite-title-clickable:hover {
+  color: var(--el-color-primary);
+  text-decoration: underline;
+}
 .tp-cite-score {
   color: var(--el-text-color-placeholder);
+}
+/* 点角标定位过来时闪一下 —— 否则"滚过去了"与"本来就在那儿"看不出区别 */
+.tp-cite-flash {
+  animation: tp-flash 1.2s ease-out;
+}
+@keyframes tp-flash {
+  0% {
+    background: var(--el-color-primary-light-8);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.tp-cited {
+  flex: none;
 }
 
 /* 输入区 */

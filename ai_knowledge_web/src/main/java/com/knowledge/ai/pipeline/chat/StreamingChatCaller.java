@@ -1,5 +1,6 @@
 package com.knowledge.ai.pipeline.chat;
 
+import java.util.List;
 import java.util.function.Consumer;
 
 /**
@@ -42,6 +43,50 @@ public interface StreamingChatCaller {
      * @throws RuntimeException 模型不可用 / 网络失败 —— 调用方决定怎么向用户交代
      */
     Outcome stream(String prompt, Consumer<String> onDelta);
+
+    /**
+     * 发一次提示词**并附原图**，逐段回调（`T-806` · 需求 `09` §4.7）。
+     *
+     * <h3>为什么是"再加一个默认方法"而不是改 {@link #stream}</h3>
+     * <p>改签名会牵动全部既有替身与 26 处引用，而**绝大多数调用点根本不该带图**
+     * （默认链路只传 VL 描述，见 §4.7）。加默认方法让"不带图的调用点"一个字都不用改，
+     * 而"带图的"必须显式走新签名 —— 这个不对称是有意的：
+     * **多模态是例外路径，默认路径要保持单一**。
+     *
+     * <h3>🔴 为什么默认实现是"抛"而不是"退化成纯文本"</h3>
+     * <p>需求 `09` §4.10 逐字写着「**最糟的处理是静默忽略图片** —— 用户以为模型看到了图，
+     * 实际没有，这类问题极难排查」。退化成纯文本正是那个最糟的处理：它**能跑通、能出答案**，
+     * 而答案里少了一个用户明确要求过的东西，页面上看不出来。
+     * 所以这里抛 —— 调用方（编排）会把它转成 {@code event: error}，用户**立刻看见**。
+     *
+     * <p>⚠️ 生产实现必须覆写它（{@code RegistryStreamingChatCaller}）。
+     * 不覆写的替身一旦被喂图会**当场炸**，而不是安静地给一个不含图的答案。
+     *
+     * @param images 原图（**空 / {@code null} 时等价于 {@link #stream(String, Consumer)}**）
+     */
+    default Outcome stream(String prompt, List<ChatImage> images, Consumer<String> onDelta) {
+        if (images == null || images.isEmpty()) {
+            return stream(prompt, onDelta);
+        }
+        throw new UnsupportedOperationException(
+                "当前对话调用方不支持直接读原图（未覆写多模态入口）—— "
+                        + "本轮若继续，答案会在**没有看到图**的情况下产生，那比失败更糟。"
+                        + "请改用支持视觉的链路，或关闭 useVision。");
+    }
+
+    /**
+     * 一张原图。
+     *
+     * <h3>为什么带 {@code mime} 而不是让实现自己猜</h3>
+     * <p>Spring AI 把 {@code Media} 转成 base64 data-URI 时要写 MIME。猜错（例如把 PNG
+     * 声明成 JPEG）的后果**不是报错**，而是模型看到一张解不开的图 ——
+     * 现象与"模型没看懂"完全一样。MIME 在附件落库时就有（`sys_chat_attachment.mime`），
+     * 一路上都有真值，没有理由在这里猜。
+     *
+     * @param bytes 原始字节（**已经是图片本体**，不是 base64 串）
+     */
+    record ChatImage(byte[] bytes, String mime) {
+    }
 
     /**
      * 一次流式调用的元数据。

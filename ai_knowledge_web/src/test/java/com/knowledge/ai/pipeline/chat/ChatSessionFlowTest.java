@@ -41,6 +41,9 @@ class ChatSessionFlowTest extends RetrievalFlowSupport {
 
     @AfterEach
     void m08TearDown() {
+        // `T-804` 起本类会造打点明细行 —— 按 trace_id 前缀自清（该表没有 kb/doc 水位线）
+        jdbc.update("delete from sys_retrieval_trace_chunk where trace_id like 'hist-cite-%' "
+                + "or trace_id like 'legacy-cite-%'");
         jdbc.update("delete from sys_chat_message where session_id > ?", sessionFloor);
         jdbc.update("delete from sys_chat_session where id > ?", sessionFloor);
         cleanProbeData();
@@ -100,6 +103,89 @@ class ChatSessionFlowTest extends RetrievalFlowSupport {
 
         var row = jdbc.queryForMap("select * from sys_chat_session where id = ?", sessionId);
         assertThat(row.get("title")).isEqualTo("型号 A-100 的单价是多少");
+    }
+
+    // ==================== T-804 · 历史引用的口径 ====================
+
+    /**
+     * 历史 `citations` 只回**被引用过**的那几条（`T-804`）。
+     *
+     * <h3>为什么要造"三条里只引一条"而不是"只有一条"</h3>
+     * <p>只造一条的话，`where cited = 1` 与"不过滤"两种写法**结果相同** —— 判据是空的。
+     * 造三条（1 被引用 / 0 明确没被引用 / null 没采集）才能把三种写法分开。
+     */
+    @Test
+    @DisplayName("T-804：历史 citations 只回 `cited = 1` 的行（逐条对得上，不是数量对得上）")
+    void historyCitationsOnlyReturnReallyCitedRows() {
+        kbId = insertKb("M06C_HISTCITE");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        long chunkId = jdbc.queryForObject(
+                "select id from sys_chunk where doc_id = ? limit 1", Long.class, docId);
+
+        long sessionId = chatSessionService.resolve(reader().getUserId(), null, null);
+        chatSessionService.appendUser(sessionId, "型号 A-100 的单价是多少");
+        String traceId = "hist-cite-" + System.nanoTime();
+        long messageId = chatSessionService.appendAssistant(sessionId, "1800 元[1]。",
+                null, null, null, "stop", traceId, false);
+
+        insertChunk(traceId, 1, chunkId, docId, 1);
+        insertChunk(traceId, 2, chunkId, docId, 0);
+        insertChunk(traceId, 3, chunkId, docId, null);
+
+        var page = chatSessionService.messages(reader().getUserId(), sessionId);
+        var assistant = page.list().stream().filter((m) -> m.role().equals("assistant")).findFirst().orElseThrow();
+
+        assertThat(assistant.citations())
+                .as("🔴 三种写法在这条用例上会给出不同的结果：不过滤 ⇒ 3 条；"
+                        + "`cited <> 0` ⇒ 2 条；只有 `cited = 1` ⇒ 1 条")
+                .hasSize(1);
+        assertThat(assistant.citations().getFirst().chunkId()).isEqualTo(chunkId);
+        assertThat(assistant.citations().getFirst().rankNo())
+                .as("名次 1 那条被引用")
+                .isEqualTo(1);
+        assertThat(messageId).isPositive();
+    }
+
+    /**
+     * 旧数据（`cited` 全 `null`，`T-804` 之前落的行）**退回全部**。
+     *
+     * <h3>为什么不是"退回空"</h3>
+     * <p>`cited` 全 `null` 的语义是**没采集**，不是"都没被引用"。退回空会让历史会话的
+     * 引用卡片**整块消失** —— 而用户看不出"这是历史数据的限制"还是"那次真的没引用"。
+     * 退回全部是**旧口径**（= 喂给模型的那批），比空更接近真相。
+     */
+    @Test
+    @DisplayName("T-804：`cited` 全 null 的旧数据退回全部（不是退回空）")
+    void legacyRowsFallBackToAllChunks() {
+        kbId = insertKb("M06C_LEGACY");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        long chunkId = jdbc.queryForObject(
+                "select id from sys_chunk where doc_id = ? limit 1", Long.class, docId);
+
+        long sessionId = chatSessionService.resolve(reader().getUserId(), null, null);
+        chatSessionService.appendUser(sessionId, "型号 A-100 的单价是多少");
+        String traceId = "legacy-cite-" + System.nanoTime();
+        chatSessionService.appendAssistant(sessionId, "1800 元。", null, null, null, "stop", traceId, false);
+
+        // 三条**全 null** —— 模拟本批之前落的行
+        insertChunk(traceId, 1, chunkId, docId, null);
+        insertChunk(traceId, 2, chunkId, docId, null);
+
+        var page = chatSessionService.messages(reader().getUserId(), sessionId);
+        var assistant = page.list().stream().filter((m) -> m.role().equals("assistant")).findFirst().orElseThrow();
+
+        assertThat(assistant.citations())
+                .as("全 null = 没采集 ⇒ 退回**全部**。退回空会让历史会话的引用卡片整块消失，"
+                        + "而用户分不出那是「历史限制」还是「那次真没引用」")
+                .hasSize(2);
+    }
+
+    /** 插一条打点明细；`cited` 三态都要能造。 */
+    private void insertChunk(String traceId, int rankNo, long chunkId, long docId, Integer cited) {
+        jdbc.update("insert into sys_retrieval_trace_chunk "
+                        + "(trace_id, rank_no, chunk_id, doc_id, score, source, cited) "
+                        + "values (?, ?, ?, ?, 0.5, 'vector', ?)",
+                traceId, rankNo, chunkId, docId, cited);
     }
 
     @Test

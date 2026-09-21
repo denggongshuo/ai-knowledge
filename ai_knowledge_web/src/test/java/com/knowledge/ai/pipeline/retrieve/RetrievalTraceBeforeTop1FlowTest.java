@@ -95,7 +95,9 @@ class RetrievalTraceBeforeTop1FlowTest extends RetrievalFlowSupport {
         String traceId = "before-top1-" + System.nanoTime();
         traceIds.add(traceId);
         retrievalTraceWriter.write(new RetrievalTraceWriter.TraceWrite(
-                traceId, null, null, null, result, 1000L, 1500L));
+                traceId, null, null, null, result, 1000L, 1500L,
+                // T-804 新增参：本用例关心的是 `rerank_before_top1`，角标与它无关 ⇒ 空集（→ `cited` 整列 NULL）
+                java.util.Set.of()));
 
         Double stored = jdbc.queryForObject(
                 "select rerank_before_top1 from sys_retrieval_trace where trace_id = ?",
@@ -127,7 +129,9 @@ class RetrievalTraceBeforeTop1FlowTest extends RetrievalFlowSupport {
         String traceId = "before-top1-miss-" + System.nanoTime();
         traceIds.add(traceId);
         retrievalTraceWriter.write(new RetrievalTraceWriter.TraceWrite(
-                traceId, null, null, null, result, 1000L, 1500L));
+                traceId, null, null, null, result, 1000L, 1500L,
+                // T-804 新增参：本用例关心的是 `rerank_before_top1`，角标与它无关 ⇒ 空集（→ `cited` 整列 NULL）
+                java.util.Set.of()));
 
         assertThat(jdbc.queryForObject(
                 "select rerank_before_top1 from sys_retrieval_trace where trace_id = ?",

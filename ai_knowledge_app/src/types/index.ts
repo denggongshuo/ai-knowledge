@@ -151,7 +151,16 @@ export interface ChatMessage {
   content: string
   /** SSE 是否仍在生成 */
   streaming?: boolean
+  /** 答案**实际引用**的那几条（`T-804`；来自 `done.citations`）—— 渲染行内角标与来源卡片 */
   citations?: Citation[]
+  /**
+   * **检索找到**的那批分片（来自 `retrieval.chunks`）—— 渲染检索详情面板。
+   *
+   * <p>⚠️ 与 {@link citations} 是**两份不同的清单**：这份答“系统找到了哪些材料”，
+   * 那份答“答案真的用上了哪几条”。`T-804` 之前只有一个 `citations`，
+   * 而它是拿这份按 `i + 1` 拼出来的 —— 于是“没被引用”与“被引用”在页面上长得一样。
+   */
+  retrievedChunks?: Citation[]
   trace?: RetrievalTrace
   createdAt: number
   /** 该轮回答使用的对话模型（落库 usedModelId / 名称，用于归因） */
@@ -200,7 +209,14 @@ export interface ChatAttachment {
   /** 是否降级（VL 未配置 / 调用失败，由备用多模态模型完成） */
   degraded?: boolean
   /** 理解进度 */
-  stage?: 'UPLOADING' | 'DESCRIBING' | 'DONE' | 'FAILED'
+  /**
+   * 该附件在本轮里的阶段。
+   *
+   * <p>`READING` = **正在把原图交给对话模型**（`T-806` 的「直接读原图」）——
+   * 与 `DESCRIBING`（VL 正在描述）是两件事：后者要等 40~60 秒（真 VL 实测），
+   * 前者不调 VL。合成一个阶段会让用户**等一个不会来的东西**。
+   */
+  stage?: 'UPLOADING' | 'DESCRIBING' | 'READING' | 'DONE' | 'FAILED'
   /** 上传进度 0~100 */
   progress?: number
 }
@@ -226,7 +242,15 @@ export interface ChatSessionItem {
 
 /** 引用角标 */
 export interface Citation {
+  /** 答案里的**角标号**（`[1]` 就是 1）—— 点角标定位到分片用它 */
   index: number
+  /**
+   * 检索名次（`sys_retrieval_trace_chunk.rank_no`）。
+   *
+   * <p>⚠️ 它与 `index` **可以不等** —— 模型完全可能只引用名次 3 的那条，
+   * 而它在那句话里是 `[1]`。面板按它排序，角标按 `index` 定位。
+   */
+  rankNo: number
   docId: number
   docTitle: string
   chunkId: number

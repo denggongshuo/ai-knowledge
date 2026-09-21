@@ -116,12 +116,14 @@ public final class ChatDtos {
     // 图片理解进度（`T-907` · 需求 `09` §4.9）
     // ==================================================================
 
-    /** {@code attachment} 事件的两个阶段（§4.9 的事件序列）。 */
+    /** {@code attachment} 事件的三个阶段（§4.9 的事件序列 + `T-806` 的 §4.7）。 */
     public enum AttachmentStage {
         /** 正在理解（VL 调用中）。用户看见「正在理解图片（VL 模型）…」+ 转圈。 */
         DESCRIBING,
         /** 理解完成（成功或降级）。 */
         DONE,
+        /** **正在读原图**（`T-806` 兜底链路）—— **不调 VL**，只是把原图装进请求体。 */
+        READING,
     }
 
     /**
@@ -163,6 +165,24 @@ public final class ChatDtos {
             return new AttachmentEvent(AttachmentStage.DONE, attachmentId, desc, searchSummary,
                     vlModel, degraded);
         }
+
+        /**
+         * 「正在读原图」（`T-806` · 需求 `09` §4.7 的兜底链路）。
+         *
+         * <h3>🔴 为什么它必须与 {@link #describing} 分开，而不是复用后者</h3>
+         * <p>{@code DESCRIBING} 的语义是「**VL 模型正在描述这张图**」—— 用户据此预期
+         * 「等 40~60 秒」（真 VL 实测耗时，`#179`）。而「直接读原图」这条路**不调 VL**，
+         * 只是在把原图装进请求体。复用同一个阶段名会让用户**等一个不会来的东西**，
+         * 而页面看起来完全正常 —— 那正是「静默降级」那一族的形状。
+         *
+         * <p>前端按 {@code stage} 分发（{@code ChatView.vue#onAttachment}），
+         * 新增一个阶段名**不会让旧前端出错**（它走进 {@code else} 分支）。
+         * ⚠️ 但旧前端在这个阶段会把 {@code desc/searchSummary} 读成 {@code null}
+         * 并显示「图片已理解」—— 故前端同步改（计划 §3.1 步 11）。
+         */
+        public static AttachmentEvent reading(String attachmentId) {
+            return new AttachmentEvent(AttachmentStage.READING, attachmentId, null, null, null, null);
+        }
     }
 
     /**
@@ -193,7 +213,8 @@ public final class ChatDtos {
                             String modelName,
                             TokenUsage tokenUsage,
                             String finishReason,
-                            boolean usedVision) {
+                            boolean usedVision,
+                            List<Citation> citations) {
     }
 
     /**
@@ -262,17 +283,26 @@ public final class ChatDtos {
     }
 
     /**
-     * 一条历史引用（{@code GET /chat/sessions/{id}/messages} 的 {@code citations[]}）。
+     * 一条引用（`done.citations[]` 与 {@code GET /chat/sessions/{id}/messages} 的
+     * {@code citations[]} 共用）。
      *
      * <p>字段与 {@code mock/index.ts:717} 的 {@code citations} 逐字一致。
      *
-     * <p>⚠️ 它表达的是**「这一轮喂给模型的分片」**，不是"答案真的引用了哪几条"
-     * —— {@code sys_retrieval_trace_chunk.cited} 本批**恒为 NULL**（"被引用"要解析答案角标，
-     * 属 `T-804`）。与实时 `retrieval` 事件的 {@code chunks[]} **同源同口径**。
+     * <h3>🔴 `index` 与 `rankNo` 是**两个不同的数**，都要发</h3>
+     * <p>`T-804` 之前这里只有一个 `index`，它的值是**检索名次**（`rank_no`），
+     * 而前端渲染的 `[1][2]` 是拿它当角标用的 —— 于是「答案引用了哪几条」这件事
+     * **从来没被表达过**。现在：
+     * <ul>
+     *   <li>{@code index} = **答案正文里的角标号**（`[1]` 就是 1）—— 前端拿它定位；</li>
+     *   <li>{@code rankNo} = **检索名次**（`sys_retrieval_trace_chunk.rank_no`）—— 面板按它排序。</li>
+     * </ul>
+     * 两者**可以不等**：模型完全可能只引用名次 3 的那条，而它在那句话里是 `[1]`。
+     * ⚠️ **不替换、只新增** —— 有消费方按 `index` 当名次用的话，替换会静默改掉它的排序。
      *
-     * @param index 角标序号，从 1 起（= 检索名次）
+     * @param index  答案里的角标号（从 1 起）
+     * @param rankNo 检索名次（从 1 起）
      */
-    public record Citation(int index, long docId, String docTitle, long chunkId,
+    public record Citation(int index, int rankNo, long docId, String docTitle, long chunkId,
                            double score, String source) {
     }
 

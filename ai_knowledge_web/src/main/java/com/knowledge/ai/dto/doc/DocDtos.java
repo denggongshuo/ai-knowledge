@@ -152,13 +152,19 @@ public final class DocDtos {
      * 文档元信息（对齐前端 {@code DocMeta}，{@code types/index.ts:693}）= {@code DocInfo} + 治理与统计字段。
      *
      * <h3>🔴 四个字段**故意**为 {@code null}，且它们**不是**"没有数据"</h3>
-     * <p>本批是纯只读批，这四个字段的**采集方/落库方在本仓都还不存在**。返回 {@code 0}
+     * <p>`S7-M06-A` 时这四个字段的**采集方/落库方在本仓都还不存在**。返回 {@code 0}
      * 或空数组会把"从没采过"说成"确实是 0" —— 而那是**一句关于内容的断言**（`D-2`：
-     * 打点后补 = 数据永久缺失）。故一律 {@code null}，前端渲染成「未采集」而不是「0 次」：
+     * 打点后补 = 数据永久缺失）。故当时一律 {@code null}，前端渲染成「未采集」而不是「0 次」：
      * <ul>
-     *   <li>{@code citations} / {@code downVotes} —— 根因是 {@code sys_retrieval_trace_chunk.cited}
-     *       的写入方**恒写 null**（{@code RetrievalTraceWriter.java:89-94}），而"哪些块真被答案引用了"
-     *       正是 {@code T-804} 要采的东西。**同一根因**，所以两个字段一起为 null；</li>
+     *   <li>🆕 {@code citations} —— **`S7-M06-C` 起转真**：`T-804` 让
+     *       {@code sys_retrieval_trace_chunk.cited} 由答案角标解析而来，本列 = 该文档的
+     *       分片被**实际引用**过的次数。⚠️ 只数 {@code cited = 1} ——
+     *       {@code cited is null}（本批之前的历史行）**不算**，那是"没采集"不是"没被引用"。
+     *       ⇒ 所以本列的语义是「**本批之后**的引用次数」，历史为 0 不代表当时没被引；</li>
+     *   <li>⚠️ {@code downVotes} —— **仍为 {@code null}**，且**根因与 `citations` 不同**：
+     *       它要的是"这篇文档的答案被点踩几次"，是 {@code sys_chat_message.feedback}
+     *       × {@code trace_id} × {@code doc_id} 的**跨表口径**。`T-804` 只解决了"被引用"，
+     *       没解决"被点踩" ⇒ 两个字段**没有同一根因**，一起转真会让两条判据看起来像一条；</li>
      *   <li>{@code version} —— 版本机制整块不存在（无 `sys_doc_version` 表、`sys_document` 无该列）。
      *       ⚠️ 不要拿 {@code sys_document.parse_version} 顶替：那是**解析器指纹**（`V20` 的注释
      *       明写"≠ 文档版本"），语义不同。归属 `T-606`~`T-608`；</li>
@@ -180,8 +186,9 @@ public final class DocDtos {
      *                          ⚠️ 它**不是**"没有密级"（生效值见 {@code securityLevel}），
      *                          也不要拿它跟 {@code kbSecurityLevel} 比相等来判断"是否继承" ——
      *                          用户主动把文档设成与库相同的值，在数据上与"继承"是两回事
-     * @param citations         见上，恒 {@code null}
-     * @param downVotes         见上，恒 {@code null}
+     * @param citations         该文档的分片被答案**实际引用**过的次数（`T-804` 起为真值）。
+     *                          ⚠️ 只数 `cited = 1`，所以它**不覆盖**本批之前的历史提问
+     * @param downVotes         见上，恒 {@code null}（**与 `citations` 不是同一根因**）
      * @param version           见上，恒 {@code null}
      * @param tags              见上，恒 {@code null}
      */

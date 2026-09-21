@@ -140,7 +140,10 @@ public class ChatSessionService {
         if (session != null && (session.getTitle() == null || session.getTitle().isBlank())) {
             session.setTitle(truncate(content, TITLE_MAX));
         }
-        return save(sessionId, "user", content, null, null, null, null, null, null);
+        // 用户行**没有**「用了什么链路」这件事 —— 那一列说的是 assistant 那一轮。
+        // 传 false 而不是 null：本轮的 user 行确实是"没用原图"（它不是回答）。
+        // ⚠️ 真正的"未采集"只有 V38 之前的历史行，那由 DDL 的可空性表达
+        return save(sessionId, "user", content, null, null, null, null, null, null, false);
     }
 
     /**
@@ -152,13 +155,19 @@ public class ChatSessionService {
      */
     @Transactional
     public long appendAssistant(long sessionId, String content, Long modelId, String modelName,
-                                ChatDtos.TokenUsage usage, String finishReason, String traceId) {
+                                ChatDtos.TokenUsage usage, String finishReason, String traceId,
+                                boolean usedVision) {
         touch(sessionId);
         return save(sessionId, "assistant", content, modelId, modelName,
                 traceId,
                 usage == null ? null : usage.prompt(),
                 usage == null ? null : usage.completion(),
-                finishReason);
+                finishReason,
+                // `T-806` · 需求 `09` §4.7：只对**该轮**生效。
+                // 注意这里传的是 `boolean`（不是 Boolean）——
+                // 本轮的值**总是知道的**（编排里算出来的），
+                // "未采集"那个三态只对 **V38 之前的历史行** 有意义
+                usedVision);
     }
 
     /** 刷新会话的最近活动时间 —— 列表按它倒序，不用去扫消息表。 */
@@ -173,7 +182,7 @@ public class ChatSessionService {
 
     private long save(long sessionId, String role, String content, Long modelId, String modelName,
                       String traceId, Integer tokenPrompt, Integer tokenCompletion,
-                      String finishReason) {
+                      String finishReason, boolean usedVision) {
         SysChatMessage message = new SysChatMessage();
         message.setSessionId(sessionId);
         message.setRole(role);
@@ -184,6 +193,7 @@ public class ChatSessionService {
         message.setTokenPrompt(tokenPrompt);
         message.setTokenCompletion(tokenCompletion);
         message.setFinishReason(finishReason);
+        message.setUsedVision(usedVision);
         message.setCreatedAt(LocalDateTime.now());
         return messageRepository.save(message).getId();
     }
@@ -407,6 +417,9 @@ public class ChatSessionService {
                         select c.trace_id, c.rank_no, c.chunk_id, c.doc_id, c.score, c.source
                         from sys_retrieval_trace_chunk c
                         where c.trace_id in (:traceIds)
+                          and (c.cited = 1
+                               or not exists (select 1 from sys_retrieval_trace_chunk d
+                                               where d.trace_id = c.trace_id and d.cited is not null))
                         order by c.trace_id, c.rank_no
                         """)
                 .setParameter("traceIds", traceIds)
@@ -417,9 +430,18 @@ public class ChatSessionService {
         for (Object[] row : chunkRows) {
             String traceId = String.valueOf(row[0]);
             long docId = ((Number) row[3]).longValue();
+            int rankNo = row[1] == null ? 0 : ((Number) row[1]).intValue();
             byTrace.computeIfAbsent(traceId, k -> new ArrayList<>())
                     .add(new ChatDtos.Citation(
-                            row[1] == null ? 0 : ((Number) row[1]).intValue(),
+                            // `T-804`：`index` 现在是**答案里的角标号**，而历史行里没有它 ——
+                            // 只能退回 `rank_no`。⚠️ 这个退回是**有损**的：它表达的又是
+                            // "喂给模型的第几条"，而不是"答案引用了第几条"。
+                            // 如实这样做而不是编一个角标：两者**当前恰好相同**的概率很高
+                            // （prompt 按列表顺序编号），但"很可能相同"不是"相同"。
+                            // ⇒ 历史消息的 `index` 是**近似值**，实时 `done.citations` 才是准的。
+                            // 登记在计划 §9。
+                            rankNo,
+                            rankNo,
                             docId,
                             titles.getOrDefault(docId, ""),
                             ((Number) row[2]).longValue(),

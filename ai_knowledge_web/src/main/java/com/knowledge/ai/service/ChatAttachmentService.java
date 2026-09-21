@@ -129,6 +129,49 @@ public class ChatAttachmentService {
     }
 
     /**
+     * 按 id 取原图**字节**（`T-806` · 需求 `09` §4.7 的「直接读原图」）。
+     *
+     * <h3>为什么它与 {@link #describe} 分成两个方法，而不是加一个布尔参数</h3>
+     * <p>两条路要做的事**没有交集**：{@code describe} 读字节是**为了喂 VL**（还会查缓存、
+     * 写回描述五列、发进度事件）；本方法读字节是**为了喂对话模型**（不调 VL、不写库、
+     * 不发事件）。把它们合成一个方法，调用方就得在方法里判"这次到底要不要调 VL"——
+     * 而那个判断一旦写错，表现是「点了直接读原图，却仍然走了一遍 40~60 秒的 VL 描述」
+     * （真 VL 实测耗时，见 `#179`），页面看起来完全正常。
+     *
+     * <h3>归属校验与 {@code describe} 逐字同源</h3>
+     * <p>同样走 {@code findByIdAndUserId} —— 校验与取数是**同一条 SQL**。
+     * 「直接读原图」不因为"只读字节"就放松：它比描述更敏感（描述是中间产物，
+     * 原图是用户上传的原始内容）。
+     *
+     * @param userId        提问人（归属校验到人 —— 会话在此刻还没建，见类注释）
+     * @param attachmentIds 前端传来的附件 id（**字符串形式**）
+     * @return 与 {@code attachmentIds} **等长同序**的原图
+     * @throws BizException 任一 id 不存在 / 不属于当前用户（**同码 NOT_FOUND**，不区分）
+     */
+    @Transactional(readOnly = true)
+    public List<Original> originals(Long userId, List<String> attachmentIds) {
+        if (attachmentIds == null || attachmentIds.isEmpty()) {
+            return List.of();
+        }
+        List<Original> out = new ArrayList<>(attachmentIds.size());
+        for (String rawId : attachmentIds) {
+            Long id = parseId(rawId);
+            if (id == null) {
+                throw BizException.of(ErrorCode.NOT_FOUND);
+            }
+            SysChatAttachment row = repository.findByIdAndUserId(id, userId)
+                    .orElseThrow(() -> BizException.of(ErrorCode.NOT_FOUND));
+            out.add(new Original(String.valueOf(row.getId()),
+                    storage.readBytes(row.getObjectKey()), row.getMime()));
+        }
+        return out;
+    }
+
+    /** 一张原图（`T-806`）。{@code mime} 一路上都有真值，见 {@code StreamingChatCaller.ChatImage}。 */
+    public record Original(String attachmentId, byte[] bytes, String mime) {
+    }
+
+    /**
      * 理解一组图片（`T-907` · 需求 `09` FR-SYS-04）—— 问答链路的入口。
      *
      * <h3>为什么"附件不存在"直接报错，而不是跳过它</h3>

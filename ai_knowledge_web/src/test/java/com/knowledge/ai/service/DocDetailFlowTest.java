@@ -67,6 +67,9 @@ class DocDetailFlowTest extends ApiTestSupport {
 
     @AfterEach
     void clearFixtures() {
+        // `T-804` 起本类会造 `sys_retrieval_trace_chunk` 行 —— 那张表按 `trace_id` 关联，
+        // `ProbeCleanup` 的水位线认不出本类造的那几行，故按 trace_id 前缀自清
+        jdbc.update("delete from sys_retrieval_trace_chunk where trace_id like 'trace-cite-%'");
         clearAll();
     }
 
@@ -300,25 +303,67 @@ class DocDetailFlowTest extends ApiTestSupport {
     }
 
     @Test
-    @DisplayName("判据 13：citations/downVotes/version/tags **严格 null**，且根因可证")
+    @DisplayName("判据 13（S7-M06-C 改写）：citations 转真；downVotes/version/tags **仍严格 null**")
     void uncollectedFieldsAreNullNotZero() {
         Map<String, Object> meta = mapOf(get("/api/doc/" + docId, adminToken).data("$"));
 
+        // 🔴 `S7-M06-A` 时这四个字段**一起**为 null，根因都是"没有采集方"。
+        //    `S7-M06-C` 的 `T-804` 让 `cited` 由答案角标解析而来 ⇒ `citations` 转真，
+        //    而**另外三个仍然没有采集方**。这条判据按新契约改写 —— 但**不是**把断言放宽：
+        //    它现在钉的是"**只有一个字段翻了**"，防止下一个人顺手把四个一起填 0。
+        // ⚠️ 取出来是 `Integer`（JSON 反序列化的默认数字类型），所以比 `longValue()`
+        // 而不是直接比 `0L` —— 后者会因为 `0L != 0`（装箱类型不同）而红，
+        // 而那条红说的是"测试写法不对"，不是"契约不对"
+        assertThat(((Number) meta.get("citations")).longValue())
+                .as("本探针文档没被打过点引用过 ⇒ 真值是 **0**（不是 null）。"
+                        + "⚠️ 这里的 0 与 null 分别是「确实没被引用」与「还没采集」—— "
+                        + "T-804 之后本字段有采集方了，所以 0 是诚实的那一个")
+                .isZero();
         // `0`/`''`/`[]`/`null` 全是 falsy —— falsy 断言会在"值错了"时照样绿（§5「缺席 ≡ 0」）
-        assertThat(meta).containsEntry("citations", null);
         assertThat(meta).containsEntry("downVotes", null);
         assertThat(meta).containsEntry("version", null);
         assertThat(meta).containsEntry("tags", null);
-
-        // 根因：`cited` 列存在但写入方恒写 null（T-804 未做）⇒ 不是"真没被引用过"
-        assertThat(dbLong("select count(*) from sys_retrieval_trace_chunk where cited is not null"))
-                .as("cited 非空行数必须为 0，否则上面四个 null 的理由不成立")
-                .isZero();
 
         // 索引任务的 version 同一根因（不是"这份任务没有版本"）
         List<Map<String, Object>> tasks = listOf(get("/api/doc/" + docId + "/index-tasks", adminToken).data("$.list"));
         assertThat(tasks).isNotEmpty();
         assertThat(taskOf(tasks, "DONE")).containsEntry("version", null);
+    }
+
+    @Test
+    @DisplayName("T-804：citations 只数 `cited = 1` 且属于**本篇**的行（null 与 0 都不算）")
+    void citationsCountOnlyReallyCitedRows() {
+        long chunkId = dbLong("select id from sys_chunk where doc_id = " + docId + " limit 1");
+
+        // A：本篇的 2 条被引用
+        insertTraceChunk("trace-cite-a1", chunkId, 1, 1);
+        insertTraceChunk("trace-cite-a2", chunkId, 2, 1);
+        // B：**另一篇文档**的行 —— 必须不计数（否则这条判据是空的）
+        insertTraceChunkForDoc("trace-cite-b1", chunkId, 1, 1, docId + 999_999L);
+        // C：本篇但 `cited` 为 **null**（本批之前的历史行）—— 不算，那是"没采集"
+        insertTraceChunkForDoc("trace-cite-c1", chunkId, 1, null, docId);
+        // D：本篇但 `cited = 0`（明确没被引用）—— 也不算
+        insertTraceChunkForDoc("trace-cite-d1", chunkId, 2, 0, docId);
+
+        Map<String, Object> meta = mapOf(get("/api/doc/" + docId, adminToken).data("$"));
+
+        assertThat(((Number) meta.get("citations")).longValue())
+                .as("🔴 三种错法都过不了这条：取 `count(*) where doc_id = ?` 得 4；"
+                        + "取 `cited is not null` 得 3；取 `cited <> 0` 得 3。"
+                        + "只有「`cited = 1` **且** `doc_id` 是本篇」得 2")
+                .isEqualTo(2L);
+    }
+
+    /** 插一条打点明细（`cited` 三态都要能造：1 / 0 / null）。 */
+    private void insertTraceChunk(String traceId, long chunkId, int rankNo, Integer cited) {
+        insertTraceChunkForDoc(traceId, chunkId, rankNo, cited, docId);
+    }
+
+    private void insertTraceChunkForDoc(String traceId, long chunkId, int rankNo, Integer cited, long targetDocId) {
+        jdbc.update("insert into sys_retrieval_trace_chunk "
+                        + "(trace_id, rank_no, chunk_id, doc_id, score, source, cited) "
+                        + "values (?, ?, ?, ?, 0.5, 'vector', ?)",
+                traceId, rankNo, chunkId, targetDocId, cited);
     }
 
     // ==================================================================

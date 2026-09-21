@@ -36,6 +36,13 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
     @Autowired
     private ChatStreamService chatStreamService;
 
+    @Autowired
+    private com.knowledge.ai.service.ChatAttachmentService attachmentService;
+
+    /** 一张真的 1×1 PNG（`T-O26`：探针素材要**可复算**，不靠记忆里的 base64）。 */
+    private static final byte[] PNG_1X1 = java.util.Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
     /** 本用例开始前 `sys_chat_session` 的最大 id —— 之后新增的全是本轮造的。 */
     private long sessionFloor;
 
@@ -48,6 +55,9 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
      */
     private long missFloor;
 
+    /** 本用例开始前 `sys_chat_attachment` 的最大 id（该表没有 kb/doc 坐标，探针清理认不出）。 */
+    private long attachmentFloor;
+
     @BeforeEach
     void m08SetUp() {
         RetrievalTestStubs.resetStream();
@@ -58,6 +68,8 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         sessionFloor = max == null ? 0L : max;
         Long missMax = jdbc.queryForObject("select coalesce(max(id), 0) from sys_qa_miss", Long.class);
         missFloor = missMax == null ? 0L : missMax;
+        Long attMax = jdbc.queryForObject("select coalesce(max(id), 0) from sys_chat_attachment", Long.class);
+        attachmentFloor = attMax == null ? 0L : attMax;
     }
 
     @AfterEach
@@ -289,6 +301,300 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         assertThat(poolTop)
                 .as("两处对不上而两边看着都合理 —— 这正是要钉住它的理由")
                 .isEqualTo(traceTop);
+    }
+
+    // ==================== T-804 · 引用角标 → cited 落库 ====================
+
+    /**
+     * `T-804` 的核心判据：**`cited` 由答案角标解析而来，不是"喂给模型的那批"**。
+     *
+     * <h3>为什么必须"逐条相等"而不是"数量相等"</h3>
+     * <p>本仓的硬口径（`G7-2` 那条：「A 的合计 = B」）已经在同一个形状上翻过车 ——
+     * 数量相等时，**把两条都标错**也能过。这里用集合相等把它堵死。
+     *
+     * <h3>为什么要先断言"被引用的比喂进去的少"</h3>
+     * <p>若两者恒相等（例如实现退化成"全都标 1"），下面那条集合相等**照样绿** ——
+     * 那就是一条空判据。所以先钉住这个**不等关系**：本用例让替身只引用第 2 条，
+     * 而喂进去的是 3 条。
+     */
+    @Test
+    @DisplayName("T-804：cited 由**答案角标**解析 —— 与喂给模型的那批不等，且逐条对得上")
+    void citedComesFromAnswerMarkersNotFromTheFedChunks() {
+        kbId = insertKb("M06C_CITED");
+        long docId = insertDocWithChunks("报价单",
+                "型号 A-100 单价 1800 元", "型号 A-200 单价 2400 元", "型号 A-300 单价 3300 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("单价", 3);
+
+        // 替身只引用**第 2 条**（正文里打 `[2]`）—— 而检索喂进去 3 条
+        RetrievalTestStubs.streamStub = RetrievalTestStubs.canned("结论：A-200 是 2400 元[2]。");
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-200 的单价是多少"), sink);
+
+        String traceId = jdbc.queryForObject(
+                "select trace_id from sys_retrieval_trace where session_id > ?", String.class, sessionFloor);
+
+        List<Integer> cited = jdbc.queryForList(
+                "select rank_no from sys_retrieval_trace_chunk where trace_id = ? and cited = 1 order by rank_no",
+                Integer.class, traceId);
+        int fed = jdbc.queryForObject(
+                "select count(*) from sys_retrieval_trace_chunk where trace_id = ?", Integer.class, traceId);
+
+        assertThat(cited)
+                .as("🔴 答案只打了 [2] ⇒ 只有名次 2 那条被引用。"
+                        + "若实现是「全部标 1」，这里会是 [1,2,3]，而下面的集合相等照样绿 —— "
+                        + "所以**这一条断言是那条相等断言不空的前提**")
+                .containsExactly(2);
+        assertThat(fed)
+                .as("喂给模型的是 3 条 —— 它必须**大于**被引用数，否则本用例验不出任何东西")
+                .isGreaterThan(cited.size());
+        assertThat(cited)
+                .as("被引用的集合必须**逐条**等于答案角标集合")
+                .isEqualTo(List.of(2));
+    }
+
+    @Test
+    @DisplayName("T-804：模型没打角标 ⇒ cited 写 NULL 而**不是 0**")
+    void noMarkerWritesNullNotZero() {
+        kbId = insertKb("M06C_NOCITED");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+
+        // 替身回一段**没有角标**的答案（模型没照 prompt 做，或者它认为不需要引用）
+        RetrievalTestStubs.streamStub = RetrievalTestStubs.canned("单价是 1800 元。");
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少"), sink);
+
+        String traceId = jdbc.queryForObject(
+                "select trace_id from sys_retrieval_trace where session_id > ?", String.class, sessionFloor);
+
+        List<Boolean> nullFlags = jdbc.queryForList(
+                "select cited is null from sys_retrieval_trace_chunk where trace_id = ?",
+                Boolean.class, traceId);
+        assertThat(nullFlags)
+                .as("明细行本身要在（喂过就有行）—— 否则下面那条断言在空集上恒真")
+                .isNotEmpty()
+                .allMatch(Boolean::booleanValue);
+
+        Integer zeroCount = jdbc.queryForObject(
+                "select count(*) from sys_retrieval_trace_chunk where trace_id = ? and cited = 0",
+                Integer.class, traceId);
+        assertThat(zeroCount)
+                .as("🔴 **0 是一句关于内容的断言**（「这条没被引用」），而「没解析出角标」是"
+                        + "「没采集到」。两者在页面上长得一样，语义差一个量级 —— "
+                        + "与 top1_score / rerank_before_top1 同一条口径")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("T-804：done.citations 是**按角标号**的清单，与 retrieval.chunks 是两份")
+    void doneCitationsAreByMarkerNumberNotByRank() {
+        kbId = insertKb("M06C_DONECITE");
+        long docId = insertDocWithChunks("报价单",
+                "型号 A-100 单价 1800 元", "型号 A-200 单价 2400 元", "型号 A-300 单价 3300 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("单价", 3);
+
+        RetrievalTestStubs.streamStub = RetrievalTestStubs.canned("只引第三条[3]。");
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-300 的单价是多少"), sink);
+
+        assertThat(sink.done).isNotNull();
+        assertThat(sink.done.citations())
+                .as("`done.citations` 必须**按角标序**（这里是 [3]）—— 它答的是"
+                        + "「答案引用了哪几条」，不是「系统找到了哪些」")
+                .hasSize(1);
+        assertThat(sink.done.citations().getFirst().index())
+                .as("index = 答案里的角标号")
+                .isEqualTo(3);
+        assertThat(sink.done.citations().getFirst().rankNo())
+                .as("rankNo = 检索名次。**两者可以不等**，而这条用例恰好造出了不等的情形："
+                        + "角标 [3] 对应名次 3 —— 若实现把 index 恒等于 rankNo，"
+                        + "本条会绿而上面那条集合判据会红，两条一起才钉得住")
+                .isEqualTo(3);
+        assertThat(sink.done.citations().getFirst().docTitle())
+                .as("引用要能显示文档名（前端直接渲染）")
+                .isEqualTo("报价单");
+    }
+
+    @Test
+    @DisplayName("T-804：空召回时 cited 全 NULL，且 done.citations 为空清单（不是 null）")
+    void emptyRecallHasNoCitations() {
+        kbId = insertKb("M06C_EMPTYCITE");
+        // 什么都不建 ⇒ 空召回 ⇒ 不调模型
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少"), sink);
+
+        assertThat(RetrievalTestStubs.STREAM_CALLS.get()).isZero();
+        assertThat(sink.done).isNotNull();
+        assertThat(sink.done.citations())
+                .as("发**空清单**而不是 null —— 前端按数组遍历，缺字段要写判空；"
+                        + "而「这轮没有引用」与「这个字段还没实现」在页面上要能分开")
+                .isNotNull()
+                .isEmpty();
+    }
+
+    // ==================== T-806 · 直接读原图 ====================
+
+    @Test
+    @DisplayName("T-806：useVision=false（缺省）时**一张图都不带** —— 默认链路不变")
+    void defaultPathCarriesNoImage() {
+        kbId = insertKb("M06C_NOVIS");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少"), sink);
+
+        assertThat(RetrievalTestStubs.LAST_IMAGES.get())
+                .as("缺省（含 request.useVision() 为 null）必须走**原样**的纯文本链路 —— "
+                        + "需求 09 §4.7：「默认链路保持解耦与低成本」")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("T-806：useVision=true 而模型未声明 vision ⇒ **拒**，且不调模型")
+    void useVisionIsRejectedWhenModelCannotSee() {
+        kbId = insertKb("M06C_VISDENY");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+
+        // 种子那行的 capabilities 是 NULL ⇒ 读侧兜底 VISION=false
+        Long chatId = jdbc.queryForObject(
+                "select id from sys_model_config where model_type = 'CHAT' and is_active = 1 limit 1", Long.class);
+        String original = jdbc.queryForObject(
+                "select capabilities from sys_model_config where id = ?", String.class, chatId);
+        jdbc.update("update sys_model_config set capabilities = null where id = ?", chatId);
+        try {
+            RecordingSink sink = new RecordingSink();
+            chatStreamService.chat(reader(),
+                    new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
+                            List.of("999001"), Boolean.TRUE), sink);
+
+            assertThat(sink.error)
+                    .as("🔴 **置灰不是约束** —— 前端那个按钮的 disabled 拦不住直接打端点的人。"
+                            + "需求 09 §4.7 的前置要在**服务端**成立")
+                    .isNotNull()
+                    .contains("视觉");
+            assertThat(RetrievalTestStubs.STREAM_CALLS.get())
+                    .as("拒了就不该调模型 —— 退回描述链路会悄悄花掉 40~60 秒并给出不含图的答案")
+                    .isZero();
+        } finally {
+            // 复原：`#166` 那族「改全局状态的用例必须复原」—— 忘了复原会让**看着无关**的类红
+            jdbc.update("update sys_model_config set capabilities = ? where id = ?", original, chatId);
+        }
+    }
+
+    @Test
+    @DisplayName("T-806：useVision=true 且附件不存在 ⇒ 报附件错误，**不是**能力错误")
+    void missingAttachmentIsReportedAsAttachmentProblem() {
+        kbId = insertKb("M06C_VISATT");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(),
+                new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
+                        List.of("999002"), Boolean.TRUE), sink);
+
+        // 能力闸在前、附件校验在后 —— 本仓种子的 capabilities 是 NULL（vision=false），
+        // 所以这一条**先撞能力闸**。两条错误都"看起来正常"（都是 error 事件），
+        // 所以要断言的是**文案指向哪一个**：它必须说清是"不支持视觉"而不是"附件不存在"。
+        assertThat(sink.error)
+                .as("顺序是刻意的：能力闸在前（它不需要查库），附件校验在后。"
+                        + "反过来的话，一个未声明的模型会在「图片不存在」上先报错，"
+                        + "而用户会去重传图片、问题照旧")
+                .isNotNull()
+                .contains("视觉")
+                .doesNotContain("重新上传");
+    }
+
+    @Test
+    @DisplayName("T-806：usedVision 落库，且**只对该轮生效**（同一会话上一轮仍为 0）")
+    void usedVisionIsPersistedPerRound() {
+        kbId = insertKb("M06C_USEDVIS");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 1);
+
+        Long chatId = jdbc.queryForObject(
+                "select id from sys_model_config where model_type = 'CHAT' and is_active = 1 limit 1", Long.class);
+        String original = jdbc.queryForObject(
+                "select capabilities from sys_model_config where id = ?", String.class, chatId);
+        // 把对话模型声明成支持视觉 —— 步 0 探针实测**同一个模型确实看得懂图**（计划 §1-#3）
+        jdbc.update("update sys_model_config set capabilities = ? where id = ?",
+                "{\"stream\":true,\"vision\":true,\"contextWindow\":128000,\"supportSystemRole\":true}", chatId);
+        try {
+            // 真上传一张图（真字节 → 真落桶 → 真落库）。
+            // ⚠️ 走 `ChatAttachmentService#upload` 而不是 HTTP：本基座没有 HTTP 客户端
+            //    （`RetrievalFlowSupport` 直接继承 `Object`），而这里要验的是**编排**，
+            //    上传接口本身另有 `ChatAttachmentFlowTest` 覆盖。
+            String attachmentId = String.valueOf(attachmentService.upload(
+                    reader().getUserId(),
+                    new org.springframework.mock.web.MockMultipartFile(
+                            "file", "报价单截图.png", "image/png", PNG_1X1)).attachmentId());
+
+            // 第一轮：带图 + useVision=true ⇒ used_vision = 1
+            RecordingSink first = new RecordingSink();
+            chatStreamService.chat(reader(),
+                    new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
+                            List.of(attachmentId), Boolean.TRUE), first);
+
+            assertThat(first.error).as("能力闸放行了就不该再报错").isNull();
+            assertThat(first.done).isNotNull();
+            assertThat(first.done.usedVision())
+                    .as("`done.usedVision` 必须是**真值**（此前写死 false）")
+                    .isTrue();
+            assertThat(RetrievalTestStubs.LAST_IMAGES.get())
+                    .as("这条路上**真的把图带下去了** —— 这是整条兜底链路的意义所在，"
+                            + "而它在用例里本来不可见")
+                    .isEqualTo(1);
+            assertThat(RetrievalTestStubs.LAST_IMAGE_DETAIL.getFirst().mime())
+                    .as("MIME 一路带到底（猜错 MIME 的后果是模型收到解不开的图，"
+                            + "而现象与「没看懂」完全一样）")
+                    .isEqualTo("image/png");
+
+            Long sessionId = jdbc.queryForObject(
+                    "select session_id from sys_chat_message where id = ?", Long.class,
+                    Long.parseLong(first.done.messageId()));
+            assertThat(intOf(jdbc.queryForObject(
+                    "select used_vision from sys_chat_message where id = ?", Object.class,
+                    Long.parseLong(first.done.messageId()))))
+                    .as("需求 09 §4.7 的「记录」那一行")
+                    .isEqualTo(1);
+
+            // 第二轮：同一会话，**不带图** ⇒ used_vision = 0（上一轮不受影响）
+            RecordingSink second = new RecordingSink();
+            chatStreamService.chat(reader(),
+                    new ChatDtos.ChatRequest("那 A-200 呢", sessionId, null, null, null), second);
+            assertThat(second.done.usedVision()).isFalse();
+            assertThat(RetrievalTestStubs.LAST_IMAGES.get())
+                    .as("缺省 useVision ⇒ 不带图")
+                    .isZero();
+
+            List<Integer> flags = jdbc.queryForList(
+                    "select used_vision from sys_chat_message where session_id = ? and role = 'assistant' "
+                            + "order by id", Integer.class, sessionId);
+            assertThat(flags)
+                    .as("🔴 **只对该轮生效**（§4.7 原文）—— 会话级会让上一轮被覆盖成 1，"
+                            + "而「用描述 vs 用原图」的对比就做不出来了")
+                    .containsExactly(1, 0);
+        } finally {
+            jdbc.update("update sys_model_config set capabilities = ? where id = ?", original, chatId);
+            // 附件行按水位线删（`sys_chat_attachment` 没有 kb_id / doc_id 坐标 ⇒
+            // 基座的探针清理认不出它）。⚠️ 桶里那个对象由 `ProbeCleanup` 的
+            // `chat-attachments/` 前缀兜底收走（`T-O10`），不在这里手工删 ——
+            // 两处都删会出现"一行删了两次"的假象，反而看不清谁该负责
+            jdbc.update("delete from sys_chat_attachment where id > ?", attachmentFloor);
+        }
     }
 
     // ==================== 断连仍留痕 ====================

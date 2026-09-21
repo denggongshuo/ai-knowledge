@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 检索打点的**落库**那一半（`T-707` · `I-13` / `I-14`）。
@@ -53,6 +54,11 @@ public class RetrievalTraceWriter {
      *                            ⚠️ 不传 0 —— 那会把"没生成"记成"生成耗时 0ms"
      * @param totalMillis         端到端总耗时（检索 + 生成）。⚠️ 不是
      *                            {@link RetrievalTrace#totalMillis()} —— 那个只到检索为止
+     * @param citedRanks          答案里**实际出现的角标编号**（`T-804`）。
+     *                            ⚠️ **空集 = 没解析出角标**（含空召回、生成失败、模型没打角标），
+     *                            那时 `cited` 列写 {@code NULL} 而**不是 0** ——
+     *                            `0` 是一句关于内容的断言（"这条没被引用"），
+     *                            而"没解析出来"是"没采集到"。两者在页面上长得一样
      */
     public record TraceWrite(String traceId,
                              Long userId,
@@ -60,7 +66,8 @@ public class RetrievalTraceWriter {
                              Long messageId,
                              RetrievalResult result,
                              Long llmGenerationMillis,
-                             long totalMillis) {
+                             long totalMillis,
+                             Set<Integer> citedRanks) {
     }
 
     private static final String INSERT_TRACE = """
@@ -86,11 +93,30 @@ public class RetrievalTraceWriter {
                :missFlag, :rerankBeforeTop1, :top1Score, :chunkCount)
             """;
 
+    /**
+     * 分片明细的 `cited` 列（`T-804`）。
+     *
+     * <h3>🔴 为什么用一条 {@code CASE} 而不是"逐行算好再传参"</h3>
+     * <p>逐行算意味着把"第 i 条是不是被引用了"这个判断写在 Java 里，而**名次到角标的映射
+     * 在 `RetrievalTraceWriter` 这层是拿不到的** —— 它手里只有 {@code rankNo}（检索名次），
+     * 而角标是"喂给模型的第几条"。两者**当前恰好相同**（{@code ChatStreamService#prompt}
+     * 按列表顺序编号），但那是**另一处的约定**。写成 {@code CASE} 让这条 SQL 自己表达
+     * 「名次 ∈ 角标集合」，映射关系的唯一来源仍是 {@code CitationParser} + prompt。
+     *
+     * <h3>空集走 {@code NULL}，不走 0</h3>
+     * <p>{@code :citedRanks} 为空时整个 {@code in} 是空的 ⇒ 所有行都落到 {@code else} ——
+     * 若那个 {@code else} 是 0，就会把"这轮没解析出角标"记成"这轮一条都没被引用"。
+     * 所以用 {@code :hasCited} 这个布尔把两种情形分开：**没有角标信息 ⇒ 整列 NULL**。
+     * 与 `top1_score`/`rerank_before_top1` 同一条口径（"没测到"与"得了 0"是两件事）。
+     */
     private static final String INSERT_CHUNK = """
             insert into sys_retrieval_trace_chunk
               (trace_id, rank_no, chunk_id, doc_id, score, source, table_parent_id, cited)
             values
-              (:traceId, :rankNo, :chunkId, :docId, :score, :source, :tableParentId, null)
+              (:traceId, :rankNo, :chunkId, :docId, :score, :source, :tableParentId,
+               case when :hasCited = false then null
+                    when :rankNo in (:citedRanks) then 1
+                    else 0 end)
             """;
 
     /** 未命中沉淀（`T-A00`）—— 打点行写完之后按 `miss_flag` 派生池子那一步。 */
@@ -156,7 +182,7 @@ public class RetrievalTraceWriter {
                     .setParameter("chunkCount", chunks.size());
             insert.executeUpdate();
 
-            writeChunks(write.traceId(), chunks);
+            writeChunks(write.traceId(), chunks, write.citedRanks());
 
             // 🔴 顺序是**先打点、后沉淀**（`T-A00`）：沉淀自己开 `REQUIRES_NEW`。
             // 反过来先沉淀的话，打点一旦失败就留下"池子里有一行、打点里查不到"——
@@ -214,7 +240,12 @@ public class RetrievalTraceWriter {
      * <p>逐条 insert 而不是拼一条多值 INSERT：最多十几行，而拼串要处理转义与超长。
      * 这个量级下两种写法的耗时差在噪声里。
      */
-    private void writeChunks(String traceId, List<RetrievedChunk> chunks) {
+    private void writeChunks(String traceId, List<RetrievedChunk> chunks, Set<Integer> citedRanks) {
+        boolean hasCited = citedRanks != null && !citedRanks.isEmpty();
+        // 空集时传一个**非空的占位值**：`:citedRanks` 在 `in (...)` 里为空
+        // 会让整条 SQL 变成语法错误（不是“一行都不匹配”）。
+        // 而结果对不对由 `hasCited` 决定 —— 它为 false 时 `case` 第一支直接返 null。
+        List<Integer> ranks = hasCited ? List.copyOf(citedRanks) : List.of(-1);
         for (RetrievedChunk chunk : chunks) {
             Long chunkId = numericId(chunk.chunkId());
             if (chunkId == null) {
@@ -233,6 +264,8 @@ public class RetrievalTraceWriter {
                     .setParameter("score", chunk.score())
                     .setParameter("source", chunk.source().getCode())
                     .setParameter("tableParentId", table == null ? null : table.parentChunkId())
+                    .setParameter("hasCited", hasCited)
+                    .setParameter("citedRanks", ranks)
                     .executeUpdate();
         }
     }

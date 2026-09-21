@@ -1,4 +1,4 @@
-import type { ApiResponse } from '@/types'
+import type { ApiResponse, Citation } from '@/types'
 
 /**
  * 请求层 —— fetch 封装
@@ -200,7 +200,8 @@ export const http = {
 export interface SSEHandlers {
   /** 图片理解进度（V2 新增）：带图片时首包即 DESCRIBING */
   onAttachment?: (data: {
-    stage: 'DESCRIBING' | 'DONE'
+    /** `READING` = 直接读原图（`T-806`）—— **不调 VL**，与 `DESCRIBING` 是两件事 */
+    stage: 'DESCRIBING' | 'DONE' | 'READING'
     attachmentId: string
     desc?: string
     searchSummary?: string
@@ -216,6 +217,9 @@ export interface SSEHandlers {
     tokenUsage: unknown
     finishReason: string
     usedVision?: boolean
+    /** 答案**实际引用**的那几条（`T-804`）—— 按角标号升序。
+     *  ⚠️ 与 `onRetrieval` 的 `chunks` 是**两份不同的清单**（后者 = 检索找到的） */
+    citations?: Citation[]
   }) => void
   onError?: (message: string) => void
 }

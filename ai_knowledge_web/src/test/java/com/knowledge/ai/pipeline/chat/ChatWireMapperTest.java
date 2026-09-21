@@ -149,6 +149,56 @@ class ChatWireMapperTest {
         assertThat(trace.graphFallback()).isNull();
     }
 
+    // ==================== T-804 · 引用映射 ====================
+
+    @Test
+    @DisplayName("T-804：citations 按**角标号**升序，且 index 与 rankNo 是两个数")
+    void citationsAreOrderedByMarkerNumber() {
+        List<RetrievedChunk> chunks = List.of(
+                chunk("1001", 11L, 0.90, Map.of()),
+                chunk("1002", 22L, 0.80, Map.of()),
+                chunk("1003", 33L, 0.70, Map.of()));
+
+        // 答案里只打了 `[3]` 与 `[1]` —— 故意**逆序**，好让"按出现顺序返回"当场露馅
+        var citations = MAPPER.citations(java.util.Set.of(3, 1), chunks, Map.of(11L, "甲", 33L, "丙"));
+
+        assertThat(citations).hasSize(2);
+        assertThat(citations.get(0).index())
+                .as("按角标号**升序** —— 前端拿它渲染，顺序乱会让角标行读起来是乱的")
+                .isEqualTo(1);
+        assertThat(citations.get(1).index()).isEqualTo(3);
+        assertThat(citations.get(0).rankNo())
+                .as("角标 1 对应喂给模型的第 1 条 ⇒ 检索名次也是 1（本夹具里名次 = 列表下标 + 1）")
+                .isEqualTo(1);
+        assertThat(citations.get(0).chunkId()).isEqualTo(1001L);
+        assertThat(citations.get(0).docTitle()).isEqualTo("甲");
+        assertThat(citations.get(0).score()).isEqualTo(0.90);
+        assertThat(citations.get(1).chunkId()).isEqualTo(1003L);
+        assertThat(citations.get(1).docTitle()).isEqualTo("丙");
+    }
+
+    @Test
+    @DisplayName("T-804：角标越界时整条丢掉（解析器已滤过一遍，这里是它自己的契约）")
+    void outOfRangeMarkerIsDroppedHereToo() {
+        List<RetrievedChunk> chunks = List.of(chunk("1001", 11L, 0.9, Map.of()));
+
+        assertThat(MAPPER.citations(java.util.Set.of(1, 5), chunks, Map.of()))
+                .as("`5` 越界（只喂了 1 条）⇒ 丢掉。"
+                        + "⚠️ 解析器也会滤，但本方法的入参是公开的 —— "
+                        + "「越界即跳过」是**它自己**的契约，不该靠调用方守")
+                .hasSize(1);
+    }
+
+    @Test
+    @DisplayName("T-804：空角标集合 ⇒ 空清单（调用方据此让 cited 写 NULL）")
+    void emptyRanksYieldEmptyCitations() {
+        List<RetrievedChunk> chunks = List.of(chunk("1001", 11L, 0.9, Map.of()));
+
+        assertThat(MAPPER.citations(java.util.Set.of(), chunks, Map.of())).isEmpty();
+        assertThat(MAPPER.citations(null, chunks, Map.of())).isEmpty();
+        assertThat(MAPPER.citations(java.util.Set.of(1), List.of(), Map.of())).isEmpty();
+    }
+
     // ==================== 夹具 ====================
 
     private static RetrievalResult result(RetrievedChunk... chunks) {

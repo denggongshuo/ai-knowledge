@@ -110,6 +110,58 @@ public class ChatWireMapper {
     }
 
     /**
+     * **答案实际引用的那几条**（`T-804` · `done.citations[]`）。
+     *
+     * <h3>🔴 它与 {@link #firstPacket} 的 {@code chunks[]} 是**两份不同的清单**</h3>
+     * <p>{@code chunks[]} 答的是「系统**找到了**哪些材料」（按检索名次，最多前 5 条）；
+     * 本方法答的是「答案**真的用上了**哪几条」（按答案里的角标号）。
+     * 在 `T-804` 之前，前端是拿前者按 `i + 1` 拼出 `[1][2]` 的 ——
+     * 那让一个**没被引用**的分片也显示成 `[1]`，而用户看不出来。
+     *
+     * <h3>角标号 → 分片，靠"喂给模型的顺序"这一步</h3>
+     * <p>{@code ChatStreamService#prompt} 按 {@code chunks} 的**列表顺序**给资料编号
+     * （第 i 条写 `[i]`），所以角标 `n` 对应的就是 {@code chunks.get(n - 1)}。
+     * ⚠️ 这个映射**依赖"两处用同一个列表"** —— 若将来 prompt 改了排序（例如按分数重排），
+     * 这里必须同步改，否则角标会指向**另一条分片**，而它看起来完全正常。
+     * 判据见 `CitationTraceFlowTest`：拿真落库的 `rank_no` 与答案角标逐条对。
+     *
+     * @param citedRanks 答案里出现的角标号（**空集 = 没解析出角标** ⇒ 返回空列表，
+     *                   调用方据此让 `cited` 列写 {@code NULL} 而不是 0）
+     * @return **按角标号升序**的引用条目（不是按检索名次）
+     */
+    public List<ChatDtos.Citation> citations(Set<Integer> citedRanks, List<RetrievedChunk> chunks,
+                                             Map<Long, String> docTitles) {
+        if (citedRanks == null || citedRanks.isEmpty() || chunks == null || chunks.isEmpty()) {
+            return List.of();
+        }
+        List<ChatDtos.Citation> out = new ArrayList<>(citedRanks.size());
+        List<Integer> sorted = new ArrayList<>(citedRanks);
+        sorted.sort(Integer::compareTo);
+        for (Integer no : sorted) {
+            // 越界在 `CitationParser` 已经滤过一遍。这里再判一次不是重复：
+            // 本方法的入参是**公开的**（将来可能有人从别处调它），而"越界即跳过"
+            // 是它自己的契约，不该靠调用方守
+            if (no == null || no < 1 || no > chunks.size()) {
+                continue;
+            }
+            RetrievedChunk chunk = chunks.get(no - 1);
+            long chunkId;
+            try {
+                chunkId = Long.parseLong(chunk.chunkId());
+            } catch (NumberFormatException ex) {
+                // 与 `refs` 同一条口径：主键非数字的分片**整条丢掉**，
+                // 不猜一个 id 出来（错挂到别的分片上比少一条更糟）
+                log.warn("[问答] 引用条目的分片主键非数字，跳过：角标={} chunkId={}", no, chunk.chunkId());
+                continue;
+            }
+            out.add(new ChatDtos.Citation(no, chunk.rank(), chunk.docId(),
+                    docTitles.getOrDefault(chunk.docId(), ""), chunkId,
+                    chunk.score(), chunk.source().getCode()));
+        }
+        return List.copyOf(out);
+    }
+
+    /**
      * 9 段耗时，**按真实发生的先后**排（不是按 §9 的编号排）。
      *
      * <p>"先后"这件事对排查有用：面板从上往下读就是一次检索的时间线。

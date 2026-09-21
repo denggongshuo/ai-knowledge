@@ -1,11 +1,18 @@
 package com.knowledge.ai.service;
 
+import com.knowledge.ai.core.ai.ModelClientRegistry;
+import com.knowledge.ai.core.ai.ModelConfigJson;
+import com.knowledge.ai.core.ai.ModelConfigSpec;
+import com.knowledge.ai.core.enums.ModelType;
 import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.trace.TraceContext;
+import com.knowledge.ai.entity.SysModelConfig;
 import com.knowledge.ai.pipeline.chat.ChatDtos;
 import com.knowledge.ai.pipeline.chat.ChatSink;
 import com.knowledge.ai.pipeline.chat.ChatWireMapper;
+import com.knowledge.ai.pipeline.chat.CitationParser;
 import com.knowledge.ai.pipeline.chat.StreamingChatCaller;
 import com.knowledge.ai.pipeline.retrieve.RetrievalResult;
 import com.knowledge.ai.pipeline.retrieve.RetrievalService;
@@ -13,12 +20,15 @@ import com.knowledge.ai.pipeline.retrieve.RetrievalTrace;
 import com.knowledge.ai.pipeline.retrieve.RetrievalTraceWriter;
 import com.knowledge.ai.pipeline.retrieve.RetrievedChunk;
 import com.knowledge.ai.pipeline.vision.VisionResult;
+import com.knowledge.ai.repository.SysModelConfigRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 一轮问答的编排（`T-800` · `T-801` · `T-708`）。
@@ -72,6 +82,9 @@ public class ChatStreamService {
     private final ChatWireMapper wireMapper;
     private final RetrievalTraceWriter traceWriter;
     private final ChatAttachmentService chatAttachmentService;
+    /** `T-806` 的服务端能力闸要读 `capabilities`（见 {@link #requireVisionCapable()}）。 */
+    private final ModelClientRegistry modelClientRegistry;
+    private final SysModelConfigRepository modelConfigRepository;
 
     /**
      * 跑一轮问答。
@@ -95,18 +108,31 @@ public class ChatStreamService {
 
         // `T-907`：图片理解**串行阻塞在检索之前**（需求 `09` §4.9 的时序）。
         // 它必须在 appendUser 之后 —— 用户消息落的是**原问题**，不是合成 query
-        String searchQuery;
+        //
+        // `T-806`：`useVision=true` 时**改走"直接读原图"**（需求 `09` §4.7）——
+        // 不调 VL、query 就是原问题、原图随提示词一起给对话模型。两条路的分岔
+        // 收敛在下面这一个方法里（调用方不必知道走的是哪条）。
+        Attachments attachments;
         try {
-            searchQuery = understandAttachments(user, request, sink, question);
+            attachments = understandAttachments(user, request, sink, question);
         } catch (BizException ex) {
             // 附件不存在 / 不是你的：**不进链路**（§4.10 第 1 行的同一条处置），
             // 而不是"跳过这张图继续答" —— 静默忽略图片是 §4.10 点名的最糟处理
+            //
+            // 🔴 但"重新上传"这句**只对附件本身的问题成立**。同一个 catch 现在还会接住
+            //    `requireVisionCapable` 抛的能力错误（"模型不支持视觉"），
+            //    而给它接一句"请重新上传该图片"是**指错方向** —— 用户会去重传图片、
+            //    问题照旧。`S7-M06-C` 施工时被一条判据当场逮到（见计划 §8）。
+            //    判据：`NOT_FOUND`（附件）才有那句；能力错误（`PARAM_INVALID`）原样给出。
             log.warn("[问答] 附件校验未通过：userId={} 原因={}", user.getUserId(), ex.getMessage());
-            sink.error(ex.getMessage() + " —— 请重新上传该图片后再发送。");
+            String hint = ex.getErrorCode() == ErrorCode.NOT_FOUND
+                    ? " —— 请重新上传该图片后再发送。"
+                    : "";
+            sink.error(ex.getMessage() + hint);
             return;
         }
 
-        RetrievalResult result = retrievalService.search(user, searchQuery, null);
+        RetrievalResult result = retrievalService.search(user, attachments.query(), null);
         Map<Long, String> docTitles = wireMapper.loadDocTitles(result.chunks());
 
         sink.retrieval(wireMapper.firstPacket(result, docTitles));
@@ -116,6 +142,8 @@ public class ChatStreamService {
         StreamingChatCaller.Outcome outcome = null;
         String finishReason = FINISH_EMPTY_RECALL;
         boolean generated = false;
+        // 默认空集（不是 null）：空召回与生成失败都会走到收尾，那时"没有引用"是事实
+        Set<Integer> citedRanks = Set.of();
 
         try {
             if (result.empty()) {
@@ -128,6 +156,7 @@ public class ChatStreamService {
                 generated = true;
                 long genStart = System.nanoTime();
                 outcome = streamingChatCaller.stream(prompt(question, result.chunks()),
+                        attachments.images(),
                         piece -> {
                             answer.append(piece);
                             // ⚠️ 客户端已断开时**只是不再发**，循环照常跑完：
@@ -139,6 +168,10 @@ public class ChatStreamService {
                         });
                 llmMillis = elapsedMillis(genStart);
                 finishReason = outcome.finishReason();
+                // `T-804`：**角标只在"真的调过模型"的那条路上才有意义** ——
+                // 空召回的兜底话术里没有角标，`chunkCount` 也是 0，
+                // 走同一条解析只会得到空集（无害，但没必要）
+                citedRanks = CitationParser.parse(answer.toString(), result.chunks().size());
             }
         } catch (RuntimeException ex) {
             // 生成失败**不吞**：用户必须看见"这次没答上来"以及能做什么（`G4-3`）
@@ -149,17 +182,39 @@ public class ChatStreamService {
             sink.error(note);
         } finally {
             finish(user.getUserId(), result, docTitles, sink, sessionId, traceId,
-                    answer.toString(), outcome, llmMillis, finishReason, generated, startNanos);
+                    answer.toString(), outcome, llmMillis, finishReason, generated, startNanos,
+                    citedRanks, attachments.usedVision());
         }
     }
 
     /**
-     * 图片理解（`T-907` · 需求 `09` §4.9/§4.5）。
+     * 图片处理（`T-907` + `T-806` · 需求 `09` §4.9/§4.5/§4.7）—— **两条路的分岔点**。
      *
-     * <h3>事件顺序</h3>
+     * <h3>两条路互斥，而不是叠加</h3>
+     * <ul>
+     *   <li><b>默认链路</b>（`useVision != true`）：调 VL 出描述 → 合成 query → 检索 → 生成。
+     *       原图**不进**对话模型。</li>
+     *   <li><b>兜底链路</b>（`useVision == true`，§4.7）：**不调 VL**、query 就是原问题、
+     *       原图随提示词一起给对话模型。</li>
+     * </ul>
+     * §4.7 的原文是「默认链路保持解耦与低成本，但精度上限没有丢 ——
+     * **只在真正需要时才付 vision 的代价**」。所以若在 `useVision=true` 时仍先跑一遍 VL 描述，
+     * 用户点这个按钮要**先白等 40~60 秒**（真 VL 实测，`#179`），而那段描述**根本没被用上**。
+     *
+     * <h3>🔴 能力闸放在服务端，不只在页面上</h3>
+     * <p>前端 {@code ChatView.vue#canReadOriginal} 已按 {@code capabilities.vision} 置灰按钮，
+     * 但**置灰不是约束** —— 任何人可以带 {@code useVision: true} 直接打这个端点。
+     * §4.7 把前置写成一条规则，规则就要在服务端成立。
+     *
+     * <h3>为什么"不支持"是拒，而不是"退回描述链路"</h3>
+     * <p>退回描述链路会**悄悄花掉 40~60 秒并给出一个不含图的答案**，而用户明确要求过看图 ——
+     * 那正是 §4.10 点名的最糟处理（"用户以为模型看到了图，实际没有"）。
+     * 拒的代价是用户多点一次，收益是"这件事可见"。
+     *
+     * <h3>事件顺序（默认链路）</h3>
      * <pre>
      *   attachment{DESCRIBING} × N   ← 逐张先报"正在理解"
-     *   …（VL 调用，1~3s，串行阻塞）…
+     *   …（VL 调用，串行阻塞）…
      *   attachment{DONE} × N         ← 逐张报结果（成功与降级都发，由 degraded 区分）
      *   retrieval                    ← 此时 query 已含 searchSummary
      * </pre>
@@ -174,16 +229,34 @@ public class ChatStreamService {
      * 存的是**合成 query**，而 `FR-SYS-03` §3.2 把那一列定义为「用户**原始**问法（不归一化）」。
      * 原始问题**没有丢** —— 它在 {@code sys_chat_message.content} 里（{@link ChatSessionService#appendUser}
      * 落的是原文）。§4.5 原本还要求「同时记录仅文字 query 与合成 query **两路**的召回结果」，
-     * 本批未做（做第二趟完整检索会让每次带图提问的检索耗时翻倍，见计划 §3.4 假设 3）。
+     * 本批未做（做第二趟完整检索会让每次带图提问的检索耗时翻倍）。
+     * ⚠️ **兜底链路不合成** —— 那时没有 VL 描述，query 就是原问题，逐字不变。
      *
-     * @return 实际送去检索的 query（无附件时**就是原问题**，逐字不变）
+     * @return 送检的 query + 本轮是否走原图 + 要随提示词给模型的图（**默认链路恒为空**）
+     * @throws BizException 附件不存在 / 不是你的；或 `useVision` 而模型未声明支持视觉
      */
-    private String understandAttachments(LoginUser user, ChatDtos.ChatRequest request, ChatSink sink,
-                                         String question) {
+    private Attachments understandAttachments(LoginUser user, ChatDtos.ChatRequest request, ChatSink sink,
+                                              String question) {
         List<String> ids = request.attachmentIds();
         if (ids == null || ids.isEmpty()) {
-            return question;
+            return new Attachments(question, List.of(), false);
         }
+        if (Boolean.TRUE.equals(request.useVision())) {
+            requireVisionCapable();
+            for (String id : ids) {
+                // 这一条路上**不发** `DESCRIBING` —— 它说的是"VL 正在描述"，
+                // 而本轮不调 VL。发了就是一句假进度，比不发更糟（让人以为在等 VL）
+                sink.attachment(ChatDtos.AttachmentEvent.reading(id));
+            }
+            List<ChatAttachmentService.Original> originals =
+                    chatAttachmentService.originals(user.getUserId(), ids);
+            List<StreamingChatCaller.ChatImage> images = new ArrayList<>(originals.size());
+            for (ChatAttachmentService.Original original : originals) {
+                images.add(new StreamingChatCaller.ChatImage(original.bytes(), original.mime()));
+            }
+            return new Attachments(question, images, true);
+        }
+
         for (String id : ids) {
             sink.attachment(ChatDtos.AttachmentEvent.describing(id));
         }
@@ -208,7 +281,54 @@ public class ChatStreamService {
         // 降级 / 无描述时 summary 为空 ⇒ 检索仍按原问题走。
         // 刻意不在那时拼一个空串：`"问题 "` 与 `"问题"` 对向量化是不同的输入，
         // 而它换不来任何好处（多一个尾随空格只会让排查时分不清是哪种情形）
-        return summary.isEmpty() ? question : question + " " + summary;
+        String query = summary.isEmpty() ? question : question + " " + summary;
+        return new Attachments(query, List.of(), false);
+    }
+
+    /**
+     * `useVision` 的前置：当前**启用的对话模型**必须声明支持视觉（需求 `09` §4.7）。
+     *
+     * <p>⚠️ 读的是 {@code sys_model_config.capabilities.vision}，**不是** VL 模型的能力 ——
+     * §4.7 的原文是「当前**对话模型** {@code capabilities.vision = true}」。
+     * 两者是不同的模型、不同的配置行：VL 那个是"生成描述"的，这个才是"看原图"的。
+     *
+     * @throws BizException 该模型未声明 vision（含"查不到那一行"与"引导期没有数字 id"两种情形）
+     */
+    private void requireVisionCapable() {
+        ModelConfigSpec spec = modelClientRegistry.activeSpec(ModelType.CHAT);
+        if (ModelConfigJson.readVision(capabilitiesOf(spec.id()))) {
+            return;
+        }
+        throw BizException.of(ErrorCode.PARAM_INVALID,
+                "当前对话模型「" + spec.model() + "」未声明支持视觉（capabilities.vision），"
+                        + "因此不能把原图直接交给它。请去掉「直接读原图」后重试，"
+                        + "或到「模型配置」页把该模型的「视觉」能力打开（前提是它确实支持）。");
+    }
+
+    /**
+     * 取某条模型配置的 `capabilities` JSON。
+     *
+     * <p>⚠️ **查不到就返回 {@code null}** ⇒ 读侧按默认值 `false` 处理。
+     * 不抛：能力闸的失败形态是"拒绝并把原因说清"，而不是一个 500 ——
+     * 后者会让用户以为系统坏了，而不是"这个模型不支持"。
+     */
+    private String capabilitiesOf(String specId) {
+        if (specId == null) {
+            return null;
+        }
+        try {
+            return modelConfigRepository.findById(Long.valueOf(specId.strip()))
+                    .map(SysModelConfig::getCapabilities)
+                    .orElse(null);
+        } catch (NumberFormatException ex) {
+            // 引导配置的 id 是 `bootstrap-chat`（非数字），它没有 `capabilities` 行 ——
+            // 与 `#161`/`#138` 那族"引导期没有数字主键"同一条限制
+            return null;
+        }
+    }
+
+    /** {@link #understandAttachments} 的产出：送检 query + 本轮是否读原图 + 随提示词的图。 */
+    private record Attachments(String query, List<StreamingChatCaller.ChatImage> images, boolean usedVision) {
     }
 
     /**
@@ -216,11 +336,15 @@ public class ChatStreamService {
      *
      * <p>顺序是有意的：**先发终包再落库**，用户看到的时间线不会因为写库而卡一下；
      * 而 `done` 必须最后发 —— 它带着 {@code messageId}，那个 id 要等消息行落完才有。
+     *
+     * @param citedRanks 答案里实际出现的角标编号（`T-804`）；**空集 = 没解析出角标**
+     *                   ⇒ 打点明细的 `cited` 写 {@code NULL} 而不是 0（见 `CitationParser`）
      */
     private void finish(Long userId, RetrievalResult result, Map<Long, String> docTitles, ChatSink sink,
                         long sessionId, String traceId, String answer,
                         StreamingChatCaller.Outcome outcome, Long llmMillis,
-                        String finishReason, boolean generated, long startNanos) {
+                        String finishReason, boolean generated, long startNanos,
+                        Set<Integer> citedRanks, boolean usedVision) {
         long totalMillis = elapsedMillis(startNanos);
 
         sink.retrieval(wireMapper.finalPacket(result, docTitles,
@@ -230,24 +354,26 @@ public class ChatStreamService {
                 outcome == null ? null : outcome.modelId(),
                 outcome == null ? null : outcome.modelName(),
                 outcome == null ? null : outcome.tokenUsage(),
-                finishReason, traceId);
+                finishReason, traceId, usedVision);
 
         traceWriter.write(new RetrievalTraceWriter.TraceWrite(traceId, userId, sessionId, assistantId,
                 result,
                 // ⚠️ 没生成就给 null（空召回 / 生成前失败）—— 填 0 会把"没生成"
                 // 记成"生成耗时 0ms"，那是 `G5-12` 要读的列
                 llmMillis,
-                totalMillis));
+                totalMillis,
+                citedRanks));
 
         sink.done(new ChatDtos.DoneEvent(String.valueOf(assistantId),
                 outcome == null ? null : outcome.modelId(),
                 outcome == null ? null : outcome.modelName(),
                 outcome == null ? null : outcome.tokenUsage(),
                 finishReason,
-                // `T-907` 已接图片理解（描述链路），但**「直接读原图」仍未做** ——
-                // 那是需求 §4.7 的独立入口，前置是「当前对话模型 capabilities.vision = true」
-                // 且只对该轮生效，属 `T-806`。本批如实回 false，不假装
-                false));
+                usedVision,
+                // `T-804`：**按角标序**的引用条目 —— 与 `retrieval.chunks[]`（按检索名次）
+                // 是两份不同的清单。前端拿它渲染"答案真的引用了哪几条"，
+                // 点角标能定位到分片；而 `chunks[]` 渲染的是"系统找到了哪些材料"。
+                wireMapper.citations(citedRanks, result.chunks(), docTitles)));
 
         log.info("[问答] 完成：traceId={} 会话={} 分片={} 生成={} 耗时={}ms（其中生成 {}ms）",
                 traceId, sessionId, result.chunks().size(),
@@ -292,13 +418,24 @@ public class ChatStreamService {
     private static String prompt(String question, List<RetrievedChunk> chunks) {
         StringBuilder sb = new StringBuilder();
         sb.append("请根据下面提供的资料回答问题。\n")
-                .append("如果资料中没有足够信息，请明确回答「资料中未找到相关内容」，不要凭常识补充或编造。\n\n")
+                .append("如果资料中没有足够信息，请明确回答「资料中未找到相关内容」，不要凭常识补充或编造。\n")
+                // 🔴 `T-804`：角标必须在 prompt 里被**要求**过。
+                //    此前从头到尾没提过角标，模型**没有理由**输出 `[1]` ——
+                //    而前端那个 `[1][2]` 是按 `i + 1` 自己拼的（渲染的是"喂给了模型
+                //    哪些分片"，不是"答案引用了哪几条"）。改这一行会**影响全部问答**
+                //    （含无引用的普通提问），故它单独一条判据（见计划 §6+7 判据 2/6）。
+                .append("凡是用到了某条资料的论断，请在句末标注该资料的编号，形如 [1]；")
+                .append("同一句用了多条就依次标注，形如 [1][3]。没有资料支撑的话不要标注。\n\n")
                 .append("【资料】\n");
         int index = 1;
         for (RetrievedChunk chunk : chunks) {
-            sb.append("(").append(index++).append(") ");
+            // ⚠️ 编号用**半角方括号**（与角标同形，这是有意的：模型看到 `[1]` 才会照着打 `[1]`）。
+            //    正因如此，标题路径**必须换一种括号** —— 两处都用 `[...]` 时，
+            //    一个形如 `[12]` 的标题路径会被 `CitationParser` 解析成"引用了第 12 条"，
+            //    而那是一条**假引用**，且它在页面上看起来完全正常。
+            sb.append("[").append(index++).append("] ");
             if (chunk.titlePath() != null && !chunk.titlePath().isBlank()) {
-                sb.append("[").append(chunk.titlePath().replace('\n', ' ')).append("] ");
+                sb.append("（").append(chunk.titlePath().replace('\n', ' ')).append("）");
             }
             sb.append(chunk.content()).append("\n\n");
         }
