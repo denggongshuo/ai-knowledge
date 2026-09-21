@@ -13,6 +13,16 @@ coverage/
 .codegraph/
 temp/
 
+# Codex 的镜像配置与草稿（本机另有 Codex 在用，不入库）：
+# 根 AGENTS.md 与根 CLAUDE.md 内容等价、.agents/skills/ 与 .claude/skills/ 同名同内容，
+# 但入库会得到两份会漂移的规则副本（实测 sprint-delivery 已漂）。规则唯一副本 = 根 CLAUDE.md。
+# 路径必须**锚到根**：`scripts/` 不加斜杠会连带忽略 ai_knowledge_app/scripts/（那是有用的 E2E 脚本）。
+/AGENTS.md
+/.agents/
+
+# 本机 relay 排查脚本与代理抓包（scripts/claude-token-stats.py 等，全仓零引用）
+/scripts/
+
 # 绘图用的 mermaid 本地副本（3.5MB 压缩产物，按需联网补，见 ai_knowledge_app/scripts/gen-diagram.mjs 顶部）
 ai_knowledge_app/scripts/vendor/
 
