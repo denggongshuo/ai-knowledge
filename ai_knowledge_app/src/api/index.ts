@@ -1,5 +1,5 @@
 import { http, chatStream, type SSEHandlers } from './request'
-import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DocVersionDiff, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
+import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DocVersionDiff, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, RecycleType, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
 
 /** 认证接口 */
 export const authApi = {
@@ -303,13 +303,21 @@ export const noticeApi = {
 export const recycleApi = {
   items: (query?: { type?: string; keyword?: string; page?: number; size?: number }) =>
     http.get<{ list: RecycleItem[]; total: number; keepDays: number }>('/recycle/items', query),
-  /** 恢复：文档恢复后需重建索引；知识库恢复连带其下全部文档 */
-  restore: (body: { ids: number[]; targetKbId?: number }) =>
+  /**
+   * 恢复：文档恢复后需重建索引；知识库恢复连带其下全部文档。
+   *
+   * 🔴 `type` **必填** —— `sys_document.id` 与 `sys_kb.id` 是两个独立的自增序列，
+   * 光凭一个 `ids` 列表无法判定它指的是文档还是知识库（id=5 可能两者都有）。
+   * 服务端按 `type` 分派，混用会报 `10030`。
+   */
+  restore: (body: { type: RecycleType; ids: number[]; targetKbId?: number }) =>
     http.post<{ restored: number; needReindex: boolean; affectedDocs: number; targetKbId: number | null; note: string }>(
       '/recycle/restore',
       body,
     ),
-  remove: (ids: number[]) => http.delete<{ deleted: number }>('/recycle/items', { ids }),
+  /** 彻底删除（不可逆）。⚠️ 同样必须带 `type`，理由见 `restore`。 */
+  remove: (type: RecycleType, ids: number[]) =>
+    http.delete<{ deleted: number }>('/recycle/items', { type, ids }),
   clearAll: () => http.delete<{ cleared: number }>('/recycle/all'),
   cleanup: () => http.post<{ cleaned: number; note: string }>('/recycle/cleanup'),
 }

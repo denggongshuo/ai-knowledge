@@ -222,6 +222,70 @@ class ProbeArtifactCoverageTest extends ApiTestSupport {
                 .containsExactlyInAnyOrderElementsOf(ProbeArtifacts.NON_TABLE);
     }
 
+    /**
+     * `T-O28` 那一族的**第二处**：MinIO 前缀清单**两侧对账**。
+     *
+     * <h3>为什么这条闸必须有（而不是"记得两边都改"）</h3>
+     * <p>MinIO 的归属有两套完全不同的口径，各自有一份清单：
+     * <ul>
+     *   <li><b>Java 侧</b>{@code ProbeCleanup.MINIO_PREFIXES}（九个）—— 归属是
+     *       <b>库里的列</b>或<b>路径里的 userId</b>，兜底扫描用它；</li>
+     *   <li><b>脚本侧</b>{@code probe-teardown.mjs} 的 {@code USER_MINIO_PREFIXES} ——
+     *       那些**不挂在任何探针库下**、只能按 `{前缀}{userId}/…` 单独收的。</li>
+     * </ul>
+     * <p>🔴 第二份**没有任何机器检查**，而它已经漏过一次：`S7-M06-E` 新造了
+     * `batch-download/` 与 `doc-export/`，脚本侧这两个是**事后补的**
+     * （`probe-teardown.mjs` 里那行注释原话：「新前缀当时只加进了 Java 侧的登记表，
+     * 脚本侧这个函数漏了 —— 而'脚本侧漏了'的表现是 **E2E 每跑一轮桶里多几个对象**，
+     * 且没有任何闸会点名」）。
+     * <p>⚠️ 漏了**不报错**：`ls` 一个不存在的目录就是空输出 ⇒ 清理"成功"、对象一个没少。
+     * 所以这里两条方向都要对：
+     * <ol>
+     *   <li><b>脚本侧 → Java</b>：逐条必须被 Java 认识（拼错/改名 ⇒ 脚本侧清理变成空操作）；</li>
+     *   <li><b>Java（`Owner.PATH_USER_ID`）→ 脚本侧**：一个都不能漏 ——
+     *       那四个前缀的 Java 兜底**只在"账号行已经没了"时才扫得到**，
+     *       账号还在的时候它们**只**能靠脚本侧收。</li>
+     * </ol>
+     */
+    @Test
+    @DisplayName("MinIO 前缀两侧对账：脚本侧 USER_MINIO_PREFIXES 与 Java 的「路径即归属」逐条相等且无拼错")
+    void minioPrefixListsAgreeWithTheScriptSide() throws Exception {
+        Path script = Path.of("..", "ai_knowledge_app", "scripts", "lib", "probe-teardown.mjs");
+        assertThat(Files.exists(script))
+                .as("找不到脚本侧登记表：%s —— 本仓是 monorepo，两边必须能互相看见", script.toAbsolutePath())
+                .isTrue();
+        String text = Files.readString(script, StandardCharsets.UTF_8);
+
+        Matcher block = Pattern.compile("export const USER_MINIO_PREFIXES = \\[([^\\]]*)\\]")
+                .matcher(text);
+        assertThat(block.find())
+                .as("在 probe-teardown.mjs 里找不到 `USER_MINIO_PREFIXES = [...]` 这一段 —— "
+                        + "它改名了？那这条对账会静默失效（恒通过的闸比没有闸危险，见 `#136`）")
+                .isTrue();
+        Set<String> scriptPrefixes = new LinkedHashSet<>();
+        Matcher one = Pattern.compile("'([^']+)'").matcher(block.group(1));
+        while (one.find()) {
+            scriptPrefixes.add(one.group(1));
+        }
+        // 防空断言：解析写错时这里会是 0 个，而下面两条 `containsAll` 对空集**恒真**
+        assertThat(scriptPrefixes)
+                .as("从脚本侧一个前缀都没解出来 —— 这条对账会变成空断言")
+                .hasSizeGreaterThanOrEqualTo(3);
+
+        assertThat(ProbeCleanup.coveredMinioPrefixes())
+                .as("脚本侧写了 Java 侧不认识的前缀（%s）—— 那种拼错的后果是 `teardownUserProbe` "
+                        + "一个对象都删不到，**而且不报错**（`ls` 一个不存在的目录是空输出）",
+                        scriptPrefixes)
+                .containsAll(scriptPrefixes);
+
+        assertThat(scriptPrefixes)
+                .as("这些前缀在 Java 侧是 `Owner.PATH_USER_ID`，脚本侧却没有 ⇒ 用探针账号造出来的"
+                        + "那些对象要靠下一轮 `mvn test` 的 Java 兜底才被扫走"
+                        + "（`T-O19` 那条「会造行的脚本自己不清」的同形）。Java 侧当前是：%s",
+                        ProbeCleanup.pathUserIdPrefixes())
+                .containsAll(ProbeCleanup.pathUserIdPrefixes());
+    }
+
     @Test
     @DisplayName("清理器与登记表对得上：按 kb/user 删的那些表名都在登记表里")
     void cleanupTargetsAreRegistered() {

@@ -4,11 +4,15 @@ import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
 import io.minio.GetObjectArgs;
 import io.minio.GetPresignedObjectUrlArgs;
+import io.minio.ListObjectsArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
+import io.minio.RemoveObjectArgs;
+import io.minio.Result;
 import io.minio.StatObjectArgs;
 import io.minio.StatObjectResponse;
 import io.minio.http.Method;
+import io.minio.messages.Item;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -79,6 +83,15 @@ public class DocStorage {
 
     /** 对象名前缀。 */
     private static final String PREFIX = "documents/";
+
+    /**
+     * 解析产物的对象名前缀（`T-502`）。
+     *
+     * <p>⚠️ 提成常量是 `T-616` 顺手做的：原来它是 {@code storeArtifact} 里的一个字面量，
+     * 而库级彻底删除（要按前缀整块删）需要**同一个值**。两处各写一遍字面量的话，
+     * 改了其中一处就会让"删掉的"与"写下的"不是同一批对象 —— 那是**删不干净的静默形态**。
+     */
+    private static final String ARTIFACT_PREFIX = "parsed/";
 
     /**
      * 打包下载产物的对象名前缀（`T-614`）。
@@ -339,7 +352,7 @@ public class DocStorage {
      * @return 可直接写入 {@code sys_document.parse_path} 的对象名
      */
     public String storeArtifact(long kbId, long docId, String name, byte[] bytes) {
-        String objectKey = "parsed/" + kbId + "/" + docId + "/" + safeName(name);
+        String objectKey = ARTIFACT_PREFIX + kbId + "/" + docId + "/" + safeName(name);
         try (InputStream in = new java.io.ByteArrayInputStream(bytes)) {
             minioClient.putObject(PutObjectArgs.builder()
                     .bucket(bucket)
@@ -419,12 +432,83 @@ public class DocStorage {
 
     /** 删除对象（文档被彻底删除时用）。**当前无调用方** —— `T-616` 起接入。 */
     public void remove(String objectKey) {        try {
-            minioClient.removeObject(io.minio.RemoveObjectArgs.builder()
+            minioClient.removeObject(RemoveObjectArgs.builder()
                     .bucket(bucket).object(objectKey).build());
         } catch (Exception ex) {
             // 与 sizeOf 同一取舍：删不掉不该让业务失败（对象存储有生命周期规则兜底）
             log.warn("删除对象失败：object={} err={}", objectKey, ex.getMessage());
         }
+    }
+
+    /**
+     * **按前缀**删掉一批对象，返回实际删掉的个数（`T-616` 的库级彻底删除用）。
+     *
+     * <h3>为什么需要它 —— 与 {@link #remove(String)} 的分工</h3>
+     * <p>库级彻底删除要清的是一整块：`documents/{kbId}/**` 与 `parsed/{kbId}/**`
+     * （`O7` 规则表的第 ②/⑥ 列：源文件与解析产物**都删**）。
+     * 那时**文档行也一起没了** ⇒ 没法再枚举 `storage_path` 逐个删，只能按前缀扫。
+     *
+     * <p>⚠️ 与之相对，**文档级**彻底删除**继续用 {@link #remove(String)} 逐个删**
+     * （路径就在那一行里，精确删比按前缀扫更安全）—— 别为了"统一"把精确的那条也换掉。
+     *
+     * <h3>🔴 它与 {@code remove} 的取舍**刻意相反**：失败要抛</h3>
+     * <p>{@code remove} 吞异常是因为它在"尽力而为"的路径上（对象存储有生命周期规则兜底）。
+     * 而这里**必须让调用方知道没删掉**：需求 `06` §7.9 的原话是「清理失败会造成**存储泄漏**」
+     * —— 把失败吞成 warn，用户会以为空间已经释放了，而实际上一个字节都没少。
+     *
+     * <p>⚠️ **调用方必须遵守的顺序**：先删对象与向量、**再删数据库行**。
+     * 反过来（先删行）一旦对象删除失败，那些对象的唯一线索（`storage_path`）就没了
+     * ⇒ 它们变成**谁也找不到的孤儿**，正是本仓反复清的那一族。
+     * 按这个顺序，失败时行还在、用户重试即可（MinIO 的 remove 对不存在的键是幂等的）。
+     *
+     * @param prefix 带斜杠的前缀，如 {@code documents/123/}；**不接受空串或裸斜杠**
+     *               （那等于"删掉整个桶"，而调用方绝不会有这个意图 —— 拦在这里比事后追悔便宜）
+     * @return 实际删掉的对象个数
+     */
+    public int removePrefix(String prefix) {
+        if (prefix == null || prefix.isBlank() || "/".equals(prefix.trim())) {
+            // ⚠️ 空前缀在 listObjects 里等于"列出全桶" ⇒ 传错就是灭顶之灾。
+            //    这不是"防御性编程"，是这个参数的**误用后果与后果的不可逆性**不成比例。
+            throw new BizException(ErrorCode.PARAM_INVALID, "对象前缀不能为空");
+        }
+        int removed = 0;
+        try {
+            for (Result<Item> result : minioClient.listObjects(ListObjectsArgs.builder()
+                    .bucket(bucket).prefix(prefix).recursive(true).build())) {
+                minioClient.removeObject(RemoveObjectArgs.builder()
+                        .bucket(bucket).object(result.get().objectName()).build());
+                removed++;
+            }
+        } catch (Exception ex) {
+            log.error("按前缀删除对象失败（已删 {} 个后中断）：prefix={} err={}",
+                    removed, prefix, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR,
+                    "文件清理失败（已清理 " + removed + " 个），请稍后重试");
+        }
+        log.info("按前缀删除对象完成：prefix={} removed={}", prefix, removed);
+        return removed;
+    }
+
+    // ==================== 库级前缀（`T-616`）====================
+
+    /**
+     * 某个知识库的**源文件**前缀 —— 库级彻底删除时按它整块清（`T-616`）。
+     *
+     * <p>⚠️ 与 {@link #kbParsedPrefix} 一起，是本类**唯一**两处"按前缀删一大片"的输入。
+     * 给出它们而不是让调用方自己拼字符串：拼错一个字符的后果是
+     * **一个字节都没删掉而调用方以为删了**（`removePrefix` 只认字面量匹配，
+     * 前缀对不上就一个对象都列不出来，且**不报错** —— 那是静默失败）。
+     *
+     * <p>⚠️ 末尾**必须带斜杠**：不带的话 `documents/12/` 会匹配到 `documents/123/...`
+     * —— 删 A 库的文件顺手删掉 B 库的，且没有任何迹象。
+     */
+    public static String kbDocPrefix(long kbId) {
+        return PREFIX + kbId + "/";
+    }
+
+    /** 某个知识库的**解析产物**前缀（同上）。 */
+    public static String kbParsedPrefix(long kbId) {
+        return ARTIFACT_PREFIX + kbId + "/";
     }
 
     // ==================== 打包下载（`T-614`）====================

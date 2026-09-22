@@ -406,9 +406,109 @@ public class DocService {
                     // 直接 `((Number) r[15])` 会抛 ClassCastException，而它的表现是
                     // **整个文档列表接口 500**（实测踩到）—— 一个"列的类型"问题炸掉了一整页。
                     // 两种都收下：驱动版本/连接参数一变就会在两个之间切，而这里没有理由挑边。
-                    boolOf(r[15])));
+                    boolOf(r[15]),
+                    // `T-612`：按库的列表**不填** kbId/kbName（它们只服务跨库那条）
+                    null, null));
         }
         return new DocDtos.DocPage(list, total, list.size());
+    }
+
+    // ==================== T-612 · 跨库文档列表 ====================
+
+    /**
+     * {@code GET /api/doc/all} —— **跨库**文档列表（全站口径，行含 {@code kbId}/{@code kbName}）。
+     *
+     * <h3>它与 {@link #page} 的关系</h3>
+     * <p>同一份行投影、同一个取数口径（{@code total} 也是"满足条件的总数"），
+     * 差别只有两条：**加了 kb 的 join**（要它的名字）与**范围从"一个库"变成"所有可见的库"**。
+     * 复用同一个 {@code DocDtos.DocRow} 是刻意的 —— 两套行声明必然各自演化。
+     *
+     * <h3>🔴 可见性必须落在 SQL 里</h3>
+     * <p>用 {@code DataScopeService#kbVisibility} 的片段拼进 where，**不是**查回来再在内存里筛：
+     * 后者一旦有人改了分页，筛的顺序与 limit 的关系就会让"翻到第 2 页才看见不该看的"。
+     * 而且这条片段自带 {@code k.deleted_at IS NULL}（软删的库恒不可见）与"账号停用恒不可见"
+     * ⇒ 本方法**不再重复写**那两个条件（同一句话写两遍就是多一个漏掉的机会）。
+     *
+     * <h3>⚠️ 列表里会出现**归档版本**（与 {@code /kb/{kbId}/docs} 一致）</h3>
+     * <p>两条列表都**没有** {@code is_current = 1} 过滤。这是沿用现状而不是本批的决定：
+     * "库文档列表要不要列归档版本"是 `S7-M06-D` §9 D-③ 记下的**待产品确认**项。
+     * 本批**刻意不给跨库这一条单独加过滤** —— 加了会让两处口径分叉，而分叉的表现是
+     * "同一个库，在上传页看到 5 篇、在下载页看到 3 篇"。已登记为遗留。
+     */
+    @Transactional(readOnly = true)
+    public DocDtos.AllDocPage allDocs(String keyword, String kbId, String type,
+                                      Integer page, Integer size) {
+        LoginUser user = LoginUserContext.require();
+        DataScopeService.ScopeCondition cond = dataScopeService.kbVisibility(user);
+
+        Map<String, Object> params = new HashMap<>(cond.params());
+        // 拼接处保留前导空格（B1 §8.1 实测过 `andEXISTS` 那个坑）
+        StringBuilder where = new StringBuilder(" where d.deleted_at is null and " + cond.sql());
+        if (keyword != null && !keyword.isBlank()) {
+            where.append(" and (d.title like :kw or d.file_name like :kw)");
+            params.put("kw", "%" + keyword.trim() + "%");
+        }
+        if (kbId != null && !kbId.isBlank() && !"all".equals(kbId)) {
+            where.append(" and d.kb_id = :filterKbId");
+            params.put("filterKbId", parseIdOrFail(kbId, "知识库"));
+        }
+        if (type != null && !type.isBlank() && !"all".equals(type)) {
+            where.append(" and d.type = :filterType");
+            params.put("filterType", type.trim().toUpperCase(Locale.ROOT));
+        }
+
+        int pageSize = size == null || size <= 0 ? DEFAULT_PAGE_SIZE : Math.min(size, 200);
+        int offset = Math.max(0, (page == null || page <= 0 ? 1 : page) - 1) * pageSize;
+
+        Query countQuery = entityManager.createNativeQuery(
+                "select count(*) from sys_document d join sys_kb k on k.id = d.kb_id" + where);
+        params.forEach(countQuery::setParameter);
+        long total = ((Number) countQuery.getSingleResult()).longValue();
+
+        Query query = entityManager.createNativeQuery("""
+                        select d.id, d.title, d.type, d.size_bytes, d.chunk_count, d.status,
+                               d.table_total, d.table_parsed, d.image_total, d.image_parsed,
+                               d.pages_total, d.pages_with_text,
+                               u.real_name, d.created_at,
+                               d.scan_status, d.has_macro,
+                               k.id, k.name
+                        from sys_document d
+                        join sys_kb k on k.id = d.kb_id
+                        left join sys_user u on u.id = d.owner_id
+                        """ + where + " order by d.id desc limit :limit offset :offset");
+        params.forEach(query::setParameter);
+        query.setParameter("limit", pageSize);
+        query.setParameter("offset", offset);
+
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = query.getResultList();
+        List<DocDtos.DocRow> list = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            list.add(new DocDtos.DocRow(
+                    ((Number) r[0]).longValue(), (String) r[1], (String) r[2],
+                    ((Number) r[3]).longValue(), ((Number) r[4]).longValue(), (String) r[5],
+                    ((Number) r[6]).longValue(), ((Number) r[7]).longValue(),
+                    ((Number) r[8]).longValue(), ((Number) r[9]).longValue(),
+                    ((Number) r[10]).longValue(), ((Number) r[11]).longValue(),
+                    r[12] == null ? "—" : (String) r[12], formatTime(r[13]),
+                    (String) r[14], boolOf(r[15]),
+                    ((Number) r[16]).longValue(), (String) r[17]));
+        }
+        return new DocDtos.AllDocPage(list, total);
+    }
+
+    /**
+     * 前端把筛选项的"全部"发成字面量 {@code all}（`DocDownloadView.vue` 的下拉框），
+     * 之外的值必须是数字 id。⚠️ **非法值显式报错而不是忽略** —— 静默忽略会让
+     * "按某个库筛"变成"看全部"，而用户以为自己筛过了。
+     */
+    private static long parseIdOrFail(String raw, String what) {
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException ex) {
+            throw BizException.of(ErrorCode.PARAM_INVALID,
+                    what + "筛选项不合法（当前值：" + raw + "），请从列表中选择");
+        }
     }
 
     // ==================== T-511 · 未识别表格 / 解析问题清单 ====================

@@ -141,6 +141,39 @@ public final class ProbeCleanup {
             "sys_download_record");
 
     /**
+     * **兜底**：删掉那些"**三个归属坐标全为空、且已到终态**"的任务行（`T-616` 立）。
+     *
+     * <h3>它抓的是什么：一个此前结构上没人管的形状</h3>
+     * <p>`sys_async_task` 的两条既有清理线都**看不见**它们：
+     * {@code ORPHAN_SWEEP} 的条件是 `kb_id is not null and kb_id not in (...)`，
+     * {@code cleanUsers} 走 `owner_id in (...)` —— 而定时任务提交的任务
+     * （`TaskSubject.none()`：`kb_id`/`doc_id`/`owner_id` **三个都是 NULL**）两条都不匹配。
+     * <p>⇒ 本仓第四条"产物认识、归属维度不认识"的形态：这次是**"没有归属维度"本身**
+     * 让它成了谁也认领不了的行（与 `sys_model_usage` 那条同族，但那张表连坐标列都没有）。
+     *
+     * <h3>为什么条件里必须带 `status in ('DONE','FAILED')`</h3>
+     * <p>不带的话它会删掉**在途**的任务行 —— 那是把"防残留的机制"变成了"制造数据丢失"。
+     * 终态筛选保证它只碰"已经跑完、且没人认领"的那些。
+     *
+     * <h3>⚠️ `probe-%` 那一条例外（`S7-M06-F` 补）</h3>
+     * <p>用例会**手工插**一条"没有提交人"的任务行来验广播告警
+     * （`RecycleCleanupFlowTest#insertOwnerlessTask`），而那条行故意停在 `RUNNING`
+     * （它模拟的是"任务跑到一半炸了，终态由 `onTaskFailed` 之后才写"）。
+     * 于是只认终态的谓词**够不着它** —— 实测：跑四轮用例之后库里躺着 **7 行** `probe-*`
+     * 的 `RUNNING` 任务 + **3 条**它们产的广播通知（本批开工核基线时抓到的）。
+     * <p>这里按 **id 前缀**开一个例外，而不是把 `RUNNING` 放开：`probe-` 是**用例自己的命名空间**
+     * （生产永远不会产出这个形状的 id），所以"在途"那条理由对它不成立 ——
+     * 它从来不会被任何 worker 领走（是手工 INSERT 进去的）。
+     * <p>⚠️ 顺序上它要排在 {@link #sweepOrphanNotices} **之前**：删掉任务行之后，
+     * 那些任务产的**广播通知**（`user_id` 也是 NULL）才**变成**无主，被那条一并扫走。
+     */
+    public static int sweepOrphanSystemTasks(JdbcTemplate jdbc) {
+        return jdbc.update("delete from sys_async_task where owner_id is null and kb_id is null "
+                + "and doc_id is null "
+                + "and (status in ('DONE', 'FAILED') or task_id like 'probe-%')");
+    }
+
+    /**
      * **兜底**：删掉那些"父行已经不在"的产物（`kb_id` 指向一个不存在的 `sys_kb`）。
      *
      * <h3>为什么需要兜底，而不是让每个用例类自己清干净</h3>
@@ -601,6 +634,24 @@ public final class ProbeCleanup {
      */
     public static List<String> coveredMinioPrefixes() {
         return MINIO_PREFIXES.stream().map(MinioPrefix::prefix).toList();
+    }
+
+    /**
+     * 「**路径即归属人**」的那些前缀（`Owner.PATH_USER_ID`）。
+     *
+     * <p>给**两侧对账**用（`ProbeArtifactCoverageTest#minioPrefixListsAgreeWithTheScriptSide`）：
+     * 归属在路径里的前缀，Java 这条兜底**只在"那个账号的行已经没了"时才扫得到**
+     * （见 {@link Owner#PATH_USER_ID} 的射程说明）⇒ 账号还在的时候，它们只能靠
+     * **脚本侧的 `USER_MINIO_PREFIXES`** 收。
+     * <p>所以"Java 有一套、脚本侧漏了几个"是**真的会漏对象**的那种不一致，
+     * 而不是纸面问题 —— 本类第九个前缀（`doc-export/`）就是事后补的。
+     * <p>⚠️ 包级可见：调用方在同一个包（`com.knowledge.ai.support`）。
+     */
+    static List<String> pathUserIdPrefixes() {
+        return MINIO_PREFIXES.stream()
+                .filter(p -> p.owner() == Owner.PATH_USER_ID)
+                .map(MinioPrefix::prefix)
+                .toList();
     }
 
     /**

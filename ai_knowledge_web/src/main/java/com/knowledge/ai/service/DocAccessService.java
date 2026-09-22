@@ -56,13 +56,17 @@ public class DocAccessService {
      * @param storagePath    MinIO 对象名；**可空** —— 文档在转存完成前该列是 {@code null}
      *                       （{@code DocRecordWriter#insertVersioned} 先插行、转存成功才回填），
      *                       下载侧遇到它会拒绝并给出可执行的原因
+     * @param parsePath      解析产物的对象名；同样**可空**（未解析成功时是 {@code null}）。
+     *                       `T-616` 的彻底删除要用它 —— `O7` 规则表第 ② 列写着
+     *                       「彻底删除文档：源文件**删** + 解析产物**删**」
      * @param sizeBytes      上传时记录的字节数。⚠️ 它与 MinIO 里对象的实际大小**是两个数**：
      *                       这里要的是"审批口径"（门禁 `G7-8` 的 2GB 上限按它算），
      *                       而"对象真的有多大"由对象存储回答（{@code DocStorage#sizeOf}）
      */
     public record DocRow(long id, long kbId, String status, String ownSecretLevel,
                          String kbSecretLevel, Long ownerId, int indexGeneration,
-                         String title, String fileName, String storagePath, long sizeBytes) {
+                         String title, String fileName, String storagePath, String parsePath,
+                         long sizeBytes) {
 
         /** 生效密级 = {@code max(自己, 库级)}（`I-6`）；{@code sys_kb.secret_level} 是 NOT NULL ⇒ 恒非 {@code null}。 */
         public SecretLevel effectiveSecretLevel() {
@@ -95,7 +99,8 @@ public class DocAccessService {
     public DocRow requireVisibleDoc(long docId) {
         List<?> rows = entityManager.createNativeQuery("""
                         select d.id, d.kb_id, d.status, d.secret_level, k.secret_level, d.owner_id,
-                               d.index_generation, d.title, d.file_name, d.storage_path, d.size_bytes
+                               d.index_generation, d.title, d.file_name, d.storage_path, d.parse_path,
+                               d.size_bytes
                           from sys_document d
                           join sys_kb k on k.id = d.kb_id
                          where d.id = :id and d.deleted_at is null
@@ -124,7 +129,7 @@ public class DocAccessService {
         return new DocRow(((Number) r[0]).longValue(), kbId, (String) r[2], (String) r[3],
                 (String) r[4], r[5] == null ? null : ((Number) r[5]).longValue(),
                 r[6] == null ? 0 : ((Number) r[6]).intValue(),
-                (String) r[7], (String) r[8], (String) r[9],
-                r[10] == null ? 0L : ((Number) r[10]).longValue());
+                (String) r[7], (String) r[8], (String) r[9], (String) r[10],
+                r[11] == null ? 0L : ((Number) r[11]).longValue());
     }
 }

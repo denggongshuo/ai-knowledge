@@ -92,6 +92,33 @@ public class NoticePublisher {
      */
     private static final String DOWNLOAD_PATH = "/doc/download";
 
+    /**
+     * 回收站超期清理（`T-616`）。⚠️ 与 {@code RecycleService.TASK_TYPE_CLEANUP} **逐字一致**。
+     *
+     * <p>它是本仓**第一个没有提交人**的任务类型（定时任务提交，`TaskSubject.none()`）
+     * ⇒ 也是第一个走**广播**的通知 —— 见 {@link #BROADCAST_TYPES}。
+     */
+    private static final String TYPE_RECYCLE_CLEANUP = "recycle-cleanup";
+
+    /**
+     * **本来就该广播**的任务类型（没有"提交人"这个概念）。
+     *
+     * <h3>🔴 为什么要一张白名单，而不是"owner 为 NULL 就广播"</h3>
+     * <p>{@code owner_id} 为 NULL 有**两种完全不同的成因**：
+     * <ul>
+     *   <li><b>本来就该广播</b>（定时/系统任务 —— 它压根没有提交人）；</li>
+     *   <li><b>提交方漏传坐标</b>（`#110`：`AuditExportService` 当年就没传 `TaskSubject`
+     *       ⇒ 那条导出任务**永远查不出是谁触发的**）。</li>
+     * </ul>
+     * <p>把两者混成一条"NULL 就广播"，第二种缺陷会**从"少一条通知"变成"给所有人发一条
+     * 莫名其妙的通知"** —— 那是把静默缺陷升级成噪声缺陷。所以这里**逐个类型点名**：
+     * 白名单之外的 NULL 仍然打那条 warn（提醒提交方漏了坐标）。
+     *
+     * <p>⚠️ 这张表还有个副产品：它让「哪些通知是广播」这件事**可检索**
+     * —— 「这条通知为什么所有人都收到了」有一个能查的答案。
+     */
+    private static final java.util.Set<String> BROADCAST_TYPES = java.util.Set.of(TYPE_RECYCLE_CLEANUP);
+
     private final NoticeRepository noticeRepository;
 
     /** 任务成功。{@code result} 是任务体自己给的结果对象（形状见下面的各分支）。 */
@@ -120,7 +147,8 @@ public class NoticePublisher {
                 // 该任务类型本批不产通知 —— 正常路径，不记日志（否则每篇文档一条噪声）
                 return;
             }
-            if (coord.ownerId() == null) {
+            boolean broadcast = coord.ownerId() == null;
+            if (broadcast && !BROADCAST_TYPES.contains(coord.type())) {
                 // 没有提交人就没处可发（`TaskSubject.none()` 的任务）。不是错误，但要留痕：
                 // 这一族的上一形态是 `#110`「导出任务 owner_id 为 NULL ⇒ 永远查不出是谁触发的」，
                 // 那次是**提交方漏传坐标**，已被修；今天再现就说明有新入口又漏了。
@@ -128,7 +156,10 @@ public class NoticePublisher {
                         taskId, coord.type());
                 return;
             }
-            if (!noticeRepository.isEnabled(coord.ownerId(), payload.noticeType())) {
+            // ⚠️ 广播**不能过 `isEnabled`**：那条查询按 `user_id` 找用户设置，
+            //    而广播没有"哪个人"可查。好在它本来也不该被某一个人的开关静音 ——
+            //    「清理失败」是全站性的运维事件（需求 06 §7.9）。
+            if (!broadcast && !noticeRepository.isEnabled(coord.ownerId(), payload.noticeType())) {
                 // 用户在设置里关掉了这一类（需求 §2.5）。debug 级 —— 这是**预期行为**，不是异常。
                 log.debug("通知按用户设置跳过：userId={} type={}", coord.ownerId(), payload.noticeType());
                 return;
@@ -208,6 +239,16 @@ public class NoticePublisher {
                             "重建任务中断：" + reason(errorMsg) + "。当前检索仍指向重建前的版本，"
                                     + "服务未受影响。请重试重建。",
                             List.of(NoticeAction.primary("重试重建", kbPath(kbId))), true, false);
+
+            // 回收站超期清理（`T-616`）。🔴 **成功不产通知**（"清理跑成功了"不值得打扰任何人），
+            // 只有**失败**才发 —— 且发**广播**（它没有提交人，白名单见 BROADCAST_TYPES）。
+            // 需求 06 §7.9 的原话：「定时清理任务需幂等，且失败要有告警（走通知中心）」。
+            case TYPE_RECYCLE_CLEANUP -> done ? null
+                    : new NoticePayload(NoticeType.ALERT, "回收站清理失败",
+                            "超期清理未完成：" + reason(errorMsg)
+                                    + "。⚠️ 清理失败会造成**存储泄漏**（到期对象与向量留在库里），"
+                                    + "请尽快查看服务日志并手工重试。",
+                            List.of(NoticeAction.primary("去回收站", "/recycle")), true, false);
 
             default -> null;
         };

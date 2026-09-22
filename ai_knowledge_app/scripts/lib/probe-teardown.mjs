@@ -33,7 +33,9 @@
 import { spawnSync } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { unlinkSync, writeFileSync } from 'node:fs'
 
 /** `ai-knowledge/`（仓库根）。本文件在 `ai_knowledge_app/scripts/lib/`，故上溯三级。 */
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
@@ -285,8 +287,6 @@ export const OUT_OF_SCOPE = [
 // 基础动作（原先散在 5 个脚本里各一份）
 // ---------------------------------------------------------------------------
 
-/** 单引号包裹并转义 —— 传给 `sh -c` 的 JSON 体统一走这里，避免手工拼串漏转义。 */
-const sq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`
 
 /**
  * 直连 MySQL 取一个标量（多行时返回多行文本）。
@@ -378,18 +378,29 @@ export function minioStillPresent(rawObjectKeys) {
  * 所以 `minioKeysOf`（要 join `sys_kb`）**看不见**它们，只能按用户前缀单独收。
  *
  * <p>🔴 每**新增**一个这种形状的前缀都要加到这里，否则那个脚本造一个对象、
- * 桶里就多一个（`#163` 的原始形状）。目前三个：
+ * 桶里就多一个（`#163` 的原始形状）。目前五个：
  * <ul>
  *   <li>{@code chat-attachments/}（`T-805` 预上传的问答图片）；</li>
  *   <li>{@code batch-download/}（`T-614` 打包 zip，`S7-M06-E` 新增）；</li>
- *   <li>{@code doc-export/}（`T-615` 下载记录清单 CSV，`S7-M06-E` 新增）。</li>
+ *   <li>{@code doc-export/}（`T-615` 下载记录清单 CSV，`S7-M06-E` 新增）；</li>
+ *   <li>{@code audit-export/}（`T-O11` 审计日志导出）；</li>
+ *   <li>{@code ops-export/}（`T-A02` 运营报表导出）。</li>
  * </ul>
- * <p>⚠️ 后两个是 `S7-M06-E` 补进来的：新前缀**当时只加进了 Java 侧的登记表**
- * （`ProbeCleanup#MINIO_PREFIXES`），脚本侧这个函数漏了 —— 而"脚本侧漏了"的表现是
- * **E2E 每跑一轮桶里多几个对象**，且没有任何闸会点名（Java 侧那条
- * `everyKnownPrefixIsClassified` 查的是 Java 侧的清单）。
+ * <p>⚠️ 前三个的来历是「事后补的」：`S7-M06-E` 新造了 `batch-download/` 与
+ * `doc-export/`，**当时只加进了 Java 侧的登记表**（`ProbeCleanup#MINIO_PREFIXES`），
+ * 本函数漏了 —— 而"脚本侧漏了"的表现是 **E2E 每跑一轮桶里多几个对象**，
+ * 且没有任何闸会点名（Java 侧那条 `everyKnownPrefixIsClassified` 查的是 Java 侧的清单）。
+ * <p>🔴 后两个（`S7-M06-F` 补）是**同一条闸**在两侧对账时才抓出来的 ——
+ * 它们的对象一直由 `e2e-audit-backfill` / `e2e-ops-qa-stats` **各自点名清**，
+ * 于是"按调用点清"看着没问题；而 {@link teardownUserProbe} 这条**通用**的收尾
+ * 一个都删不到它们，只能等下一轮 `mvn test` 的 Java 兜底扫走。
+ * <p>盯这条的机器检查：`ProbeArtifactCoverageTest#minioPrefixListsAgreeWithTheScriptSide`
+ * —— 它要求本清单与 Java 侧 `Owner.PATH_USER_ID` 的那几个**逐条相等**，
+ * 并顺带挡住"拼错前缀"（拼错的后果是 `ls` 一个不存在的目录 ⇒ 空输出 ⇒ 清理"成功"却一个没删）。
  */
-export const USER_MINIO_PREFIXES = ['chat-attachments/', 'batch-download/', 'doc-export/']
+export const USER_MINIO_PREFIXES = [
+  'chat-attachments/', 'batch-download/', 'doc-export/', 'audit-export/', 'ops-export/',
+]
 
 export function minioKeysOfUserPrefix(userIds) {
   return USER_MINIO_PREFIXES.flatMap((prefix) => minioKeysOfPathUserPrefix(prefix, userIds))
@@ -438,16 +449,44 @@ function normalizeKeys(raw) {
   return lines.map((s) => String(s).trim()).filter((s) => s && s !== 'NULL')
 }
 
-/** Milvus REST v2（2.4+ 自带，零新增依赖）。返回解析后的 JSON；失败时 `{code:-1, raw}`。 */
+/**
+ * Milvus REST v2（2.4+ 自带，零新增依赖）。返回解析后的 JSON；失败时 `{code:-1, raw}`。
+ *
+ * <h3>🔴 请求体必须走**临时文件**（`--data-binary @file`），不能内联进命令串</h3>
+ * <p>本机是 Git for Windows，`bash -c` 里**内联的非 ASCII 会被按当前代码页重新编码**
+ * ⇒ 到了服务端就是一堆乱码。而 Milvus 的集合带 BM25 分析器，它对 `bm25_text` 有
+ * **UTF-8 校验** ⇒ 报的是一句看着毫无头绪的话：
+ * <pre>
+ *   code 65535 · input with analyzer should be utf-8 format, but row: 0 not utf-8 format
+ * </pre>
+ * （实测踩到：`S7-M06-F` 的 E2E 往探针分区种中文正文时。而 `probe-orphan-vectors.mjs`
+ * 一路没踩到，纯粹因为它的探针内容是 ASCII 的 `'probe vector'` —— 这种"换一份数据就炸"
+ * 的形态最难归因。）
+ * <p>这与长期记忆里那条同源：**`curl -d '{"中文"}'` 在本机必 400，一律 `--data-binary @file`**。
+ * 写文件比拼串还顺带解决了引号转义 —— 原先那个 `sq()` 助手就是为转义而生的，
+ * 现在整个去掉。
+ */
 export function milvusPost(path, body) {
-  const out = spawnSync('bash', ['-c',
-    `curl -s -m 20 -X POST ${MILVUS}/v2/vectordb/${path} ` +
-    `-H 'Content-Type: application/json' -d ${sq(JSON.stringify(body))}`,
-  ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
+  const payload = JSON.stringify(body)
+  const tmp = join(tmpdir(), `ak-milvus-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}.json`)
+  writeFileSync(tmp, payload, 'utf8')
   try {
-    return JSON.parse(out)
-  } catch {
-    return { code: -1, raw: out }
+    const out = spawnSync('bash', ['-c',
+      `curl -s -m 20 -X POST ${MILVUS}/v2/vectordb/${path} ` +
+      `-H 'Content-Type: application/json' --data-binary @'${tmp.replace(/'/g, "'\\''")}'`,
+    ], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout ?? ''
+    try {
+      return JSON.parse(out)
+    } catch {
+      return { code: -1, raw: out }
+    }
+  } finally {
+    // 用后即焚：探针脚本可能一轮调几十次，攒着会把 tmp 塞满
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // 删不掉也不该让探针失败（与 `DocStorage#remove` 同一取舍）
+    }
   }
 }
 
@@ -495,6 +534,52 @@ export async function milvusLeftoverPartitions(ids) {
     else return left
   }
   return []
+}
+
+/**
+ * **无主分区兜底**（`T-O28` 那一族的第三件 · `S7-M06-F` 补）。
+ *
+ * <h3>它补的是哪个洞</h3>
+ * <p>{@link milvusDropPartitions} 只丢**调用方点名的那几个 kb** 的代分区
+ * （`milvusDropPartitions([kbId, ...])`）。于是一旦某一轮的收尾没跑到
+ * （被打断 / 被强杀 / 崩在半路），它留下的分区就**再也没有人认领** ——
+ * 后面每一轮都不认识那个 kbId。
+ * <p><b>实测</b>：本批收尾时集合里躺着 **4 个** `kb*_g1` 分区，
+ * 而它们的 `sys_kb` 行早就不在了（`kb1008100` / `kb1008101` / `kb1013472` / `kb1013474`）。
+ * 它们**是空的**（向量一条不剩），所以 `T-O27` 那条"以条数计"的判据看不见它们 ——
+ * 而那正是分区这一族的老形状：**容器是容器，点是点**。
+ *
+ * <h3>🔴 只按「名字形状 + 库还在不在」判，不做任何猜测</h3>
+ * <p>形状不符的一律**不动**：`_default`（集合自带的）、
+ * `zzvecprobe` / `zzprobe_*`（`MilvusVectorWriteTest` 等探针自建的）、
+ * 以及人工建的任何分区 —— 它们**不属于任何库**，也就谈不上"无主"。
+ * 这与 `ProbeCleanup#pathOwnerId` 那条"解析不出来就跳过、不猜"是同一条纪律：
+ * **猜错的代价是删掉别人的东西。**
+ *
+ * @returns {{dropped: string[], failed: string[], scanned: number}}
+ */
+export function sweepOrphanPartitions() {
+  const names = milvusPartitionNames()
+  if (names === null) {
+    // 「空」与「没查成」必须分开报（否则一次查询失败会被读成"没有无主分区"）
+    return { dropped: [], failed: [], scanned: -1 }
+  }
+  const alive = existingKbIds()
+  const orphan = names.filter((n) => {
+    const m = /^kb(\d+)_g\d+$/.exec(n)
+    return m ? !alive.has(Number(m[1])) : false
+  })
+  for (const name of orphan) {
+    // 顺序固定：release → drop（裸 drop 会以"分区已加载"失败）
+    milvusPost('partitions/release', { collectionName: COLLECTION, partitionNames: [name] })
+    milvusPost('partitions/drop', { collectionName: COLLECTION, partitionName: name })
+  }
+  const after = milvusPartitionNames() ?? []
+  return {
+    dropped: orphan.filter((n) => !after.includes(n)),
+    failed: orphan.filter((n) => after.includes(n)),
+    scanned: names.length,
+  }
 }
 
 /** 删点：按 `kb_id` 过滤删掉探针库的全部向量。 */
@@ -814,6 +899,57 @@ export function sweepOrphanMisses() {
   return before - mysqlCount('select count(*) from sys_qa_miss;')
 }
 
+/**
+ * **无主产物兜底**（`T-O28` 那一族的脚本侧半边 · `S7-M06-F` 补）。
+ *
+ * <h3>它补的是哪个洞（实测）</h3>
+ * <p>本文件其余所有清理路径都**从 `sys_kb` 读 id**（{@link teardownKbProbe} 的 `kbIdsOf`、
+ * {@link sweepAbandonedKbProbes} 的 `group_concat(code)`）。于是**只要父行先没了，
+ * 它们就一行都删不到** —— 而"父行先没了"在本仓是常态：
+ * 产品代码的`彻底删除 / 清空回收站`自己就会把 `sys_kb` 行删掉（那正是被测行为）。
+ * <p>🔴 这与 `#136` 是**同一个形状的第三次复现**（前两次是 `join sys_kb` 的自检与
+ * 删除各自恒返回 0）：**删除与自检都依赖同一个会被删掉的父行，它们就永远是同一句话**。
+ * <p><b>实测</b>：本批几次被中断的 E2E 轮次之后，库里躺着
+ * `sys_async_task` **18 行** · `sys_chunk` **4 行** · `sys_download_record` **3 行**
+ * —— 它们的 `kb_id` 指向一个已经不存在的库，于是**谁也认领不了**，
+ * 只有 `findKbProbeResidue` 的 `无主残留=N` 一直在报（而它**刻意不计入** `kbResidueClean`，
+ * 所以每一轮的收尾都照样全绿）。
+ *
+ * <h3>问法与 Java 侧 `ProbeCleanup.sweepOrphanKbArtifacts` 完全一致</h3>
+ * <p>不问"你清了没有"，只问"**库里还剩不剩无主的东西**"。
+ * 于是"漏一处"的代价从"永久累积"变成"多一次 DELETE"。
+ * <p>⚠️ `not in (select id from sys_kb)` 里的子查询读的是 `sys_kb`，
+ * 与删除目标**不同表** ⇒ 不会撞 MySQL 的 1093。
+ * ⚠️ **顺序**：必须排在"删 kb 行"之后、`sweepOrphanNotices` 之前 ——
+ * 删掉任务行之后，那些任务产的通知才**变成**无主。
+ *
+ * @returns 删掉的行数（> 0 说明有类漏清了 —— 这是**信号**，不是正常现象）
+ */
+export function sweepOrphanKbRows() {
+  const count = () => mysqlCount(
+    'select (select count(*) from sys_async_task where kb_id is not null and kb_id not in (select id from sys_kb))'
+    + ' + (select count(*) from sys_async_task where doc_id is not null and doc_id not in (select id from sys_document))'
+    + ' + (select count(*) from sys_chunk where kb_id is not null and kb_id not in (select id from sys_kb))'
+    + ' + (select count(*) from sys_chunk where doc_id is not null and doc_id not in (select id from sys_document))'
+    + ' + (select count(*) from sys_parse_issue where kb_id is not null and kb_id not in (select id from sys_kb))'
+    + ' + (select count(*) from sys_document where kb_id is not null and kb_id not in (select id from sys_kb))'
+    + ' + (select count(*) from sys_download_record where kb_id is not null and kb_id not in (select id from sys_kb))'
+    + ' + (select count(*) from sys_kb_grant where kb_id is not null and kb_id not in (select id from sys_kb));',
+  )
+  const before = count()
+  mysqlScalar(
+    'delete from sys_async_task where kb_id is not null and kb_id not in (select id from sys_kb);'
+    + 'delete from sys_async_task where doc_id is not null and doc_id not in (select id from sys_document);'
+    + 'delete from sys_chunk where kb_id is not null and kb_id not in (select id from sys_kb);'
+    + 'delete from sys_chunk where doc_id is not null and doc_id not in (select id from sys_document);'
+    + 'delete from sys_parse_issue where kb_id is not null and kb_id not in (select id from sys_kb);'
+    + 'delete from sys_document where kb_id is not null and kb_id not in (select id from sys_kb);'
+    + 'delete from sys_download_record where kb_id is not null and kb_id not in (select id from sys_kb);'
+    + 'delete from sys_kb_grant where kb_id is not null and kb_id not in (select id from sys_kb);',
+  )
+  return before - count()
+}
+
 export function sweepOrphanNotices() {
   const before = mysqlCount('select count(*) from sys_notice;')
   mysqlScalar(
@@ -947,6 +1083,15 @@ export async function teardownKbProbe(code) {
       .reduce((acc, s) => acc + s, ''),
   )
 
+  // ④.3 无主分区（`T-O28` 那一族的第三件）—— 与"无主行"同一条来历：
+  //      某一轮的收尾没跑到，它留下的分区就再也没人认领（后一轮不认识那个 kbId）。
+  const orphanPartitions = sweepOrphanPartitions()
+
+  // ④.4 无主行（`#136` 形状的第三次复现）—— **必须排在 ④ 之后**：
+  //      ④ 刚把探针库的行删掉，而**产品代码自己也可能删过库行**（彻底删除 / 清空回收站），
+  //      那一路留下的子行只有这一步收得掉。
+  const orphanRows = sweepOrphanKbRows()
+
   // ④.5 无主通知（`T-B03` 的外溢面）—— **必须排在 ④ 之后**：
   //    ④ 刚把任务行删掉，通知**在这一刻才变成**无主。顺序反了要等下一轮才扫得到。
   const noticesRemoved = sweepOrphanNotices()
@@ -966,7 +1111,7 @@ export async function teardownKbProbe(code) {
     code, ids, minioKeys,
     removed: {
       minio: minioRemoved, sql: '见 residue', notices: noticesRemoved, misses: missesRemoved,
-      chatFamily: chatRemoved,
+      chatFamily: chatRemoved, orphanRows, orphanPartitions,
     },
     residue, quiesce,
   }

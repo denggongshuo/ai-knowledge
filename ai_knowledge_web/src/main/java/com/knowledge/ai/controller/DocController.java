@@ -8,6 +8,7 @@ import com.knowledge.ai.core.web.WebUtils;
 import com.knowledge.ai.dto.doc.DocDtos;
 import com.knowledge.ai.service.DocAttributeService;
 import com.knowledge.ai.service.DocDetailService;
+import com.knowledge.ai.service.DocLifecycleService;
 import com.knowledge.ai.service.DocReindexService;
 import com.knowledge.ai.service.DocService;
 import com.knowledge.ai.service.DocVersionService;
@@ -15,6 +16,7 @@ import com.knowledge.ai.service.DownloadService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -67,6 +69,9 @@ public class DocController {
 
     /** `T-613`/`T-614`/`T-615`：预览地址 · 单篇下载 · 打包下载 · 任务 · 记录 · 导出清单。 */
     private final DownloadService downloadService;
+
+    /** `T-611`：软删（移入回收站）。彻底删除与恢复在 `RecycleController`。 */
+    private final DocLifecycleService docLifecycleService;
 
     /**
      * {@code POST /api/kb/{kbId}/doc/upload} —— 上传文档。
@@ -448,5 +453,61 @@ public class DocController {
     @RequiresPerm("doc:download")
     public ApiResponse<DocDtos.ExportListAccepted> exportList() {
         return ApiResponse.ok(downloadService.exportList());
+    }
+
+    // ==================================================================
+    // S7 · M06 · 阶段 F：删除（`T-611`）与跨库列表（`T-612`）
+    // ==================================================================
+
+    /**
+     * {@code GET /api/doc/all?keyword=&kbId=&type=&page=&size=} —— **跨库**文档列表（`T-612`）。
+     *
+     * <p>权限 {@code kb:view}：它是**读**侧，且**可见范围已经在 SQL 里收窄**
+     * （服务端拼 {@code kbVisibility}）—— 多叠一道权限码不会让它更安全，
+     * 只会让"能看列表的人看不了这个列表"。
+     *
+     * <p>⚠️ {@code kbId} 是**字符串**（前端下拉框把"全部"发成字面量 {@code all}）；
+     * 非法值报 {@code 10030} 而不是忽略 —— 静默忽略会把"按库筛"变成"看全部"。
+     */
+    @GetMapping("/api/doc/all")
+    @RequiresPerm("kb:view")
+    public ApiResponse<DocDtos.AllDocPage> all(@RequestParam(required = false) String keyword,
+                                               @RequestParam(required = false) String kbId,
+                                               @RequestParam(required = false) String type,
+                                               @RequestParam(required = false) Integer page,
+                                               @RequestParam(required = false) Integer size) {
+        return ApiResponse.ok(docService.allDocs(keyword, kbId, type, page, size));
+    }
+
+    /**
+     * {@code DELETE /api/doc/{id}} —— 删除文档（**软删进回收站**，`T-611` · 🚩 内容删除）。
+     *
+     * <p>🔴 <b>它不是"删掉"，是"移入回收站"</b>：对象与向量**一个都不动**（`G7-14`），
+     * 30 天内可恢复。真正抹掉内容的是 `/api/recycle/items`（标「彻底删除」，两条不同的审计）。
+     *
+     * <p>⚠️ 这条路径与 {@code GET /api/doc/{id}}（文档元信息）**同形不同方法** ——
+     * 不是笔误：REST 语义里"取"与"删"本来就该是同一个资源的两条动词。
+     */
+    @DeleteMapping("/api/doc/{id}")
+    @RequiresPerm("doc:delete")
+    public ApiResponse<DocDtos.DocDeleted> remove(@PathVariable("id") long docId) {
+        return ApiResponse.ok(docLifecycleService.softDelete(docId));
+    }
+
+    /**
+     * {@code DELETE /api/doc/batch} —— 批量删除（软删，body {@code {ids}}，`T-611`）。
+     *
+     * <p>🔴 与 {@code /api/doc/{id}} 的**同一段**业务（`batchSoftDelete` → 同一套 `markDeleted`），
+     * 只是多了"先全验后全删"那一轮 —— 批里任一文档不存在/不可见就**整批拒绝**，不静默过滤。
+     *
+     * <p>⚠️ 路径段是字面量 {@code batch}：Spring 的字面量优先规则会让它**先于**
+     * {@code /api/doc/{id}} 命中（同 {@code /doc/download-tasks} 那条的说明）。
+     */
+    @DeleteMapping("/api/doc/batch")
+    @RequiresPerm("doc:delete")
+    public ApiResponse<DocDtos.DocBatchDeleted> batchRemove(
+            @RequestBody DocDtos.BatchRemoveRequest request) {
+        return ApiResponse.ok(docLifecycleService.batchSoftDelete(
+                request == null ? null : request.ids()));
     }
 }

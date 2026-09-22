@@ -33,8 +33,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 **43** 个动作逐条写死，少一个、多一个、等级错一档都红。
- * （`S7-M06-E` 加 3 条：文档「下载文档」NORMAL / 「批量下载」HIGH / 「导出文档清单」HIGH ⇒ 40 → 43。）
+ * {@link #expectedActions()} 把裁定过的 **47** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * （`S7-M06-E` 加 3 条：文档「下载文档」NORMAL / 「批量下载」HIGH / 「导出文档清单」HIGH ⇒ 40 → 43。
+ * `S7-M06-F` 再加 4 条（含把「删除文档」从 `PLANNED` 挪进实现）⇒ **43 → 47**。）
  * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
  * 在 S6-M09-B 已经到 36 —— 两处数字长期不一致，直到 `T-A02` 加第 37 条时才被发现。
  * **冻结清单**只有一个数字，就是本类断言的那个；本行已按它对正。
@@ -154,6 +155,17 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         expected.put(AuditModule.DOC + " 批量下载", RiskLevel.HIGH);
         // 导出文档清单：带走的是"有哪些文件"的清单（也是可外带资产），同归 §4.3② HIGH。
         expected.put(AuditModule.DOC + " 导出文档清单", RiskLevel.HIGH);
+
+        // ---- 文档 · 删除 / 回收站（S7-M06-F 新增 3 条：G7-10~G7-14）----
+        // 依据逐字：`05:414` 的「内容删除」行列着「删除文档、删除知识库、**彻底删除、清空回收站**」
+        // —— 四个条目，**不再细分文档/知识库**（`Category#CONTENT_DELETE` 的 javadoc 同）。
+        expected.put(AuditModule.DOC + " 删除文档", RiskLevel.HIGH);
+        expected.put(AuditModule.DOC + " 彻底删除", RiskLevel.HIGH);
+        expected.put(AuditModule.DOC + " 清空回收站", RiskLevel.HIGH);
+        // ⚠️ 「恢复」是**本批唯一一条超出 §4.3 动作表**的登记：依据是 `O7` 规则表的
+        //    「审计日志 × ⑤恢复」那一格写着「记一条」。标 NORMAL 的推理与「版本回滚」同源
+        //    （不销毁任何东西、且可逆）；但**该记**，因为它是内容可见性的变更。
+        expected.put(AuditModule.DOC + " 恢复", RiskLevel.NORMAL);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -342,9 +354,17 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "⚠️ 前两条是需求《05》§6 文档动作表里**逐字列着**的（与 39 那两条同一种来历："
                         + "表里一直有、只是流程没做）；第三条是走通知中心的异步导出，"
                         + "与「导出审计日志 / 导出运营报表」同一个风险档。"
-                        + "⚠️ **「文档 / 删除文档」仍不在本批**（`T-611`，S7-M06-F）—— "
-                        + "「下载」与「删除」的差别不是量级，是能不能撤回）")
-                .hasSize(43);
+                        + "⚠️ **「文档 / 删除文档」当时仍不在**（`T-611`，S7-M06-F）—— "
+                        + "「下载」与「删除」的差别不是量级，是能不能撤回）"
+                        + "→ **47**（`S7-M06-F` 的四条：`删除文档` · `彻底删除` · `清空回收站` 全 HIGH + "
+                        + "`恢复` NORMAL。⚠️ 三条删除类**逐字来自 `05:414` 的「内容删除」行**"
+                        + "（它列的是「删除文档、删除知识库、彻底删除、清空回收站」，**不分文档/知识库**）；"
+                        + "`恢复` 是本批唯一一条**超出该表**的登记，依据是 `O7` 规则表 ⑤ 的「记一条」"
+                        + "—— 理由是「恢复」改变了**内容可见性**。"
+                        + "🔴 本批同时把 `AuditRiskPolicy` 的 `PLANNED` 表**清空了**"
+                        + "（`05` 两张动作表里可落地的条目至此全部交付）—— "
+                        + "与 `S7-M06-E` 那条「从 PLANNED 变 IMPLEMENTED 牵着三处」是同一族的收尾）")
+                .hasSize(47);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

@@ -33,7 +33,18 @@ public final class DocDtos {
                          long imageTotal, long imageParsed,
                          long pagesTotal, long pagesWithText,
                          String owner, String uploadedAt,
-                         String scanStatus, Boolean hasMacro) {
+                         String scanStatus, Boolean hasMacro,
+                         /**
+                          * 所属知识库 —— **只有 {@code GET /doc/all}（`T-612` 跨库列表）填**，
+                          * 按库的列表（{@code GET /kb/{kbId}/docs}）恒为 {@code null}。
+                          *
+                          * <p>⚠️ 为什么塞进同一个 record 而不是另开一个"18 字段的扁平副本"：
+                          * 前端那条接口的泛型是 {@code KbDocRow & { kbId; kbName }}（**扁平交叉**）
+                          * ⇒ JSON 必须是平的、不能嵌套。而两套声明必然各自演化 ——
+                          * 本仓 `AdminDtos` 的注释记过同型坑（"字段对不上时不报错、只是静默空白"）。
+                          * 代价是：按库那条接口会多两个恒 {@code null} 的键（前端不声明、也不读）。
+                          */
+                         Long kbId, String kbName) {
     }
 
     /**
@@ -46,6 +57,19 @@ public final class DocDtos {
      * <p>前端把 {@code total} 渲染成「共 N 篇」（{@code KbUploadView.vue:540}）。
      */
     public record DocPage(List<DocRow> list, long total, long displayed) {
+    }
+
+    /**
+     * **跨库**文档列表分页体（`T-612` · `GET /doc/all`）。
+     *
+     * <p>⚠️ 它**没有 {@code displayed}** —— 那个字段是文档上传页的历史产物
+     * （「共 N 篇（本页 M 篇）」那句文案）。下载页只渲染 {@code total}，
+     * 凭空多给一个字段只会让下一个读接口的人以为它与 {@code total} 有某种关系。
+     *
+     * <p>行类型复用 {@link DocRow}，其中 {@code kbId}/{@code kbName} **只有本接口填**
+     * （见那边的说明）。
+     */
+    public record AllDocPage(List<DocRow> list, long total) {
     }
 
     // ==================== T-501 · MD5 去重 ====================
@@ -622,5 +646,41 @@ public final class DocDtos {
      *               （mock 也回这个字段），少了它那句提示会是 {@code undefined}
      */
     public record ExportListAccepted(String taskId, String status, String note) {
+    }
+
+    // ==================== T-611 · 删除文档（`G7-14`） ====================
+
+    /**
+     * 删除单篇文档的结果（对齐前端 {@code docApi.remove}，`api/index.ts:189`：
+     * {@code http.delete<{docId, recycled}>}）。
+     *
+     * <p>🔴 **它是"移入回收站"，不是删除** —— `recycled` 恒 {@code true} 就是在说这件事。
+     * 需求 `06` §7.9 的硬约束：**删除时不立即删向量**（等超期彻底删除时才清），
+     * 否则恢复之后还得重新向量化（花钱、花时间）。所以本动作**一个字节的对象都不动**。
+     *
+     * <p>⚠️ 与「彻底删除」是**两个动作、两条审计**：那个在 `/api/recycle/items`，
+     * 标 `HIGH` 且不可逆；这个只写两个软删列。
+     */
+    public record DocDeleted(long docId, boolean recycled) {
+    }
+
+    /**
+     * 批量删除的结果（对齐前端 {@code docApi.batchRemove}：{@code {deleted}}）。
+     *
+     * <p>🔴 `deleted` 恒等于**请求里的文档数** —— 因为本动作是**先全验后全删**：
+     * 批里任一文档不存在 / 不可见就**整批拒绝**（`10044`/`10022`），没有"部分成功"这一档。
+     * ⚠️ 这与 `S7-M06-E` 的打包下载是同一条硬口径（那边一个 `try/catch continue`
+     * 就写成静默过滤）—— 见 `plan/2026-09-21-S7-M06-E.md` §8.1 判据 5。
+     */
+    public record DocBatchDeleted(int deleted) {
+    }
+
+    /**
+     * 批量删除请求体（对齐前端 {@code docApi.batchRemove}，`api/index.ts:190`：
+     * {@code http.delete('/doc/batch', { ids })}）。
+     *
+     * @param ids 要删除的文档 id；空 / 含不存在或不可见的文档 ⇒ **整批拒绝**
+     */
+    public record BatchRemoveRequest(List<Long> ids) {
     }
 }

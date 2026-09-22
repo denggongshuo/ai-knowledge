@@ -62,7 +62,15 @@ public final class ProbeArtifacts {
             Map.entry("sys_parse_issue", "逐页问题。按 kb_id 删"),
             Map.entry("sys_kb_grant", "知识库授权。按 kb_id 删"),
             Map.entry("sys_async_task",
-                    "异步任务。按 kb_id 删。⚠️ S5 补 —— 此前**根本没有清理**，实测 +76 行/轮；"
+                    "异步任务。**三条线**：① 按 kb_id 进 `ORPHAN_SWEEP`；② 按 owner_id 进 `cleanUsers`；"
+                            + "③ 🔴 `T-616` 补的第三条 —— **三个坐标全空**且已终态的行进 "
+                            + "`sweepOrphanSystemTasks`。"
+                            + "⚠️ ①② 都不匹配③那一族（定时任务的 `TaskSubject.none()` 让 "
+                            + "`kb_id`/`doc_id`/`owner_id` **同时为空**）⇒ 它是本仓第四条"
+                            + "「产物认识、归属维度不认识」，而这次是**「没有归属维度」本身**"
+                            + "让它成了谁也认领不了的行 —— 与 `sys_model_usage` 同族"
+                            + "（那张表连坐标列都没有，靠按日期兜底）。"
+                            + "⚠️ S5 补 ① 之前**根本没有清理**，实测 +76 行/轮；"
                             + "而漏掉它的现象很隐蔽：任务行都 DONE 了，只有 kb 行没了才看得出是孤儿"),
             Map.entry("sys_user", "账号主表。按 username 删，**必须在最后**"),
             Map.entry("sys_user_role", "用户角色关联。按 user_id 删，先于 sys_user（避开外键）"),

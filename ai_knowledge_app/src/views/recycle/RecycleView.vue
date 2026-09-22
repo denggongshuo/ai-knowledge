@@ -75,7 +75,8 @@ async function doRestore(items: RecycleItem[]) {
     : `恢复后需重建索引才能参与检索。${items.some((i) => i.hasNewer) ? '注意：部分条目已有更新版本，恢复旧版本可能造成版本混乱。' : ''}确认恢复 ${items.length} 篇文档？`
 
   await ElMessageBox.confirm(msg.replace(/\*\*/g, ''), isKb ? '恢复知识库' : '恢复文档', { type: 'warning' })
-  const res = await recycleApi.restore({ ids: items.map((i) => i.id), targetKbId: targetKbId.value })
+  const type: RecycleType = isKb ? 'KB' : 'DOC'
+  const res = await recycleApi.restore({ type, ids: items.map((i) => i.id), targetKbId: targetKbId.value })
   ElMessage.success(`已恢复 ${res.restored} 项（影响 ${res.affectedDocs} 篇文档），请重建索引以参与检索`)
   targetVisible.value = false
   await loadAll()
@@ -104,7 +105,7 @@ async function purgeOne(item: RecycleItem) {
       confirmButtonClass: 'el-button--danger',
     },
   )
-  const res = await recycleApi.remove([item.id])
+  const res = await recycleApi.remove(item.type, [item.id])
   ElMessage.success(`已彻底删除（清理 ${res.deleted} 项）`)
   await loadAll()
 }
@@ -116,7 +117,9 @@ async function batchPurge() {
     confirmButtonText: '彻底删除',
     confirmButtonClass: 'el-button--danger',
   })
-  const res = await recycleApi.remove(selected.value.map((i) => i.id))
+  // ⚠️ `tab` 就是这一批的类型：页面同一时刻只渲染一个 Tab 的表格，
+  //    而切 Tab 会清空 `selected`（`@tab-change="selected = []"`）⇒ 批内不会混类型
+  const res = await recycleApi.remove(tab.value, selected.value.map((i) => i.id))
   ElMessage.success(`已彻底删除 ${res.deleted} 项`)
   await loadAll()
 }

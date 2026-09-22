@@ -170,6 +170,11 @@ public abstract class ApiTestSupport {
     @AfterEach
     void sweepOrphanKbArtifacts() {
         ProbeCleanup.sweepOrphanKbArtifacts(jdbc);
+        // `T-616`：**三个坐标全空**的终态任务行 —— 上面那条（按 kb_id）与 `cleanUsers`
+        //（按 owner_id）结构上都够不着它们（定时任务的 `TaskSubject.none()`）。
+        // ⚠️ 必须排在通知兜底**之前**：清掉任务行后，它们产的**广播通知**才变成无主、
+        //    被 `sweepOrphanNotices` 同批扫走。
+        ProbeCleanup.sweepOrphanSystemTasks(jdbc);
         // `T-905` 的用量表是**第三种形态的盲区**：它一个归属列都没有，
         // 上面那套"无主产物"问法（扫 kb_id 悬空）与覆盖率闸（扫带归属列的表）**都够不着它**。
         // 唯一可用且有意义的维度是**日期**（它是按天聚合的）。理由与代价写在
