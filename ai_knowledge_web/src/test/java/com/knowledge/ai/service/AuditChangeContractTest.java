@@ -116,12 +116,17 @@ class AuditChangeContractTest extends ApiTestSupport {
     void singleFileDownloadIsNotHighRisk() {
         // §4.3「明确不计入高危」：单文件浏览式下载是日常动作，
         // 标成高危会让告警失去意义 —— 这正是 G3-8 要防的事。
-        AuditRiskPolicy.Rule single = AuditRiskPolicy.findPlanned("文档", "下载文档").orElseThrow();
+        // ⚠️ 查的是 findImplemented 而不是 findPlanned —— `T-613`/`T-614` 于 2026-09-22（`S7-M06-E`）落地，
+        // **两个动作都从 PLANNED 移入 IMPLEMENTED**（策略一个字没变，只是**有了触发点**）。
+        // 本断言跟着搬，断的仍然是「分界就在批量」这一件事 —— 与下面 `删除知识库` 那条同一种处置。
+        // 🔴 这正是策略表分 PLANNED/IMPLEMENTED 两档的代价：**落地那一批要顺手搬这条断言**，
+        // 否则它会以 `NoSuchElementException` 的形态红 —— 而那个错看起来像"策略表丢了条目"。
+        AuditRiskPolicy.Rule single = AuditRiskPolicy.findImplemented("文档", "下载文档").orElseThrow();
         assertThat(single.risk()).isEqualTo(RiskLevel.NORMAL);
         assertThat(single.category()).isEqualTo(AuditRiskPolicy.Category.NOT_HIGH_RISK);
 
         // 分界就在"批量"：批量形态属 §4.3② 数据导出
-        AuditRiskPolicy.Rule batch = AuditRiskPolicy.findPlanned("文档", "批量下载").orElseThrow();
+        AuditRiskPolicy.Rule batch = AuditRiskPolicy.findImplemented("文档", "批量下载").orElseThrow();
         assertThat(batch.risk()).isEqualTo(RiskLevel.HIGH);
         assertThat(batch.category()).isEqualTo(AuditRiskPolicy.Category.DATA_EXPORT);
 

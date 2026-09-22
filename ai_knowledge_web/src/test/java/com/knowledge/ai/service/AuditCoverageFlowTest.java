@@ -33,7 +33,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 **40** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 **43** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * （`S7-M06-E` 加 3 条：文档「下载文档」NORMAL / 「批量下载」HIGH / 「导出文档清单」HIGH ⇒ 40 → 43。）
  * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
  * 在 S6-M09-B 已经到 36 —— 两处数字长期不一致，直到 `T-A02` 加第 37 条时才被发现。
  * **冻结清单**只有一个数字，就是本类断言的那个；本行已按它对正。
@@ -146,6 +147,13 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // 配套判据（DocRollbackFlowTest）证明**回滚确实发生过**：新增一条版本、旧当前版本翻 is_current=0、
         // 且 sys_retrieval_trace_chunk 一字未动（历史引用不变）。
         expected.put(AuditModule.DOC + " 版本回滚", RiskLevel.NORMAL);
+        // ---- 文档 · 下载（S7-M06-E 新增 3 条：G7-9）----
+        // 依据逐字：`05:367` 文档审计动作行含「下载」；`DATA_EXPORT` 枚举注释含「批量下载、导出报表」。
+        // 🔴 单文件下载 NORMAL / 批量下载 HIGH 的分界就在「批量」（G3-8 冻结口径：单文件浏览式下载仍 NORMAL）。
+        expected.put(AuditModule.DOC + " 下载文档", RiskLevel.NORMAL);
+        expected.put(AuditModule.DOC + " 批量下载", RiskLevel.HIGH);
+        // 导出文档清单：带走的是"有哪些文件"的清单（也是可外带资产），同归 §4.3② HIGH。
+        expected.put(AuditModule.DOC + " 导出文档清单", RiskLevel.HIGH);
         // ---- 认证（2）----
         expected.put(AuditModule.AUTH + " 修改密码", RiskLevel.HIGH);
         expected.put(AuditModule.AUTH + " 重置密码（忘记密码自助）", RiskLevel.HIGH);
@@ -328,8 +336,15 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "⚠️ 两条都是需求《05》§6 的文档动作表里**逐字列着**的 —— "
                         + "不是新裁定，是那份表里的最后两条待落地项）"
                         + "→ **40**（`S7-M06-D` 的「文档 / 版本回滚」，`G7-6`。回滚不删版本行、可逆，"
-                        + "风险等同「重建索引」⇒ NORMAL）")
-                .hasSize(40);
+                        + "风险等同「重建索引」⇒ NORMAL）"
+                        + "→ **43**（`S7-M06-E` 的三条：「文档 / 下载文档」NORMAL · "
+                        + "「文档 / 批量下载」HIGH · 「文档 / 导出文档清单」HIGH。"
+                        + "⚠️ 前两条是需求《05》§6 文档动作表里**逐字列着**的（与 39 那两条同一种来历："
+                        + "表里一直有、只是流程没做）；第三条是走通知中心的异步导出，"
+                        + "与「导出审计日志 / 导出运营报表」同一个风险档。"
+                        + "⚠️ **「文档 / 删除文档」仍不在本批**（`T-611`，S7-M06-F）—— "
+                        + "「下载」与「删除」的差别不是量级，是能不能撤回）")
+                .hasSize(43);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

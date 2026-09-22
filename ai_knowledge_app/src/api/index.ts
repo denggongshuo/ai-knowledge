@@ -188,19 +188,43 @@ export const docApi = {
   reindex: (id: number | string) => http.post<{ docId: number; taskId: string; status: string }>(`/doc/${id}/reindex`),
   remove: (id: number | string) => http.delete<{ docId: number; recycled: boolean }>(`/doc/${id}`),
   batchRemove: (ids: number[]) => http.delete<{ deleted: number }>('/doc/batch', { ids }),
-  /** 单文件下载：预签名 URL（有效期 10 分钟） */
+  /**
+   * 单文件下载：预签名 URL（有效期 10 分钟）。
+   * ⚠️ 后端每次调用都会**写一条下载记录**（`G7-9`）—— 不要拿它当"探活"或预取来用。
+   */
   downloadUrl: (docId: number | string) =>
     http.get<{ url: string; expiresAt: string; expiresInSec: number }>(`/doc/download-url/${docId}`),
-  /** 批量打包下载（异步任务） */
+  /**
+   * 预览原文件：预签名 URL（`inline`，10 分钟）。
+   * 与 `downloadUrl` 是**同一个对象、两种取法**：这条让浏览器直接打开（响应头 attachment→inline）。
+   * ⚠️ 它**不写**下载记录 —— 预览不是下载。
+   */
+  previewUrl: (docId: number | string) =>
+    http.get<{ url: string; expiresAt: string; expiresInSec: number }>(`/doc/${docId}/preview-url`),
+  /**
+   * 批量打包下载（异步任务）。受理时同步校验：非空 · ≤ 50 篇 · 合计 ≤ 2 GB ·
+   * 每篇都可见（任一失败整批拒绝）。返回的 `status` 是调度层真值 `PENDING`。
+   */
   batchDownload: (docIds: number[]) =>
     http.post<{ taskId: string; count: number; status: string }>('/doc/batch-download', { docIds }),
+  /**
+   * 单条打包任务。🔴 它是**唯一的"重新生成地址"入口**：后端每次读都现签一个
+   * 新鲜的 10 分钟地址（完成态附带 `fileUrl`），所以"链接过期"重拉一次即可，
+   * **不需要也没有**单独的续签接口。
+   */
   downloadTask: (taskId: string) => http.get<DownloadTask>(`/doc/download-tasks/${taskId}`),
   downloadTasks: () => http.get<{ list: DownloadTask[]; total: number }>('/doc/download-tasks'),
-  downloadRecords: (query?: { page?: number; pageSize?: number }) =>
+  /**
+   * 下载历史（仅本人）。
+   * ⚠️ 请求参数**两个名字都发**（`size` 与 `pageSize`）：后端两个都认、`size` 优先，
+   * 这里保留 `pageSize` 是为了不改动既有调用点。
+   */
+  downloadRecords: (query?: { page?: number; pageSize?: number; size?: number }) =>
     http.get<PageResult<DownloadRecord>>('/doc/download-records', query),
   /** 跨库文档列表（全站口径） */
   all: (query?: { keyword?: string; kbId?: string; type?: string; page?: number; size?: number }) =>
     http.get<{ list: (KbDocRow & { kbId: number; kbName: string })[]; total: number }>('/doc/all', query),
+  /** 导出**下载记录清单**（异步 CSV，完成后经通知中心给地址）。无请求体。 */
   exportList: () => http.post<{ taskId: string; status: string; note: string }>('/doc/export-list'),
 }
 

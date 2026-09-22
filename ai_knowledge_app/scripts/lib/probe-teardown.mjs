@@ -109,6 +109,12 @@ export const KB_ARTIFACTS = [
   { id: 'sql:sys_parse_issue', kind: 'sql', table: 'sys_parse_issue', via: 'kb_id', why: '未识别表格清单' },
   { id: 'sql:sys_chunk', kind: 'sql', table: 'sys_chunk', via: 'kb_id', why: '分片（C1 起）' },
   { id: 'sql:sys_document', kind: 'sql', table: 'sys_document', via: 'kb_id', why: '文档行' },
+  {
+    id: 'sql:sys_download_record', kind: 'sql', table: 'sys_download_record', via: 'kb_id',
+    why: '下载记录（V40 · S7-M06-E）。⚠️ 同一张表在 USER_ARTIFACTS 里还有**第二条** —— '
+      + '下载必然同时锚定"哪个库的哪一篇"与"谁下的"，两条归属线各自都要能收干净；'
+      + '只按 kb_id 清会漏掉"文档已删、库还在"的行，只按 user_id 清会漏掉种子账号下的行',
+  },
   { id: 'sql:sys_kb_grant', kind: 'sql', table: 'sys_kb_grant', via: 'kb_id', why: '知识库授权' },
   { id: 'sql:sys_kb', kind: 'sql', table: 'sys_kb', via: 'code', why: '主表（按 code 命中，非 id）' },
 ]
@@ -181,6 +187,11 @@ export const USER_ARTIFACTS = [
   {
     id: 'sql:sys_chat_session', kind: 'sql-user', table: 'sys_chat_session', via: 'user',
     why: '问答会话（T-802 建表半边）',
+  },
+  {
+    id: 'sql:sys_download_record_by_user', kind: 'sql-user', table: 'sys_download_record', via: 'user',
+    why: '下载记录按**下载人**清（V40 · S7-M06-E）。⚠️ 与库族那条是同一张表的两个归属：'
+      + '文档软删后 `kb_id` 那条线还能命中，但"库先没了"的行只有这条线收得掉',
   },
   {
     id: 'sql:sys_chat_attachment', kind: 'sql-user', table: 'sys_chat_attachment', via: 'user',
@@ -362,8 +373,26 @@ export function minioStillPresent(rawObjectKeys) {
  *
  * @param userIds 用户 id 集合（**必须在删 `sys_user` 之前抓**，与其它归属 id 同理）
  */
+/**
+ * 「**路径即归属、第二段是 userId**」的全部前缀 —— 它们不属于任何探针库，
+ * 所以 `minioKeysOf`（要 join `sys_kb`）**看不见**它们，只能按用户前缀单独收。
+ *
+ * <p>🔴 每**新增**一个这种形状的前缀都要加到这里，否则那个脚本造一个对象、
+ * 桶里就多一个（`#163` 的原始形状）。目前三个：
+ * <ul>
+ *   <li>{@code chat-attachments/}（`T-805` 预上传的问答图片）；</li>
+ *   <li>{@code batch-download/}（`T-614` 打包 zip，`S7-M06-E` 新增）；</li>
+ *   <li>{@code doc-export/}（`T-615` 下载记录清单 CSV，`S7-M06-E` 新增）。</li>
+ * </ul>
+ * <p>⚠️ 后两个是 `S7-M06-E` 补进来的：新前缀**当时只加进了 Java 侧的登记表**
+ * （`ProbeCleanup#MINIO_PREFIXES`），脚本侧这个函数漏了 —— 而"脚本侧漏了"的表现是
+ * **E2E 每跑一轮桶里多几个对象**，且没有任何闸会点名（Java 侧那条
+ * `everyKnownPrefixIsClassified` 查的是 Java 侧的清单）。
+ */
+export const USER_MINIO_PREFIXES = ['chat-attachments/', 'batch-download/', 'doc-export/']
+
 export function minioKeysOfUserPrefix(userIds) {
-  return minioKeysOfPathUserPrefix('chat-attachments/', userIds)
+  return USER_MINIO_PREFIXES.flatMap((prefix) => minioKeysOfPathUserPrefix(prefix, userIds))
 }
 
 /**
@@ -490,6 +519,146 @@ export function milvusDropPartitions(ids) {
     milvusPost('partitions/release', { collectionName: COLLECTION, partitionNames: [name] })
     milvusPost('partitions/drop', { collectionName: COLLECTION, partitionName: name })
   }
+}
+
+// ---------------------------------------------------------------------------
+// `T-O27`：Milvus **孤儿向量**清扫
+// ---------------------------------------------------------------------------
+
+/**
+ * 单次 `entities/query` 的取数上限（Milvus 的硬上限就是 16384）。
+ *
+ * <p>⚠️ 与下面 `MILVUS_MAX_PAGES` 一起构成"输入完整性"这条判据 —— 见 `milvusDistinctKbIds`。
+ */
+const MILVUS_PAGE = 16384
+
+/** 扫 `kb_id` 的翻页护栏（20 页 ≈ 32 万条向量；本仓探针规模远达不到）。 */
+const MILVUS_MAX_PAGES = 20
+
+/**
+ * Milvus 里**出现过的全部 `kb_id`**（去重）。
+ *
+ * <h3>🔴 必须翻页，不能一次 query 完</h3>
+ * <p>`entities/query` 单次上限 {@link MILVUS_PAGE} 行。只取一页的话，当一个库的向量
+ * 超过这个数，**后面那些 `kb_id` 根本没进过输入** —— 而现象是"扫描跑成功了、
+ * 一个孤儿都没找到"。这正是 `#149` 那一族：**闸覆盖了一类产物、另一类不在它的输入里**；
+ * 这里更隐蔽 —— 不是"少了一类"，是"**同一类少了一半**"。
+ *
+ * <h3>为什么不能只看分区名（`T-O27` 的判据原文）</h3>
+ * <p>分区是**容器**：`entities/delete` 删点不删容器（`milvus:partitions` 那条登记里写着）。
+ * 于是"分区都在"与"向量都在"是两件事 —— 反过来，"没有孤儿分区"也**推不出**
+ * "没有孤儿向量"。判据必须以**条数**为准，分区名只作旁证。
+ *
+ * @returns {{ids: number[], truncated: boolean}} `truncated=true` ⇒ 输入不完整，**结论不可信**
+ */
+export function milvusDistinctKbIds() {
+  const seen = new Set()
+  for (let page = 0; page < MILVUS_MAX_PAGES; page++) {
+    const r = milvusPost('entities/query', {
+      collectionName: COLLECTION,
+      filter: 'kb_id >= 0',
+      outputFields: ['kb_id'],
+      limit: MILVUS_PAGE,
+      offset: page * MILVUS_PAGE,
+    })
+    const rows = r?.data
+    if (!Array.isArray(rows)) {
+      // 查询失败 ⇒ 这是"判不了"，必须与"判否"分开报（否则会被读成"没有孤儿"）
+      throw new Error(`Milvus 扫 kb_id 失败：${JSON.stringify(r).slice(0, 300)}`)
+    }
+    for (const row of rows) {
+      const id = Number(row?.kb_id)
+      if (Number.isFinite(id)) seen.add(id)
+    }
+    if (rows.length < MILVUS_PAGE) return { ids: [...seen], truncated: false }
+  }
+  return { ids: [...seen], truncated: true }
+}
+
+/** 单个 kb 在 Milvus 里的向量条数（与 `milvusVectorCount` 同一个观测点：`count(*)`）。 */
+export function milvusCountOfKb(kbId) {
+  const r = milvusPost('entities/query', {
+    collectionName: COLLECTION,
+    filter: `kb_id == ${Number(kbId)}`,
+    outputFields: ['count(*)'],
+  })
+  const n = Number(r?.data?.[0]?.['count(*)'] ?? -1)
+  return Number.isFinite(n) ? n : -1
+}
+
+/** MySQL 里**现存**的 kb id 集合（判"孤儿"的那另一半输入）。 */
+export function existingKbIds() {
+  return new Set(normalizeKeys(mysqlScalar('select id from sys_kb')).map((s) => Number(s)))
+}
+
+/**
+ * **扫一次孤儿向量**：Milvus 里出现过、而 `sys_kb` 里已经没有的 `kb_id`。
+ *
+ * <p>它**只算不清**（`sweepOrphanVectors` 才真删）—— 分开是为了让"判据"能独立跑，
+ * 也让探针可以在删之前把证据打出来。
+ *
+ * @returns {{orphans: number[], before: Record<string, number>, truncated: boolean,
+ *            totalBefore: number}}
+ */
+export function findOrphanVectors() {
+  const { ids, truncated } = milvusDistinctKbIds()
+  const alive = existingKbIds()
+  const orphans = ids.filter((id) => !alive.has(id))
+
+  const before = {}
+  let totalBefore = 0
+  for (const id of orphans) {
+    const n = milvusCountOfKb(id)
+    before[id] = n
+    totalBefore += Math.max(n, 0)
+  }
+  return { orphans, before, truncated, totalBefore }
+}
+
+/**
+ * **清掉孤儿向量**，并用**独立观测点**验证真的删掉了。
+ *
+ * <h3>为什么删完要再数一次（而不是信 `entities/delete` 的返回）</h3>
+ * <p>删除的可见性有几秒延迟（`milvusVectorCount` 的注释实测过：`deleteCount=N` 之后
+ * 立刻 count 仍是 N）。所以这里**轮询到 0**；轮询不到就是**真失败**，
+ * 而不是"删了但没看见"。
+ *
+ * <p>⚠️ 判定用的是 `count(*)` 之后**再查一次 `kb_id`**（两个观测点）：
+ * 只信 `deleteCount` 就等于拿"调用方说删了"当证据 ——
+ * 本仓那条「SDK 调用成功不等于业务事实已成立」正是这个形状。
+ *
+ * @returns {{before: Record<string, number>, after: Record<string, number>,
+ *            swept: number[], failed: number[], totalBefore: number, totalAfter: number}}
+ */
+export async function sweepOrphanVectors({ dryRun = false } = {}) {
+  const { orphans, before, truncated, totalBefore } = findOrphanVectors()
+  if (truncated) {
+    // 输入不完整时**不删**：宁可留到下一轮，也不要凭半份输入做不可逆的事
+    throw new Error('Milvus 扫 kb_id 撞到翻页上限 ⇒ 输入不完整，本轮**不执行删除**（调大 MILVUS_MAX_PAGES 后重试）')
+  }
+  if (dryRun || orphans.length === 0) {
+    return { before, after: before, swept: [], failed: [], totalBefore, totalAfter: totalBefore }
+  }
+
+  milvusDeleteVectors(orphans)
+
+  const after = {}
+  const swept = []
+  const failed = []
+  let totalAfter = 0
+  for (const id of orphans) {
+    for (let i = 0; i < 6; i++) {
+      const n = milvusCountOfKb(id)
+      if (n === 0) break
+      if (i < 5) await sleep(2000)
+    }
+    const left = milvusCountOfKb(id)
+    after[id] = left
+    totalAfter += Math.max(left, 0)
+    if (left === 0) swept.push(id)
+    else failed.push(id)
+  }
+  return { before, after, swept, failed, totalBefore, totalAfter }
 }
 
 // ---------------------------------------------------------------------------

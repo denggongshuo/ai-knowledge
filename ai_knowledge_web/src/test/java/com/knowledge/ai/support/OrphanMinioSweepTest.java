@@ -212,7 +212,13 @@ class OrphanMinioSweepTest extends ApiTestSupport {
             "documents/", "parsed/", "chat-attachments/", "avatars/", "images/", "audit-export/",
             // `T-A02` 加了第七个 —— 它**刻意不复用** `audit-export/`（理由见 `ProbeCleanup` 的
             // `OPS_EXPORT_PREFIX`）。这一次是**先加清单再加服务**，与 `images/` 那次相反。
-            "ops-export/");
+            "ops-export/",
+            // `S7-M06-E` 加了第八、第九个（两者同批出生，登记见 `ProbeCleanup`）：
+            // `batch-download/`（打包 zip）与 `doc-export/`（下载记录清单 CSV）。
+            // ⚠️ 这一次的顺序是**先加服务、后加清单** —— 而闸当场就把它点名了（本批实测：
+            // `everyKnownPrefixIsClassified` 转红，报"前缀清单与登记不一致"），
+            // 也就是说 `T-O11` 那条机器检查**真的在起作用**，不是摆设。
+            "batch-download/", "doc-export/");
 
     @Test
     @DisplayName("T-O11 判据 6：七个前缀**逐个表态** —— 覆盖集必须与冻结清单完全相等")

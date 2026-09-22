@@ -1670,6 +1670,23 @@ register('GET', '/api/doc/download-url/:docId', (_req, res, ctx) => {
   })
 })
 
+/**
+ * 预览地址（`T-613`，`S7-M06-E`）。
+ *
+ * ⚠️ **它与上面那条是同形不同命的两个端点**：后端同一个对象、只差一个
+ * `response-content-disposition`（`inline` vs `attachment`）。mock 里两条都注册，
+ * 是因为前端**真的会分别调它们**（`DocPreviewView` 的「新窗口打开」走这条）——
+ * 少注册一条，mock 模式下那个按钮就是 404（`audit-api` 的 ① 会点名）。
+ */
+register('GET', '/api/doc/:id/preview-url', (_req, res, ctx) => {
+  const now = Date.now()
+  json(res, 0, {
+    url: `/mock-files/doc-${ctx.params.id}.pdf`,
+    expiresAt: new Date(now + 10 * 60_000).toISOString(),
+    expiresInSec: 600,
+  })
+})
+
 register('POST', '/api/doc/batch-download', async (req, res, ctx) => {
   await delay(400)
   const ids = (ctx.body as { docIds?: number[] }).docIds ?? []

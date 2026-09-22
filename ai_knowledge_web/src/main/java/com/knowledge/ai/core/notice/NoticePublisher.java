@@ -47,8 +47,11 @@ public class NoticePublisher {
      *
      * <p>⚠️ **不覆盖、且是刻意不覆盖的**（见计划 §3.1「明确不做」⑥）：
      * {@code DOC_SCAN}（需求未点名要通知，且它的结果形状本批没核实）·
-     * 批量下载（`T-614` 流程本身还没做）· 定时清理（触发点在批处理里，本批拿不到真取证）。
+     * 定时清理（触发点在批处理里，本批拿不到真取证）。
      * **不为不存在的流程写代码** —— 承 `#187` 的判例。
+     *
+     * <p>⚠️ **{@code batch-download} 本批（`S7-M06-E`）已接入** —— 上面那句"批量下载刻意不覆盖"
+     * 的前提（"流程还没做"）已随本批消失。
      */
     private static final String TYPE_AUDIT_EXPORT = "audit-export";
 
@@ -61,6 +64,33 @@ public class NoticePublisher {
     private static final String TYPE_DOC_UPLOAD = "doc-upload";
 
     private static final String TYPE_KB_REINDEX = "KB_REINDEX";
+
+    /**
+     * 打包下载（`T-614` · `S7-M06-E`）。⚠️ 与 {@code DownloadService.TASK_TYPE} **逐字一致**。
+     *
+     * <p>由 `S6-M11` §9-⑨「批量下载刻意不产通知（流程还没做）」升级而来 —— 本批流程做了，
+     * 通知就得接上（需求 `06` §6.6：打包完成经**通知中心**给地址）。归 {@code SYSTEM}
+     * （用户 2026-09-21 裁定：语义最近，不动前后端 NoticeType 契约）。
+     */
+    private static final String TYPE_BATCH_DOWNLOAD = "batch-download";
+
+    /**
+     * 下载记录清单导出（`T-615`）。⚠️ 与 {@code DownloadService.EXPORT_TASK_TYPE} **逐字一致**。
+     *
+     * <p>导的是**下载记录**（`sys_download_record` 里"我下过什么"），不是文档列表 ——
+     * 原型 `09-文档下载.html:660` 把 {@code POST /doc/export-list} 逐字注成
+     * 「导出下载记录清单」。
+     */
+    private static final String TYPE_DOC_EXPORT_LIST = "doc-export-list";
+
+    /**
+     * 下载相关通知的兜底入口（`T-613`~`T-615`）。
+     *
+     * <p>为什么不是 {@code kbPath(kbId)}：这几个任务**没有知识库维度**
+     * （用户可以跨库勾选，{@code TaskSubject.kbId} 留 null），兜底到 `/kb` 会让
+     * 「回文档列表」跳到知识库列表 —— 那不是他刚才待的页面。下载任务列表在 `/doc/download`。
+     */
+    private static final String DOWNLOAD_PATH = "/doc/download";
 
     private final NoticeRepository noticeRepository;
 
@@ -124,7 +154,7 @@ public class NoticePublisher {
         Long docId = coord.docId();
         return switch (coord.type() == null ? "" : coord.type()) {
             case TYPE_AUDIT_EXPORT -> done
-                    ? exportDone("审计导出完成", "去审计页", "/audit", result)
+                    ? exportDone("审计导出完成", "导出文件", "去审计页", "/audit", result)
                     // 导出失败对用户是"想要的 CSV 没拿到" —— 归 ALERT（需求 §2.2 的「任务中断」）
                     : new NoticePayload(NoticeType.ALERT, "审计导出失败",
                             "导出任务未完成：" + reason(errorMsg) + "。可调整筛选条件后重新导出。",
@@ -132,10 +162,17 @@ public class NoticePublisher {
 
             // 运营报表导出（`T-A02`）。走与审计导出**同一段** fileUrl 处理 —— 见 exportDone
             case TYPE_OPS_EXPORT -> done
-                    ? exportDone("运营报表导出完成", "回运营页", "/ops/qa", result)
+                    ? exportDone("运营报表导出完成", "导出文件", "回运营页", "/ops/qa", result)
                     : new NoticePayload(NoticeType.ALERT, "运营报表导出失败",
                             "导出任务未完成：" + reason(errorMsg) + "。可调整筛选条件后重新导出。",
                             List.of(NoticeAction.primary("重新导出", "/ops/qa")), true, false);
+
+            // 下载记录清单导出（`T-615`）。与上面两个导出同一形状（都是 CSV + fileUrl）
+            case TYPE_DOC_EXPORT_LIST -> done
+                    ? exportDone("下载记录导出完成", "导出文件", "回下载页", DOWNLOAD_PATH, result)
+                    : new NoticePayload(NoticeType.ALERT, "下载记录导出失败",
+                            "导出任务未完成：" + reason(errorMsg) + "。可到下载页重新导出。",
+                            List.of(NoticeAction.primary("回下载页", DOWNLOAD_PATH)), true, false);
 
             case TYPE_DOC_UPLOAD -> done
                     ? new NoticePayload(NoticeType.UPLOAD, "解析完成",
@@ -152,6 +189,13 @@ public class NoticePublisher {
                                     : List.of(NoticeAction.primary("去文档详情", "/doc/" + docId),
                                             NoticeAction.secondary("查看解析质量", kbPath(kbId))),
                             true, true);
+
+            // 打包下载完成（`T-614`）。走与两个导出**同一段** fileUrl 处理（zip 的下载地址在 result.fileUrl）
+            case TYPE_BATCH_DOWNLOAD -> done
+                    ? exportDone("打包下载完成", "打包文件", "回下载页", DOWNLOAD_PATH, result)
+                    : new NoticePayload(NoticeType.ALERT, "打包下载失败",
+                            "打包任务未完成：" + reason(errorMsg) + "。可减少文件数量后重试。",
+                            List.of(NoticeAction.primary("回下载页", DOWNLOAD_PATH)), true, false);
 
             // 需求 §2.10 点名：「全库重建完成后产出通知，**并附「查看检索质量变化」入口**」
             case TYPE_KB_REINDEX -> done
@@ -173,28 +217,31 @@ public class NoticePublisher {
      * 导出成功 —— 🔴 **这条是本类存在理由的证明**：它要的是 `result` 里的 `fileUrl`，
      * 而那个东西**只在这一层拿得到**（`sys_async_task.result` 不持久化）。
      *
-     * <p>两个导出（审计件 `T-304` / 运营报表 `T-A02`）共用这一段：
+     * <p>三处（审计件 `T-304` / 运营报表 `T-A02` / 下载记录 `T-615`）共用这一段：
      * "`fileUrl` 有就用它当按钮、没有就退回页面入口"这条规则**只该有一份** ——
      * 各写一份的话，一边记得处理 `fileUrl` 为空、另一边忘，现象是"通知里有个点不动的按钮"。
      * 所以标题与兜底入口做成参数，**规则本身不复制**。
      *
+     * @param noun          产出物的**中文名**（"导出文件" / "打包文件"）。做参数是为了让
+     *                      三个caller各自的正文与按钮文案都对：复用同一段规则不等于
+     *                      复用同一句话 —— 把 zip 叫成"导出文件"就是文案与事实不符
      * @param fallbackLabel / {@code fallbackPath}：`fileUrl` 缺失时退回去的入口
      */
-    private NoticePayload exportDone(String title, String fallbackLabel, String fallbackPath,
-                                     Object result) {
+    private NoticePayload exportDone(String title, String noun, String fallbackLabel,
+                                     String fallbackPath, Object result) {
         String fileUrl = stringField(result, "fileUrl");
         Long rows = longField(result, "rows");
         String detail = rows == null ? "" : "共 " + rows + " 行。";
         if (fileUrl == null || fileUrl.isBlank()) {
             // 结果里没有地址（不该发生）—— 不能给一个点不动的按钮
-            log.warn("导出任务完成但结果里没有 fileUrl，通知退回页面入口：title={}", title);
+            log.warn("任务完成但结果里没有 fileUrl，通知退回页面入口：title={}", title);
             return new NoticePayload(NoticeType.SYSTEM, title,
-                    "导出文件已生成，" + detail + "请到页面重新导出获取下载地址。",
+                    noun + "已生成，" + detail + "请到页面重新获取下载地址。",
                     List.of(NoticeAction.primary(fallbackLabel, fallbackPath)), false, true);
         }
         return new NoticePayload(NoticeType.SYSTEM, title,
-                "导出文件已生成，" + detail + "下载地址有时效，请尽快下载。",
-                List.of(NoticeAction.primary("下载导出文件", fileUrl)), false, true);
+                noun + "已生成，" + detail + "下载地址有时效，请尽快下载。",
+                List.of(NoticeAction.primary("下载" + noun, fileUrl)), false, true);
     }
 
     private static String kbPath(Long kbId) {

@@ -284,6 +284,22 @@ public final class AuditRiskPolicy {
         register(AuditModule.DOC, "版本回滚", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
                 "§4.3 四类均不沾；回滚=新增版本+重向量化+清旧向量、不删版本行且可逆，风险等同「重建索引」，标 NORMAL");
 
+        // ---------- `S7-M06-E`（2026-09-21）：下载（`G7-9`）—— 从 PLANNED 移入 ----------
+        // 依据同「重建索引/移动知识库」那两条：`05:367` 的文档审计动作行逐字含「下载」。
+        // 移入判据是"注解真的挂上去了"（`DownloadService` 的 @AuditLog）。删除文档仍留 PLANNED（属 `T-611`/F 批）。
+        register(AuditModule.DOC, "下载文档", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
+                "§4.3 明确不计入高危：单文件浏览式下载是日常动作（`G3-8` 冻结口径逐字：单文件浏览式下载**仍 NORMAL**）。"
+                        + "否则每天上百条高危、标记失效 —— 这正是 §4.3「界限必须写死」要防的事。"
+                        + "⚠️ 与「批量下载」的分界就在**批量**：一次拉一篇是浏览、一次拉一批是数据外带");
+        register(AuditModule.DOC, "批量下载", Category.DATA_EXPORT, RiskLevel.HIGH,
+                "§4.3②数据导出：`DATA_EXPORT` 枚举注释逐字列着「**批量下载**、导出会话、导出报表、导出审计日志」"
+                        + "⇒ 这是**口径要求**不是判断。一次打包把 ≤50 篇文档带出系统，属数据外带风险面，"
+                        + "与单文件下载的分界就在「批量」。与「导出会话/运营报表」同属 §4.3②，档次一致");
+        register(AuditModule.DOC, "导出文档清单", Category.DATA_EXPORT, RiskLevel.HIGH,
+                "§4.3②数据导出（`T-615` 的 export-list）。⚠️ 与「批量下载」的差别：那个带走**文件本身**，"
+                        + "这个带走**清单**（有哪些文件、多大、谁传的）—— 清单本身也是一份可外带的资产"
+                        + "（暴露了库里有什么），故同归 §4.3② 标 HIGH。与运营报表导出同一条形态");
+
         // ---------- 系统 · 模型配置（2026-09-18 · S6-M09-A 的 T-900~T-903 落地） ----------
         // 四条一起登记：它们**本来就是同一条裁定**（`MODEL_CONFIG_CHANGE` 的类注释原文是
         // 「四类模型的**新增、编辑、删除、启用或切换**」），`PLANNED` 里那两条只预告了"启用"半边。
@@ -324,10 +340,8 @@ public final class AuditRiskPolicy {
     private static final Map<String, Rule> PLANNED = new LinkedHashMap<>();
 
     static {
-        register(PLANNED, AuditModule.DOC, "下载文档", Category.NOT_HIGH_RISK, RiskLevel.NORMAL,
-                "§4.3 明确不计入高危：单文件浏览式下载是日常动作，否则每天上百条高危、标记失效（G3-8 判据）");
-        register(PLANNED, AuditModule.DOC, "批量下载", Category.DATA_EXPORT, RiskLevel.HIGH,
-                "§4.3②数据导出：批量形态属数据外带风险（与单文件下载的分界就在「批量」）");
+        // ⚠️ 「下载文档」「批量下载」已于 `S7-M06-E`（2026-09-21）**移入 IMPLEMENTED**（`DownloadService` 落地）。
+        //    「导出文档清单」同批新登记，直接进 IMPLEMENTED。此处只剩删除文档（属 `T-611`/F 批）。
         register(PLANNED, AuditModule.DOC, "删除文档", Category.CONTENT_DELETE, RiskLevel.HIGH,
                 "§4.3③内容删除");
         // ⚠️ 原有的两条模型配置预告（「启用模型配置」「切换重排模型」）已于 `S6-M09-A`（2026-09-18）

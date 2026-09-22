@@ -1,13 +1,18 @@
 package com.knowledge.ai.controller;
 
 import com.knowledge.ai.core.model.ApiResponse;
+import com.knowledge.ai.core.model.PageQuery;
+import com.knowledge.ai.core.model.PageResult;
 import com.knowledge.ai.core.security.RequiresPerm;
+import com.knowledge.ai.core.web.WebUtils;
 import com.knowledge.ai.dto.doc.DocDtos;
 import com.knowledge.ai.service.DocAttributeService;
 import com.knowledge.ai.service.DocDetailService;
 import com.knowledge.ai.service.DocReindexService;
 import com.knowledge.ai.service.DocService;
 import com.knowledge.ai.service.DocVersionService;
+import com.knowledge.ai.service.DownloadService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -59,6 +64,9 @@ public class DocController {
     private final DocReindexService docReindexService;
 
     private final DocVersionService docVersionService;
+
+    /** `T-613`/`T-614`/`T-615`：预览地址 · 单篇下载 · 打包下载 · 任务 · 记录 · 导出清单。 */
+    private final DownloadService downloadService;
 
     /**
      * {@code POST /api/kb/{kbId}/doc/upload} —— 上传文档。
@@ -324,5 +332,121 @@ public class DocController {
     @RequiresPerm("doc:reindex")
     public ApiResponse<DocDtos.DocReindexAccepted> reindex(@PathVariable("id") long docId) {
         return ApiResponse.ok(docReindexService.submit(docId));
+    }
+
+    // ==================================================================
+    // S7 · M06 · 阶段 E：预览地址 / 下载 / 打包 / 任务 / 记录 / 导出
+    // （`T-613` / `T-614` / `T-615` · `G7-7` / `G7-8` / `G7-9`）
+    // ==================================================================
+
+    /**
+     * {@code GET /api/doc/{id}/preview-url} —— **预览**用的预签名地址（{@code inline}，10 分钟）。
+     *
+     * <p>权限 {@code doc:preview}（与预览页其余五条同码）。它与下面那条下载地址的区别
+     * **不在权限，在响应头**：这边让对象存储回 {@code Content-Disposition: inline}，
+     * 浏览器直接开；那边回 {@code attachment}，浏览器另存为。
+     * 需求 `10` §14 把两条并排列出正是这个意思（同一个对象、两种取法）。
+     *
+     * <p>⚠️ 前端预览页目前用元信息**本地渲染正文**（需求 §14 line 365 的「前端改用」），
+     * 这条端点保留给大文件与"直接看原文件"的场景 —— 后端有、前端未接入。
+     */
+    @GetMapping("/api/doc/{id}/preview-url")
+    @RequiresPerm("doc:preview")
+    public ApiResponse<DocDtos.DownloadUrl> previewUrl(@PathVariable("id") long docId) {
+        return ApiResponse.ok(downloadService.previewUrl(docId));
+    }
+
+    /**
+     * {@code GET /api/doc/download-url/{docId}} —— **单篇下载**的预签名地址（{@code attachment}，10 分钟）。
+     *
+     * <p>🔴 每次调用都会写一条下载记录（`G7-9`）—— 它是"我下过什么"的证据链起点，
+     * 不是一条可以随便重放的查询接口。
+     *
+     * <p>⚠️ 路径段是 {@code download-url}（字面量）而不是 {@code {id}} 的某个动作：
+     * 《10》§7 就是这么定的。与 {@code /doc/{id}/preview-url} 的形状不同是**故意的**
+     * —— 前者以动作开头（下载是全局动作），后者以资源开头（预览是文档的动作）。
+     */
+    @GetMapping("/api/doc/download-url/{docId}")
+    @RequiresPerm("doc:download")
+    public ApiResponse<DocDtos.DownloadUrl> downloadUrl(@PathVariable long docId,
+                                                       HttpServletRequest request) {
+        return ApiResponse.ok(downloadService.downloadUrl(docId, WebUtils.clientIp(request)));
+    }
+
+    /**
+     * {@code POST /api/doc/batch-download} —— 批量打包下载（异步，`G7-8`）。
+     *
+     * <p>body = {@code {docIds: [..]}}。**受理时同步**校验：非空 · ≤ 50 篇 · 合计 ≤ 2GB ·
+     * 每一篇都可见（任一失败 ⇒ 整批拒绝，不静默过滤）。
+     * 通过后立刻返回 {@code taskId}，打包在异步任务里做，完成后经**通知中心**交付地址。
+     */
+    @PostMapping("/api/doc/batch-download")
+    @RequiresPerm("doc:download")
+    public ApiResponse<DocDtos.BatchDownloadAccepted> batchDownload(
+            @RequestBody DocDtos.BatchDownloadRequest request,
+            HttpServletRequest httpRequest) {
+        // body 整个缺省时 request 为 null（前端 mock 之外没有这种调用，但不该 500）
+        List<Long> docIds = request == null ? null : request.docIds();
+        return ApiResponse.ok(downloadService.batchDownload(docIds, WebUtils.clientIp(httpRequest)));
+    }
+
+    /**
+     * {@code GET /api/doc/download-tasks} —— **我的**打包任务列表。
+     *
+     * <p>🔴 归属过滤在服务端 SQL 里（{@code owner_id}）——
+     * 不是"查全部再让前端只显示自己的"。
+     */
+    @GetMapping("/api/doc/download-tasks")
+    @RequiresPerm("doc:download")
+    public ApiResponse<DocDtos.DownloadTaskList> downloadTasks() {
+        return ApiResponse.ok(downloadService.taskList());
+    }
+
+    /**
+     * {@code GET /api/doc/download-tasks/{taskId}} —— 单条打包任务（前端轮询它推进度）。
+     *
+     * <p>⚠️ 与上面那条泛用的 {@code GET /api/doc/tasks/{taskId}} **不是一回事**：
+     * 那条是文档解析等任务的投影（{@code DocDtos.TaskView}，六字段），
+     * 这条是**打包下载**的投影（{@code DownloadTaskView}，带文件名 / 大小 / 下载地址），
+     * 且**带归属校验** —— 泛用那条只要求登录（理由见它的 javadoc：taskId 本身就是能力凭证），
+     * 而这条的响应里有**能把文件取走的预签名地址**，必须有归属。
+     */
+    @GetMapping("/api/doc/download-tasks/{taskId}")
+    @RequiresPerm("doc:download")
+    public ApiResponse<DocDtos.DownloadTaskView> downloadTask(@PathVariable String taskId) {
+        return ApiResponse.ok(downloadService.taskDetail(taskId));
+    }
+
+    /**
+     * {@code GET /api/doc/download-records?page=&size=} —— 我的下载历史（分页）。
+     *
+     * <p>⚠️ {@code size} 与 {@code pageSize} **两个名字都收，{@code size} 优先**：
+     * 需求 `06` §5.7 的请求参数写的是 {@code size}，而前端历史代码发的是 {@code pageSize}
+     * （{@code DocDownloadView.vue} 的 {@code PAGE_SIZE}）。只认一个的话，
+     * 另一种调用会**静默退回默认 20 条** —— 现象是"每页条数设了没用"，最难查的一类。
+     * 只做请求侧的兼容；**响应**统一走全站标准的 {@code { list, total, page, size }}。
+     */
+    @GetMapping("/api/doc/download-records")
+    @RequiresPerm("doc:download")
+    public ApiResponse<PageResult<DocDtos.DownloadRecordRow>> downloadRecords(
+            @RequestParam(required = false) Integer page,
+            @RequestParam(required = false) Integer size,
+            @RequestParam(required = false) Integer pageSize) {
+        int safePage = page == null ? PageQuery.DEFAULT_PAGE : page;
+        int safeSize = size != null ? size
+                : (pageSize == null ? PageQuery.DEFAULT_SIZE : pageSize);
+        return ApiResponse.ok(downloadService.records(PageQuery.of(safePage, safeSize)));
+    }
+
+    /**
+     * {@code POST /api/doc/export-list} —— 导出**下载记录清单**（异步 CSV，走通知中心）。
+     *
+     * <p>无请求体：导出范围就是"当前用户的全部下载记录"（记录页没有筛选器）。
+     * 🚩 数据导出，审计标 HIGH。
+     */
+    @PostMapping("/api/doc/export-list")
+    @RequiresPerm("doc:download")
+    public ApiResponse<DocDtos.ExportListAccepted> exportList() {
+        return ApiResponse.ok(downloadService.exportList());
     }
 }

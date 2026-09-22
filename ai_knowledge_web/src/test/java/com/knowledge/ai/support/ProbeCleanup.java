@@ -122,6 +122,9 @@ public final class ProbeCleanup {
             // 于是这类任务**谁也认领不了**（已一并修好，见那边注释）
             jdbc.update("delete from sys_async_task where owner_id in (" + idIn + ")", idArgs);
             // `sys_login_log` 是 `#98` 的根因所在：此前**一个类都没删过**（实测 +242 行/轮）
+            // 下载记录（`V40` · `S7-M06-E`）。⚠️ 它的归属列是 `user_id`（下载人）——
+            // 与 `sys_async_task` 那条（`owner_id`）不同名，**别互相照抄**
+            jdbc.update("delete from sys_download_record where user_id in (" + idIn + ")", idArgs);
             jdbc.update("delete from sys_login_log where user_id in (" + idIn + ")", idArgs);
             jdbc.update("delete from sys_user_role where user_id in (" + idIn + ")", idArgs);
         }
@@ -130,7 +133,12 @@ public final class ProbeCleanup {
 
     /** 无主产物兜底要扫的表 —— **顺序即执行顺序**（子表在前）。 */
     private static final List<String> ORPHAN_SWEEP = List.of(
-            "sys_async_task", "sys_parse_issue", "sys_chunk", "sys_document", "sys_kb_grant");
+            "sys_async_task", "sys_parse_issue", "sys_chunk", "sys_document", "sys_kb_grant",
+            // `S7-M06-E`（`V40`）：下载记录。⚠️ 它在**生产**里是"库删了也要留"的
+            // （下载历史是既成事实），但在**探针**里必须跟着库一起清 ——
+            // 否则每跑一轮就留一批"kb 已不存在"的记录，而它们的 `doc_id` 也早没了。
+            // 与 `sys_async_task` 同一种处境：生产要留、探针要清。
+            "sys_download_record");
 
     /**
      * **兜底**：删掉那些"父行已经不在"的产物（`kb_id` 指向一个不存在的 `sys_kb`）。
@@ -535,6 +543,27 @@ public final class ProbeCleanup {
     public static final String OPS_EXPORT_PREFIX = "ops-export/";
 
     /**
+     * `batch-download/` 的前缀常量（`S7-M06-E` 新增）—— `DocStorage.BATCH_PREFIX` 用的是同一个字面量。
+     *
+     * <p>同 {@link #OPS_EXPORT_PREFIX}：路径即归属（`batch-download/{userId}/{taskId}/documents.zip`），
+     * 刻意不复用别的前缀 —— 打包 zip 是"用户导出的一份数据外带件"，归属在路径里。
+     *
+     * <p>⚠️ 路径里多出来的 `{taskId}` 那一段**正是产物可被反查的原因**：对象名由
+     * `ownerId + taskId` 唯一决定（`DocStorage#batchZipObjectKey`），任务行里就有这两个值
+     * ⇒ 重启后（任务结果不落库）仍然算得出"文件在哪、多大"。删掉那一段就等于
+     * 把"重新生成下载地址"这条路一起删了。
+     */
+    public static final String BATCH_DOWNLOAD_PREFIX = "batch-download/";
+
+    /**
+     * `doc-export/` 的前缀常量（`S7-M06-E` 新增）—— `DocStorage.DOC_EXPORT_PREFIX` 用的是同一个字面量。
+     *
+     * <p>同 {@link #BATCH_DOWNLOAD_PREFIX}：路径即归属（`doc-export/{userId}/{时间戳}-downloads.csv`）。
+     * 它是下载记录清单的导出件（`T-615` 的 `POST /doc/export-list`）。
+     */
+    public static final String DOC_EXPORT_PREFIX = "doc-export/";
+
+    /**
      * **受管前缀清单**。⚠️ 新增一个"系统产出的对象前缀"时，**必须在这里加一行**，
      * 否则它**结构上不在兜底的输入里** —— 那正是 `#149` 记的"闸覆盖了一类产物、
      * 另一类不在输入里"那个形态。
@@ -556,7 +585,13 @@ public final class ProbeCleanup {
             new MinioPrefix(AUDIT_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"),
             // `T-A02` 新增的第七个 —— 运营报表导出（`OpsExportService#store`）。
             // 与第六个同形：`ops-export/{userId}/{时间戳}-qa-ops.csv`，归属同样在路径里。
-            new MinioPrefix(OPS_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"));
+            new MinioPrefix(OPS_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"),
+            // `S7-M06-E` 新增的第八个 —— 打包下载的 zip（`DocStorage.BATCH_PREFIX`）。
+            // 与第六/七个同形：归属在路径里（`batch-download/{userId}/...`），Owner.PATH_USER_ID。
+            new MinioPrefix(BATCH_DOWNLOAD_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"),
+            // `S7-M06-E` 新增的第九个 —— 下载记录清单的 CSV（`DocStorage.DOC_EXPORT_PREFIX`）。
+            // 同形：`doc-export/{userId}/{时间戳}-downloads.csv`，归属在路径里。
+            new MinioPrefix(DOC_EXPORT_PREFIX, Owner.PATH_USER_ID, "sys_user", "id"));
 
     /**
      * 兜底**覆盖了哪些前缀**（供机器检查比对，见 {@code OrphanMinioSweepTest}）。

@@ -502,4 +502,125 @@ public final class DocDtos {
      */
     public record RollbackRequest(String version) {
     }
+
+    // ==================== T-613 · 预览 / 下载地址（S7-M06-E · G7-7） ====================
+
+    /**
+     * 预签名地址（{@code GET /doc/download-url/{docId}} 与 {@code /doc/{id}/preview-url} 共用）。
+     *
+     * <p>对齐前端 {@code docApi.downloadUrl}（`api/index.ts:192`）：
+     * {@code { url, expiresAt, expiresInSec }}。
+     *
+     * <p>🔴 **只回事实、不缓存 URL**：预签名 URL 有 TTL（本面 10 分钟，见 {@code PresignTtl.DOC_DOWNLOAD_MINUTES}），
+     * 每次调用**现签**，不落库、不缓存（与 {@code SysChatAttachment} 类注释同一条纪律）。
+     *
+     * @param url          预签名 GET URL（下载带 {@code response-content-disposition=attachment}；
+     *                     预览带 {@code inline}）
+     * @param expiresAt    绝对过期时刻（格式化），前端用来提示"链接 X 前有效"
+     * @param expiresInSec 相对有效秒数（= {@code PresignTtl.DOC_DOWNLOAD_MINUTES * 60}）——
+     *                     判据 1/12 直接断言它 = 600
+     */
+    public record DownloadUrl(String url, String expiresAt, int expiresInSec) {
+    }
+
+    // ==================== T-614 · 打包下载受理（G7-8） ====================
+
+    /**
+     * 打包下载受理结果（对齐前端 {@code docApi.batchDownload}，`api/index.ts:195`：
+     * {@code { taskId, count, status }}）。
+     *
+     * <p>🔴 **同步只做受理**：`≤50 件 / ≤2GB` 的上限**在受理时同步校验**（超限直接
+     * {@code PARAM_INVALID} + 现象 + 下一步，**不异步再失败** —— 那会让用户等半天才知道传多了）。
+     * 通过后立刻返回 {@code taskId}，打包在异步任务里做（照 {@code AuditExportService} 形），
+     * 完成后经通知中心（{@code SYSTEM}）给下载地址（`G7-8`）。
+     *
+     * @param taskId 供 {@code GET /doc/download-tasks/{taskId}} 轮询
+     * @param count  被打包的文档数
+     * @param status 调度层真值 {@code PENDING}（不是 mock 的字面量；理由同 {@code AuditExportService}）
+     */
+    public record BatchDownloadAccepted(String taskId, int count, String status) {
+    }
+
+    // ==================== T-615 · 下载任务 / 记录（G7-9） ====================
+
+    /**
+     * 打包任务视图（对齐前端 {@code DownloadTask}，{@code types/index.ts:938}）。
+     *
+     * <p>🔴 **它是 {@code sys_async_task}（type={@code batch-download}）+ payload 的投影**，
+     * 不是独立任务表（计划 §3.4 假设 1）：{@code name/count/size} 从任务的 payload 拼，
+     * {@code status/percent} 从 {@code AsyncTaskInfo} 取。
+     *
+     * @param status **{@code DownloadStatus}**（{@code PACKING/DONE/EXPIRED/FAILED}），
+     *               由 {@code AsyncTaskStatus} 映射：PENDING/RUNNING→{@code PACKING}、
+     *               DONE→{@code DONE}、FAILED→{@code FAILED}。
+     *               ⚠️ **不直接下发 AsyncTaskStatus 的枚举名** —— 前端词表是 DownloadStatus，
+     *               两套词表混用就是 {@code sys_kb.status} 分叉那个坑。
+     *               🔴 **{@code EXPIRED} 服务端恒不下发**：每次读都**现签**一个新地址
+     *               （对象名可由 {@code ownerId + taskId} 推出），所以"读到的这一刻"地址必然有效。
+     *               需求 `06` §5.8 要的「过期后给出重新生成入口」由此满足 ——
+     *               前端那边表现为"过期态是**本地**判断"（拿到的 {@code expiresAt} 已过），
+     *               点「重新生成」= 重新拉一次本接口
+     * @param fileUrl 完成态才有的预签名下载 URL；未完成 {@code null}。
+     *                ⚠️ 产物已被清理时为 {@code null}，并伴随下面那个 {@code status=FAILED}
+     * @param expiresAt fileUrl 的过期时刻；未完成 / 无地址时 {@code null}
+     * @param errorMsg  失败态才有；**必须具体**（`G4-3`）
+     */
+    public record DownloadTaskView(String taskId, String name, int count, long size,
+                                   String status, int percent, String createdAt,
+                                   String fileUrl, String expiresAt, String errorMsg) {
+    }
+
+    public record DownloadTaskList(List<DownloadTaskView> list, long total) {
+    }
+
+    /**
+     * 打包下载请求体（对齐前端 `api/index.ts:196`：{@code http.post(..., { docIds })}）。
+     *
+     * @param docIds 要打包的文档 id 列表。空 / 超 50 / 累计 > 2GB / 含不可见文档 ⇒ 受理即 {@code PARAM_INVALID}
+     */
+    public record BatchDownloadRequest(List<Long> docIds) {
+    }
+
+    /**
+     * 下载记录行（对齐前端 {@code DownloadRecord}，{@code types/index.ts:952}）。
+     *
+     * <p>🔴 {@code docTitle}/{@code kbName} **由查询时 join 取**，不落 {@code sys_download_record}
+     * （存事实不存视图，见 `V40` 头注）。文档 / 知识库那一行**真的没了**才用「已删除」占位；
+     * **软删（进回收站）不算** —— 那种情况 join 仍然拿得到它当初的标题
+     * （下载是既成事实，"我下过的那个文件叫什么"不该被别人的删除动作抹掉）。
+     *
+     * @param type {@code SINGLE}（单篇下载）/ {@code BATCH}（打包里的一篇）
+     *             ⚠️ <b>分页壳用标准的 {@link com.knowledge.ai.core.model.PageResult}</b>，
+     *             不另开一个记录 —— 需求 `06` §5.7 那一行写的是
+     *             {@code { list, total, page, pageSize }}，而 {@code pageSize} 在后端
+     *             **没有第二个出处**：全仓分页响应都是 §0 的 {@code { list, total, page, size }}
+     *             （{@code PageResult} 的类注释把"字段名逐字一致"写成了硬约束），
+     *             前端这条接口的泛型也正是 {@code PageResult<DownloadRecord>}。
+     *             为一处笔误新造一种分页壳，代价是前端要为它写第二套取值逻辑
+     */
+    public record DownloadRecordRow(long id, long docId, String docTitle, String kbName,
+                                    long size, String operator, String at, String ip, String type) {
+    }
+
+    /**
+     * 导出下载记录清单的受理结果（{@code POST /doc/export-list}，异步走通知中心）。
+     *
+     * <p>🔴 <b>导出的对象是「下载记录」，不是「文档列表」</b> —— 端点名叫 {@code export-list}
+     * 容易读成"导出文件清单"，但原型 `09-文档下载.html:660` 把这条接口逐字注成
+     * 「🚩 导出下载记录清单」，UI 上那个按钮（同文件 `:471`）也长在**下载记录** Tab 里、
+     * 文案是「导出记录」。三处一致，故以「下载记录」为准。
+     *
+     * <p>与打包下载的区别：打包是**把源文件打成 zip**，本接口是**把我下过什么导成 CSV**
+     * （照 {@code OpsExportService} 形）。同样异步、同样经通知中心。
+     *
+     * <p>⚠️ **无请求体**：导出范围是"当前用户的全部下载记录"（记录页没有筛选器，
+     * 所以没有可带的条件）。前端 {@code docApi.exportList()} 也是一个空 {@code POST}。
+     *
+     * @param taskId 供轮询
+     * @param status 调度层真值 {@code PENDING}（口径同 {@link BatchDownloadAccepted}）
+     * @param note   给用户看的一句话。⚠️ 前端 `api/index.ts` 的泛型里就有它
+     *               （mock 也回这个字段），少了它那句提示会是 {@code undefined}
+     */
+    public record ExportListAccepted(String taskId, String status, String note) {
+    }
 }

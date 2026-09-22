@@ -51,6 +51,13 @@ public final class ProbeArtifacts {
                             + "它按人删不掉，但按日期可以"),
             Map.entry("sys_kb", "探针库主表。按 code 删（它自己没有 kb_id，是别人指向它）"),
             Map.entry("sys_document", "文档行。按 kb_id 删，**必须先于 sys_kb**"),
+            Map.entry("sys_download_record",
+                    "下载记录（`V40` · `S7-M06-E`）。**两条归属线都要走**：按 kb_id 进"
+                            + "`ORPHAN_SWEEP`，按 user_id 进 `cleanUsers`。"
+                            + "⚠️ 只登记一条会漏 —— 下载页的用例用的是**种子超管**"
+                            + "（`cleanUsers` 按探针账号删，清不到它），而 E2E 用的是探针账号 + 探针库。"
+                            + "⚠️ 它的生产口径与这里**相反**：生产里库删了、下载历史仍要留"
+                            + "（那是既成事实的留痕，见 `V40` 头注），探针里则必须跟着库一起清"),
             Map.entry("sys_chunk", "分片。按 kb_id 删"),
             Map.entry("sys_parse_issue", "逐页问题。按 kb_id 删"),
             Map.entry("sys_kb_grant", "知识库授权。按 kb_id 删"),

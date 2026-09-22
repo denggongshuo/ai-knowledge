@@ -260,8 +260,21 @@ async function reindex() {
 function askDoc() {
   router.push({ path: '/chat', query: { docId: docId.value } })
 }
-function openNewWindow() {
-  ElMessage.info('已在新窗口打开原文（演示）')
+/**
+ * 新窗口打开**原文件**（`T-613` 的 `preview-url`）。
+ *
+ * 🔴 与上面 `download()` 是**同一个对象、两种取法**：这条走 `inline`
+ * （浏览器直接打开，PDF 能就地看），那条走 `attachment`（强制落盘）。
+ * <p>之前这里是 `ElMessage.info('已在新窗口打开原文（演示）')` —— 一句纯粹的假话：
+ * 点了没有任何东西被打开，而用户会以为浏览器拦了弹窗。
+ */
+async function openOriginal() {
+  try {
+    const res = await docApi.previewUrl(docId.value)
+    window.open(res.url, '_blank')
+  } catch {
+    ElMessage.error('原文件打开失败，请稍后重试')
+  }
 }
 </script>
 
@@ -360,7 +373,7 @@ function openNewWindow() {
                   <span class="mono zoom-val">{{ zoom }}%</span>
                   <el-button size="small" :icon="ZoomIn" @click="zoomIn" />
                   <span class="tiny muted mono ml-8">第 {{ currentPage }} / {{ pageCount }} 页</span>
-                  <el-button size="small" :icon="TopRight" @click="openNewWindow">新窗口打开</el-button>
+                  <el-button size="small" :icon="TopRight" @click="openOriginal">新窗口打开</el-button>
                 </div>
               </div>
 

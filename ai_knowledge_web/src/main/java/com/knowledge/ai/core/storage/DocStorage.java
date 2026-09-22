@@ -2,10 +2,13 @@ package com.knowledge.ai.core.storage;
 
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import io.minio.GetObjectArgs;
+import io.minio.GetPresignedObjectUrlArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.StatObjectArgs;
 import io.minio.StatObjectResponse;
+import io.minio.http.Method;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,9 +17,12 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 文档原始文件存储（`T-500` 的落盘侧）。
@@ -73,6 +79,48 @@ public class DocStorage {
 
     /** 对象名前缀。 */
     private static final String PREFIX = "documents/";
+
+    /**
+     * 打包下载产物的对象名前缀（`T-614`）。
+     *
+     * <p>⚠️ **必须是独立前缀**：它决定了生命周期规则能否单独作用于打包产物
+     * （与 {@code ChatAttachmentStorage.PREFIX} 同一条理由）。打包产物是**临时物**
+     * —— 与源文档"长期保存"的寿命完全不同，混在 {@code documents/} 下就没法
+     * 只对前者配过期规则。
+     *
+     * <p>⚠️ 前缀的第二段是**用户 id**（{@code ProbeCleanup} 的
+     * {@code BATCH_DOWNLOAD_PREFIX} 登记按它认归属）—— 与
+     * {@code ChatAttachmentStorage} 的 {@code chat-attachments/{userId}/...} 同构。
+     */
+    public static final String BATCH_PREFIX = "batch-download/";
+
+    /**
+     * 打包产物的**固定叶子名**。
+     *
+     * <p>为什么是常量而不是"带时间戳的名字"：对象名要能从
+     * {@code ownerId + taskId} **推出来**（见 {@link #batchZipObjectKey}），
+     * 推出对象名之后，"这个任务的文件多大、地址是什么"就都能在**重启之后**答出来
+     * —— 而任务结果（{@code payload}）是不落库的。
+     * 时间戳名字会让这件事需要一个额外的映射表，那是本批明确不做的。
+     */
+    private static final String BATCH_ZIP_LEAF = "documents.zip";
+
+    /**
+     * 打包产物的**对外名字**（= 对象名的叶子段）。`T-615` 的 `DownloadTask.name` 用它。
+     *
+     * <p>公开出去是为了让"对象叫什么"与"界面上显示叫什么"只有一个来源：
+     * 服务层从对象名里取叶子段来显示，一旦有人改了叶子名而忘了改展示文案，
+     * 用户看到的文件名就会与实际下到的对不上。
+     */
+    public static final String BATCH_ZIP_NAME = BATCH_ZIP_LEAF;
+
+    /**
+     * 下载记录清单（CSV）的对象名前缀。`T-615` 新增。
+     *
+     * <p>与 {@code audit-export/} / {@code ops-export/} 同构：**导出件单独一个前缀**，
+     * 好让生命周期规则能只作用于它（导出件是临时物，不该跟着源文档一起永久留着）。
+     */
+    public static final String DOC_EXPORT_PREFIX = "doc-export/";
 
     /** 文件大小上限：100 MB（《06》§3.1）。**后端兜底**，前端已先拦一道。 */
     private static final long MAX_BYTES = 100L * 1024 * 1024;
@@ -236,13 +284,44 @@ public class DocStorage {
      *         不是参数错误 —— 比如有人手动清过桶）
      */
     public byte[] open(String objectKey) {
-        try (InputStream in = minioClient.getObject(io.minio.GetObjectArgs.builder()
+        try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
                 .bucket(bucket)
                 .object(objectKey)
                 .build())) {
             return in.readAllBytes();
         } catch (Exception ex) {
             log.error("读回文档对象失败：object={} err={}", objectKey, ex.getMessage());
+            throw new BizException(ErrorCode.DOC_NOT_FOUND, "文档文件已不存在，请重新上传");
+        }
+    }
+
+    /**
+     * 取对象的**原始输入流**（不读进内存）—— `T-614` 打包下载的入口。
+     *
+     * <p>与 {@link #open(String)} 的差别是"字节去哪儿"：{@code open} 的消费方
+     * （解析、扫描）要的是**一整块字节**（它们要么交给 PDF 库、要么交给杀毒引擎），
+     * 而打包要的是**把字节搬进 zip 条目** —— 后者没有理由先落一个 {@code byte[]}。
+     *
+     * <p>⚠️ 两者都不会把"整批文件"同时读进内存：调用方**逐个**取、**逐个**写。
+     * 100MB 的单篇上限意味着峰值是一篇的大小，与"50 篇"无关。
+     *
+     * <p>🔴 **调用方必须关闭它**（try-with-resources）。它是 MinIO 的 HTTP 响应体，
+     * 不关就是连接泄漏 —— 而连接池耗尽后，所有 MinIO 操作（含上传）会一起挂。
+     *
+     * @return 对象输入流（**未**自动关闭）
+     * @throws BizException 对象不存在时抛 {@code 10044}（理由同 {@link #open}）
+     */
+    public InputStream stream(String objectKey) {
+        try {
+            return minioClient.getObject(GetObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .build());
+        } catch (Exception ex) {
+            // ⚠️ 注意这里只覆盖"建流就失败"那一半。对象不存在时 MinIO 往往先回 200 头、
+            //    真正的 404 在**第一次 read 时**才抛出 —— 那一半由调用方（写 zip 条目处）
+            //    捕获，见 DownloadService 的说明。
+            log.error("打开文档对象流失败：object={} err={}", objectKey, ex.getMessage());
             throw new BizException(ErrorCode.DOC_NOT_FOUND, "文档文件已不存在，请重新上传");
         }
     }
@@ -298,6 +377,25 @@ public class DocStorage {
     }
 
     /**
+     * 打包产物的**对象名**（`T-614`）。
+     *
+     * <p>🔴 <b>它只由 {@code ownerId + taskId} 决定，是个可推导的纯函数</b> ——
+     * 这是"重启后还能给出下载地址"的全部依据：任务行（{@code sys_async_task}）
+     * 里就有这两个值，于是 {@code GET /doc/download-tasks/{taskId}} 不需要
+     * 任务结果（不落库）也能知道文件在哪、多大。
+     *
+     * <p>与 {@link #imageObjectKey} 同一种形状：**起名**与**写入**拆开，
+     * 好让"要写哪个名字"在写入之前就定得下来（异步体里 taskId 才有值）。
+     *
+     * <p>⚠️ {@code taskId} 是 {@code TraceContext.newTraceId()} 产的十六进制串
+     * （{@code [0-9a-f]}），不含路径分隔符 —— 但它仍然过一遍 {@link #safeName}：
+     * 将来若换了生成器，"对象名里出现 {@code ../}"这种事不该由调用方去保证。
+     */
+    public static String batchZipObjectKey(long ownerId, String taskId) {
+        return BATCH_PREFIX + ownerId + "/" + safeName(taskId) + "/" + BATCH_ZIP_LEAF;
+    }
+
+    /**
      * 写一张图的字节（对象名由 {@link #imageObjectKey} 起好）。
      *
      * <p>⚠️ 与 {@code storeArtifact} 同一条取舍：**全量覆盖写**（同名对象覆盖），
@@ -326,6 +424,128 @@ public class DocStorage {
         } catch (Exception ex) {
             // 与 sizeOf 同一取舍：删不掉不该让业务失败（对象存储有生命周期规则兜底）
             log.warn("删除对象失败：object={} err={}", objectKey, ex.getMessage());
+        }
+    }
+
+    // ==================== 打包下载（`T-614`）====================
+
+    /**
+     * 把**已经整好的** zip 文件传上去（`T-614` 的产物侧）。
+     *
+     * <p>为什么收 {@link Path} 而不是 {@code byte[]}：zip 是把 N 篇源文档**聚合**出来的，
+     * 它的体积上限是 {@code 2GB}（门禁 `G7-8`）—— 那不是一个能放进堆里的数。
+     * 调用方（{@code DownloadService}）先把 zip 落在**本地临时文件**上，
+     * 这里再以流的方式推给 MinIO：全程只有"一篇文档"级别的内存占用。
+     *
+     * <p>⚠️ 本方法**不删**那个临时文件 —— 删除由调用方在 finally 里做
+     * （与 {@link #storeFromFile} 对暂存文件的分工一致：谁落的盘谁负责收）。
+     *
+     * @param objectKey 由 {@link #batchZipObjectKey} 起好（写入方与读取方共用同一个函数，
+     *                  没有"两处各拼一次名字"的漂移面）
+     * @param size      zip 的字节数（必须是**已落盘的真实长度**，用于 multipart 分段）
+     */
+    public void storeBatchZip(String objectKey, Path zipFile, long size) {
+        try (InputStream in = Files.newInputStream(zipFile)) {
+            // 与 putObject 同一取舍：≥5MB 走 multipart（断哪段重传哪段），
+            // 小于它单次 PUT 更快。2GB 的产物必然走 multipart。
+            long partSize = size >= PART_SIZE ? PART_SIZE : -1L;
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .stream(in, size, partSize)
+                    .contentType("application/zip")
+                    .build());
+        } catch (Exception ex) {
+            // 与两个导出服务同一条取舍：写盘失败 ⇒ 任务**明确失败**
+            // （不能返回"成功但没文件"的结果 —— 用户会以为打好了）
+            log.error("打包产物写入 MinIO 失败：object={} size={} err={}",
+                    objectKey, size, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "打包文件写入失败，请稍后重试");
+        }
+        log.info("打包产物已写入：object={} size={}", objectKey, size);
+    }
+
+    /**
+     * 下载记录清单（CSV）的**对象名**（`T-615`）。与 {@link #batchZipObjectKey} 同形：
+     * 起名与写入拆开，写入方在异步体里才拿得到 taskId / 时刻。
+     *
+     * @param stamp 形如 {@code 20260922-153000}（时间戳进名字是为了同一人多次导出**不互相覆盖**
+     *              —— 与 `batchZipObjectKey` 不同：那边一个任务只会产出一个文件，
+     *              而"导出"是用户可以反复点的动作）
+     */
+    public static String docExportObjectKey(long ownerId, String stamp) {
+        return DOC_EXPORT_PREFIX + ownerId + "/" + safeName(stamp) + "-downloads.csv";
+    }
+
+    /**
+     * 写一小段字节（导出件用）。小对象单次 PUT 足够 —— 调用方保证
+     * {@code bytes} 是能放进堆里的量级（导出 CSV 是最坏几 MB 的文本，
+     * 与 {@link #storeBatchZip} 面对的 2GB 完全是两回事）。
+     */
+    public void putBytes(String objectKey, byte[] bytes, String contentType) {
+        try (InputStream in = new java.io.ByteArrayInputStream(bytes)) {
+            minioClient.putObject(PutObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .stream(in, bytes.length, -1)
+                    .contentType(contentType == null || contentType.isBlank()
+                            ? "application/octet-stream" : contentType)
+                    .build());
+        } catch (Exception ex) {
+            log.error("字节写入 MinIO 失败：object={} size={} err={}",
+                    objectKey, bytes.length, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR, "导出文件写入失败，请稍后重试");
+        }
+    }
+
+    /**
+     * 预签名 GET 地址（`T-613`/`T-614`）。
+     *
+     * <p>🔴 <b>不落库、不缓存</b> —— 每次调用**现签**。理由与
+     * {@code SysChatAttachment} 的类注释同一条：预签名 URL 自带 TTL，
+     * 存下来就等于存一个必然过期的字符串。
+     *
+     * <p>{@code response-content-disposition} 决定浏览器是**直接打开**还是**另存为**：
+     * <ul>
+     *   <li>{@code inline} —— 预览（能在标签页里直接看 PDF）；</li>
+     *   <li>{@code attachment} —— 下载（强制落盘，不会把 pdf 变成新标签页）。</li>
+     * </ul>
+     * 两者走的是**同一个对象**，只是让 MinIO 回一个不同的响应头 ——
+     * 所以这里是一个参数，不是两个方法。
+     *
+     * <p>⚠️ 刻意**不带 {@code filename}**：带上就要处理中文名的 RFC 5987 编码，
+     * 而 MinIO SDK 会对 {@code extraQueryParams} 的值再做一次 URL 编码
+     * （写进去的 {@code %} 会变成 {@code %25}，签名与实际请求对不上）。
+     * 不带时浏览器按对象名的最后一段命名 —— 源文档的叶子名**就是**原始文件名，
+     * 打包产物是 {@code documents.zip}，两者都是可读的。
+     *
+     * @param ttl         有效期。⚠️ 用 {@link Duration} 而不是"分钟数"：本仓的预签名 TTL
+     *                    同时存在**分钟**档（文档下载 10 分钟）与**小时**档（导出件 24 小时），
+     *                    收成一个 {@code int} 就得在调用点写 {@code * 60}，
+     *                    而那个乘数是"单位悄悄换了"最容易被漏掉的地方
+     *                    （{@link PresignTtl} 的类注释正是为这件事存在的）
+     * @param disposition {@code inline} 或 {@code attachment}
+     * @return 预签名 URL；**失败时返回 {@code null} 而不抛** —— 与
+     *         {@code AvatarStorage} / 两个导出服务同一条取舍：能不能"把地址拼出来"
+     *         与"文件在不在"是两件事，前者失败不该把后者说成失败。
+     *         ⚠️ 但**要不要因此失败由调用方决定**：同步点击的接口（用户要的就是地址）
+     *         必须自己判空后报错，异步产物的展示可以降级成"地址暂不可用"
+     */
+    public String presignedGet(String objectKey, Duration ttl, String disposition) {
+        // MinIO 的 expiry 是 (int 分钟) 粒度：向上取整，免得"30 秒"被抹成 0（那会直接报错）
+        long minutes = Math.max(1L, ttl.toMinutes() + (ttl.toSecondsPart() > 0 ? 1 : 0));
+        try {
+            return minioClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
+                    .method(Method.GET)
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .expiry((int) minutes, TimeUnit.MINUTES)
+                    .extraQueryParams(Map.of("response-content-disposition", disposition))
+                    .build());
+        } catch (Exception ex) {
+            log.warn("预签名 URL 生成失败（文件本身可能仍在）：object={} err={}",
+                    objectKey, ex.getMessage());
+            return null;
         }
     }
 

@@ -285,6 +285,105 @@ public class SysAsyncTaskRepository {
                 .getResultList();
     }
 
+    // ==================== 读 · 打包下载任务（`T-615`）====================
+
+    /**
+     * 打包下载任务的**持久化投影**。
+     *
+     * <p>它只带 `sys_async_task` 真正存着的那几列。{@code result} **不在这里** ——
+     * 它不持久化（见 {@link #find} 的注释）。而 `DownloadTaskView` 要的
+     * {@code size / fileUrl / expiresAt} **也不需要它**：打包产物的对象名可以由
+     * {@code ownerId + taskId} **推出来**（见 {@code DocStorage#batchZipObjectKey}），
+     * 于是"这个任务的文件多大、地址是什么"由**对象存储**回答 —— 重启后照样答得出。
+     * 这是有意的：payload 一旦要落库，就得为它开一列 JSON，而那等于把
+     * "任务结果"和"任务状态"两件不同寿命的东西绑在一起。
+     *
+     * @param chunkTotal 被打包的文档数（任务体用 {@code context.total(n)} 写进来）——
+     *                   ⚠️ 这是 {@code count} 的**真值来源**，不是"分片数"：打包任务的分片
+     *                   粒度就是"一篇文档"。别看到列名就按解析任务的口径去读它
+     * @param finishedAt 终态时刻（结束耗时由它与 {@code createdAt} 相减得出）
+     */
+    public record DownloadTaskRow(String taskId, String status, int percent, int chunkDone,
+                                  int chunkTotal, String errorMsg,
+                                  LocalDateTime createdAt, LocalDateTime finishedAt) {
+    }
+
+    /**
+     * 「我的打包下载任务」列表，创建时间倒序。
+     *
+     * <p>🔴 **归属与类型两个条件一个都不能少** —— 见下面 {@link #findDownloadTask} 的注释。
+     * 少了 {@code owner_id} 就是把全站所有人的下载任务列给当前用户看。
+     *
+     * @param limit 上限（调用方给；本表按 {@code owner_id} 没有索引，靠
+     *              {@code created_at} 排序 + limit 收敛扫描面）
+     */
+    @SuppressWarnings("unchecked")
+    @Transactional(readOnly = true)
+    public List<DownloadTaskRow> listDownloadTasks(long ownerId, String type, int limit) {
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select task_id, status, percent, chunk_done, chunk_total, error_msg, "
+                                + "created_at, finished_at from sys_async_task "
+                                + "where type = :type and owner_id = :ownerId "
+                                + "order by created_at desc limit :limit")
+                .setParameter("type", type)
+                .setParameter("ownerId", ownerId)
+                .setParameter("limit", limit)
+                .getResultList();
+        List<DownloadTaskRow> out = new ArrayList<>(rows.size());
+        for (Object[] r : rows) {
+            out.add(toDownloadTaskRow(r));
+        }
+        return out;
+    }
+
+    /**
+     * 单条打包下载任务 —— **必须同时按 taskId + ownerId + type 过滤**。
+     *
+     * <p>⚠️ **为什么不复用 {@link #find(String)}**（本方法存在的全部理由）：
+     * {@code find} 是**单键**查询，不带归属、不带类型。拿它实现
+     * {@code GET /doc/download-tasks/{taskId}} 等于把任意 taskId 变成一个可读句柄 ——
+     * 而下载任务的响应里带**预签名下载地址**（能直接把文件取走），
+     * 这比泄露一个进度百分比严重得多。
+     * {@code type} 也不能省：不复用它就分不出"这条 taskId 是不是一个下载任务"，
+     * 于是 {@code /doc/download-tasks/{某个解析任务的id}} 会返回一条形态对不上的记录。
+     */
+    @SuppressWarnings("unchecked")
+    @Transactional(readOnly = true)
+    public Optional<DownloadTaskRow> findDownloadTask(String taskId, long ownerId, String type) {
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select task_id, status, percent, chunk_done, chunk_total, error_msg, "
+                                + "created_at, finished_at from sys_async_task "
+                                + "where task_id = :taskId and owner_id = :ownerId and type = :type")
+                .setParameter("taskId", taskId)
+                .setParameter("ownerId", ownerId)
+                .setParameter("type", type)
+                .getResultList();
+        return rows.isEmpty() ? Optional.empty() : Optional.of(toDownloadTaskRow(rows.getFirst()));
+    }
+
+    /**
+     * 「我的打包下载任务」**总数**。
+     *
+     * <p>为什么不拿 {@link #listDownloadTasks} 的条数当 {@code total}：那条有 {@code limit}
+     * —— 一个有 200 条任务的用户会看到"共 50 条"，而列表上明明滚不完。
+     * 分页壳里的 {@code total} 是**满足条件的总数**（{@code PageResult#total} 的 javadoc
+     * 把它写成了硬约束），列表有上限的时候，那个数只能另查。
+     */
+    @Transactional(readOnly = true)
+    public long countDownloadTasks(long ownerId, String type) {
+        return ((Number) entityManager.createNativeQuery(
+                        "select count(*) from sys_async_task where type = :type and owner_id = :ownerId")
+                .setParameter("type", type)
+                .setParameter("ownerId", ownerId)
+                .getSingleResult()).longValue();
+    }
+
+    private static DownloadTaskRow toDownloadTaskRow(Object[] r) {
+        return new DownloadTaskRow((String) r[0], (String) r[1], ((Number) r[2]).intValue(),
+                ((Number) r[3]).intValue(), ((Number) r[4]).intValue(), (String) r[5],
+                toLdt(r[6]), toLdt(r[7]));
+    }
+
     // ==================== 小工具 ====================
 
     /** 领取到的一条作业。 */
