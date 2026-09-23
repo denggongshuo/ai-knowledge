@@ -12,6 +12,10 @@ coverage/
 .workbuddy/
 .codegraph/
 temp/
+# `temp/residue-watermark.json` —— 跨轮残留水位（`T-O30`）。
+# ⚠️ 它**必须**不入库：它是**本机运行期状态**（"上一轮跑完时库里有多少无主残留"），
+#    换一台机器没有意义，而进 git 会让每次拉代码都带来一次**假红**
+#    （别人的机器水位低、你的库里存量高 ⇒ 一开工就报"本轮新增 N 个"）。
 
 # Codex 的镜像配置与草稿（本机另有 Codex 在用，不入库）：
 # 根 AGENTS.md 与根 CLAUDE.md 内容等价、.agents/skills/ 与 .claude/skills/ 同名同内容，

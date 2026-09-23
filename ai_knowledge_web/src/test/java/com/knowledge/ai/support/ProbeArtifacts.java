@@ -185,7 +185,17 @@ public final class ProbeArtifacts {
      */
     public static final Set<String> NON_TABLE = Set.of(
             "minio:storage_path", "minio:parse_path",
-            "milvus:vectors", "milvus:partitions");
+            "milvus:vectors", "milvus:partitions",
+            // 🔴 `T-C00`（`S9-M12-A`）新增的**第四种存储** —— 实体/关系写进 Neo4j。
+            //    ⚠️ 它与前四项的处境**不一样**，必须写清楚，否则会被读成"已经覆盖了"：
+            //    · Java 侧**有**清理，但它是**用例级**的（`GraphWriteFlowTest#cleanGraphResidue`
+            //      按登记的 docId 清），**不是** `ProbeCleanup` 那种全局兜底 ——
+            //      因为图里的 `:Entity` 是跨文档共享的，按 docId 删不掉也不该删（`07:462`）；
+            //    · 脚本侧**没有任何清理能力**（要引 neo4j 客户端或起 `cypher-shell` 子进程）。
+            //      当前不构成泄漏：E2E 不写图（`m05.graph.enabled` 只在测试期被打开）。
+            //    ⇒ 这一行的作用是**表态**：新增一个存储产物时，必须过一次人的判断。
+            //      哪天真让 E2E 打开图谱开关，它必须跟着升级成真清理。
+            "neo4j:graph");
 
     public static final Map<String, String> EXEMPT = Map.of();
 

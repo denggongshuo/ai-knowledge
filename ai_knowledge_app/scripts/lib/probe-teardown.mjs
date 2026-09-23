@@ -33,6 +33,8 @@
 import { spawnSync } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+// `T-O30`（`S9-M12-A`）：跨轮残留水位。**同一目录下的兄弟模块**，不引任何依赖。
+import { deltaOf, readWatermark, writeWatermark } from './residue-watermark.mjs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { unlinkSync, writeFileSync } from 'node:fs'
@@ -102,6 +104,17 @@ export const KB_ARTIFACTS = [
   {
     id: 'milvus:partitions', kind: 'milvus-partitions',
     why: 'T-406 起按代分区存放。entities/delete 只删**点**不删**容器**，于是每次跑完留下空分区',
+  },
+  {
+    id: 'neo4j:graph', kind: 'neo4j-graph',
+    why: '🔴 `T-C00`（S9-M12-A）新增的**第四种存储产物** —— 实体/关系写进 Neo4j，'
+      + '而前三种（MinIO 对象 / Milvus 向量 / Milvus 分区）的兜底**一个都不认识它**。'
+      + '⚠️ 脚本侧**没有**它的清理能力（要引 neo4j 客户端或起 `cypher-shell` 子进程），'
+      + '所以这一行是**登记 + 表态**，不是"已覆盖"：'
+      + '① Java 侧 `GraphWriteFlowTest` 的 `@AfterEach` 按登记的 docId 清（那是本批真正在做的）；'
+      + '② E2E 侧当前**不写图**（`m05.graph.enabled=false` 只在测试期开）⇒ 脚本侧暂时无对象可清。'
+      + '⚠️ 哪天真让 E2E 打开图谱开关，这一行必须跟着升级成真清理 —— '
+      + '否则"产物认识、清理不认识"就是这个仓库已复现五次的那个形状。',
   },
   {
     id: 'sql:sys_async_task', kind: 'sql', table: 'sys_async_task', via: 'kb_id',
@@ -1107,13 +1120,24 @@ export async function teardownKbProbe(code) {
 
   // ⑤ 残留自检 —— 独立观测点
   const residue = await findKbProbeResidue(code, { ids, minioKeys, quiesceTimedOut: !!quiesce.timedOut })
+
+  // ⑥ 🔴 `T-O30`：**收尾做完之后**才记水位。
+  //
+  //    顺序是判据的一部分：`findKbProbeResidue` 读水位、这里写水位。
+  //    反过来的话，"刚被兜底清掉的那批"会被写成新基线 ——
+  //    于是下一轮真新增时看起来是平的（**把红抹掉**）。
+  //
+  //    ⚠️ 只记 `orphanTotal`（存量），**不记 `sqlTotal` 那些本轮的** ——
+  //    后者本来就该是 0，记它没有意义（它一非 0 就是红，不需要水位）。
+  const watermark = writeWatermark(residue.orphanTotal)
+
   return {
     code, ids, minioKeys,
     removed: {
       minio: minioRemoved, sql: '见 residue', notices: noticesRemoved, misses: missesRemoved,
       chatFamily: chatRemoved, orphanRows, orphanPartitions,
     },
-    residue, quiesce,
+    residue, quiesce, watermark,
   }
 }
 
@@ -1345,6 +1369,17 @@ export async function findKbProbeResidue(code, snapshot = {}) {
       `select count(*) from ${a.table} t left join ${parent} p on p.id = t.${a.via} `
       + `where t.${a.via} is not null and p.id is null;`)
   }
+  const orphanTotal = Object.values(orphans).reduce((a, b) => a + b, 0)
+
+  // 🔴 `T-O30`（`S9-M12-A`）：把跨轮水位算进来 —— **存量**与**本轮新增**分开报。
+  //
+  //    这里**读**水位（不写）：写水位的时机是**收尾做完之后**
+  //    （`teardownKbProbe` 的末尾），而本函数是"看一眼还剩什么"。
+  //    顺序反了会把"刚被兜底清掉"误读成"这轮本来就是干净的"。
+  //
+  //    ⚠️ 调用方**可以不接**（`orphanDelta` 缺失 ⇒ `kbResidueClean` 退化）。
+  //    那条路径不静默：`describeKbResidue` 打的格式不一样，一眼看得出。
+  const orphanDelta = { ...deltaOf(orphanTotal, readWatermark()), byTable: orphans }
 
   return {
     sql,
@@ -1352,7 +1387,9 @@ export async function findKbProbeResidue(code, snapshot = {}) {
     /** 本轮的 ids 抓到了几个 —— **0 表示上表里 `in (ids)` 那几格无从查起**（不是"干净"）。 */
     idsUsed: ids.length,
     orphans,
-    orphanTotal: Object.values(orphans).reduce((a, b) => a + b, 0),
+    orphanTotal,
+    /** 存量 / 基线 / **本轮新增** —— 判红看 `added`，见 `kbResidueClean`。 */
+    orphanDelta,
     milvusVectors: await milvusVectorCount(ids),
     milvusPartitions: await milvusLeftoverPartitions(ids),
     /** ⚠️ 只有「清理前快照到的那些对象」能这么查 —— 更早的轮次留下的孤儿对象查不到。 */
@@ -1420,10 +1457,19 @@ export function findUserProbeResidue(prefix, snapshot = {}) {
 /** 把 `findKbProbeResidue` 的结果压成一行中文，给脚本的 `check(...)` 描述用。 */
 export function describeKbResidue(r) {
   // ⚠️ `无主` 是**跨轮**的数（任何一轮留下的孤儿都算），所以它出现在这一行里是**报警**，
-  // 不参与 `kbResidueClean` —— 见 findKbProbeResidue 的注释
+  // 不参与 `kbResidueClean` —— 见 findKbProbeResidue 的注释。
+  //
+  // 🔴 `T-O30`（`S9-M12-A`）起多两个数：**存量 / 本轮新增**。
+  //    在此之前只有一个 `无主残留=N`，而它**从不判红** —— 实测从 7 涨到 25
+  //    而每一轮收尾都照绿。现在存量仍不判红（理由不变），但**新增会判红**，
+  //    见 `kbResidueClean` 与 `residue-watermark.mjs`。
+  const delta = r.orphanDelta
+  const orphanLine = delta
+    ? `无主残留=${delta.total}（存量基线 ${delta.baseline} · 本轮新增 ${delta.added}${delta.firstRun ? ' · 首次运行' : ''}）`
+    : `无主残留=${r.orphanTotal}`
   return `库行=${r.sql.sys_kb} 文档=${r.sql.sys_document} 分片=${r.sql.sys_chunk} `
     + `问题行=${r.sql.sys_parse_issue} 授权=${r.sql.sys_kb_grant} 作业=${r.sql.sys_async_task} · `
-    + `无主残留=${r.orphanTotal} · `
+    + `${orphanLine} · `
     + `Milvus 向量=${r.milvusVectors} 分区=[${r.milvusPartitions.join(',') || '—'}] `
     + `MinIO 对象=${r.minioStillThere.length}`
     + (r.quiesceTimedOut
@@ -1436,13 +1482,25 @@ export function describeKbResidue(r) {
 /**
  * `findKbProbeResidue` 是否全清。
  *
- * <p>⚠️ **`orphanTotal` 刻意不在条件里** —— 它是跨轮的，并进来会让"跑完 `mvn test`
+ * <p>⚠️ **存量的 `orphanTotal` 刻意不在条件里** —— 它是跨轮的，并进来会让"跑完 `mvn test`
  * 再跑 E2E"变成假红（Java 侧的历史残留被算到 E2E 头上）。
- * 它由 `describeKbResidue` 打出来报警，并由 `selftest-residue.mjs` 的负向锚钉住"它数得出来"。
+ *
+ * <p>🔴 <b>`T-O30`（`S9-M12-A`）起：**本轮新增**的孤儿**进条件**。</b>
+ * 这是本函数自 `S4-D2` 建立以来第一次改判据，理由值得写全：
+ * 旧口径下那个 `无主残留=N` **从不判红**，于是它**报了 25 次而每一轮收尾都照绿**
+ * —— 一个一直在报、从不判红的数字等于没有。而它涨的时候正是最该有人停下来的时刻
+ * （有人在造谁也认领不了的产物）。现在：**存量不计**（跨轮的老问题不该由这一轮背），
+ * **新增计**（这一轮造的就是这一轮的问题）。水位由 `residue-watermark.mjs` 维护。
+ *
+ * <p>⚠️ `orphanDelta` **缺失时退化为旧行为**（不判新增）—— 那是给"还没接水位的调用方"
+ * 留的兼容路径，而它**不静默**：`describeKbResidue` 会打出没有 delta 的那种格式，
+ * 一眼看得出这个调用方没接。接法是 `findKbProbeResidue` 自己算（见那边的注释）。
  */
 export const kbResidueClean = (r) =>
   r.sqlTotal === 0 && r.milvusVectors === 0 && r.milvusPartitions.length === 0
   && r.minioStillThere.length === 0
+  // 🔴 `T-O30`：**本轮新增**的无主残留 ⇒ 判红。存量（`orphanDelta.baseline` 以内）不计。
+  && (!r.orphanDelta || r.orphanDelta.added === 0)
   // 🔴 `#187`：**等不到解析作业停下来 ⇒ 清理不算干净**。
   //    它的语义不是"现在有残留"（此刻多半真是 0），而是"这份报告不可信" ——
   //    还在跑的 worker 会在删完之后继续写，实测几分钟后多出 156 行孤儿分片 + 1 个空分区。

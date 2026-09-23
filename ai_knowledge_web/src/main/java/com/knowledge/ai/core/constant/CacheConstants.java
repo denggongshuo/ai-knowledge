@@ -28,8 +28,15 @@ public final class CacheConstants {
      * `resources/prompts/` 下的文件，但本版本号的用途是"旧缓存语义失效"，
      * 与模板存在哪儿无关 —— 不改它，`ak:enhance:v1:*` 的旧缓存会继续命中，
      * 而它们**没有 chapters 字段**，表现为"改了提示词却没生效"。
+     *
+     * <p>⚠️ 2026-09-22（`S9-M12-A`）由 `v2` → `v3`：`EnhancePrompts` 的**文档级提示词**又改了
+     * 输出契约 —— `relations` 多一个 **`confidence`** 字段（`FR-GRAPH-01` 要求"关系必须带
+     * confidence"，见 `docs/需求文档/07-需求-检索与问答.md:467`）。
+     * 旧缓存里的关系**没有这个字段**，反序列化后一律落到 `0.0` ⇒ 检索侧 `>= 0.6` 全判否
+     * ⇒ 表现为"图谱一条边都跳不出去"。不改版本号的话，这个现象**只会出现在老文档上**，
+     * 是最难查的那一类。`EnhancePrompts.VERSION` 同时 +1（两者用途不同，见那边的 javadoc）。
      */
-    public static final String PROMPT_VERSION = "v2";
+    public static final String PROMPT_VERSION = "v3";
 
     /** 检索增强结果缓存前缀：{@code ak:enhance:{promptVersion}:{md5(内容)}}。 */
     public static final String ENHANCE = PREFIX + "enhance:";

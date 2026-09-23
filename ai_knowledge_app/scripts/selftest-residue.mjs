@@ -24,6 +24,13 @@ import {
   describeKbResidue,
   kbResidueClean,
 } from './lib/probe-teardown.mjs'
+import {
+  readWatermark,
+  writeWatermark,
+  deltaOf,
+  WATERMARK_FILE,
+} from './lib/residue-watermark.mjs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 
 const stamp = Date.now()
 const CODE = `kb_zzselftest${stamp}`
@@ -39,7 +46,7 @@ function check(name, ok, detail) {
 }
 
 function cleanup() {
-  mysqlScalar(`delete from sys_async_task where kb_id = ${GHOST_KB_ID};`)
+  mysqlScalar(`delete from sys_async_task where kb_id in (${GHOST_KB_ID}, ${GHOST_KB_ID + 1});`)
   mysqlScalar(`delete from sys_kb where code like 'kb_zzselftest%';`)
   mysqlScalar(`delete from sys_kb where code like 'kb_zzghost%';`)
 }
@@ -94,16 +101,97 @@ try {
   check('② 新口径：无主残留数得出来', ghost.orphanTotal >= 1,
     `无主残留=${ghost.orphanTotal}（sys_async_task=${ghost.orphans.sys_async_task}）`)
 
-  check('② 无主残留**不进** kbResidueClean（它是跨轮的报警，不是本轮的判据）',
-    kbResidueClean({ ...ghost, milvusVectors: 0, milvusPartitions: [], minioStillThere: [] }) === true,
-    `sqlTotal=${ghost.sqlTotal} orphanTotal=${ghost.orphanTotal}`)
+  // ⚠️ `ghost.orphanDelta` 这时**必然**是 `added >= 1`（上一轮收尾把基线记成了 0，
+  //    而这一轮刚插了一行孤儿）—— 也就是说下面那条"存量不计"必须**显式构造** added=0，
+  //    不能直接用 `ghost.orphanDelta`。这不是绕路：它正是"闸要先证伪自己"那条纪律，
+  //    直接用现场值会让两条断言里的一条永远测不到。
+
+  // 🔴 `T-O30` 把这条判据拆成了两半 —— 两半都要断言，只测一半抓不住"恒红的实现"：
+  //    ① **存量**（在基线以内）不计 ⇒ 不判红（跨轮的老问题不该由这一轮背）；
+  //    ② **新增**计 ⇒ 判红（这一轮造的就是这一轮的问题）。
+  //    旧版只有 ① 的语义，于是它"报了 25 次而每轮照样全绿"。
+  const noDelta = { ...ghost, milvusVectors: 0, milvusPartitions: [], minioStillThere: [] }
+  check('② 存量（在基线以内）**不计**入 kbResidueClean',
+    kbResidueClean({ ...noDelta, orphanDelta: { ...ghost.orphanDelta, added: 0 } }) === true,
+    `sqlTotal=${ghost.sqlTotal} orphanTotal=${ghost.orphanTotal} added=0`)
+  check('② 新增（超基线）**计入** kbResidueClean（`T-O30` 新增的那一半）',
+    kbResidueClean(noDelta) === false,
+    `orphanTotal=${ghost.orphanTotal} added=${ghost.orphanDelta.added}`)
+
+  // ---------- 场景 ③：**跨轮水位**（`T-O30` · `S9-M12-A`）----------
+  //
+  // 这里要证的是那条**分界**：存量不再重复判红、新增一定判红。
+  // 判据 10 的全部内容都在这三格里。
+  //
+  // ⚠️ 水位文件是**本机状态**，所以本场景先把它**备份再恢复**：
+  //    自检脚本不许改变"这个仓库当前的残留基线"（那会让它自己的运行成为别人假红的来源）。
+  const savedWatermark = existsSync(WATERMARK_FILE) ? readFileSync(WATERMARK_FILE, 'utf8') : null
+  try {
+    const before = await findKbProbeResidue(GHOST_CODE, { ids: [] })
+
+    // ③-① **无基线** ⇒ 存量也判红一次（保守方向：文件丢了不许变成免检通道）
+    if (existsSync(WATERMARK_FILE)) unlinkSync(WATERMARK_FILE)
+    const noBaseline = deltaOf(before.orphanTotal, readWatermark())
+    check('③ 无水位文件 ⇒ 存量也判红一次（保守方向，不静默当 0）',
+      noBaseline.firstRun && noBaseline.added === before.orphanTotal,
+      `added=${noBaseline.added} total=${noBaseline.total}（${noBaseline.note}）`)
+
+    // ③-② 把当前存量记成基线 ⇒ **同样的数不再判红**
+    writeWatermark(before.orphanTotal)
+    const steady = deltaOf(before.orphanTotal, readWatermark())
+    check('③ 存量计入基线 ⇒ 同样的数**不判红**（这正是"报了 25 次没人看"的修法）',
+      steady.added === 0 && !steady.firstRun,
+      `added=${steady.added} total=${steady.total} baseline=${steady.baseline}`)
+
+    // ③-③ **再新造一个孤儿** ⇒ 必须判红，且只报新增的那 1 个
+    mysqlScalar(
+      `insert into sys_async_task (task_id, type, status, kb_id, created_at, updated_at) `
+      + `values ('zzghost2${stamp}', 'doc-parse', 'DONE', ${GHOST_KB_ID + 1}, now(), now());`,
+    )
+    const grown = await findKbProbeResidue(GHOST_CODE, { ids: [] })
+    const delta = deltaOf(grown.orphanTotal, readWatermark())
+    check('③ 新增 1 个孤儿 ⇒ **必判红**，且只报新增的那个（不是把存量一起报）',
+      delta.added === 1 && grown.orphanTotal === before.orphanTotal + 1,
+      `added=${delta.added} total=${delta.total} baseline=${delta.baseline}`)
+
+    // ③-④ 存量**涨了**时不许抬高基线 —— 否则那条红会被它自己抹掉
+    const beforeRaise = readWatermark().orphanTotal
+    writeWatermark(beforeRaise + 5)
+    check('③ 存量涨了 ⇒ **不抬高基线**（抬高等于把刚判出来的红抹掉）',
+      readWatermark().orphanTotal === beforeRaise,
+      `基线仍=${readWatermark().orphanTotal}（试写 ${beforeRaise + 5}）`)
+
+    // ③-⑤ 存量**降了**（兜底清掉了一些）⇒ 基线跟着降。
+    //      ⚠️ 这一条必须**先手工把基线抬到实测值之上**才验得到 ——
+    //      否则 `writeWatermark` 的"只降不升"会让它恒等于当前值（一个恒真的假判据）。
+    mysqlScalar(
+      `insert into sys_async_task (task_id, type, status, kb_id, created_at, updated_at) `
+      + `values ('zzghost3${stamp}', 'doc-parse', 'DONE', ${GHOST_KB_ID + 2}, now(), now());`,
+    )
+    const high = (await findKbProbeResidue(GHOST_CODE, { ids: [] })).orphanTotal
+    writeFileSync(WATERMARK_FILE, `${JSON.stringify({ orphanTotal: high + 10, at: null })}\n`, 'utf8')
+    mysqlScalar(`delete from sys_async_task where kb_id = ${GHOST_KB_ID + 2};`)
+    const nowLower = (await findKbProbeResidue(GHOST_CODE, { ids: [] })).orphanTotal
+    const lowered = writeWatermark(nowLower)
+    check('③ 存量降了 ⇒ 基线跟着降（否则"清掉又新造"会看起来正常）',
+      lowered === nowLower && readWatermark().orphanTotal === nowLower,
+      `新基线=${lowered}（原基线=${high + 10} · 实测=${nowLower}）`)
+  } finally {
+    if (savedWatermark === null) {
+      if (existsSync(WATERMARK_FILE)) unlinkSync(WATERMARK_FILE)
+    } else {
+      writeFileSync(WATERMARK_FILE, savedWatermark, 'utf8')
+    }
+    mysqlScalar(`delete from sys_async_task where kb_id in `
+      + `(${GHOST_KB_ID}, ${GHOST_KB_ID + 1}, ${GHOST_KB_ID + 2});`)
+  }
 } finally {
   cleanup()
 }
 
 // ---------- 收尾核对：自检自己不许留痕 ----------
 const left = mysqlCount(`select count(*) from sys_kb where code like 'kb_zzselftest%' or code like 'kb_zzghost%';`)
-  + mysqlCount(`select count(*) from sys_async_task where kb_id = ${GHOST_KB_ID};`)
+  + mysqlCount(`select count(*) from sys_async_task where kb_id in (${GHOST_KB_ID}, ${GHOST_KB_ID + 1});`)
 check('自检自身不留痕', left === 0, `剩余=${left}`)
 
 const failed = steps.filter((s) => !s.ok).length

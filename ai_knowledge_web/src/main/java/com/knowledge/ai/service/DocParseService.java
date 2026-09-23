@@ -53,6 +53,8 @@ import java.util.Set;
  *   按类型分派           ← PDF / Office / 纯文本 三条路，见下
  *   TextLayerGuard       ← 「无文本层」检测（P0，T-0S1 §六-1）
  *   storeArtifact        ← 产物落 parsed/ 前缀
+ *   replaceChunks        ← 块落 sys_chunk（**此刻才有 chunk.id**）
+ *   writeGraph           ← 实体关系写 Neo4j（`T-C00`，锚点靠上一步的 id）
  *   markParsed           ← INDEXING + 质量列 + parse_path
  *   replaceIssues        ← 逐页问题（成功与失败两条路都调）
  * </pre>
@@ -103,6 +105,9 @@ public class DocParseService {
 
     /** 读已落库的块给向量化用（主键必须是落库后的 chunk.id）。 */
     private final ChunkReader chunkReader;
+
+    /** `T-C00` 图谱构建侧：把增强抽出的实体关系写进 Neo4j。 */
+    private final com.knowledge.ai.pipeline.graph.GraphWriter graphWriter;
 
     /** 内容级近重复识别（`优化/O9` 步 1/2）—— **只提示，不阻断**。 */
     private final ContentDuplicateDetector contentDuplicateDetector;
@@ -214,6 +219,22 @@ public class DocParseService {
 
             chunkCount = recordWriter.replaceChunks(docId, row.kbId(), enhanced.blocks());
 
+            // `T-C00` 图谱构建侧（`FR-GRAPH-01`）：把这次增强抽出的实体关系写进 Neo4j。
+            //
+            // 🔴 位置是**硬约束**，在 `replaceChunks` **之后**：关系的锚点是
+            //    `sys_chunk.id`（自增主键），而它**落库那一刻才存在** ——
+            //    `RelationAnchor` 先用块序锚定，这里回查换 id，见那边的 javadoc。
+            //
+            // ⚠️ 与增强同一条取舍：**图谱写失败绝不牵连文档**（`07:523`）——
+            //    `GraphWriter` 内部把一切异常都吞了，这里不 catch 是因为它压根不抛。
+            //    这一条就是 `G9-3` 的判据本体。
+            //
+            // ⚠️ 它**在事务之外**：解析 worker 不是 `@Transactional`，而图的写入
+            //    也不该与 MySQL 的行锁绑在一起（Neo4j 慢会拖住行锁）。
+            //    代价是"图写了、MySQL 回滚了"这类不一致**理论可能**，
+            //    但那要求解析在 chunk 落库之后才失败 —— 而那时文档已进 INDEXING，
+            //    唯一会失败的后续步骤是向量化，它失败也不回滚 chunk 行。
+            writeGraph(docId, row, enhanced, enhanced.blocks());
             // `O9` 步 1/2：内容指纹 + 同库近重复提示。
             // ⚠️ 位置在**清洗之后、向量化之前**：指纹的输入必须是**规范化文本**，
             //    而清洗（`O3`）正是"去页眉页脚"的那一步 —— 在它之前取指纹，
@@ -440,6 +461,65 @@ public class DocParseService {
                     log.warn("文档级增强未产出摘要（文档已正常入库，不影响检索）：docId={} 原因={}",
                             docId, enhanced.detail());
         }
+    }
+
+    /**
+     * 把这次增强抽出的实体关系写进 Neo4j（`T-C00`）。
+     *
+     * <h3>两步，缺一不可</h3>
+     * <ol>
+     *   <li><b>锚定</b>：{@link com.knowledge.ai.pipeline.graph.RelationAnchor#anchor} 用
+     *       "实体名在块文本里首次出现"把每条关系落到一个**块序**上 ——
+     *       模型给的三元组里没有分片信息，这个映射只能我们算（需求 `:469` 要求可回源）；</li>
+     *   <li><b>换 id</b>：块序 → {@code sys_chunk.id}。⚠️ 这一步**必须**在
+     *       {@code replaceChunks} 之后（自增主键那时才存在），
+     *       而映射里查不到的块序一律丢弃该条关系（`GraphWriter` 里留痕）。</li>
+     * </ol>
+     *
+     * <h3>为什么单独一个方法而不是塞在调用点上</h3>
+     * <p>调用点那段注释已经很长了，而这里要做的三件事（判空、锚定、换 id）
+     * 与"解析编排"是两件事。抽出来之后，{@code enhanced.enhancement() == null}
+     * 这条分支（增强关掉 / 失败时它就是 null）有了唯一一处判空。
+     *
+     * <p>⚠️ {@code enhancement} 为 null 时**直接返回**，不调 {@code GraphWriter} ——
+     * 这一条同时是 `I-16` 零残留的**构建侧半边**：关掉增强 ⇒ 一次图调用都没有。
+     */
+    private void writeGraph(long docId, Row row, IndexEnhancer.Result enhanced,
+                            List<com.knowledge.ai.pipeline.Block> blocks) {
+        IndexEnhancer.Enhancement enhancement = enhanced.enhancement();
+        if (enhancement == null || enhancement.relations().isEmpty()) {
+            // 没抽到关系 ⇒ **也要走一次清理**（旧版本抽到过、这一版没抽到，
+            // 不清就留下"属于上一版的关系"）。GraphWriter 收到空表时会做这件事。
+            graphWriter.replaceDocument(docId, row.fileName(), List.of(), Map.of());
+            return;
+        }
+        List<com.knowledge.ai.pipeline.graph.RelationAnchor.Anchored> anchored =
+                com.knowledge.ai.pipeline.graph.RelationAnchor.anchor(enhancement.relations(), blocks);
+        graphWriter.replaceDocument(docId, row.fileName(), anchored, chunkIdsByOrder(docId));
+    }
+
+    /**
+     * 回查「块序 → `sys_chunk.id`」。
+     *
+     * <p>只查 {@code order_no} 与 {@code id} 两列 —— 图侧要的只是**回源锚点**，
+     * 正文一个字都不进 Neo4j（`07:464`「不存全文、不建向量，仅作锚点」）。
+     *
+     * <p>⚠️ 同一 {@code order_no} 在一篇文档里**唯一**（`ChunkingService#nextOrderNo`
+     * 按产出顺序递增，表格子块的 orderNo 也来自它）。但这里仍用
+     * {@code putIfAbsent} 而不是 {@code put}：真出现重复时保留**第一条**，
+     * 而不是让后一条静默覆盖 —— 两种都错，但"确定地取第一条"至少可复现。
+     */
+    @SuppressWarnings("unchecked")
+    private Map<Integer, Long> chunkIdsByOrder(long docId) {
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select order_no, id from sys_chunk where doc_id = :docId")
+                .setParameter("docId", docId)
+                .getResultList();
+        Map<Integer, Long> out = new HashMap<>(rows.size() * 2);
+        for (Object[] r : rows) {
+            out.putIfAbsent(((Number) r[0]).intValue(), ((Number) r[1]).longValue());
+        }
+        return out;
     }
 
     /**

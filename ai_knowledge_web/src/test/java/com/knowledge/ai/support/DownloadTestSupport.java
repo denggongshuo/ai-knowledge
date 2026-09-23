@@ -163,6 +163,20 @@ public abstract class DownloadTestSupport extends ApiTestSupport {
     protected RawResponse uploadReady(long kbId, String filename, String token) {
         byte[] content = ("# " + filename + "\n\n正文段落，用于解析与下载取证。")
                 .getBytes(StandardCharsets.UTF_8);
+        return uploadReady(kbId, filename, content, token);
+    }
+
+    /**
+     * 上传一篇**指定正文**的真文档并等它走完转换 + 解析。
+     *
+     * <p>⚠️ 存在的理由：默认正文（"正文段落，用于解析与下载取证。"）里**没有任何实体名**，
+     * 而 `T-C00` 的图谱用例要的是「实体名真的出现在某一块的正文里」——
+     * 否则 {@code RelationAnchor} 锚不上、图里一条边都没有，
+     * 用例会以"接线断了"的样子红（而其实只是正文里没那个词）。
+     *
+     * @param content 文件字节（必须是真可解析的 Markdown / 文本）
+     */
+    protected RawResponse uploadReady(long kbId, String filename, byte[] content, String token) {
         RawResponse accepted = postMultipart("/api/kb/" + kbId + "/doc/upload", content, filename,
                 MediaType.APPLICATION_OCTET_STREAM_VALUE, token);
         if (accepted.code() != 0) {

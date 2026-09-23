@@ -158,7 +158,30 @@ public class IndexEnhancer {
             chapters = chapters == null ? List.of() : List.copyOf(chapters);
         }
 
-        public record Relation(String subject, String predicate, String object) {
+        /**
+         * 一条实体关系（`T-C00` 的图库输入）。
+         *
+         * <p>⚠️ <b>{@code confidence} 是**模型自评**的，不是我们算的</b> ——
+         * `FR-GRAPH-01` 要求"关系必须带 confidence（LLM 抽取不确定性）"
+         * （`docs/需求文档/07-需求-检索与问答.md:467`），而它只能是**抽取方**知道的量。
+         * 本批之前提示词里**根本没有这个字段**，于是这一列无从填起 ——
+         * 当时的候选是"写死 1.0"或"写死 0.5"，两个都是**编造**：前者让
+         * `>= 0.6` 这道闸形同虚设（`07:512` 的"跳转关系限 confidence ≥ 0.6"），
+         * 后者会让**所有**关系都跳不出去、图谱静默变成空转。
+         * ⇒ 处置是**改提示词把它要出来**（`EnhancePrompts.VERSION` 随之 +1）。
+         *
+         * <p>⚠️ 缺失时取 {@code 0.0} 而**不是** 0.5：缺失的语义是"模型没表态"，
+         * 而 `0.0 < 0.6` ⇒ 不参与跳转 —— 与"没抽到"同向。
+         * 取 0.5 会把"不知道"读成"有一半把握"，那正是本仓最忌讳的静默降级。
+         *
+         * @param confidence 0~1；超出区间一律夹住，非数字取 0.0
+         */
+        public record Relation(String subject, String predicate, String object, double confidence) {
+
+            /** 旧形态（无 confidence）—— 只给用例与旧调用点用，生产路径一律走四参。 */
+            public Relation(String subject, String predicate, String object) {
+                this(subject, predicate, object, 0.0);
+            }
         }
 
         /**
@@ -510,7 +533,7 @@ public class IndexEnhancer {
             // 三要素缺一不可：缺了的关系进图库就是一条断边
             if (!s.isEmpty() && !p.isEmpty() && !o.isEmpty()
                     && relations.size() < EnhancePrompts.MAX_RELATIONS) {
-                relations.add(new Enhancement.Relation(s, p, o));
+                relations.add(new Enhancement.Relation(s, p, o, confidenceOf(rel.path("confidence"))));
             }
         }
 
@@ -526,6 +549,31 @@ public class IndexEnhancer {
         }
 
         return new Enhancement(summary, labels, relations, chapters);
+    }
+
+    /**
+     * 读模型给的关系置信度（`FR-GRAPH-01`）。
+     *
+     * <p>三种坏输入都要接住，且**都不抛**（一条关系的置信度读不出来，
+     * 不该让整次增强判 `BAD_OUTPUT` —— 摘要和标签还好好的）：
+     * <ul>
+     *   <li><b>缺失</b>（旧提示词 / 模型不听话）→ {@code 0.0}，语义是"没表态"；</li>
+     *   <li><b>不是数字</b>（{@code "高"} / {@code null}）→ {@code 0.0}；</li>
+     *   <li><b>超出 [0,1]</b>（模型偶尔给 {@code 95} 或 {@code -1}）→ **夹住**而不是判否：
+     *       夹住保留了"它说很高"这个信息，判 0 会把它当成"没表态"。</li>
+     * </ul>
+     *
+     * <p>⚠️ 用 {@link JsonNode#isNumber()} 先判而不是直接 {@code asDouble()}：
+     * 后者对字符串会尽力解析（{@code "0.9"} 能过），对 {@code "高"} 回 0.0 ——
+     * 看着结果一样，但"尽力解析"这件事本身是**静默的宽容**，而这个仓的纪律是
+     * 宽容要写出来（这里就是）。
+     */
+    private static double confidenceOf(JsonNode node) {
+        if (node == null || !node.isNumber()) {
+            return 0.0;
+        }
+        double v = node.asDouble();
+        return Math.max(0.0, Math.min(1.0, v));
     }
 
     /**

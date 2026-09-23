@@ -278,6 +278,41 @@ class IndexEnhancerTest {
     }
 
     @Test
+    @DisplayName("🔴 `confidence` 是**模型给的值**，不是常量 —— 三种坏输入各有各的落点")
+    void confidenceComesFromTheModelNotAConstant() {
+        String withConfidence = """
+                {"summary": "摘要内容足够长以通过校验。",
+                 "labels": [],
+                 "relations": [
+                   {"subject": "甲", "predicate": "属于", "object": "乙", "confidence": 0.3},
+                   {"subject": "丙", "predicate": "属于", "object": "丁", "confidence": 0.95},
+                   {"subject": "戊", "predicate": "属于", "object": "己", "confidence": 95},
+                   {"subject": "庚", "predicate": "属于", "object": "辛", "confidence": -1},
+                   {"subject": "壬", "predicate": "属于", "object": "癸"},
+                   {"subject": "子", "predicate": "属于", "object": "丑", "confidence": "高"}
+                 ]}
+                """;
+        IndexEnhancer.Result result = enhancerWith(new FakeCaller(withConfidence), true)
+                .enhance(doc(), blocks());
+
+        List<Double> confidences = result.enhancement().relations().stream()
+                .map(IndexEnhancer.Enhancement.Relation::confidence).toList();
+        assertThat(confidences)
+                .as("🔴 写死常量（无论 1.0 还是 0.5）都会被这一条逮到 —— "
+                        + "0.3 与 0.95 必须**原样**带出来。"
+                        + "⚠️ 这条判据不能只落在图上（`GraphWriteFlowTest#confidenceIsCarriedThrough`）："
+                        + "那条验的是「图上带出来了」，而**常量在这里就被写死了** —— "
+                        + "本仓对「只测一半的断言」已经吃过两次亏。")
+                .containsExactly(0.3, 0.95, 1.0, 0.0, 0.0, 0.0);
+
+        // 三个 0.0 的语义各不相同，但**落点是同一个**：不参与跳转（`< 0.6`）。
+        //  - 缺失（`壬`）：模型没表态 ⇒ 0.0
+        //  - 超上限（`戊`，模型给了 95）：**夹住**而不是判否 —— 它确实在说"很确定"
+        //  - 超下限（`庚`，-1）与不是数字（`子`，"高"）：都夹/落到 0.0
+        assertThat(result.enhancement().relations().get(2).subject()).isEqualTo("戊");
+    }
+
+    @Test
     @DisplayName("关掉开关 → DISABLED，不调用模型、块集原样（测试期与运维临时关都走这条）")
     void disabledSkipsTheModelEntirely() {
         FakeCaller caller = new FakeCaller(GOOD_JSON);

@@ -30,8 +30,14 @@ public final class EnhancePrompts {
      *
      * <p>不是为了自动化，是为了**事后能回答"这份摘要是哪版提示词产出的"**。
      * 摘要质量要人工抽查（无法自动评分），抽查发现问题时要能定位到是哪一版。
+     *
+     * <p>⚠️ <b>2026-09-22（`S9-M12-A`）由 `doc-enhance-v2` → `v3`</b>：`relations` 的 JSON 结构
+     * 多了一个 **`confidence`** 字段（`FR-GRAPH-01` 要求"关系必须带 confidence"，
+     * 见 `docs/需求文档/07-需求-检索与问答.md:467`）。同时 `CacheConstants.PROMPT_VERSION`
+     * 也要跟着 +1 —— 两处是**两个不同的东西**（这个是"产出物由哪版提示词产"的标签，
+     * 那个是"旧缓存语义失效"的开关），本仓已经踩过一次"改了提示词而缓存继续命中"的坑。
      */
-    public static final String VERSION = "doc-enhance-v2";
+    public static final String VERSION = "doc-enhance-v3";
 
     /**
      * 文档级提示词（1 次 / 篇）。
@@ -58,7 +64,7 @@ public final class EnhancePrompts {
                 {
                   "summary": "150~300 字的中文摘要",
                   "labels": ["3~8 个内容标签"],
-                  "relations": [{"subject": "主体", "predicate": "关系", "object": "客体"}],
+                  "relations": [{"subject": "主体", "predicate": "关系", "object": "客体", "confidence": 0.9}],
                   "chapters": [{"title": "章节标题", "summary": "80~150 字"}]
                 }
 
@@ -67,6 +73,10 @@ public final class EnhancePrompts {
                    **不要引入文档之外的任何知识**，也不要写"本文介绍了……"这种空话套话。
                 2. labels 用简短的名词（如「项目管理」「风险控制」），不要整句。
                 3. relations 抽不到就给空数组 []，**不要编造**。
+                   `confidence` 是你对**这条关系本身**的把握程度，取 0~1 的小数：
+                   文中**明写**（如"X 基于 Y"）给 0.9 以上；**从上下文推出来**的给 0.5~0.7；
+                   只是**猜测**给 0.3 以下 —— 它会被用来决定这条关系能不能参与检索跳转，
+                   **猜的关系填高分会把不相关的内容带进答案**。
                 4. chapters 是**逐章**摘要：`title` 必须与上面内容里的标题**逐字一致**
                    （不要改写、不要加序号、不要翻译），只对**在内容里真实出现过**的章节产出。
                    对每一章写 80~150 字，说清"这一章讲了什么"——它比文档级摘要更有用，

@@ -59,6 +59,15 @@ public class DocLifecycleService {
     /** 按代分区（`T-406`）—— 库级彻底删除要按 `kbId` 找出**全部代**再逐个丢。 */
     private final MilvusPartitionManager partitionManager;
 
+    /**
+     * `T-C00` 的**清理面** —— 图里的边也是"这篇文档的产物"，删文档时要一并清。
+     *
+     * <p>🔴 <b>不接这一步就是一个新开的泄漏面</b>：文档行删了、对象删了、向量删了，
+     * 而图里的边永远留着，**任何清扫都发现不了它**（`S7-M06-D` 的 `#130` 族形状第四次 ——
+     * "删除与自检都依赖同一个会被删掉的父行"）。
+     */
+    private final com.knowledge.ai.pipeline.graph.GraphWriter graphWriter;
+
     // ==================================================================
     // `T-611` · 软删（移入回收站）
     // ==================================================================
@@ -190,16 +199,24 @@ public class DocLifecycleService {
             log.info("[彻底删除] 文档从未向量化，跳过清向量：docId={}", doc.id());
         }
 
-        // ③ 派生行
+        // ③ 图库（`T-C00`）：实体关系也是这篇文档的产物。
+        //    ⚠️ 放在**删主行之前**：`GraphWriter` 按 `(:Document{docId})` 找，
+        //    而那个节点与 MySQL 的行是两回事（它不会因为删了行就消失）——
+        //    顺序其实无所谓，但放在这里读起来是"清理产物"的一部分。
+        //    ⚠️ 它**永不抛**（`07:523`），所以不会让这次彻底删除失败；
+        //    失败时 GraphWriter 自己记 error，本方法照常往下走。
+        graphWriter.deleteDocument(doc.id(), "文档被彻底删除");
+
+        // ④ 派生行
         entityManager.createNativeQuery("delete from sys_chunk where doc_id = :docId")
                 .setParameter("docId", doc.id()).executeUpdate();
         entityManager.createNativeQuery("delete from sys_parse_issue where doc_id = :docId")
                 .setParameter("docId", doc.id()).executeUpdate();
 
-        // ④ 主行（**提交点**：这一步之前失败都还是"可重试"，之后就不再有这根线索了）
+        // ⑤ 主行（**提交点**：这一步之前失败都还是"可重试"，之后就不再有这根线索了）
         entityManager.createNativeQuery("delete from sys_document where id = :id")
                 .setParameter("id", doc.id()).executeUpdate();
-        log.info("[彻底删除] docId={} kbId={} 标题={}（对象 + 向量 + 派生行 + 主行都已清）",
+        log.info("[彻底删除] docId={} kbId={} 标题={}（对象 + 向量 + 图 + 派生行 + 主行都已清）",
                 doc.id(), doc.kbId(), doc.title());
     }
 
@@ -291,7 +308,15 @@ public class DocLifecycleService {
         int objects = docStorage.removePrefix(DocStorage.kbDocPrefix(kbId))
                 + docStorage.removePrefix(DocStorage.kbParsedPrefix(kbId));
 
-        // ③ 行族：子表在前、主表在后（无外键，但顺序与探针清理同口径，残留排查时好解释）
+        // ③ 图库（`T-C00`）—— ⚠️ **必须在删 MySQL 行之前**：图里**没有 `kbId` 维度**
+        //    （实体是"同一全库实体合一、跨库共享"，`07:462`），所以清理只能按
+        //    「该库下**全部文档**的 docId」来 —— 而那份 docId 列表**只有此刻查得到**
+        //    （下一句就把 `sys_document` 行删了）。顺序反了 = 一条都删不到，
+        //    而现象是"图里留着已删库的边"（静默）。
+        //    ⚠️ 它永不抛（`07:523`），失败时自己记 error。
+        graphWriter.deleteDocuments(docIdsOfKb(kbId), kbId);
+
+        // ④ 行族：子表在前、主表在后（无外键，但顺序与探针清理同口径，残留排查时好解释）
         int docs = deleteByKb("delete from sys_chunk where kb_id = :kbId", kbId);
         deleteByKb("delete from sys_parse_issue where kb_id = :kbId", kbId);
         deleteByKb("delete from sys_document where kb_id = :kbId", kbId);
@@ -304,6 +329,20 @@ public class DocLifecycleService {
 
     private int deleteByKb(String sql, long kbId) {
         return entityManager.createNativeQuery(sql).setParameter("kbId", kbId).executeUpdate();
+    }
+
+    /**
+     * 该知识库下**全部文档**的 id（`T-C00` 的图清理要，**必须在删行之前调**）。
+     *
+     * <p>⚠️ 不过滤 `deleted_at`：软删的文档也在回收站里、也在库里，
+     * 它们的图边同样要清（`purgeKb` 是"整库全清"，没有"留下回收站里的"这一说）。
+     */
+    @SuppressWarnings("unchecked")
+    private List<Long> docIdsOfKb(long kbId) {
+        return ((List<Number>) entityManager.createNativeQuery(
+                        "select id from sys_document where kb_id = :kbId")
+                .setParameter("kbId", kbId)
+                .getResultList()).stream().map(Number::longValue).toList();
     }
 
     // ==================================================================
