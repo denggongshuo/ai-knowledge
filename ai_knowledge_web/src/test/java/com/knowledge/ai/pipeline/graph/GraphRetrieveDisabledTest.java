@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.Session;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.test.context.TestPropertySource;
 
 import java.util.List;
 import java.util.Map;
@@ -31,10 +30,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>另一半（**一个驱动都不取**）在 {@code GraphEntityLinkerTest#disabledNeverTouchesTheDriver}：
  * 那边用记数替身直接数调用次数。
+ *
+ * <h3>⚠️ `T-C03` 起开关的来源变了：`@TestPropertySource` → `sys_setting` 行</h3>
+ * <p>改造前这里写的是 {@code m05.graph.retrieve.enabled=false}（启动期属性）。
+ * 那个写法现在**测不到真东西**了：开关的事实源已经是 {@code sys_setting}，
+ * 而 {@code PUT /system/feature/graph} 改的也是那一行 —— 若还靠属性驱动，
+ * 本类会变成"关掉一个没人读的属性 ⇒ 绿"，而真实路径上开关根本没关。
+ * 所以改成**改库行**（与 {@code SystemSettingService} 既有口径一致：
+ * DB 是事实源，那个属性只在缺行时兜底）。
+ *
+ * <p>⚠️ 收尾**必须还原为 `true`**：把开关留在关的状态会静默改变后续所有用例的检索行为
+ * （同库跑批，单值模型）。断言还原成功，不靠"应该会还原吧"。
  */
-@TestPropertySource(properties = {
-        "m05.graph.retrieve.enabled=false",
-        "m05.graph.enabled=false"})
 class GraphRetrieveDisabledTest extends RetrievalFlowSupport {
 
     private static final String ENTITY = "图谱探针-关掉也不该跑";
@@ -53,6 +60,9 @@ class GraphRetrieveDisabledTest extends RetrievalFlowSupport {
 
     @BeforeEach
     void setUp() {
+        // 事实源是这一行（不是启动期属性）——见类注释
+        jdbc.update("update sys_setting set setting_value = 'false'"
+                + " where setting_key = 'retrieval.graph-bypass-enabled'");
         resetProbeState();
     }
 
@@ -64,6 +74,14 @@ class GraphRetrieveDisabledTest extends RetrievalFlowSupport {
             // 清不掉不该让用例失败
         }
         cleanProbeData();
+        // ⚠️ 必须还原。留在 false 会静默改变后续所有用例的检索行为（单值模型、同库跑批）
+        jdbc.update("update sys_setting set setting_value = 'true'"
+                + " where setting_key = 'retrieval.graph-bypass-enabled'");
+        assertThat(jdbc.queryForObject(
+                "select setting_value from sys_setting where setting_key = 'retrieval.graph-bypass-enabled'",
+                String.class))
+                .as("开关没还原成 true ⇒ 后面的批次会莫名其妙少走图谱")
+                .isEqualTo("true");
     }
 
     @Test

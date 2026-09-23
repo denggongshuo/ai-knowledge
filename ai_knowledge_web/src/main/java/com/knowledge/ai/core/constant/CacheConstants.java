@@ -35,8 +35,15 @@ public final class CacheConstants {
      * 旧缓存里的关系**没有这个字段**，反序列化后一律落到 `0.0` ⇒ 检索侧 `>= 0.6` 全判否
      * ⇒ 表现为"图谱一条边都跳不出去"。不改版本号的话，这个现象**只会出现在老文档上**，
      * 是最难查的那一类。`EnhancePrompts.VERSION` 同时 +1（两者用途不同，见那边的 javadoc）。
+     *
+     * <p>⚠️ 2026-09-23（`S9-M12-C`）由 `v3` → `v4`：`EnhancePrompts` 的文档级提示词要求 3
+     * 加了「实体名**逐字照抄**正文」（O 轨「锚定率」的动作项）。这一版与上两次不同：
+     * 输出**结构没变**、旧的 `confidence` 字段照样能反序列化。改版本号的唯一理由是
+     * **语义变了** —— `v3` 缓存里的关系名可能是被模型改写过的，它们锚不上正文；
+     * 继续命中就等于"新提示词对新文档生效、老文档还是老样子"，
+     * 而那正是上一版踩过的"改了提示词却没生效"的同一种现象。
      */
-    public static final String PROMPT_VERSION = "v3";
+    public static final String PROMPT_VERSION = "v4";
 
     /** 检索增强结果缓存前缀：{@code ak:enhance:{promptVersion}:{md5(内容)}}。 */
     public static final String ENHANCE = PREFIX + "enhance:";

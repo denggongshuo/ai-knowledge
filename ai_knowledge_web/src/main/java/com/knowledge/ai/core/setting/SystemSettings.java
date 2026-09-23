@@ -48,6 +48,24 @@ public final class SystemSettings {
      */
     public static final String RETRIEVAL_DEGRADE_DURING_REINDEX = "retrieval.degrade-during-reindex";
 
+    /**
+     * 图谱旁路开关（FR-GRAPH-01 · `T-C03`）。**运行时可翻**，事实源就是本键。
+     *
+     * <p>为什么要有兜底而不是直接抛：检索是问答热路径，**一行配置缺失不该让整站问不出答案**
+     * （同 {@link #RETRIEVAL_DEGRADE_DURING_REINDEX} 的理由）。兜底会留 {@code warn}。
+     *
+     * <p>⚠️ 它**不**管建图。写路径用的是另一个开关 {@code m05.graph.enabled}
+     * （{@code GraphWriter} / {@code GraphSchema} 构造期读取）—— 关掉旁路不等于停建图。
+     *
+     * <p>⚠️ **曾经**还有一个启动期属性 {@code m05.graph.retrieve.enabled} 被当作本键的
+     * 部署兜底（改造前它由 {@code RetrievalService} / {@code GraphEntityLinker} /
+     * {@code GraphNeighborReader} 三处各自用 {@code @Value} 读）。`T-C03` 之后它**没有
+     * 任何生产代码读者** —— 唯一读口收拢到了 {@code GraphFeatureToggle}，走
+     * {@link #DEFAULT_GRAPH_ENABLED}。残留的 {@code @TestPropertySource} 声明是无害的
+     * 空转（见计划 §9 遗留项）。**别照着旧注释去找那个属性的读者**，它会把你引到一个空处。
+     */
+    public static final String RETRIEVAL_GRAPH_ENABLED = "retrieval.graph-bypass-enabled";
+
     // ==================== 缺行时的兜底值 ====================
 
     public static final double DEFAULT_RECALL_THRESHOLD = 0.15;
@@ -59,4 +77,14 @@ public final class SystemSettings {
     public static final int DEFAULT_RERANK_TOP_K = 5;
 
     public static final boolean DEFAULT_DEGRADE_DURING_REINDEX = true;
+
+    /**
+     * 图谱旁路缺行时的兜底 = **开**。
+     *
+     * <p>缺行是**部署事故**而不是常规状态（{@code V43} 会种上这一行）—— 兜底选"开"是为了
+     * 让"迁移没跑成功"退化成"功能照旧"，而不是"图谱悄悄停了而没人知道"。
+     * 每次兜底都会在 {@code SystemSettingService#snapshot()} 留一条 {@code warn}，
+     * 所以它不会被静默吞掉。
+     */
+    public static final boolean DEFAULT_GRAPH_ENABLED = true;
 }

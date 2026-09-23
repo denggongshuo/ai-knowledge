@@ -19,8 +19,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * 文档生命周期（`T-611` 软删 · `T-616` 的彻底删除半边）。
@@ -262,8 +264,8 @@ public class DocLifecycleService {
      *
      * <p>删什么（用户 2026-09-22 裁定的"整库全清"）：
      * <ol>
-     *   <li>`documents/{kbId}/**` 与 `parsed/{kbId}/**` **两个前缀整块删**
-     *       （那时文档行也一起没了 ⇒ 没法再枚举 `storage_path` 逐个删）；</li>
+     *   <li>`documents/{kbId}/**` 与 `parsed/{kbId}/**` **两个前缀整块删** ——
+     *       ⚠️ **但留下仍被活行引用的那些对象**（见下）；</li>
      *   <li>该库**全部代**的 Milvus 分区（不只当前代）——
      *       ⚠️ 只删当前代的话，历史代分区在库行消失后**谁也认领不了**，
      *       正是 `T-O27` 刚清掉的那一族无主向量；</li>
@@ -276,6 +278,31 @@ public class DocLifecycleService {
      * <h3>⚠️ 为什么先分区、再对象、最后删行</h3>
      * <p>三个都是"删完就没线索"的动作，顺序要保证**失败时仍可重试**：
      * `sys_kb` 那一行是唯一能算出前缀与分区名的东西 ⇒ 它必须**最后**删。
+     *
+     * <h3>🔴 `#223`：为什么"按前缀整块删"会删到别人家的文件</h3>
+     * <p>对象名与知识库**绑死**（`documents/{kbId}/…`），而
+     * {@code DocReindexService#moveToKb}（`G7-4`）**只改 `kb_id`、不搬对象**
+     * （它删的是旧代分区的向量，不是 MinIO 里的字节）。于是「从本库移到 B 库」的文档：
+     * 行在 B 库、**对象还躺在本库前缀下**。按前缀整块删会连它的源文件一起删掉 ——
+     * 而 B 库那一行仍是 `READY`，用户点下载拿不到文件，**且没有任何地方报错**
+     * （`DocStorage#remove` 是静默的）。
+     *
+     * <p>修法是**留下仍被活行引用的路径**：本步在删行（④）**之前**跑，
+     * 所以此刻查 `sys_document.storage_path` / `parse_path` 拿到的正是"还有主"的那批。
+     * 排除集的口径是**别的库的全部文档行**（见 {@link #referencedObjectKeys}）——
+     * 它们既含活行、也含"在回收站里还没清"的行，两类都留，因为那两类的对象**都还有用**。
+     *
+     * <p>🔴 **本库自己的行（含本库回收站里的）一律不在排除集里**，它们的对象照删。
+     * 别把这条读成疏漏：`purgeKb` 是**整库全清**，步骤④删行时**不看 `deleted_at`**
+     * —— 本库回收站里的文档行同样会被删掉。它们的对象若不跟着删，
+     * 就是一批"行没了、字节还在"的孤儿（`OrphanMinioSweepTest` 那一族要捞的正是不该存在的这种）。
+     * 所以"留"与"删"在这里不是按 `deleted_at` 分的，而是按 **`kb_id` 分**。
+     * 剩下的（本库已彻底删除的行留下的孤儿对象）也照删。
+     *
+     * <p>⚠️ **曾经**这里写的是"那时文档行也一起没了 ⇒ 没法再枚举 `storage_path` 逐个删"。
+     * 那句话与代码**自相矛盾**：本步一直在④删行之前 —— 读起来像是在解释
+     * "为什么必须按前缀删"，实际描述的是一个**并不存在的约束**。真正的理由是"整库对象一起没"
+     * 这个语义，而它恰恰是 `#223` 的成因。
      */
     @Transactional
     public void purgeKb(long kbId) {
@@ -304,9 +331,11 @@ public class DocLifecycleService {
             }
         }
 
-        // ② 对象：两个前缀整块删（⚠️ 失败会抛 —— 存储泄漏必须让调用方知道）
-        int objects = docStorage.removePrefix(DocStorage.kbDocPrefix(kbId))
-                + docStorage.removePrefix(DocStorage.kbParsedPrefix(kbId));
+        // ② 对象：两个前缀整块删，**留下主在别处的那些**（`#223`，理由见 javadoc）。
+        //    ⚠️ 这份名单必须**在④删行之前**取：名单来自 `sys_document` 的行，
+        //    而④会把本库的行删掉（借住的那批虽然不在本库，但清单口径是"全部活行"，
+        //    放在删行之后取会让语义随实现漂移）
+        Set<String> stillReferenced = referencedObjectKeys(kbId);
 
         // ③ 图库（`T-C00`）—— ⚠️ **必须在删 MySQL 行之前**：图里**没有 `kbId` 维度**
         //    （实体是"同一全库实体合一、跨库共享"，`07:462`），所以清理只能按
@@ -315,6 +344,16 @@ public class DocLifecycleService {
         //    而现象是"图里留着已删库的边"（静默）。
         //    ⚠️ 它永不抛（`07:523`），失败时自己记 error。
         graphWriter.deleteDocuments(docIdsOfKb(kbId), kbId);
+
+        // ③.5 现在才动对象 —— 与图同一条"先取证后破坏"的顺序。
+        //    ⚠️ 失败会抛 —— 存储泄漏必须让调用方知道
+        int objects = docStorage.removePrefixExcept(DocStorage.kbDocPrefix(kbId), stillReferenced)
+                + docStorage.removePrefixExcept(DocStorage.kbParsedPrefix(kbId), stillReferenced);
+        if (!stillReferenced.isEmpty()) {
+            log.warn("[彻底删除] 库 kbId={} 下有 {} 个对象**因仍被活行引用而保留**"
+                    + "（这些行在别的库里 —— 移动造成的借住）—— 见 `#223`",
+                    kbId, stillReferenced.size());
+        }
 
         // ④ 行族：子表在前、主表在后（无外键，但顺序与探针清理同口径，残留排查时好解释）
         int docs = deleteByKb("delete from sys_chunk where kb_id = :kbId", kbId);
@@ -325,6 +364,41 @@ public class DocLifecycleService {
 
         log.warn("[彻底删除] 知识库 kbId={} 已物理删除：分区 {} 个 · 对象 {} 个 · 文档 {} 篇"
                         + "（**不可逆**）", kbId, dropped, objects, docs);
+    }
+
+    /**
+     * **会被本库前缀删到、但主在别处的对象名**（`#223` 的"排除集"）。
+     *
+     * <h3>🔴 为什么条件是本库之外，而不是本库之内</h3>
+     * <p>直觉上会写成 `where kb_id = :kbId`（"本库文档的对象"）—— 那是**反的**。
+     * 本库的全部文档行在步骤④都要删掉，它们名下的对象**本来就该一起清**。
+     * 真正要救的是另一种：**行在别的库、对象还压在本库前缀下**的那批 ——
+     * 它们由 {@code moveToKb} 的"只改 `kb_id`、不搬对象"造成（见 {@link #purgeKb} 的 javadoc）。
+     * 所以条件只能是 `kb_id <> :kbId`。
+     *
+     * <p>于是这里**不需要**解析对象名里的前缀 —— 拿"会活下来的行"的全部路径当排除集，
+     * 而 {@link DocStorage#removePrefixExcept} 只在本次前缀范围内应用它，
+     * 天然就只会保护到"压在本库前缀下、主却在别处"的那几个。
+     * 这也顺带避开了"把对象名嵌 kbId 的约定再抄一遍"（抄漏了就是静默的误删）。
+     *
+     * <p>⚠️ 两个列都可能为 NULL（未解析的文档没有 `parse_path`）——
+     * 收进去之前滤掉，否则 `Set` 里会出现 `null`（虽无害，但会让日志里的数字对不上）。
+     */
+    private Set<String> referencedObjectKeys(long kbId) {
+        @SuppressWarnings("unchecked")
+        List<Object[]> rows = entityManager.createNativeQuery(
+                        "select storage_path, parse_path from sys_document where kb_id <> :kbId")
+                .setParameter("kbId", kbId)
+                .getResultList();
+        Set<String> keys = new HashSet<>();
+        for (Object[] row : rows) {
+            for (Object value : row) {
+                if (value != null && !String.valueOf(value).isBlank()) {
+                    keys.add(String.valueOf(value));
+                }
+            }
+        }
+        return keys;
     }
 
     private int deleteByKb(String sql, long kbId) {

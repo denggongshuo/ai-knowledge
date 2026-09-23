@@ -33,14 +33,19 @@ public class GraphEntityLinker {
     private static final int MAX_ENTITIES = 20_000;
 
     private final ObjectProvider<Driver> driverProvider;
-    private final boolean enabled;
+    /**
+     * `T-C03` 起开关来自 {@link GraphFeatureToggle}（`sys_setting`），**不再是构造期 {@code @Value}**。
+     * 理由同 {@link com.knowledge.ai.pipeline.retrieve.RetrievalService}：构造期读一次的属性
+     * 让 `PUT /system/feature/graph` 变成"重启才生效"，而 I-16 要的是"关得掉"。
+     */
+    private final GraphFeatureToggle featureToggle;
     private final Duration timeout;
 
     public GraphEntityLinker(ObjectProvider<Driver> driverProvider,
-                             @Value("${m05.graph.retrieve.enabled:true}") boolean enabled,
+                             GraphFeatureToggle featureToggle,
                              @Value("${m05.graph.retrieve.timeout-ms:200}") long timeoutMs) {
         this.driverProvider = driverProvider;
-        this.enabled = enabled;
+        this.featureToggle = featureToggle;
         this.timeout = Duration.ofMillis(timeoutMs);
     }
 
@@ -56,7 +61,7 @@ public class GraphEntityLinker {
 
     public Result link(String query) {
         String text = query == null ? "" : query.strip();
-        if (!enabled) {
+        if (!featureToggle.enabled()) {
             return Result.skipped("图谱检索开关未开启");
         }
         if (IdentifierTokenizer.count(text) < MIN_QUERY_TOKENS) {

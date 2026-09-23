@@ -48,4 +48,24 @@ public final class SystemDtos {
                              double lowScoreWarn,
                              int rerankTopK) {
     }
+
+    /**
+     * {@code GET /system/feature/graph} —— 图谱旁路开关状态（`T-C03` · FR-GRAPH-01）。
+     *
+     * <h3>为什么只有一个字段</h3>
+     * <p>契约原文（《10》§11）就是 {@code { enabled }}。不顺手把
+     * {@code timeout-ms} / 建图开关一起塞进来：多返回一个字段就多一个"页面上要不要显示"
+     * 的问题，而这一版前端**还没接入**（《10》§13 仍标 `⏳ 待开发`）。
+     * 后端先把契约的最小面做对，加字段是纯新增、可逆。
+     *
+     * <p>⚠️ 字段名 {@code enabled} 与需求逐字一致 —— 名字对不上会**静默丢字段**
+     * （页面显示 undefined），不会报错。同 {@link Thresholds} 的约定。
+     *
+     * <h3>{@code PUT} 的请求体复用本类型</h3>
+     * <p>读写同一个形状（{@code { enabled }}），不是巧合：这样"读到的值"可以原样回写。
+     * 若拆成两个类型，某天有人给读侧加了派生字段、写侧没加，
+     * 就会出现"回写被静默忽略"——而 PUT 的其余字段是白名单语义，多传的字段也不会报错。
+     */
+    public record FeatureSwitch(boolean enabled) {
+    }
 }

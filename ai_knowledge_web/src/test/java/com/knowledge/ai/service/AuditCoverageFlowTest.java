@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 **47** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 **48** 个动作逐条写死，少一个、多一个、等级错一档都红。
  * （`S7-M06-E` 加 3 条：文档「下载文档」NORMAL / 「批量下载」HIGH / 「导出文档清单」HIGH ⇒ 40 → 43。
  * `S7-M06-F` 再加 4 条（含把「删除文档」从 `PLANNED` 挪进实现）⇒ **43 → 47**。）
  * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
@@ -196,6 +196,11 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         expected.put(AuditModule.SYSTEM + " 编辑模型配置", RiskLevel.HIGH);
         expected.put(AuditModule.SYSTEM + " 删除模型配置", RiskLevel.HIGH);
         expected.put(AuditModule.SYSTEM + " 启用模型配置", RiskLevel.HIGH);
+
+        // 功能开关（`T-C03` · FR-GRAPH-01）：第 7 类 `SYSTEM_BEHAVIOR_CHANGE` 的第一个成员。
+        // ⚠️ 它**不**归 MODEL_CONFIG_CHANGE —— §4.3④ 的射程是「四类模型」，图谱旁路不是模型。
+        // 与上面那条同一条纪律：归类塞错会让"这批高危里哪些动了模型"这个筛选题失真。
+        expected.put(AuditModule.SYSTEM + " 开关图谱旁路", RiskLevel.HIGH);
         return expected;
     }
 
@@ -364,7 +369,7 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "🔴 本批同时把 `AuditRiskPolicy` 的 `PLANNED` 表**清空了**"
                         + "（`05` 两张动作表里可落地的条目至此全部交付）—— "
                         + "与 `S7-M06-E` 那条「从 PLANNED 变 IMPLEMENTED 牵着三处」是同一族的收尾）")
-                .hasSize(47);
+                .hasSize(48);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

@@ -27,7 +27,7 @@ class GraphEntityLinkerTest {
     @DisplayName("判据1/2 · 开关关闭 ⇒ 一个驱动都不取（零开销）")
     void disabledNeverTouchesTheDriver() {
         ProbeDriverProvider provider = new ProbeDriverProvider(null);
-        GraphEntityLinker linker = new GraphEntityLinker(provider, false, TIMEOUT_MS);
+        GraphEntityLinker linker = new GraphEntityLinker(provider, new ProbeFeatureToggle(false), TIMEOUT_MS);
 
         GraphEntityLinker.Result result = linker.link(LONG_ENOUGH);
 
@@ -40,7 +40,7 @@ class GraphEntityLinkerTest {
     @DisplayName("判据2 · 提问长度 < 6 个 token ⇒ 静默跳过、不查 Neo4j")
     void shortQuerySkipsEntirely() {
         ProbeDriverProvider provider = new ProbeDriverProvider(null);
-        GraphEntityLinker linker = new GraphEntityLinker(provider, true, TIMEOUT_MS);
+        GraphEntityLinker linker = new GraphEntityLinker(provider, new ProbeFeatureToggle(true), TIMEOUT_MS);
 
         GraphEntityLinker.Result result = linker.link("A-100");
 

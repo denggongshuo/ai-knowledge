@@ -41,14 +41,15 @@ public class GraphNeighborReader {
     private static final int MAX_CANDIDATES = 128;
 
     private final ObjectProvider<Driver> driverProvider;
-    private final boolean enabled;
+    /** `T-C03` 起开关来自 {@link GraphFeatureToggle}（`sys_setting`），**不再是构造期 {@code @Value}**。 */
+    private final GraphFeatureToggle featureToggle;
     private final Duration timeout;
 
     public GraphNeighborReader(ObjectProvider<Driver> driverProvider,
-                               @Value("${m05.graph.retrieve.enabled:true}") boolean enabled,
+                               GraphFeatureToggle featureToggle,
                                @Value("${m05.graph.retrieve.timeout-ms:200}") long timeoutMs) {
         this.driverProvider = driverProvider;
-        this.enabled = enabled;
+        this.featureToggle = featureToggle;
         this.timeout = Duration.ofMillis(timeoutMs);
     }
 
@@ -67,7 +68,7 @@ public class GraphNeighborReader {
 
     /** 查询实体的 1~2 跳邻居；异常/超时转为空结果而不是抛给问答。 */
     public Result neighbors(List<String> entityNames) {
-        if (!enabled || entityNames == null || entityNames.isEmpty()) {
+        if (!featureToggle.enabled() || entityNames == null || entityNames.isEmpty()) {
             return Result.skipped("图谱旁路未触发");
         }
         Driver driver = driverProvider.getIfAvailable();

@@ -11,6 +11,7 @@ import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.setting.SystemSettingService;
 import com.knowledge.ai.core.setting.SystemSettings;
+import com.knowledge.ai.pipeline.graph.GraphFeatureToggle;
 import com.knowledge.ai.pipeline.graph.GraphRetriever;
 import com.knowledge.ai.service.ModelUsageRecorder;
 import com.knowledge.ai.service.RebuildStateService;
@@ -94,14 +95,16 @@ public class RetrievalService {
     private final GraphRetriever graphRetriever;
 
     /**
-     * 图谱旁路开关（`m05.graph.retrieve.enabled`，默认开）。
+     * 图谱旁路开关（`T-C03` 起 = `sys_setting` 的 `retrieval.graph-bypass-enabled`）。
      *
-     * <p>⚠️ 这里是**字段注入**而不是构造参数：本类走 `@RequiredArgsConstructor`，而 Lombok
-     * 生成的构造器**不会**把 `@Value` 搬到参数上（仓里 `MinioConfig` / `AsyncConfig` 同处理）。
-     * 开关在这层读一次就够 —— 关掉时**连异步任务都不提交**（判据 1 的"零开销"）。
+     * <p>⚠️ **不再是字段注入的 {@code @Value}**：那个属性只在 bean 构造期读一次，
+     * 于是 `PUT /system/feature/graph` 打开/关闭之后**必须重启才生效**——
+     * 而需求 `G9-1`/I-16 要的是"关得掉、可回滚"。改为每次检索问一次
+     * {@link GraphFeatureToggle}（一次 KV 主键查询）。
+     *
+     * <p>关掉时**连异步任务都不提交**（判据 1 的"零开销"）。
      */
-    @Value("${m05.graph.retrieve.enabled:true}")
-    private boolean graphEnabled;
+    private final GraphFeatureToggle graphFeatureToggle;
 
     /** 图谱旁路的整体预算（`m05.graph.retrieve.timeout-ms`；需求 `07:522` 给的是 200ms）。 */
     @Value("${m05.graph.retrieve.timeout-ms:200}")
@@ -163,7 +166,7 @@ public class RetrievalService {
         // 开关关 ⇒ 连任务都不提交（判据 1 要的"零开销"）；跑起来后整体压进 `timeout-ms`
         // （默认 200ms），超时/异常**静默降级**：问答不受影响（需求 `07:522`）
         long graphStart = System.nanoTime();
-        CompletableFuture<GraphRetriever.GraphRecall> graphFuture = graphEnabled
+        CompletableFuture<GraphRetriever.GraphRecall> graphFuture = graphFeatureToggle.enabled()
                 ? CompletableFuture.supplyAsync(() -> graphRetriever.recall(trimmed, scope), retrievalExecutor)
                 : null;
 

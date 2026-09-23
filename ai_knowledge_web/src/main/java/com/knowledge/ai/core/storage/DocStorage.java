@@ -489,6 +489,59 @@ public class DocStorage {
         return removed;
     }
 
+    /**
+     * **按前缀**删掉一批对象，但**留下 {@code keep} 里点名的那些**（`S9-M12-C` 步 14 · 销 `#223`）。
+     *
+     * <h3>🔴 为什么需要它 —— `removePrefix` 在库级删除上会误删</h3>
+     * <p>对象名与知识库是**绑死**的：{@code documents/{kbId}/{docId}/...} 由上传时的 kbId 决定。
+     * 而 {@code DocReindexService#moveToKb}（`G7-4`）只改 {@code sys_document.kb_id} /
+     * {@code sys_chunk.kb_id} + 删**旧分区**的向量 —— **一个字节的对象都不搬**。
+     * 于是「从 A 库移到 B 库」的那篇文档，行在 B 库、**对象还躺在 A 库的前缀下**。
+     * 此时彻底删除 A 库，`removePrefix("documents/{A}/")` 会**连它的源文件一起删掉**，
+     * 而 B 库里那一行还在、状态还是 {@code READY} —— 用户点下载拿不到文件，
+     * 且**没有任何地方报错**（`remove` 是静默的），排查时看 B 库一切正常。
+     *
+     * <h3>为什么是"排除集"而不是"逐行删"</h3>
+     * <p>逐行删要调 N 次 MinIO，且库级删除本来就是「整库对象一起没」的语义 ——
+     * 真正需要保护的只是**凤毛麟角的"借住"对象**。所以保持按前缀列举的一次遍历，
+     * 只在删除那一步跳过点名项。这样既没有 N 次往返，也不丢"整块"的语义。
+     *
+     * @param prefix 要清的前缀（同 {@link #removePrefix} 的非空校验）
+     * @param keep   动不得的对象名（**空集 = 与 {@code removePrefix} 等价**）。
+     *               ⚠️ 传进来的应当是**仍然被活行引用**的路径 —— 由调用方负责查准
+     * @return 实际删掉的对象个数（跳过的不计）
+     */
+    public int removePrefixExcept(String prefix, java.util.Set<String> keep) {
+        if (prefix == null || prefix.isBlank() || "/".equals(prefix.trim())) {
+            // 与 removePrefix 同一道闸，同一理由（见那边：空前缀 = 列出全桶）
+            throw new BizException(ErrorCode.PARAM_INVALID, "对象前缀不能为空");
+        }
+        java.util.Set<String> protectedKeys = keep == null ? java.util.Set.of() : keep;
+        int removed = 0;
+        int skipped = 0;
+        try {
+            for (Result<Item> result : minioClient.listObjects(ListObjectsArgs.builder()
+                    .bucket(bucket).prefix(prefix).recursive(true).build())) {
+                String name = result.get().objectName();
+                if (protectedKeys.contains(name)) {
+                    // ⚠️ 这一格是 `#223` 的落点：跳过而不是删。它上面的行还在**别的库**里
+                    skipped++;
+                    continue;
+                }
+                minioClient.removeObject(RemoveObjectArgs.builder()
+                        .bucket(bucket).object(name).build());
+                removed++;
+            }
+        } catch (Exception ex) {
+            log.error("按前缀删除对象失败（已删 {} 个 / 跳过 {} 个后中断）：prefix={} err={}",
+                    removed, skipped, prefix, ex.getMessage(), ex);
+            throw new BizException(ErrorCode.SYSTEM_ERROR,
+                    "文件清理失败（已清理 " + removed + " 个），请稍后重试");
+        }
+        log.info("按前缀删除对象完成：prefix={} removed={} skipped={}", prefix, removed, skipped);
+        return removed;
+    }
+
     // ==================== 库级前缀（`T-616`）====================
 
     /**
