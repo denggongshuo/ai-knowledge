@@ -12,6 +12,7 @@ import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -61,6 +62,17 @@ public class ParseWorker implements SmartLifecycle {
 
     /** 单轮最多领几条 —— 防止一次领取把库读成大结果集。 */
     private static final int MAX_BATCH = 8;
+
+    /**
+     * 当前 JVM 的**进程身份**（`T-O28` ⓑ）。
+     *
+     * <p>⚠️ 只记 pid 不够：Windows / Docker 重启后 pid 会复用，单看
+     * {@code pid=1234} 分不出「当前进程」与「上一轮死掉的进程」。所以带上
+     * JVM 的 OS 启动秒。两者合起来才是本机同一时刻可判定的身份。
+     */
+    private static final long PROCESS_ID = ProcessHandle.current().pid();
+    private static final long PROCESS_START_EPOCH_SECOND = ProcessHandle.current().info().startInstant()
+            .orElseGet(Instant::now).getEpochSecond();
 
     private final SysAsyncTaskRepository repository;
 
@@ -349,8 +361,18 @@ public class ParseWorker implements SmartLifecycle {
     }
 
     private String workerId() {
-        return "parse-worker@" + Integer.toHexString(System.identityHashCode(this))
-                + "/" + Thread.currentThread().getName();
+        return "parse-worker@pid=" + PROCESS_ID + "/start=" + PROCESS_START_EPOCH_SECOND
+                + "/th=" + Thread.currentThread().getName();
+    }
+
+    /**
+     * 本进程的 worker 标识前缀（`T-O28` ⓑ 的断言用）。
+     *
+     * <p>与 {@link #workerId()} 同一处拼，避免用例自己重造格式 ——
+     * 重造的字符串只要和生产那边差一个字符，判据就变成了"每条锁都是外进程"的假红。
+     */
+    public static String processTag() {
+        return "parse-worker@pid=" + PROCESS_ID + "/start=" + PROCESS_START_EPOCH_SECOND + "/th=";
     }
 
     /** 观测用：已执行的作业总数。 */
