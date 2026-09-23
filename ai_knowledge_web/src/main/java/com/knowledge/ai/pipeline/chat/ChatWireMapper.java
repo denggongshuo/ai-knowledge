@@ -102,11 +102,25 @@ public class ChatWireMapper {
                 totalMillis,
                 stages(trace, llmGenerationMillis),
                 refs,
-                // 图谱旁路未实现（`T-C00`）：`graphUsed` 照 §9 保留但恒 false，
-                // 另两个可选字段**不发**（null）—— 不发比发一个 0 更诚实：
-                // "没走过图谱"与"图谱耗时 0ms"不是同一件事
-                false, null, null);
+                // 图谱旁路（`T-C02`）：`graphUsed` 说"这次图谱有没有贡献分片"；
+                // `graphCostMs` **只在真的跑过时**下发 —— 不发比发一个 0 更诚实：
+                // "没走过图谱"与"图谱耗时 0ms"不是同一件事（判据 1 与判据 9 一正一反钉这条）
+                trace.graphUsed(),
+                graphCostMs(trace),
+                trace.graphFallback() ? Boolean.TRUE : null);
         return new ChatDtos.RetrievalEvent(refs, wire, result.kbCount());
+    }
+
+    /**
+     * 图谱旁路的耗时：**只有真的跑过才下发**（没跑就 {@code null}）。
+     *
+     * <p>"跑过"用三个字段的并来判：命中（{@code graphUsed}）、降级（{@code graphFallback}）、
+     * 或耗时非 0。⚠️ 这建立在 {@code trace} 的口径上 —— 开关关时三个字段全 0/false，
+     * 见 {@code V42} 的列注释与 {@link RetrievalTrace#graphMillis()}。
+     */
+    private static Long graphCostMs(RetrievalTrace trace) {
+        boolean ran = trace.graphUsed() || trace.graphFallback() || trace.graphMillis() > 0L;
+        return ran ? trace.graphMillis() : null;
     }
 
     /**

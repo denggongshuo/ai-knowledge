@@ -123,6 +123,6 @@ class RetrievalResultContractTest {
         // 两个说明串都留空 = **没有**降级、没有重排异常；`degraded()` 由 degradeNote 派生
         return new RetrievalTrace("测试提问", RetrievalMode.HYBRID, List.of(1L), kbCount,
                 10, false, 5, 5, 6, 1L, 2L, 1L, 1L, 1L, 1L, 3L, 1L, 7L, 20, 0.15, 5, true, 1.2,
-                0.35, 0.65, true, "", "", 0.42, false, chunks);
+                0.35, 0.65, true, "", "", 0.42, false, 0L, false, null, false, chunks);
     }
 }

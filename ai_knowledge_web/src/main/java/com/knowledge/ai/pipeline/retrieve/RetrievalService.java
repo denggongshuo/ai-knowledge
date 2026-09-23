@@ -11,6 +11,7 @@ import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.setting.SystemSettingService;
 import com.knowledge.ai.core.setting.SystemSettings;
+import com.knowledge.ai.pipeline.graph.GraphRetriever;
 import com.knowledge.ai.service.ModelUsageRecorder;
 import com.knowledge.ai.service.RebuildStateService;
 import com.knowledge.ai.dto.kb.KbDtos;
@@ -18,12 +19,22 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+
+import static com.knowledge.ai.config.AsyncConfig.RETRIEVAL_EXECUTOR;
 
 /**
  * 检索编排（`T-700`~`T-704` 的缝合处）—— **`M08` 的唯一入口**。
@@ -33,6 +44,7 @@ import java.util.Map;
  *   <li>{@link RetrievalScope} —— MySQL 先算可见范围（`I-9`）；</li>
  *   <li>{@link RetrievalParams} —— 库级配置 + 全局阈值合成；</li>
  *   <li>{@link HybridRetriever} —— 两路并行召回 top-20；</li>
+ *   <li>{@link GraphRetriever} —— 图谱旁路（`T-C02`，第三条召回路径，**可关可超时**）；</li>
  *   <li>{@link RrfFusion} —— 倒数排名融合、按 chunkId 去重；</li>
  *   <li>{@link RerankClient} —— 精排（可降级）；</li>
  *   <li>`T-704` 契约 —— {@link RetrievalResult}。</li>
@@ -78,6 +90,32 @@ public class RetrievalService {
     /** `T-905` 的用量落点。见 {@link #recordRerankUsage}。 */
     private final ModelUsageRecorder usageRecorder;
 
+    /** `T-C02`：图谱旁路（实体链接 → 1~2 跳 → 可见性过滤 → 回源）。 */
+    private final GraphRetriever graphRetriever;
+
+    /**
+     * 图谱旁路开关（`m05.graph.retrieve.enabled`，默认开）。
+     *
+     * <p>⚠️ 这里是**字段注入**而不是构造参数：本类走 `@RequiredArgsConstructor`，而 Lombok
+     * 生成的构造器**不会**把 `@Value` 搬到参数上（仓里 `MinioConfig` / `AsyncConfig` 同处理）。
+     * 开关在这层读一次就够 —— 关掉时**连异步任务都不提交**（判据 1 的"零开销"）。
+     */
+    @Value("${m05.graph.retrieve.enabled:true}")
+    private boolean graphEnabled;
+
+    /** 图谱旁路的整体预算（`m05.graph.retrieve.timeout-ms`；需求 `07:522` 给的是 200ms）。 */
+    @Value("${m05.graph.retrieve.timeout-ms:200}")
+    private long graphTimeoutMs;
+
+    /**
+     * 图谱旁路**与主链路并行**发起用的池 —— 刻意复用 `HybridRetriever` 同一个
+     * （见 {@link com.knowledge.ai.config.AsyncConfig#retrievalExecutor} 上关于
+     * **traceId 装饰器**的硬约束：少了它，"这一次请求花了多久"就拼不起来）。
+     */
+    @Autowired
+    @Qualifier(RETRIEVAL_EXECUTOR)
+    private Executor retrievalExecutor;
+
     /**
      * 检索。
      *
@@ -121,13 +159,27 @@ public class RetrievalService {
 
         // ---------- ③ 两路并行召回 ----------
         long recallStart = System.nanoTime();
+        // ---------- ③.5 图谱旁路（T-C02）：**先发起**，与主链路并行跑 ----------
+        // 开关关 ⇒ 连任务都不提交（判据 1 要的"零开销"）；跑起来后整体压进 `timeout-ms`
+        // （默认 200ms），超时/异常**静默降级**：问答不受影响（需求 `07:522`）
+        long graphStart = System.nanoTime();
+        CompletableFuture<GraphRetriever.GraphRecall> graphFuture = graphEnabled
+                ? CompletableFuture.supplyAsync(() -> graphRetriever.recall(trimmed, scope), retrievalExecutor)
+                : null;
+
         HybridRetriever.Recall recall = hybridRetriever.recall(trimmed, scope, params);
         long recallMillis = elapsed(recallStart);
 
+        GraphRetriever.GraphRecall graph = resolveGraph(graphFuture, graphStart);
+
         // ---------- ④ RRF 融合 ----------
         long fuseStart = System.nanoTime();
-        List<RrfFusion.FusedHit> fused = RrfFusion.fuse(RrfFusion.DEFAULT_K,
-                recall.vectorHits(), recall.bm25Hits());
+        // ⚠️ 图谱**不多占一步加权**：它作为第三路进同一个 `fuse`，只按名次计分
+        // （需求 `07:508`：去重合并进 Rerank，不单独加权）。没跑（开关关）时**只传两路**
+        // —— 判据 1 要的正是这个形状
+        List<RrfFusion.FusedHit> fused = graph == null
+                ? RrfFusion.fuse(RrfFusion.DEFAULT_K, recall.vectorHits(), recall.bm25Hits())
+                : RrfFusion.fuse(RrfFusion.DEFAULT_K, recall.vectorHits(), recall.bm25Hits(), graph.hits());
         long fuseMillis = elapsed(fuseStart);
 
         // ---------- ⑤ 精排（可降级）----------
@@ -169,7 +221,15 @@ public class RetrievalService {
                 params.recallTopK(), params.recallThreshold(), params.rerankTopK(),
                 params.rerankEnabled(), params.tableWeight(), params.missThreshold(),
                 params.lowScoreWarn(), rerank.applied(), rerank.note(),
-                degradeNote, rerankBeforeTop1, rerank.miss(chunks, params), chunks);
+                // 图谱四格（判据 8 的四种状态都落在这四列上）：`graphUsed` = 本次是否
+                // 真的贡献了分片；`graphMillis` 为 0 表示**没跑**（开关关），跑了就会 > 0；
+                // `graphEntities` 空集写 NULL（"缺席不是空值"，照 `S3-M03-A` 的既有口径）
+                degradeNote, rerankBeforeTop1,
+                graph != null && !graph.hits().isEmpty(),
+                graph == null ? 0L : graph.millis(),
+                graph != null && graph.fallback(),
+                graph == null || graph.entities().isEmpty() ? null : graph.entities(),
+                rerank.miss(chunks, params), chunks);
 
         log.info("[检索] 完成：query={} 库数={} 可见文档={} 向量={} BM25={} 融合={} 返回={} "
                         + "重排={} 回表={} 未命中={} 耗时={}ms（范围 {} + 召回 {} + 融合 {} + 重排 {} + 回表 {}）",
@@ -385,6 +445,30 @@ public class RetrievalService {
         return new Degrade(params.withMode(RetrievalMode.KEYWORD), note);
     }
 
+    /**
+     * 等图谱旁路的结果：**超时/异常一律静默降级**成空结果（不抛、不影响主链路）。
+     *
+     * <p>{@code future == null} 只有一个含义：**本次压根没跑**（开关关）。调用方据此
+     * 判断"要不要把第三路交给 {@link RrfFusion}"与"该不该下发 {@code graphCostMs}"
+     * —— 那两件事都以「跑没跑」为准，而不是以「有没有命中」为准（判据 1）。
+     *
+     * <p>⚠️ 超时后不取消底层任务：那一步多半正卡在 Neo4j 的套接字上，
+     * 且叶子自己带了 `TransactionConfig` 超时；这里只保证**主链路不等它**。
+     */
+    private GraphRetriever.GraphRecall resolveGraph(CompletableFuture<GraphRetriever.GraphRecall> future,
+                                                   long start) {
+        if (future == null) {
+            return null;
+        }
+        try {
+            return future.orTimeout(graphTimeoutMs, TimeUnit.MILLISECONDS).join();
+        } catch (CompletionException | CancellationException ex) {
+            Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+            return new GraphRetriever.GraphRecall(List.of(), elapsed(start), true,
+                    "图谱旁路超时/异常，已静默降级：" + cause.getClass().getSimpleName(), List.of());
+        }
+    }
+
     /** 降级的结果：换过的参数 + 说明（没有降级时说明为空串）。 */
     private record Degrade(RetrievalParams params, String note) {
 
@@ -402,7 +486,7 @@ public class RetrievalService {
                 scope.docScopeCount(), scope.docFallback(),
                 0, 0, 0, scopeMillis, 0L, 0L, 0L, 0L, 0L, 0L, 0L, elapsed(start),
                 0, 0d, 0, false, 0d, 0d, 0d, false, note, "",
-                null, false, List.of());
+                null, false, 0L, false, null, false, List.of());
         return new RetrievalResult(List.of(), trace, scope.kbIds().size());
     }
 

@@ -78,9 +78,9 @@ public final class ChatDtos {
      *
      * @param queryAnalysis 「查询解析」耗时。⚠️ 后端**没有**这一步，恒 0 ——
      *                      不拿"可见范围耗时"冒充它（那是`可见范围`那一段的事）
-     * @param graphUsed     图谱旁路是否命中。本批恒 {@code false}（`T-C00` 未实现）
-     * @param graphCostMs   图谱旁路耗时；恒 {@code null}
-     * @param graphFallback 图谱旁路是否降级；恒 {@code null}
+     * @param graphUsed     图谱旁路**本次是否贡献了分片**（`T-C02`）
+     * @param graphCostMs   图谱旁路耗时；**没跑过就是 {@code null}**（"没跑"与"耗时 0ms"不是一回事）
+     * @param graphFallback 图谱旁路是否超时/异常降级；没跑过是 {@code null}，跑了且没降级是 {@code false}
      */
     public record TraceWire(long queryAnalysis,
                             long embed,

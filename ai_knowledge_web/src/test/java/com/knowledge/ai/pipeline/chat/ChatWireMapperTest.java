@@ -218,6 +218,6 @@ class ChatWireMapperTest {
         return new RetrievalTrace("提问", RetrievalMode.HYBRID, List.of(1L), 1,
                 3, false, 2, 2, 3,
                 5L, 20L, 8L, 12L, 9L, 1L, 30L, 2L, 60L,
-                20, 0.15, 5, true, 1.2, 0.35, 0.65, true, "", "", 0.42, false, chunks);
+                20, 0.15, 5, true, 1.2, 0.35, 0.65, true, "", "", 0.42, false, 0L, false, null, false, chunks);
     }
 }

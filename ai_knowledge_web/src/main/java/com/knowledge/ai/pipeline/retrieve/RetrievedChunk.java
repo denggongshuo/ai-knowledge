@@ -121,8 +121,13 @@ public record RetrievedChunk(String chunkId,
      * 而 §9 的 {@code source} 是**单值**（前端拿它渲染引用角标上的"来源"）。所以必须定一条
      * 确定性的取法，否则同一条分片在不同请求里可能显示不同的来源。
      *
-     * <p>取法是**名次更好的那一路**（并列取向量）：名次更靠前的那一路才是"先找到它"的那一路，
-     * 按它归属对用户最有解释力。取"向量优先"是固定的兜底，不随名次摇摆。
+     * <p>取法是**名次更好的那一路**：名次更靠前的那一路才是"先找到它"的那一路，
+     * 按它归属对用户最有解释力。⚠️ **图谱不特殊对待** —— 它比的是同一个"名次"
+     * （需求 `07:508`：去重合并进 Rerank，不单独加权）。并列时按 **向量 > BM25 > 图谱**
+     * 取前者（"并列取向量"是既有口径，图谱作为第三条路径接进来时沿用同一条规则）。
+     *
+     * <p>⚠️ **通道数不写死**：实现按"逐个比名次"扫一遍，所以将来再加一路不需要改这里的结构
+     * —— 上一版是两两比较（`vector <= bm25`），加第三路时必须重写成遍历，索性一次写成遍历。
      *
      * <p>⚠️ **这是一次有损投影** —— "两路都命中了"这件事实在本方法里被丢掉。
      * 需要它时（例如按"双路命中"给分加权）是**新口径**，届时改 {@link RrfFusion} 的计分，
@@ -134,13 +139,23 @@ public record RetrievedChunk(String chunkId,
     public RetrievalSource source() {
         Integer vector = channelRanks.get(RetrievalHit.Channel.VECTOR);
         Integer bm25 = channelRanks.get(RetrievalHit.Channel.BM25);
-        if (vector == null) {
-            return bm25 == null ? RetrievalSource.VECTOR : RetrievalSource.BM25;
+        Integer graph = channelRanks.get(RetrievalHit.Channel.GRAPH);
+        RetrievalSource best = null;
+        int bestRank = Integer.MAX_VALUE;
+        // 顺序即"并列时的优先级"：先扫到的先用严格小于替换 ⇒ 并列时靠前的那一路胜出
+        if (vector != null && vector < bestRank) {
+            best = RetrievalSource.VECTOR;
+            bestRank = vector;
         }
-        if (bm25 == null) {
-            return RetrievalSource.VECTOR;
+        if (bm25 != null && bm25 < bestRank) {
+            best = RetrievalSource.BM25;
+            bestRank = bm25;
         }
-        return vector <= bm25 ? RetrievalSource.VECTOR : RetrievalSource.BM25;
+        if (graph != null && graph < bestRank) {
+            best = RetrievalSource.GRAPH;
+            bestRank = graph;
+        }
+        return best == null ? RetrievalSource.VECTOR : best;
     }
 
     /**

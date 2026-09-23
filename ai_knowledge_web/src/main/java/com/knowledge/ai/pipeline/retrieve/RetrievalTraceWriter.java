@@ -80,6 +80,7 @@ public class RetrievalTraceWriter {
                scope_millis, recall_millis, fuse_millis, table_millis,
                recall_top_k, recall_threshold, rerank_top_k, rerank_enabled, table_weight,
                miss_threshold, low_score_warn, rerank_applied, rerank_note, degrade_note,
+               graph_used, graph_millis, graph_fallback, graph_entities,
                miss_flag, rerank_before_top1, top1_score, chunk_count)
             values
               (:traceId, :userId, :deptId, :sessionId, :messageId, :queryText,
@@ -90,6 +91,7 @@ public class RetrievalTraceWriter {
                :scopeMillis, :recallMillis, :fuseMillis, :tableMillis,
                :recallTopK, :recallThreshold, :rerankTopK, :rerankEnabled, :tableWeight,
                :missThreshold, :lowScoreWarn, :rerankApplied, :rerankNote, :degradeNote,
+               :graphUsed, :graphMillis, :graphFallback, :graphEntities,
                :missFlag, :rerankBeforeTop1, :top1Score, :chunkCount)
             """;
 
@@ -174,6 +176,12 @@ public class RetrievalTraceWriter {
                     .setParameter("rerankApplied", trace.rerankApplied())
                     .setParameter("rerankNote", nullToEmpty(trace.rerankNote()))
                     .setParameter("degradeNote", nullToEmpty(trace.degradeNote()))
+                    .setParameter("graphUsed", trace.graphUsed())
+                    .setParameter("graphMillis", trace.graphMillis())
+                    .setParameter("graphFallback", trace.graphFallback())
+                    // 空集写 NULL 不写空串（`S3-M03-A` 的既有口径：缺席不是空值）
+                    .setParameter("graphEntities", trace.graphEntities() == null || trace.graphEntities().isEmpty()
+                            ? null : String.join(",", trace.graphEntities()))
                     .setParameter("missFlag", trace.miss())
                     // 可空：未重排 ⇒ null；重排了但重排前那条没进 top_n ⇒ 也 null。
                     // **不用 0 顶替**（"没测到"与"得了 0 分"是两件事，与 top1 同一条口径）

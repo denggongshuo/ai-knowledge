@@ -60,6 +60,12 @@ import java.util.List;
  *                          ⚠️ 可空，且 NULL 有**两种**含义，靠 {@link #rerankApplied()} 区分：
  *                          未重排；或重排前那条没进重排结果的 {@code top_n}（重排分**未知**）
  *                          ⇒ 消费方**必须**把覆盖数单独报出来，否则是在偏向高分的子集上算
+ * @param graphUsed         图谱旁路本次**是否真的贡献了分片**（`T-C02`）。⚠️ 它不等于"跑没跑"：
+ *                          长度不足 / 没链上实体时它是 false，而那种情况**跑过**（耗时非 0）
+ * @param graphMillis       图谱旁路耗时（ms）。**0 = 没跑**（开关关）；跑了就是实测值。
+ *                          判据 8 的四种状态（命中 / 没链上 / 开关关 / 超时）就是靠这四列分开的
+ * @param graphFallback     图谱旁路是否**超时/异常后静默降级**（需求 `07:522`）；正常与"没跑"都是 false
+ * @param graphEntities     命中的实体名，**保序**（便于复现）；空集写 NULL —— "缺席不是空值"
  * @param miss              是否判定未命中。⚠️ **只在 {@code rerankApplied=true} 时才有意义** ——
  *                          未重排时分数是融合分，与 {@code missThreshold} 不同量纲，恒为 {@code false}
  * @param chunks            本次返回的分片。**与 {@link RetrievalResult#chunks()} 是同一个
@@ -95,6 +101,10 @@ public record RetrievalTrace(String query,
                              String rerankNote,
                              String degradeNote,
                              Double rerankBeforeTop1,
+                             boolean graphUsed,
+                             long graphMillis,
+                             boolean graphFallback,
+                             List<String> graphEntities,
                              boolean miss,
                              List<RetrievedChunk> chunks) {
 
@@ -128,6 +138,7 @@ public record RetrievalTrace(String query,
                 vectorSearchMillis, bm25Millis, fuseMillis,
                 rerankMillis, tableMillis, totalMillis, recallTopK, recallThreshold, rerankTopK,
                 rerankEnabled, tableWeight, missThreshold, lowScoreWarn, rerankApplied, rerankNote,
-                degradeNote, rerankBeforeTop1, miss, newChunks);
+                degradeNote, rerankBeforeTop1, graphUsed, graphMillis, graphFallback, graphEntities,
+                miss, newChunks);
     }
 }

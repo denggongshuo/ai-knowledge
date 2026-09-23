@@ -187,8 +187,9 @@ public class GraphWriter {
                               r.sourceChunkId = row.sourceChunkId
                         WITH s, o, r, row
                         MATCH (d:Document {docId: $docId})
-                        MERGE (s)-[c1:CITES {docId: $docId, sourceChunkId: row.sourceChunkId}]->(d)
-                        MERGE (o)-[c2:CITES {docId: $docId, sourceChunkId: row.sourceChunkId}]->(d)
+                        MERGE (c:Chunk {chunkId: row.sourceChunkId})
+                        MERGE (s)-[c1:CITES {docId: $docId, sourceChunkId: row.sourceChunkId}]->(c)
+                        MERGE (o)-[c2:CITES {docId: $docId, sourceChunkId: row.sourceChunkId}]->(c)
                         """, Map.of("docId", docId, "rows", graphRows)).consume();
 
                 int entities = tx.run("""
@@ -243,6 +244,8 @@ public class GraphWriter {
                         Map.of("docId", docId)).consume();
                 tx.run("MATCH ()-[r:CITES]-() WHERE r.docId = $docId DELETE r",
                         Map.of("docId", docId)).consume();
+                tx.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c",
+                        Map.of()).consume();
                 tx.run("MATCH (d:Document {docId: $docId}) DELETE d",
                         Map.of("docId", docId)).consume();
                 return null;
@@ -282,6 +285,7 @@ public class GraphWriter {
                         Map.of("docIds", docIds)).consume();
                 tx.run("UNWIND $docIds AS did MATCH ()-[r:CITES]-() WHERE r.docId = did DELETE r",
                         Map.of("docIds", docIds)).consume();
+                tx.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c", Map.of()).consume();
                 return tx.run("""
                                 UNWIND $docIds AS did
                                 MATCH (d:Document {docId: did}) DELETE d

@@ -8,7 +8,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 读分片块（`T-508`）—— 从 `sys_chunk` 取出待向量化的块。
@@ -76,7 +79,43 @@ public class ChunkReader {
     }
 
     /**
-     * MySQL 的 {@code TINYINT(1)} 经原生查询回来是 {@code Integer}（0/1），
+     * 按分片主键批量读图谱回源所需的事实（`T-C02`）。
+     *
+     * <p>**只读、不过滤**：这里负责把图谱给出的 chunk id 还原成 MySQL 事实；
+     * 可见性由 {@code GraphRetriever} 按 {@code RetrievalScope.Scope#docIds()} 做，
+     * 不能在这里偷偷再写一套 SQL 口径。
+     *
+     * <p>返回值按输入 id 的顺序稳定排列，缺失的 id 不补空对象（图里悬空锚点只能降级，
+     * 不许拿一个不存在的块冒充回源成功）。
+     */
+    @Transactional(readOnly = true)
+    public List<com.knowledge.ai.pipeline.graph.GraphChunk> readByIds(Collection<Long> chunkIds) {
+        if (chunkIds == null) {
+            return List.of();
+        }
+        List<Long> ids = chunkIds.stream().filter(java.util.Objects::nonNull).distinct().toList();
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        List<?> rows = entityManager.createNativeQuery("""
+                        select c.id, c.doc_id, c.kb_id, c.chunk_type, c.title_path, c.raw_content
+                          from sys_chunk c
+                         where c.id in (:ids)
+                        """)
+                .setParameter("ids", ids)
+                .getResultList();
+        Map<Long, com.knowledge.ai.pipeline.graph.GraphChunk> byId = new java.util.HashMap<>();
+        for (Object row : rows) {
+            Object[] c = (Object[]) row;
+            long id = ((Number) c[0]).longValue();
+            byId.put(id, new com.knowledge.ai.pipeline.graph.GraphChunk(
+                    id, ((Number) c[1]).longValue(), ((Number) c[2]).longValue(),
+                    (String) c[3], (String) c[4], (String) c[5]));
+        }
+        return ids.stream().map(byId::get).filter(java.util.Objects::nonNull).toList();
+    }
+
+    /**
      * 但驱动版本不同时可能是 {@code Boolean} 或 {@code Long} —— 三种都收。
      *
      * <p>直接强转 {@code (Boolean)} 会在某次驱动升级后变成 {@code ClassCastException}，

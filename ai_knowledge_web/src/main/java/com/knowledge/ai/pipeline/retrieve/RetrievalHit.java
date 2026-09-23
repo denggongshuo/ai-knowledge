@@ -54,7 +54,15 @@ public record RetrievalHit(String chunkId,
         VECTOR("向量"),
 
         /** BM25 稀疏向量通道（{@code sparse} 列）。 */
-        BM25("BM25");
+        BM25("BM25"),
+
+        /**
+         * 图谱关联通道（`T-C02`）：由 `(:Entity)-[:REL]->(:Entity)` 跳转后回源得到。
+         *
+         * <p>⚠️ 它与另外两路**同权**参与 {@link RrfFusion}（需求 `07:508`：去重合并进
+         * Rerank，**不单独加权**）—— 名次即权重，见 {@link RrfFusion}。
+         */
+        GRAPH("图谱");
 
         private final String label;
 
