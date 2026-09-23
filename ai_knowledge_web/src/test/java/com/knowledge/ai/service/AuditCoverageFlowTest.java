@@ -33,9 +33,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖率为什么用冻结清单：扫描式断言只能发现「少登记了」，发现不了「少打了一个点」——
  * 某个写方法忘了挂 {@code @AuditLog}，扫描结果照样自洽、用例照样绿。
- * {@link #expectedActions()} 把裁定过的 **48** 个动作逐条写死，少一个、多一个、等级错一档都红。
+ * {@link #expectedActions()} 把裁定过的 **49** 个动作逐条写死，少一个、多一个、等级错一档都红。
  * （`S7-M06-E` 加 3 条：文档「下载文档」NORMAL / 「批量下载」HIGH / 「导出文档清单」HIGH ⇒ 40 → 43。
- * `S7-M06-F` 再加 4 条（含把「删除文档」从 `PLANNED` 挪进实现）⇒ **43 → 47**。）
+ * `S7-M06-F` 再加 4 条（含把「删除文档」从 `PLANNED` 挪进实现）⇒ **43 → 47**。
+ * `S9-M12-C` 加「开关图谱旁路」HIGH（新第 7 类 `SYSTEM_BEHAVIOR_CHANGE`）⇒ **47 → 48**。
+ * `S9-M12-D` 加「图谱补边」NORMAL ⇒ **48 → 49**。）
  * ⚠️ 这个数字改过一次口径：本行原写「27 个」（那是 S4-D 时的数），而下面判据里的冻结总数
  * 在 S6-M09-B 已经到 36 —— 两处数字长期不一致，直到 `T-A02` 加第 37 条时才被发现。
  * **冻结清单**只有一个数字，就是本类断言的那个；本行已按它对正。
@@ -186,6 +188,13 @@ class AuditCoverageFlowTest extends ApiTestSupport {
         // （含提问原文 + 提问人姓名），外带面更宽；两者同属 §4.3②，档次一致。
         // 同为 QA 模块的采集范围 —— 《05》§4.2 的「问答」行本就含「会话导出」，报表导出是它同一类。
         expected.put(AuditModule.QA + " 导出运营报表", RiskLevel.HIGH);
+        // `T-C04`（2026-09-23）新增：图谱补边。
+        // ⚠️ **NORMAL 而不是 HIGH** —— 与同批的「开关图谱旁路」（`SYSTEM_BEHAVIOR_CHANGE`/HIGH）
+        // 刻意分档：那条一按下去**所有用户**的问答结果都变；这条只新增一条边，
+        // 影响面限于命中该实体对的提问，删掉即完全回退（理由逐字写在 `AuditRiskPolicy` 的登记里）。
+        // 🔴 这一格的存在本身是《05》§4.3 那条纪律的落点：**不进高危的动作也要留"为什么不标"的证据** ——
+        // 少了它，下一个人只会看到"补边没有审计"，而看不出这是裁过的还是漏了的。
+        expected.put(AuditModule.QA + " 图谱补边", RiskLevel.NORMAL);
         // ---- 系统 · 模型配置（4）---- （S6-M09-A 新增：T-900~T-903 的四个写动作）
         // 四条同属 `MODEL_CONFIG_CHANGE`：`AuditRiskPolicy` 的 Category javadoc 原话就是
         // 「四类模型的**新增、编辑、删除、启用或切换**」。⚠️「连接测试」**不在**这里 ——
@@ -368,8 +377,15 @@ class AuditCoverageFlowTest extends ApiTestSupport {
                         + "—— 理由是「恢复」改变了**内容可见性**。"
                         + "🔴 本批同时把 `AuditRiskPolicy` 的 `PLANNED` 表**清空了**"
                         + "（`05` 两张动作表里可落地的条目至此全部交付）—— "
-                        + "与 `S7-M06-E` 那条「从 PLANNED 变 IMPLEMENTED 牵着三处」是同一族的收尾）")
-                .hasSize(48);
+                        + "与 `S7-M06-E` 那条「从 PLANNED 变 IMPLEMENTED 牵着三处」是同一族的收尾）"
+                        + "→ **48**（`S9-M12-C` 的「开关图谱旁路」HIGH，新开第 7 类 "
+                        + "`SYSTEM_BEHAVIOR_CHANGE` —— 它不是模型、不是权限、不是导出、不是删除，"
+                        + "而是**一按下去所有用户的问答结果都变**）"
+                        + "→ **49**（`S9-M12-D` 的「图谱补边」**NORMAL** —— 与上一条刻意分档："
+                        + "只新增一条边、影响面限于命中该实体对的提问、删掉即完全回退。"
+                        + "🔴 它存在的意义是《05》§4.3 那条纪律的落点：**不进高危的动作也要留"
+                        + "「为什么不标」的证据**，否则下一个人只看到「补边没审计」，分不清是裁过还是漏了）")
+                .hasSize(49);
         assertThat(actual).containsExactlyInAnyOrderEntriesOf(expectedActions());
 
         for (String key : NEW_IN_C2) {

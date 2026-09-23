@@ -249,6 +249,34 @@ export const opsApi = {
   qaExport: (body?: { status?: string; kbId?: string; keyword?: string }) =>
     http.post<{ taskId: string; status: string; note: string }>('/ops/qa/export', body),
 
+  /**
+   * 图谱补边（`T-C04` · 需求 `07:544`）—— 给一条未命中问题人工补一条实体关系边。
+   *
+   * <h3>⚠️ 为什么响应里有 `applied` 而不是"成功就是成功"</h3>
+   * 图库（Neo4j）是**旁路**，它不可用时后端**不报错**（承 `G9-3`：补边不能让运营页 500），
+   * 而是如实回 `applied: false` + `detail` 里的原因。⇒ 页面**必须显示 `detail`**，
+   * 不能自己写死一句"已补边" —— 否则"图库不可用"与"真的补上了"在页面上长得一样。
+   *
+   * <h3>⚠️ 没有 `confidence` 字段</h3>
+   * 人工边一律 `1.0`（需求 `03:102`），由**服务端**写死。传一个置信度上来会被忽略。
+   */
+  addGraphEdge: (id: number, body: {
+    subject: string
+    predicate: string
+    object: string
+    docId: number
+    chunkId: number
+  }) => http.post<{
+    applied: boolean
+    docId: number
+    chunkId: number
+    subject: string
+    predicate: string
+    object: string
+    confidence: number
+    detail: string
+  }>(`/ops/qa/misses/${id}/graph-edge`, body),
+
   // ---- 20 检索质量分析 ----
   // ⚠️ 五个方法**都要吃 `range`**：页面上是同一个下拉框，页 11 那批就是因为
   // `loadFeedback()` 不传 range 而让"统计卡 7 天、榜单 7 天"变成两个不同的窗口。
@@ -386,6 +414,17 @@ export const sysApi = {
   kbGrantDetail: (id: number | string) => http.get<Record<string, unknown>>(`/kb/${id}/grants`),
   saveKbGrant: (id: number | string, body: Record<string, unknown>) => http.put(`/kb/${id}/grants`, body),
   modelConfig: () => http.get<ModelConfigResponse>('/system/model/config'),
+
+  /**
+   * 图谱旁路开关（`T-C03` 后端 / `T-C04` 前端接线 · FR-GRAPH-01）。
+   *
+   * ⚠️ 事实源是 `sys_setting` 的 `retrieval.graph-bypass-enabled`，
+   * 且**同进程立即生效、无需重启** —— 关掉之后下一次检索就不走图谱了。
+   */
+  graphFeature: () => http.get<{ enabled: boolean }>('/system/feature/graph'),
+  /** 开关图谱旁路 🚩（改的是**全站**检索行为，审计里是高危「系统行为变更」）。 */
+  setGraphFeature: (enabled: boolean) =>
+    http.put<{ enabled: boolean }>('/system/feature/graph', { enabled }),
   /** 新增一条（modelType 必填；EMBEDDING 不可新增）🚩 */
   createModel: (body: Partial<ModelConfigItem> & { modelType: ModelType }) =>
     http.post<{ id: number; saved: boolean }>('/system/model/config', body),

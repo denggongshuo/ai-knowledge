@@ -30,7 +30,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>断言三件事：① 降级标记为真；② **不抛**（主链路一条不少）；③ 同一格下发到 SSE。
  */
 @TestPropertySource(properties = {
-        "m05.graph.retrieve.enabled=true",
+        // ⚠️ `T-C04`：原有一条 `m05.graph.retrieve.enabled=true` 已删（`T-C03` 起开关读 `sys_setting`，
+        // 属性不再生效 —— 留着它会让下一个人以为"改它就能关图谱"，见 `#233`）。
+        // 本类要的是"开着时超时"，而 `V43` 种的默认值就是 `true`。
         "m05.graph.retrieve.timeout-ms=1",
         "m05.graph.enabled=false"})
 class GraphRetrieveTimeoutTest extends RetrievalFlowSupport {
@@ -49,8 +51,15 @@ class GraphRetrieveTimeoutTest extends RetrievalFlowSupport {
     @Autowired
     private Driver driver;
 
+    /**
+     * 🔴 `T-C04`：开关读 `sys_setting`（不受测试配置影响）⇒ 本类显式打开它，
+     * 否则"超时降级"这条判据会变成"开关关着、根本没超时"（`graphFallback` 照样是 `false`，
+     * 而那是"没跑"而不是"跑过了没超时"—— 两种成因在这一格上长得一样）。
+     */
     @BeforeEach
     void setUp() {
+        jdbc.update("update sys_setting set setting_value = 'true'"
+                + " where setting_key = 'retrieval.graph-bypass-enabled'");
         resetProbeState();
     }
 

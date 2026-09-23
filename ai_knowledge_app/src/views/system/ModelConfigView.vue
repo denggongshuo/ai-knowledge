@@ -350,6 +350,45 @@ function typeLabel(t: ModelType) {
   return TYPE_LABEL[t]
 }
 
+/**
+ * 图谱旁路开关（`T-C04` 接线 · FR-GRAPH-01 / `T-C03` 的后端）。
+ *
+ * <h3>⚠️ 为什么它挂在这一页</h3>
+ * 它改的是**全站检索行为**，与"模型配置"同属系统级开关；而独立的"系统设置"页
+ * 本版本没有。挂在页面里当第 ⓐ 张卡（在四类模型之前），并在文案里写清
+ * 「改的是全站行为」—— 它不该看起来像一个普通的模型选项。
+ *
+ * <h3>⚠️ 不做乐观更新</h3>
+ * `el-switch` 的 `v-model` 会先把 UI 翻过去，所以这里**必须**在失败时把它翻回来 ——
+ * 否则开关显示"关"，而库里还是"开"（`I-16` 的判据会以为关掉了）。
+ * 保存成功后**以服务端的回值**为准（不是回显我传的那个值）。
+ */
+const graph = reactive({ enabled: false, saving: false })
+
+async function loadGraphSwitch() {
+  try {
+    graph.enabled = (await sysApi.graphFeature()).enabled
+  } catch {
+    // 拉不到就保持默认并说明 —— 不假装"已关闭"（那会让用户以为动过它）
+    ElMessage.warning('图谱开关状态拉取失败，页面显示的可能不是当前值')
+  }
+}
+
+async function saveGraphSwitch(next: string | number | boolean) {
+  const want = Boolean(next)
+  graph.saving = true
+  try {
+    const res = await sysApi.setGraphFeature(want)
+    graph.enabled = res.enabled
+    ElMessage.success(res.enabled ? '图谱旁路已开启（立即生效）' : '图谱旁路已关闭（立即生效）')
+  } catch (e) {
+    graph.enabled = !want // 🔴 翻回去：不翻的话页面说"关了"、库里还是"开"
+    ElMessage.error(e instanceof Error ? e.message : '图谱开关保存失败')
+  } finally {
+    graph.saving = false
+  }
+}
+
 onMounted(async () => {
   // ⚠️ 这里原来并发拉 `embeddingImpact()` 并把它塞进一个 mock 初值对象。本版本那条接口
   // 如实回「不支持」，页面也不再展示它的数 —— **直接不调**，页面因此少一次注定失败的请求
@@ -362,7 +401,7 @@ onMounted(async () => {
   usage.avgLatencySec = usageRes.avgLatencySec
   usage.byPurpose = usageRes.byPurpose ?? []
   usage.byModel = usageRes.byModel ?? []
-  await refresh()
+  await Promise.all([refresh(), loadGraphSwitch()])
 })
 </script>
 
@@ -412,6 +451,33 @@ onMounted(async () => {
           <div class="sv">{{ config.stats.monthTokensWan }} 万</div>
           <div class="sl">本月消耗 tokens</div>
         </div>
+      </div>
+    </div>
+
+    <!-- ⓐ 图谱旁路开关（`T-C04` 接线 · FR-GRAPH-01）-->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">ⓐ 图谱旁路</span>
+        <el-tag size="small" :type="graph.enabled ? 'success' : 'info'" effect="plain">
+          {{ graph.enabled ? '已开启' : '已关闭' }}
+        </el-tag>
+        <span class="sub">
+          实体图谱只**补充召回**，不改生成；关掉之后检索链路与「从未开启」完全一致（`I-16`）
+        </span>
+      </div>
+      <div class="card-body graph-switch-row">
+        <el-switch
+          v-model="graph.enabled"
+          :loading="graph.saving"
+          active-text="开启"
+          inactive-text="关闭"
+          inline-prompt
+          @change="saveGraphSwitch"
+        />
+        <span class="hint ml-12">
+          🔴 <b>改的是全站行为</b>：关掉后所有用户的问答都不再走图谱这一路补充召回。
+          立即生效、<b>无需重启</b>；这项操作会记一条<b>高危</b>审计（「系统行为变更」）。
+        </span>
       </div>
     </div>
 

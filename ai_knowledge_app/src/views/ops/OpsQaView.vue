@@ -13,8 +13,9 @@ import {
   CircleCheck,
   ChatDotRound,
   Picture,
+  Share,
 } from '@element-plus/icons-vue'
-import { opsApi, kbApi } from '@/api'
+import { opsApi, kbApi, docApi } from '@/api'
 import type { QaOverview, MissQuestion, MissStatus, TopQuestion, FeedbackStats } from '@/types'
 
 const router = useRouter()
@@ -198,6 +199,133 @@ function supplement(item: MissQuestion) {
 }
 
 /**
+ * 图谱补边（`T-C04` · 需求 `07:544`）—— 「补文档」之外的第二条闭环路。
+ *
+ * <h3>🔴 为什么两条路都要有</h3>
+ * 「补文档」解决的是"库里根本没有相关内容"；而有些问题是**文档本来就有、只是模型没抽出
+ * 那条关系** —— 重传文档解决不了，只能人工把那条边补上。
+ *
+ * <h3>⚠️ 锚点必须由人挑（文档 → 分片）</h3>
+ * 需求 `07:469` 要求每条关系可溯源回原文，回源锚就是 `sourceChunkId`；
+ * 而 `sys_qa_miss` **没有 trace 关联**（它是按问法聚合的行），程序拿不到"那次没命中的分片"。
+ * ⇒ 只能让操作员挑。后端会校验"这个分片确实属于这篇文档"，挑错了会被拒。
+ *
+ * <h3>⚠️ 关系动词是闭集（需求 `07:468`）</h3>
+ * 用下拉而不是输入框：自由输入会造出检索侧永远匹配不到的动词，而"图里积压着没人查的边"
+ * 是看不出来的（边数照涨）。
+ */
+const PREDICATES = ['基于', '提出者', '包含', '使用', '依赖', '属于', '负责', '引用'] as const
+
+const edgeVisible = ref(false)
+const edgeTarget = ref<MissQuestion | null>(null)
+const edgeSubmitting = ref(false)
+const edgeForm = ref({ subject: '', predicate: '基于' as string, object: '', docId: undefined as number | undefined, chunkId: undefined as number | undefined })
+/** 文档候选（跨库全量）与分片候选（按选中的文档拉）。 */
+const edgeDocs = ref<{ id: number; title: string; kbName?: string }[]>([])
+const edgeChunks = ref<{ id: number; orderNo: number; preview: string }[]>([])
+const edgeDocsLoading = ref(false)
+const edgeChunksLoading = ref(false)
+
+function openGraphEdge(item: MissQuestion) {
+  edgeTarget.value = item
+  // 主体/客体默认带入问题原文：`S9-M12-C` 立的那条"实体名逐字照抄"规则在这里同样成立 ——
+  // 正文里逐字出现过的词才回得到原文
+  edgeForm.value = { subject: item.question, predicate: '基于', object: '', docId: undefined, chunkId: undefined }
+  edgeChunks.value = []
+  edgeVisible.value = true
+  void loadEdgeDocs()
+}
+
+/**
+ * 文档候选：只列**已解析成功（READY）**的 —— 未解析的文档没有分片，选它锚不了任何东西。
+ *
+ * ⚠️ `GET /doc/all` **不吃 `status` 参数**（它只有 keyword/kbId/type/page/size）⇒
+ * 筛选只能在前端做。列表本身可用，但"选了没解析完的文档"这件事挡不住 ——
+ * 那由**后端**在提交时拒（`GraphEdgeService` 校验 `status = READY`，报「尚未解析成功」）。
+ * 这里只做"尽量不让人选到"，判据不依赖它。
+ */
+async function loadEdgeDocs() {
+  edgeDocsLoading.value = true
+  try {
+    const res = await docApi.all({ size: 100 })
+    edgeDocs.value = res.list
+      .filter((d) => d.status === 'READY')
+      .map((d) => ({ id: d.id, title: d.title, kbName: d.kbName }))
+  } catch {
+    edgeDocs.value = []
+    ElMessage.warning('文档列表拉取失败，暂时无法选择锚点文档')
+  } finally {
+    edgeDocsLoading.value = false
+  }
+}
+
+/**
+ * 选中文档后拉它的分片。
+ *
+ * ⚠️ `chunkId` 必须在换文档时**清空** —— 留着上一篇文档的分片 id，后端会以
+ * 「分片 X 不属于文档 Y」拒绝，而用户看到的只是"提交失败"，看不出是自己换了文档。
+ */
+async function loadEdgeChunks(docId: number | undefined) {
+  edgeForm.value.chunkId = undefined
+  edgeChunks.value = []
+  if (!docId) return
+  edgeChunksLoading.value = true
+  try {
+    const res = await docApi.chunks(docId, 'all', 1, 100)
+    edgeChunks.value = res.list.map((c) => ({
+      id: c.id,
+      orderNo: c.index,
+      preview: (c.content ?? '').slice(0, 40),
+    }))
+  } catch {
+    ElMessage.warning('分片列表拉取失败')
+  } finally {
+    edgeChunksLoading.value = false
+  }
+}
+
+async function submitGraphEdge() {
+  const t = edgeTarget.value
+  if (!t) return
+  const f = edgeForm.value
+  if (!f.subject.trim() || !f.object.trim()) {
+    ElMessage.warning('主体与客体都要填')
+    return
+  }
+  if (!f.docId || !f.chunkId) {
+    ElMessage.warning('请先选锚点文档与分片 —— 没有锚点的边回不到原文')
+    return
+  }
+  edgeSubmitting.value = true
+  try {
+    const res = await opsApi.addGraphEdge(t.id, {
+      subject: f.subject.trim(),
+      predicate: f.predicate,
+      object: f.object.trim(),
+      docId: f.docId,
+      chunkId: f.chunkId,
+    })
+    // 🔴 显示**后端回的 `detail`**，不写死一句"已补边"：
+    //    `applied=false`（图库不可用）与"真的补上了"必须长得不一样
+    if (res.applied) {
+      ElMessage.success(`已补边：${res.detail}`)
+      edgeVisible.value = false
+    } else {
+      ElMessageBox.alert(
+        `这条边**没有**落库。\n\n原因：${res.detail}\n\n可以稍后重试 —— 图库不可用不影响文档与问答。`,
+        '补边未生效',
+        { type: 'warning', confirmButtonText: '知道了' },
+      )
+    }
+  } catch (e) {
+    // 参数类错误（动词越界 / 分片不属于该文档 / 文档不可见）由后端给可读文案
+    ElMessage.error(e instanceof Error ? e.message : '补边失败')
+  } finally {
+    edgeSubmitting.value = false
+  }
+}
+
+/**
  * 需求 §1.5 的「用这些真实问法重新生成 HyQ」入口 —— 🔴 **本版本不交付**。
  *
  * 原实现弹的是 `ElMessage.success('已提交…任务，完成后通过通知中心提醒')`，
@@ -349,6 +477,7 @@ async function exportReport() {
             <el-table-column label="操作" width="240" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" text type="primary" :icon="Upload" @click="supplement(row)">补文档</el-button>
+                <el-button size="small" text :icon="Share" @click="openGraphEdge(row)">图谱补边</el-button>
                 <el-button size="small" text :icon="Refresh" @click="replay(row)">重放验证</el-button>
                 <el-dropdown trigger="click" @command="(cmd: string) => setStatus(row, cmd as MissStatus)">
                   <el-button size="small" text>更多</el-button>
@@ -491,6 +620,71 @@ async function exportReport() {
       </div>
     </el-card>
   </div>
+
+  <!-- ==================== 图谱补边（T-C04 · 需求 07:544） ==================== -->
+  <el-dialog v-model="edgeVisible" title="图谱补边" width="620px" :close-on-click-modal="false">
+    <el-alert type="info" :closable="false" show-icon class="mb-12">
+      <template #title>
+        <span class="alert-text">
+          针对这条未命中问题，人工补一条<b>实体关系边</b>（置信度固定 <b>1.0</b>）。
+          有些问题是文档本来就有、<b>只是模型没抽出那条关系</b> —— 重传文档解决不了，只能在这里补。
+          <br />⚠️ <b>锚点（文档 + 分片）必填</b>：需求要求每条关系都能溯源回原文，挑错分片会被后端拒绝。
+        </span>
+      </template>
+    </el-alert>
+
+    <el-form label-width="86px" label-position="right">
+      <el-form-item label="未命中问题">
+        <div class="edge-question">{{ edgeTarget?.question }}</div>
+      </el-form-item>
+      <el-form-item label="主体">
+        <el-input v-model="edgeForm.subject" placeholder="实体名（建议照抄正文原词）" maxlength="128" />
+      </el-form-item>
+      <el-form-item label="关系">
+        <el-select v-model="edgeForm.predicate" style="width: 220px">
+          <el-option v-for="p in PREDICATES" :key="p" :label="p" :value="p" />
+        </el-select>
+        <span class="hint ml-8">动词是闭集（需求固定 8 个），自由输入检索侧匹配不到</span>
+      </el-form-item>
+      <el-form-item label="客体">
+        <el-input v-model="edgeForm.object" placeholder="实体名（建议照抄正文原词）" maxlength="128" />
+      </el-form-item>
+      <el-form-item label="锚点文档">
+        <el-select
+          v-model="edgeForm.docId"
+          filterable
+          :loading="edgeDocsLoading"
+          placeholder="只列已解析成功的文档"
+          style="width: 100%"
+          @change="loadEdgeChunks"
+        >
+          <el-option v-for="d in edgeDocs" :key="d.id" :label="d.title" :value="d.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="锚点分片">
+        <el-select
+          v-model="edgeForm.chunkId"
+          filterable
+          :loading="edgeChunksLoading"
+          :disabled="!edgeForm.docId"
+          placeholder="先选文档"
+          style="width: 100%"
+        >
+          <el-option
+            v-for="c in edgeChunks"
+            :key="c.id"
+            :label="`#${c.orderNo} · ${c.preview}`"
+            :value="c.id"
+          />
+        </el-select>
+      </el-form-item>
+    </el-form>
+
+    <template #footer>
+      <el-button @click="edgeVisible = false">取消</el-button>
+      <el-button type="primary" :loading="edgeSubmitting" @click="submitGraphEdge">补这条边</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -838,5 +1032,17 @@ async function exportReport() {
   font-size: 12.5px;
   color: #8a6d3b;
   line-height: 1.6;
+}
+/* 补边弹窗里那条问题的原文：只读展示，不截断到看不清 */
+.edge-question {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.ml-8 {
+  margin-left: 8px;
 }
 </style>

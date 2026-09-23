@@ -3,10 +3,13 @@ package com.knowledge.ai.controller;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
+import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.LoginUserContext;
 import com.knowledge.ai.core.security.RequiresPerm;
 import com.knowledge.ai.dto.ops.OpsDtos;
+import com.knowledge.ai.service.GraphEdgeService;
 import com.knowledge.ai.service.OpsExportService;
 import com.knowledge.ai.service.QaMissService;
 import com.knowledge.ai.service.QaOpsService;
@@ -64,6 +67,8 @@ public class OpsQaController {
 
     private final ReplayService replayService;
 
+    private final GraphEdgeService graphEdgeService;
+
     /**
      * `GET /ops/qa/misses?status=&kbId=&keyword=&page=&size=` —— 未命中问题清单。
      *
@@ -97,6 +102,34 @@ public class OpsQaController {
                                                             @RequestBody OpsDtos.PatchMissRequest body) {
         String status = body == null ? null : body.status();
         return ApiResponse.ok(qaMissService.patch(id, status, LoginUserContext.requireUserId()));
+    }
+
+    /**
+     * `POST /ops/qa/misses/{id}/graph-edge` —— 图谱补边（`T-C04` · 需求 `07:544`）。
+     *
+     * <p>针对一条未命中问题，人工补一条实体关系边（`confidence` 一律 `1.0`，需求 `03:102`）。
+     * 它是"用文档补"（`T-A01` 的补文档 → 重放验证）之外的第二条闭环路：
+     * 有些问题是**文档本来就有、只是模型没抽出那条关系**，重传文档解决不了。
+     *
+     * <p>权限 `ops:qa:handle`：与 `PATCH /misses/{id}` 同码 —— 两者都是"处理未命中"这个动作的
+     * 不同侧面，能改状态就能补边，不该因为多一个动词就多要一个权限。
+     *
+     * <p>⚠️ 风险等级 **NORMAL**：它只**新增**一条边、影响面限于命中该实体对的提问，
+     * 且可由"删掉这条边"完全回退 —— 与 `PUT /system/feature/graph`（一按下去**所有用户**
+     * 的问答结果都变）不是同一量级。按《05》§4.3 的纪律，**不进高危类的动作要在
+     * `AuditRiskPolicy.IMPLEMENTED` 里留下"为什么不标"的证据**。
+     */
+    @PostMapping("/misses/{id}/graph-edge")
+    @RequiresPerm("ops:qa:handle")
+    @AuditLog(module = AuditModule.QA, action = "图谱补边", risk = RiskLevel.NORMAL)
+    public ApiResponse<OpsDtos.ManualEdgeResult> graphEdge(@PathVariable long id,
+                                                           @RequestBody OpsDtos.ManualEdgeRequest body) {
+        if (body == null || body.docId() == null || body.chunkId() == null) {
+            // 缺参数在这里就拒：让它落到服务层会变成一次"文档不存在"的误报
+            throw new BizException(ErrorCode.PARAM_INVALID, "docId 与 chunkId 必填（回源锚不能缺）");
+        }
+        return ApiResponse.ok(graphEdgeService.addEdge(id, body.subject(), body.predicate(),
+                body.object(), body.docId(), body.chunkId()));
     }
 
     /** `GET /ops/qa/overview?range=7d` —— 四个指标（需求 §1.1）。 */

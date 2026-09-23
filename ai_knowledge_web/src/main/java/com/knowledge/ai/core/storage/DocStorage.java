@@ -430,7 +430,13 @@ public class DocStorage {
         }
     }
 
-    /** 删除对象（文档被彻底删除时用）。**当前无调用方** —— `T-616` 起接入。 */
+    /**
+     * 删除对象（文档被彻底删除、或移库后删旧位置时用）。
+     *
+     * <p>⚠️ 原注释写的是「**当前无调用方** —— `T-616` 起接入」，那句在 `T-616` 落地时就过期了
+     * （`DocLifecycleService` 在多处调它）。`T-C04` 搬对象时又加了一处 —— 顺手订正，
+     * 免得下一个人照它判断"这个方法可以删"。
+     */
     public void remove(String objectKey) {        try {
             minioClient.removeObject(RemoveObjectArgs.builder()
                     .bucket(bucket).object(objectKey).build());
@@ -543,6 +549,79 @@ public class DocStorage {
     }
 
     // ==================== 库级前缀（`T-616`）====================
+
+    /**
+     * 某篇文档**原件**的对象前缀：{@code documents/{kbId}/{docId}/}（`T-C04` 销 `#232` 时提出来）。
+     *
+     * <p>⚠️ 与 {@link #kbDocPrefix} 的区别是**粒度**：搬一篇文档只该动它自己那个目录，
+     * 用库级前缀会把整个库的对象都搬走。对象名的构造规则（`putObject` 里那一行拼接）
+     * 只在这里复述一次 —— 搬错目录的后果是"文件还在，但行指向了别处"，静默。
+     */
+    public static String docObjectPrefix(long kbId, long docId) {
+        return PREFIX + kbId + "/" + docId + "/";
+    }
+
+    /** 某篇文档**解析产物**的对象前缀：{@code parsed/{kbId}/{docId}/}（同上）。 */
+    public static String docArtifactPrefix(long kbId, long docId) {
+        return ARTIFACT_PREFIX + kbId + "/" + docId + "/";
+    }
+
+    /**
+     * 把一条对象路径的**库前缀**换掉（`T-C04` 销 `#232`）。
+     *
+     * <p>对象名里的 `kbId` 是路径的一部分，而 `sys_document.storage_path` / `parse_path`
+     * 存的是**完整对象名** ⇒ 搬完对象必须同步改写这两列，否则行还指着旧位置
+     * （下载 10044、彻底删除删一个不存在的对象 —— 两处都是**静默**的失败）。
+     *
+     * @param path      原路径；为 {@code null} / 空白 / 不含 {@code oldPrefix} 时**原样返回**
+     *                  （未转存完成的文档 `storage_path` 是 null，那是合法状态，不是错误）
+     */
+    public static String retargetPath(String path, String oldPrefix, String newPrefix) {
+        if (path == null || path.isBlank() || !path.startsWith(oldPrefix)) {
+            return path;
+        }
+        return newPrefix + path.substring(oldPrefix.length());
+    }
+
+    /**
+     * 把一个前缀下的全部对象**复制**到另一个前缀（保留相对路径）。
+     *
+     * <p>⚠️ 用"读流 + 写流"而不是 MinIO 的 `copyObject`：后者要拼出源对象的**完整名字**，
+     * 而这里只需要"前缀换一下"。多一次内存拷贝换来的是本方法只管前缀、
+     * 不复制对象名的构造规则 —— 与 {@link #removePrefixExcept} 同一种取舍。
+     *
+     * @return 实际复制成功的个数
+     */
+    public int copyPrefix(String sourcePrefix, String targetPrefix) {
+        int copied = 0;
+        // ⚠️ `listObjects` 的迭代器在**取下一项时**才真正发请求，而 `get()` 声明了受检异常
+        //    （`ErrorResponseException`）⇒ 整个 for-each 必须包在 try 里，
+        //    不能只把循环体包住（那样异常从 `hasNext()` 里漏出来，编译期就报"未处理"）。
+        try {
+            for (Result<Item> result : minioClient.listObjects(ListObjectsArgs.builder()
+                    .bucket(bucket).prefix(sourcePrefix).recursive(true).build())) {
+                String name = result.get().objectName();
+                String dest = targetPrefix + name.substring(sourcePrefix.length());
+                try (InputStream in = minioClient.getObject(GetObjectArgs.builder()
+                        .bucket(bucket).object(name).build())) {
+                    minioClient.putObject(PutObjectArgs.builder()
+                            .bucket(bucket).object(dest)
+                            // partSize 交给客户端自动分段（-1 = 单次 PUT 的判定也由它做）
+                            .stream(in, -1, PART_SIZE)
+                            .build());
+                    copied++;
+                }
+            }
+        } catch (Exception ex) {
+            // 🔴 复制失败必须**抛**：调用方要在"还没删旧对象"的时候停下来。
+            //    这里吞掉的话，调用方会接着去删源前缀 ⇒ **文件真的没了**。
+            log.error("[对象搬迁] 复制失败（已复制 {} 个）：{} → {} err={}",
+                    copied, sourcePrefix, targetPrefix, ex.getMessage());
+            throw new BizException(ErrorCode.SYSTEM_ERROR,
+                    "文件搬迁失败（原文件未删），请稍后重试");
+        }
+        return copied;
+    }
 
     /**
      * 某个知识库的**源文件**前缀 —— 库级彻底删除时按它整块清（`T-616`）。

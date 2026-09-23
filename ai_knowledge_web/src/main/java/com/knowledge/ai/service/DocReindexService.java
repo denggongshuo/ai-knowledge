@@ -10,6 +10,7 @@ import com.knowledge.ai.core.enums.KbGrantLevel;
 import com.knowledge.ai.core.enums.SecretLevel;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.storage.DocStorage;
 import com.knowledge.ai.dto.doc.DocDtos;
 import com.knowledge.ai.pipeline.vectorize.ChunkVectorizer;
 import com.knowledge.ai.pipeline.vectorize.VectorWriter;
@@ -69,6 +70,12 @@ public class DocReindexService {
     private final DocRecordWriter recordWriter;
 
     private final TransactionTemplate transactionTemplate;
+
+    /**
+     * `T-C04`（销 `#232`）：搬对象用。
+     * ⚠️ 注入的是**存储实现**而不是新的抽象 —— 搬对象没有别的地方要做，多一层接口是空的。
+     */
+    private final DocStorage docStorage;
 
     // ==================================================================
     // T-610 · 单篇重建
@@ -168,6 +175,24 @@ public class DocReindexService {
         int targetGeneration = recordWriter.currentKbGeneration(targetKbIdChecked);
         String oldPartition = MilvusConstants.partitionName(doc.kbId(), doc.indexGeneration());
 
+        // ⓪ `T-C04` 销 `#232`：把 MinIO 对象**真的搬过去**。
+        //    🔴 顺序：**复制 → （下面）改库 → 最后删旧**。三段里只有中间那段会改库，
+        //    所以把不可逆的删除放到最后 —— 任一时刻崩掉，最坏是"对象在两边各有一份"
+        //    （浪费、可重跑），而反过来（先删后复制）崩掉就是**文件没了、行还在**：
+        //    页面照常列着，点下载才拿不到（同 `S7-M06-E` 的「鉴权 → 签名 → 写记录 → 返回」）。
+        //    ⚠️ 用**文档级**前缀（`documents/{kbId}/{docId}/`）而不是库级 —— 库级会把整个库搬走。
+        String srcObjectPrefix = DocStorage.docObjectPrefix(doc.kbId(), docId);
+        String dstObjectPrefix = DocStorage.docObjectPrefix(targetKbIdChecked, docId);
+        String srcArtifactPrefix = DocStorage.docArtifactPrefix(doc.kbId(), docId);
+        String dstArtifactPrefix = DocStorage.docArtifactPrefix(targetKbIdChecked, docId);
+        int objectsCopied = docStorage.copyPrefix(srcObjectPrefix, dstObjectPrefix);
+        int artifactsCopied = docStorage.copyPrefix(srcArtifactPrefix, dstArtifactPrefix);
+
+        // 改写两列路径：行必须指向**搬完之后**的真名字。漏了这一步，行还指着旧前缀，
+        // 而对象已经在新前缀 —— 下载 10044、彻底删除删一个不存在的对象，两处都静默。
+        String newStoragePath = DocStorage.retargetPath(doc.storagePath(), srcObjectPrefix, dstObjectPrefix);
+        String newParsePath = DocStorage.retargetPath(doc.parsePath(), srcArtifactPrefix, dstArtifactPrefix);
+
         // ① 先落"不可检索"，让中途失败表现为"待重建"而不是"可检索却没有向量"。
         //    ⚠️ 必须包在事务里：Hibernate 6+ 对原生 update 会校验活动事务，
         //       否则抛 `TransactionRequiredException: No active transaction for update or delete query`
@@ -182,7 +207,8 @@ public class DocReindexService {
         //    旧分区它一个字节都不碰 —— 而那两个分区属于**两个不同的库**。
         int removed = vectorWriter.replaceDocument(oldPartition, docId, java.util.List.of());
 
-        // ③ 换归属：文档 + **它的分片**。⚠️ 分片那一半不能漏：
+        // ③ 换归属：文档 + **它的分片** + `T-C04` 新增的两条**对象路径列**。
+        //    ⚠️ 分片那一半不能漏：
         //    `ChunkReader` / 检索侧都按 `sys_chunk.kb_id` join `sys_kb` 取密级，
         //    只改文档列会让分片继续按**旧库的密级**参与过滤（一个非常安静的越权口子）
         transactionTemplate.executeWithoutResult(tx -> {
@@ -190,10 +216,13 @@ public class DocReindexService {
             entityManager.createNativeQuery("""
                             update sys_document
                                set kb_id = :target, status = 'INDEXING', index_generation = 0,
+                                   storage_path = :storagePath, parse_path = :parsePath,
                                    updated_at = :now
                              where id = :id
                             """)
                     .setParameter("target", targetKbIdChecked)
+                    .setParameter("storagePath", newStoragePath)
+                    .setParameter("parsePath", newParsePath)
                     .setParameter("now", now)
                     .setParameter("id", docId)
                     .executeUpdate();
@@ -203,6 +232,12 @@ public class DocReindexService {
                     .setParameter("id", docId)
                     .executeUpdate();
         });
+
+        // ③.5 到此"库里指向新位置"是既成事实 ⇒ 可以安全删旧对象了。
+        //    ⚠️ 删旧**不校验**与复制数相等：多出来的是本就不该在这儿的残留，
+        //       少了（复制失败）在 ⓪ 已经抛出去了，走不到这一步。
+        docStorage.removePrefix(srcObjectPrefix);
+        docStorage.removePrefix(srcArtifactPrefix);
 
         // ④ 向量化到**目标库的当前代**。代复核照 `DocParseService` 的写法：
         //    "还是当初那一代吗"必须在**真正落盘之前**问（`ChunkVectorizer.GenerationGuard` 的位置）
@@ -222,8 +257,10 @@ public class DocReindexService {
         } else {
             log.warn("[文档移动] 向量化未执行，文档停在 INDEXING：docId={} 原因={}", docId, result.detail());
         }
-        log.info("[文档移动] docId={} {} → {} · 旧分区 {} 删掉 {} 条向量 · 目标第 {} 代",
-                docId, doc.kbId(), targetKbIdChecked, oldPartition, removed, targetGeneration);
+        log.info("[文档移动] docId={} {} → {} · 旧分区 {} 删掉 {} 条向量 · 目标第 {} 代 · "
+                        + "对象搬迁 原件 {} / 产物 {}",
+                docId, doc.kbId(), targetKbIdChecked, oldPartition, removed, targetGeneration,
+                objectsCopied, artifactsCopied);
         return true;
     }
 

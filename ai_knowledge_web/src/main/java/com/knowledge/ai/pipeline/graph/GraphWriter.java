@@ -145,10 +145,31 @@ public class GraphWriter {
                 //    ⚠️ `REL` 是**实体↔实体**的边（带 `r.docId` 属性标明出处），
                 //    不是"挂到 Document 节点上"的 —— 所以按**属性**删，
                 //    写成 `(d:Document)-[r:REL]-()` 会一条都匹配不到（一个静默的空删）。
-                tx.run("MATCH ()-[r:REL]-() WHERE r.docId = $docId DELETE r",
-                        Map.of("docId", docId)).consume();
-                tx.run("MATCH ()-[r:CITES]-() WHERE r.docId = $docId DELETE r",
-                        Map.of("docId", docId)).consume();
+                //
+                //    🔴 `T-C04`：**人工补的边不删**（`r.manual = true`）。
+                //    人工边与自动边同形（都是 `REL` + `docId`），唯一区分就是那个布尔属性。
+                //    不留这一步的后果很安静：运营页补的边在文档**任何一次重建**后消失，
+                //    而现象只是"补过的边过几天没了" —— 没人会把它和重建联系起来。
+                //
+                //    ⚠️ 条件必须写成 `r.manual IS NULL OR r.manual = false`：
+                //    `S9-M12-A`~`C` 写进去的**存量边没有 `manual` 属性**（值是 null），
+                //    写成 `r.manual = false` 会让存量边**一条都删不掉** ⇒ 重建后边翻倍
+                //    （一个静默的数据腐化，而现象是"关系变多了"）。
+                tx.run("""
+                        MATCH ()-[r:REL]-()
+                        WHERE r.docId = $docId AND (r.manual IS NULL OR r.manual = false)
+                        DELETE r
+                        """, Map.of("docId", docId)).consume();
+                //    🔴 `CITES` 同理必须放行人工边：锚节点 `(:Chunk)` 是靠
+                //    `MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c`（见 `deleteDocument`）
+                //    做兜底清理的 ⇒ 人工边的 CITES 一被删，那条人工边的 `sourceChunkId`
+                //    就指向一个已被删掉的 `(:Chunk)`，回源变成**悬空锚点**
+                //    （而 `GraphRetriever` 对悬空锚点是静默 `continue` —— 边看着在、跳不到原文）。
+                tx.run("""
+                        MATCH ()-[r:CITES]-()
+                        WHERE r.docId = $docId AND (r.manual IS NULL OR r.manual = false)
+                        DELETE r
+                        """, Map.of("docId", docId)).consume();
 
                 // ② 文档节点（MERGE：重解析不该造出第二个 Document 节点）
                 tx.run("""
@@ -218,6 +239,99 @@ public class GraphWriter {
                     docId, rows.size(), ex.toString());
             return Result.failed("Neo4j 写入失败：" + ex.getClass().getSimpleName()
                     + "（不影响文档索引，图谱下次重建补齐）");
+        }
+    }
+
+    /**
+     * 人工补一条边（`T-C04` · 需求 `07:544`「未命中问题可图谱补边」· 术语见 `03:102`）。
+     *
+     * <h3>与 {@link #replaceDocument} 的三处不同</h3>
+     * <ol>
+     *   <li><b>只加不删</b> —— 它是"针对未命中问题补一条缺失的边"，不是"用本篇覆盖"。
+     *       （需求 `03:102` 明确对比过另一条路：「靠改文档重索引（慢且无针对性）」是**不做的**做法。）</li>
+     *   <li><b>{@code confidence} 写死为 {@code 1.0}</b> —— 需求 `03:102` 逐字：「人工添加缺失的实体关系边
+     *       （{@code confidence = 1}）」。模型自评的置信度（`0.x`）表达的是"抽得准不准"，
+     *       而人工确认过的不存在这个问题。⚠️ 因此**本参数不开放给调用方** ——
+     *       收一个客户端传的置信度，等于让"人工 = 1"这条口径可以被绕过。</li>
+     *   <li><b>打 {@code manual = true}</b> —— 它是 {@link #replaceDocument} 删旧边时**唯一放行**的标记
+     *       （见那边的 ①）。没有它，人工边会和自动边一起在下次重建时消失。</li>
+     * </ol>
+     *
+     * <h3>⚠️ 为什么要两条 {@code CITES}（而不是只连 subject）</h3>
+     * <p>回源锚是 `(:Entity)-[:CITES]->(:Chunk)`（需求 `07:469`「实体出现在哪个分片」）。
+     * 两条都建与 {@link #replaceDocument} 同形 —— 且 `manual` 也要打在 CITES 上，
+     * 否则重建时它们会被 `deleteDocument` 的 `Chunk` 兜底清理牵连（理由见那边的注释）。
+     *
+     * <p>⚠️ **本方法永不抛** —— 与 {@link #replaceDocument} 同一条红线 ①（`G9-3`）。
+     * 运营页上补一条边不能让整页 500，Neo4j 挂了就如实回一个失败的 {@code detail}。
+     *
+     * @param docId     这篇关系出自哪篇文档（进 `MERGE` 键，与自动边同一口径）
+     * @param chunkId   **必须是真的 `sys_chunk.id`**。⚠️ 调用方（{@code GraphEdgeService}）
+     *                  负责校验它确实属于 {@code docId} —— 本类**不查 MySQL**（那是分层的事），
+     *                  而写一个悬空锚点的后果是**静默的**：`GraphRetriever` 回源查不到就
+     *                  `continue`，边看着在、跳不到原文。
+     * @param subject   实体名（主体）
+     * @param predicate 关系动词。⚠️ 固定集合的校验也在调用方 —— 需求 `07:468` 只认 8 个
+     *                  （`基于/提出者/包含/使用/依赖/属于/负责/引用`）
+     * @param object    实体名（客体）
+     */
+    public Result addManualEdge(long docId, long chunkId, String subject, String predicate, String object) {
+        if (!enabled) {
+            return Result.skipped("图谱开关未开启（m05.graph.enabled=false）");
+        }
+        Driver driver = driverProvider.getIfAvailable();
+        if (driver == null) {
+            return Result.failed("Neo4j 驱动不可用（应用未装配 spring-boot-starter-data-neo4j？）");
+        }
+
+        long start = System.nanoTime();
+        try (Session session = driver.session()) {
+            Result result = session.executeWrite(tx -> {
+                // ① 文档节点（MERGE —— 这次补边可能是该文档在图里的**第一笔**，
+                //    例如它当初抽出的关系全被锚定丢弃了）
+                tx.run("""
+                        MERGE (d:Document {docId: $docId})
+                        """, Map.of("docId", docId)).consume();
+
+                // ② 实体 + 边 + 回源锚。MERGE 键与 replaceDocument 一致（`relation` + `docId`）
+                //    ⇒ 同一条人工边补两次只留一条；而它**与自动边也不会撞车**
+                //      （同一个动词 + 同一篇文档 + 同一对实体 = 语义上就是同一条陈述）。
+                tx.run("""
+                        MERGE (s:Entity {name: $subject})
+                        MERGE (o:Entity {name: $object})
+                        MERGE (s)-[r:REL {relation: $predicate, docId: $docId}]->(o)
+                          SET r.confidence = 1.0,
+                              r.sourceChunkId = $chunkId,
+                              r.manual = true
+                        WITH s, o, r
+                        MATCH (d:Document {docId: $docId})
+                        MERGE (c:Chunk {chunkId: $chunkId})
+                        MERGE (s)-[c1:CITES {docId: $docId, sourceChunkId: $chunkId}]->(c)
+                          SET c1.manual = true
+                        MERGE (o)-[c2:CITES {docId: $docId, sourceChunkId: $chunkId}]->(c)
+                          SET c2.manual = true
+                        """, Map.of("docId", docId, "chunkId", chunkId,
+                        "subject", subject, "predicate", predicate, "object", object)).consume();
+
+                int entities = tx.run("MATCH (n:Entity) RETURN count(n) AS n")
+                        .single().get("n").asInt();
+                int rels = tx.run("MATCH ()-[r:REL]-() WHERE r.docId = $docId RETURN count(r) AS n",
+                        Map.of("docId", docId)).single().get("n").asInt();
+                int cites = tx.run("MATCH ()-[r:CITES]-() WHERE r.docId = $docId RETURN count(r) AS n",
+                        Map.of("docId", docId)).single().get("n").asInt();
+                return new Result(true, entities, rels, cites,
+                        "实体合计 " + entities + " · 关系 " + rels + " · 回源锚 " + cites);
+            }, TransactionConfig.builder().withTimeout(timeout).build());
+
+            log.info("[图谱] 人工补边完成：docId={} chunkId={} {}-[{}]->{} 耗时={}ms",
+                    docId, chunkId, subject, predicate, object,
+                    (System.nanoTime() - start) / 1_000_000);
+            return result;
+        } catch (Exception ex) {
+            // 红线 ①：吞掉一切。运营页会拿到 detail 里的原因，而不是一个 500。
+            log.error("[图谱] 人工补边失败：docId={} chunkId={} 原因={}", docId, chunkId, ex.toString());
+            return Result.failed("Neo4j 写入失败：" + ex.getClass().getSimpleName()
+                    + "（这条边没有落库，可稍后重试）");
         }
     }
 

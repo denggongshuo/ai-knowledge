@@ -261,4 +261,41 @@ public final class OpsDtos {
      */
     public record ExportAccepted(String taskId, String status, String note) {
     }
+
+    // ==================================================================
+    // `T-C04` 图谱补边（需求 `07:544`）
+    // ==================================================================
+
+    /**
+     * 补边请求（`POST /ops/qa/misses/{id}/graph-edge`）。
+     *
+     * <p>🔴 **没有 `confidence` 字段** —— 人工边一律 `1.0`（需求 `03:102`）。
+     * 收一个客户端传的置信度，等于让"人工 = 1"这条口径可以被绕过；
+     * 而且它会让"这条边是人补的还是模型抽的"变得难辨（真正的区分是 `r.manual`）。
+     *
+     * <p>⚠️ `chunkId` 是**必填**：需求 `07:469` 要求每条关系可溯源回原文，
+     * 而回源锚就是它。不给它就只能写一条悬空锚点的边（检索侧静默丢掉，见 `GraphEdgeService` 类注释）。
+     *
+     * @param subject   实体名（主体）
+     * @param predicate 关系动词，闭集见 `GraphEdgeService#ALLOWED_PREDICATES`
+     * @param object    实体名（客体）
+     * @param docId     这条关系出自哪篇文档（须可见且 `READY`）
+     * @param chunkId   回源锚，必须确实属于 `docId`
+     */
+    public record ManualEdgeRequest(String subject, String predicate, String object,
+                                    Long docId, Long chunkId) {
+    }
+
+    /**
+     * 补边回执。
+     *
+     * @param applied 是否真的落库。⚠️ **`false` 不等于接口失败** —— 图库不可用时
+     *                （承 `G9-3`：Neo4j 挂了不能影响运营页）如实回 `false` + {@code detail}
+     *                里的原因，而不是 500。前端**必须显示 `detail`**，不能自己写死
+     *                "已补边"（否则"图库不可用"与"补上了"在页面上长得一样）
+     */
+    public record ManualEdgeResult(boolean applied, long docId, long chunkId,
+                                   String subject, String predicate, String object,
+                                   double confidence, String detail) {
+    }
 }

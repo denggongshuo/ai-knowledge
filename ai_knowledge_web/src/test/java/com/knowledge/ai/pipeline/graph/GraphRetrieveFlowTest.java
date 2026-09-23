@@ -35,12 +35,14 @@ import static org.assertj.core.data.Offset.offset;
  *       （后者对"单独加权"的实现照样绿 —— 上一批栽的正是这个形状）。</li>
  * </ol>
  *
- * <p>⚠️ 测试期默认把 {@code m05.graph.retrieve.enabled} 关着（见
- * {@code src/test/resources/application.properties}），本类单独打开它 —— 与
- * {@code GraphWriteFlowTest} 打开 {@code m05.graph.enabled} 同一种做法。
+ * <p>⚠️ `T-C04`：本类原来用 `@TestPropertySource` 打开 {@code m05.graph.retrieve.enabled}。
+ * `T-C03` 把检索侧开关的事实源搬到了 `sys_setting` ⇒ 那个属性**不再被任何代码读**，
+ * 声明它只会造成"这个测试把图谱开了"的错觉（其实由 `V43` 种的默认 `true` 决定）。
+ * ⇒ 已删（`#233`）。⚠️ **但它留下了一个真问题**：本类原来靠"测试期默认关着"这句话来论证
+ * "开着"是有意的；现在开关**不受测试配置影响**，所以本类跑的就是**默认态**（开）。
+ * 要测"关掉"，写 `sys_setting` 那一行（范例 `GraphRetrieveDisabledTest#setGraphSwitch`）。
  */
 @TestPropertySource(properties = {
-        "m05.graph.retrieve.enabled=true",
         "m05.graph.enabled=true"})
 class GraphRetrieveFlowTest extends RetrievalFlowSupport {
 
@@ -62,8 +64,18 @@ class GraphRetrieveFlowTest extends RetrievalFlowSupport {
     @Autowired
     private Driver driver;
 
+    /**
+     * 🔴 `T-C04`：开关读 `sys_setting`（不受测试配置影响）⇒ 本类显式打开它。
+     *
+     * <p>理由同 {@code GraphNeighborReaderTest#enableGraphSwitch}：`GraphRetrieveDisabledTest`
+     * 会临时把这一行改成 `false`，而两个类共用一个库 —— 它没还原的话本类会
+     * **静默少一路召回**（图谱是旁路，关掉不抛也不报错，只是结果里没有图那条），
+     * 而那正好会把"图谱来源真的下发了"这类判据变成**看着绿、其实没跑**。
+     */
     @BeforeEach
     void setUp() {
+        jdbc.update("update sys_setting set setting_value = 'true'"
+                + " where setting_key = 'retrieval.graph-bypass-enabled'");
         resetProbeState();
     }
 
@@ -71,6 +83,17 @@ class GraphRetrieveFlowTest extends RetrievalFlowSupport {
     void cleanGraph() {
         try (Session session = driver.session()) {
             session.run("MATCH (e:Entity) WHERE e.name STARTS WITH '图谱探针-' DETACH DELETE e").consume();
+            // 🔴 `T-C04` 补的一条：`seedGraph` 造的边带真实 `sourceChunkId`，
+            //    删实体之后边是没了，但**探针文档的 `(:Document)` 节点留了下来**
+            //    （它没有 name、只有 docId，按前缀删碰不到）—— 实测一轮跑批攒下三十几个。
+            //    `S9-M12-B` 漏清 `(:Chunk)` 是同形的第一次。
+            //    ⚠️ **按本类自己造的 docId 删**（`docIds` 由父类在 `insertDocWithChunks` 里登记），
+            //    不用"删所有孤立 Document"那种兜底 —— 那会误伤别的用例留下的行。
+            if (!docIds.isEmpty()) {
+                session.run("MATCH (d:Document) WHERE d.docId IN $ids DELETE d",
+                        Map.of("ids", List.copyOf(docIds))).consume();
+            }
+            session.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c").consume();
         } catch (Exception ignored) {
             // 清不掉不该让用例失败：失败信息已经由断言给出
         }
