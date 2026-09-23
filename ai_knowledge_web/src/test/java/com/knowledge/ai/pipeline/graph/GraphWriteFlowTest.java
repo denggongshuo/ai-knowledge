@@ -344,4 +344,48 @@ class GraphWriteFlowTest extends DownloadTestSupport {
         assertThat(graphWriter.relationsOf(keep))
                 .as("**不该误伤别的文档** —— 库级删除是按 docIds 白名单做的").hasSize(1);
     }
+
+    @Test
+    @DisplayName("S9-M12-B 判据 10：CITES 指向 (:Chunk) 之后，删除面必须把它一起清掉")
+    void deleteRemovesChunkNodesToo() {
+        long docId = nextDocId();
+        long neighbourDocId = nextDocId();
+        long chunkId = -9_100_001L;
+        long neighbourChunkId = -9_100_002L;
+
+        graphWriter.replaceDocument(docId, "探针文档",
+                anchored(List.of(rel("探针实体-甲", "基于", "探针实体-乙", 0.9)), 1),
+                Map.of(1, chunkId));
+        graphWriter.replaceDocument(neighbourDocId, "探针文档",
+                anchored(List.of(rel("探针实体-甲", "基于", "探针实体-乙", 0.9)), 1),
+                Map.of(1, neighbourChunkId));
+
+        assertThat(chunkNodeExists(chunkId)).as("前提：CITES 真的指向了 (:Chunk)").isTrue();
+        assertThat(chunkNodeExists(neighbourChunkId)).isTrue();
+
+        assertThat(graphWriter.deleteDocument(docId, "用例")).isTrue();
+
+        assertThat(chunkNodeExists(chunkId))
+                .as("删文档不清 (:Chunk) ⇒ 这就是本批新开的一个泄漏面").isFalse();
+        assertThat(chunkNodeExists(neighbourChunkId))
+                .as("别人的分片节点不许被顺手清掉").isTrue();
+        assertThat(graphWriter.relationsOf(docId)).isEmpty();
+        try (Session session = driver.session()) {
+            int cites = session.run("""
+                    MATCH ()-[r:CITES]->() WHERE r.docId = $docId RETURN count(r) AS n
+                    """, Map.of("docId", docId)).single().get("n").asInt();
+            assertThat(cites).isZero();
+            int entities = session.run("""
+                    MATCH (e:Entity) WHERE e.name STARTS WITH '探针实体-' RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(entities).as("实体是跨文档共享的，不该被删").isPositive();
+        }
+    }
+
+    private boolean chunkNodeExists(long chunkId) {
+        try (Session session = driver.session()) {
+            return session.run("MATCH (c:Chunk {chunkId: $chunkId}) RETURN count(c) AS n",
+                    Map.of("chunkId", chunkId)).single().get("n").asInt() > 0;
+        }
+    }
 }

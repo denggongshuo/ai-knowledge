@@ -122,6 +122,13 @@ class GraphIngestFlowTest extends DownloadTestSupport {
                     Map.of("ids", List.copyOf(probeDocIds))).consume();
             session.run("MATCH (e:Entity) WHERE e.name STARTS WITH '订单系统' "
                     + "OR e.name STARTS WITH '一致性哈希' DETACH DELETE e").consume();
+            // 🔴 `S9-M12-B` 补：`CITES` 现在指向 `(:Chunk)`（不再是 `(:Document)`），
+            //    于是**真上传真解析**会在图里留下带**真实自增 chunk.id** 的 `(:Chunk)` 节点
+            //    —— 上面那四条按 docId 的删除**清不到它**（它是新的一类节点）。
+            //    实测：全量跑批后图里留下 1 个 `(:Chunk {chunkId:130848})`（真 id、无边、
+            //    MySQL 行已清）⇒ 收尾漏了一类节点，而"图库核对期望 0"当场把它照出来。
+            //    口径与生产侧 `GraphWriter#deleteDocuments` 的孤儿清理**逐字一致**。
+            session.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c").consume();
         } catch (Exception ex) {
             // 清不掉不该让用例失败 —— 断言已经给出结论；这里留一条日志便于排查
             System.err.println("图谱残留清理失败（不影响判据）：" + ex);

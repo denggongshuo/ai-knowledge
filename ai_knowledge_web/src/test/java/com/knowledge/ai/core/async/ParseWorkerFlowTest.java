@@ -392,4 +392,29 @@ class ParseWorkerFlowTest extends ApiTestSupport {
             Thread.currentThread().interrupt();
         }
     }
+    @Test
+    @DisplayName("T-O28ⓑ · workerId 带进程标识：跑一批之后，别人的锁一条都不许留")
+    void noForeignLockRemains() {
+        // ① `workerId()` 与 `processTag()` 同一处拼（见 `ParseWorker` 的注释）——
+        //    用例**不自己重造格式**：差一个字符就会把"每条锁都是外进程"变成假红
+        assertThat(ParseWorker.processTag()).as("含 pid 才分得出进程")
+                .contains("pid=").contains("start=");
+
+        String token = loginAsAdmin().data("$.accessToken");
+        long kbId = createProbeKb(token);
+        long docId = uploadAndReturnDocId(kbId, mdBytes("# 进程标识探针\n\n正文。"), "进程标识探针.md", token);
+        String taskId = parseWorker.enqueue(kbId, docId, 1L);
+        assertThat(taskId).as("前提：队列里真有一个作业").isNotNull();
+
+        // ② 用**真 worker** 跑一批（`claim` 里写的 locked_by 就是 `workerId()`）
+        parseWorker.drainOnce();
+
+        // ③ 🔴 全表扫：留下来的任何锁都必须带本进程标识。
+        //    这条补的正是 ⓐ（断言 8080 无监听）的那个不完备 —— 后端起到别端口时 ⓐ 看不见，
+        //    而"库里有一条不属于本进程的锁"看得见（`S7-M06-D` 为此花掉约半天）。
+        List<String> locks = jdbcTemplate.queryForList(
+                "select locked_by from sys_async_task where locked_by is not null and locked_by not like ?",
+                String.class, "%" + ParseWorker.processTag() + "%");
+        assertThat(locks).as("有第二个消费者在领作业 ⇒ 这条必须红").isEmpty();
+    }
 }
