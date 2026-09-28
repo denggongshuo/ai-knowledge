@@ -9,9 +9,11 @@ import { mockPlugin } from './src/mock'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const proxyTarget = env.VITE_API_PROXY_TARGET || 'http://localhost:8080'
+  // T-D03：mock 开关的**唯一读取点**（原先 mock/index.ts 自己读 process.env，那读不到 .env 文件）。
+  const useMock = env.VITE_USE_MOCK !== 'false'
 
   return {
-    plugins: [vue(), vueDevTools(), mockPlugin()],
+    plugins: [vue(), vueDevTools(), mockPlugin(useMock)],
     resolve: {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url)),

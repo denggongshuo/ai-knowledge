@@ -68,11 +68,8 @@ import type { RetrievalTrace, KbConfigForm, KnowledgeBase, ModelConfigItem, Mode
 /**
  * Mock 中间件 —— Vite dev-server 插件
  * 拦截 /api 前缀请求，返回与《01-示例数据字典》对齐的模拟数据。
- * 后端就绪后:设置 VITE_USE_MOCK=false 即切真实接口,前端零改动。
+ * 后端就绪后:由 vite.config.ts 传 enabled=false 即切真实接口,前端零改动（`T-D03`）。
  */
-
-const USE_MOCK = process.env.VITE_USE_MOCK !== 'false'
-
 // ---------------------------------------------------------------- utils
 type Req = IncomingMessage
 type Res = ServerResponse
@@ -2065,8 +2062,8 @@ register('POST', '/api/recycle/cleanup', async (req, res) => {
 })
 
 // ---------------------------------------------------------------- 插件入口
-export function mockPlugin() {
-  if (!USE_MOCK) return { name: 'ai-knowledge-mock-disabled', apply: 'serve' as const }
+export function mockPlugin(enabled: boolean = true) {
+  if (!enabled) return { name: 'ai-knowledge-mock-disabled', apply: 'serve' as const }
   return {
     name: 'ai-knowledge-mock',
     apply: 'serve' as const,
