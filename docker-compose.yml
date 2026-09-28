@@ -1,7 +1,10 @@
 # ============================================================
 # 知识库系统 - 统一数据服务 Docker Compose
 #
-# 服务清单（6 个）：MySQL · MinIO · Milvus(etcd + standalone) · Neo4j · Valkey
+# 服务清单（数据 6 个 + 应用 1 个）：
+#   · 数据/中间件：MySQL · MinIO · Milvus(etcd + standalone) · Neo4j · Valkey
+#   · 应用侧：Nginx（前端静态托管 + /api 反代，`T-D03`）
+#   · 另有 ClamAV 走 profile，默认不启动：docker compose --profile av up -d clamav
 # 数据落盘：除 MySQL 走命名卷外，其余全部在 G:\db\db_data\*（bind 挂载）
 #
 # 本文件是本项目基础设施的**编排事实源** —— 改端口 / 改镜像 / 加服务只改这里。
@@ -251,9 +254,47 @@ services:
     networks:
       - kb-network
 
-# ============================================================
-# 网络
-# ============================================================
+  # ============================================================
+  # Nginx（`T-D03`）—— 前端静态托管 + /api 反向代理
+  #
+  # 🔴 **本服务不归「数据服务」那一族**：它是应用侧的前端入口，
+  #    不落盘、不存数据，删掉它不影响任何业务数据。
+  #
+  # 部署形态（2026-09-28 用户裁定）：
+  #   · 对外 8081 → 容器 80；后端仍在**宿主机** 8080（`mvn spring-boot:run`），
+  #     因此反代目标是 host.docker.internal:8080，而不是某个容器名。
+  #   · 静态资源是宿主机 `npm run build` 的产物，**只读**挂载进来；
+  #     容器里不做构建（没有 Node 运行时），改前端要先在宿主机 build。
+  #
+  # 🔴 **本服务的门禁要害是 G9-6**：/api/chat/completions 的 proxy_buffering
+  #    必须在 nginx.conf 里显式关掉，否则 SSE 会退化。两处配置要一起看。
+  #
+  # ⚠️ Linux 宿主机（非 Docker Desktop）没有 host.docker.internal，
+  #    届时用 extra_hosts 或改 proxy_pass 目标（见 nginx.conf 头注释）。
+  # ============================================================
+  nginx:
+    container_name: kb-nginx
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    volumes:
+      # 配置只读：配置事实源是仓库里的 deploy/nginx.conf
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # 前端构建产物只读：容器不负责构建，只负责托管
+      - ./ai_knowledge_app/dist:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - kb-network
+
+  # ============================================================
+  # 网络
+  # ============================================================
 networks:
   kb-network:
     name: kb-network
