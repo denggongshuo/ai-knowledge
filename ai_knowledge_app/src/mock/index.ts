@@ -828,6 +828,19 @@ register('GET', '/api/system/thresholds', (_req, res) => {
   json(res, 0, THRESHOLDS)
 })
 
+// ⚠️ `M13-C`（2026-09-23）落地了 GET/PUT /system/feature/graph（T-C03），
+//    但 mock 层当时没跟上 —— 后果是「mock 模式 + 真后端在跑」时，
+//    Vite 的 /api proxy 会把这个请求转给真后端（/system/model 页 onMounted 要调它），
+//    真后端拿 mock 的假 token 回 401 ⇒ 该页渲染中断。
+//    实测：后端不在时 25/25 通过，后端在时该页必红（S9-M13-B §9 有完整对照）。
+//    这里补上，让 mock 模式自洽、不再依赖「后端是否在跑」。
+register('GET', '/api/system/feature/graph', (_req, res) => {
+  json(res, 0, { enabled: true })
+})
+
+register('PUT', '/api/system/feature/graph', (_req, res, ctx) => {
+  json(res, 0, { enabled: ctx.body?.enabled !== false })
+})
 // ============ 系统管理 · 部门 ============
 register('GET', '/api/depts/tree', (_req, res) => {
   json(res, 0, DEPTS)
