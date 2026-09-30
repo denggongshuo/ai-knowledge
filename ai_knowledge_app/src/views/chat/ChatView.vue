@@ -3,6 +3,7 @@ import { ref, computed, nextTick, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Promotion, Delete, FolderOpened, Timer, Connection, Picture, PictureFilled, InfoFilled, View, DocumentCopy, CaretTop, CaretBottom } from '@element-plus/icons-vue'
+import { renderAnswerHtml } from '@/utils/markdown'
 import { chatStream, chatApi, sysApi } from '@/api'
 import { FEEDBACK_REASONS } from '@/types'
 import type { ChatAttachment, ChatMessage, ChatSessionItem, Citation, ModelOption, RetrievalTrace } from '@/types'
@@ -294,29 +295,14 @@ function isCited(m: ChatMessage, rankNo: number) {
 }
 
 /**
- * 把答案正文里的 `[n]` 渲染成**可点的角标**。
+ * 把答案正文渲染成可安全塞进 `v-html` 的 HTML。
  *
- * <h3>🔴 为什么这里必须自己转义，不能用 `v-html` 直出 `m.content`</h3>
- * <p>`m.content` 是**模型生成的文本**，而 `v-html` 不转义。直接塞进去等于让模型
- * 往页面上写任意 HTML —— 一段 `<img onerror=...>` 就够。所以先转义、再只对
- * **我们认得的角标**插标记（与 `CitationParser` 同一条正则形态）。
- *
- * <p>⚠️ 不认得的角标**原样留着**（不删、不改）—— 删掉会让正文与后端落库的那份不一致，
- * 而"模型打了个越界角标"这件事应该**看得见**，不是被悄悄抹掉。
+ * <p>**实现已抽到 `@/utils/markdown`**（`T-D05`）—— 那一步做「Markdown → sanitize → 角标」，
+ * 抽出去是为了能被 `scripts/markdown-xss-check.mjs` **直接断言真实现**（而不是测一份副本）；
+ * 本函数只做「组件 → 模块」的适配。
  */
 function renderAnswer(m: ChatMessage) {
-  const escaped = m.content
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  return escaped.replace(/\[(\d{1,3})\]/g, (whole, digits: string) => {
-    const no = Number(digits)
-    const cited = m.citations?.some((c) => c.index === no)
-    // 只把**真的在引用清单里**的角标做成可点；其余原样（它可能是越界的）
-    return cited
-      ? `<span class="inline-cit" data-cit="${no}">${whole}</span>`
-      : whole
-  })
+  return renderAnswerHtml(m.content ?? '', m.citations)
 }
 
 /** 点行内角标（或引用来源卡片）→ 检索详情面板滚动定位到对应分片。 */
