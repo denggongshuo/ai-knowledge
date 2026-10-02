@@ -71,9 +71,9 @@ class GraphWriteFlowTest extends DownloadTestSupport {
         //    不收尾就会每跑一轮往图里堆一批谁也认领不了的实体与边
         //    （`S7-M06-D` 的 `#130` 族形状第五次）。
         //    按登记的 docId 清：`deleteDocuments` 会连 `REL` / `CITES` / `Document` 一起删。
-        //    ⚠️ **实体节点不清** —— 它是跨文档共享的（`07:462`），
-        //    按 docId 删不掉也不该删；探针实体名带前缀（`探针实体-`），
-        //    这里额外按名字前缀兜一次底，免得图里越积越多。
+        //    ⚠️ **实体节点的策略在 `T-O31` 变了**：此前"按 docId 删不掉也不该删"，
+        //    现在 `deleteDocuments` 会**回收孤儿实体**（无任何边引用的）——
+        //    跨文档共享的实体会被保留（有边），只被本批引用的会被清掉。
         if (!probeDocIds.isEmpty()) {
             graphWriter.deleteDocuments(List.copyOf(probeDocIds), -1L);
             try (Session session = driver.session()) {
@@ -379,6 +379,88 @@ class GraphWriteFlowTest extends DownloadTestSupport {
                     MATCH (e:Entity) WHERE e.name STARTS WITH '探针实体-' RETURN count(e) AS n
                     """).single().get("n").asInt();
             assertThat(entities).as("实体是跨文档共享的，不该被删").isPositive();
+        }
+    }
+
+    // ==================================================================
+    // `T-O31`（销 `#237`）：孤儿实体回收
+    // ==================================================================
+
+    @Test
+    @DisplayName("T-O31 判据 1：deleteDocument ⇒ 只被这篇引用的实体被回收（不再留 rels=0 的孤儿）")
+    void deleteDocumentReclaimsOrphanEntities() {
+        long docId = nextDocId();
+        // 造一对**只被这篇文档引用**的实体
+        graphWriter.replaceDocument(docId, "探针文档",
+                anchored(List.of(rel("孤儿探针-甲", "基于", "孤儿探针-乙", 0.9)), 1),
+                orderToChunkId(1));
+
+        try (Session session = driver.session()) {
+            int before = session.run("""
+                    MATCH (e:Entity) WHERE e.name STARTS WITH '孤儿探针-' RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(before).as("前提：两条实体真的建出来了").isEqualTo(2);
+        }
+
+        assertThat(graphWriter.deleteDocument(docId, "用例")).isTrue();
+
+        try (Session session = driver.session()) {
+            int after = session.run("""
+                    MATCH (e:Entity) WHERE e.name STARTS WITH '孤儿探针-' RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(after)
+                    .as("🔴 只被这篇文档引用的实体必须被回收 —— 否则就是 #237 那个泄漏面"
+                            + "（实测彻底删文档会留 34 个 rels=0 的孤儿）")
+                    .isZero();
+            // 再正面确认"全图一个孤儿都没有"
+            int orphans = session.run("""
+                    MATCH (e:Entity) WHERE NOT (e)--() RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(orphans).as("全图孤儿实体数应为 0").isZero();
+        }
+    }
+
+    @Test
+    @DisplayName("T-O31 判据 3 负向锚：**有边引用的实体不许被误删**（跨文档共享）")
+    void sharedEntitySurvivesWhenOneDocIsDeleted() {
+        long docA = nextDocId();
+        long docB = nextDocId();
+        // 两篇文档引用**同一个**实体对 —— 实体是"全库合一、跨库共享"的（需求 07:465）
+        for (long id : List.of(docA, docB)) {
+            graphWriter.replaceDocument(id, "探针文档",
+                    anchored(List.of(rel("共享探针-甲", "基于", "共享探针-乙", 0.9)), 1),
+                    orderToChunkId(1));
+        }
+
+        assertThat(graphWriter.deleteDocument(docA, "用例")).isTrue();
+
+        try (Session session = driver.session()) {
+            int alive = session.run("""
+                    MATCH (e:Entity) WHERE e.name STARTS WITH '共享探针-' RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(alive)
+                    .as("⚠️ 这篇删了，但它还被 docB 引用 ⇒ **绝不能删**（否则就是误伤别的文档）")
+                    .isEqualTo(2);
+        }
+    }
+
+    @Test
+    @DisplayName("T-O31 判据 4：deleteDocuments（库级）同样回收孤儿实体")
+    void deleteDocumentsReclaimsOrphanEntities() {
+        long gone = nextDocId();
+        graphWriter.replaceDocument(gone, "探针文档",
+                anchored(List.of(rel("库级孤儿-甲", "基于", "库级孤儿-乙", 0.9)), 1),
+                orderToChunkId(1));
+
+        graphWriter.deleteDocuments(List.of(gone), -1L);
+
+        try (Session session = driver.session()) {
+            int after = session.run("""
+                    MATCH (e:Entity) WHERE e.name STARTS WITH '库级孤儿-' RETURN count(e) AS n
+                    """).single().get("n").asInt();
+            assertThat(after)
+                    .as("库级那半必须与文档级口径一致 —— 只补一处 ⇒ 这条红")
+                    .isZero();
         }
     }
 

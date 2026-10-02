@@ -360,6 +360,22 @@ public class GraphWriter {
                         Map.of("docId", docId)).consume();
                 tx.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c",
                         Map.of()).consume();
+                // 🔴 `T-O31`（销 `#237`）：**孤儿实体回收**。
+                //    上面两条把 `REL`/`CITES` 删掉之后，只被这篇文档引用过的 `Entity`
+                //    就成了"没有任何边"的孤立节点 —— 此前**不回收**，实测彻底删一篇文档会
+                //    留下 34 个 `rels=0` 的实体（`S9-M13-B` 实测）。
+                //
+                //    ⚠️ **为什么能全局扫，而不是按 docId 定向删**：
+                //    需求 `07:465` 写死了「实体名是联合主键（**同一全库实体合一，跨库共享**）」
+                //    —— 一个 `Entity` 可能同时被**多篇文档、多个库**引用，所以**绝不能**
+                //    "这篇文档删了就把它的实体删掉"。唯一安全的判据是「**还有没有边引用它**」。
+                //    ⚠️ 与上面那条"扫孤 `Chunk`"是**同一手法**（同样是"删完边再收尾"），
+                //    不是新引入的范式。
+                //    ⚠️ 它不会误伤：`GraphNeighborReader` 的入口是
+                //    `MATCH p=(start:Entity)-[rels:REL*1..2]->(end:Entity)` ——
+                //    **无 `REL` 的孤立实体在这条路径上本来就不可达**。
+                tx.run("MATCH (e:Entity) WHERE NOT (e)--() DELETE e",
+                        Map.of()).consume();
                 tx.run("MATCH (d:Document {docId: $docId}) DELETE d",
                         Map.of("docId", docId)).consume();
                 return null;
@@ -400,6 +416,10 @@ public class GraphWriter {
                 tx.run("UNWIND $docIds AS did MATCH ()-[r:CITES]-() WHERE r.docId = did DELETE r",
                         Map.of("docIds", docIds)).consume();
                 tx.run("MATCH (c:Chunk) WHERE NOT (()-[:CITES]->(c)) DELETE c", Map.of()).consume();
+                // 🔴 `T-O31`（销 `#237`）：库级删除**同样**要回收孤儿实体 ——
+                //    ⚠️ 与文档级那半必须**口径一致**，否则"清空整个库"之后图里仍留一批孤儿。
+                //    判据 4 专门钉这一点（只补一处 ⇒ 它转红）。
+                tx.run("MATCH (e:Entity) WHERE NOT (e)--() DELETE e", Map.of()).consume();
                 return tx.run("""
                                 UNWIND $docIds AS did
                                 MATCH (d:Document {docId: did}) DELETE d
