@@ -156,6 +156,16 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /**
+   * **思考过程**（`T-D07`，来自 `event: reasoning`）。
+   *
+   * <p>与 {@link content} 是两条通道：思考渲染在可折叠区，正文渲染在气泡主体。
+   * `undefined` = 本轮没有思考过程（非思考模型 / 关闭了思考模式）—— **不填空串**，
+   * 否则页面会长出一个空的折叠框。
+   */
+  reasoning?: string
+  /** 思考区是否已折叠（`T-D07`）：流式中展开，正文开始/结束时自动折叠 */
+  reasoningCollapsed?: boolean
   /** SSE 是否仍在生成 */
   streaming?: boolean
   /** 答案**实际引用**的那几条（`T-804`；来自 `done.citations`）—— 渲染行内角标与来源卡片 */

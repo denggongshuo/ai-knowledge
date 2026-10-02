@@ -47,6 +47,27 @@ public interface ChatSink {
         // 默认空操作：见 javadoc
     }
 
+    /**
+     * `event: reasoning` —— 思考模型的一小段**思考过程**（`T-D07` · 用户 2026-10-02 需求）。
+     *
+     * <p>与 {@link #delta} 是**两条通道**：正文按 `delta` 发，思考按本方法发。
+     * 前端把它们渲染在两个区域，并在正文开始后自动折叠思考区 —— 所以这里
+     * **不能**把 reasoning 混进 `delta`（混进去就无法折叠、也会污染答案正文与引用角标解析）。
+     *
+     * <p>⚠️ 默认实现是**空操作** —— 本接口有若干只关心"检索 → 生成"的既有替身，
+     * 逼它们全部实现一个新方法是纯负担。但**生产实现必须覆盖它**
+     * （{@code ChatController} 的 sink），否则用户在页面上永远看不到思考过程。
+     *
+     * <p>⚠️ **不可用时不得发空内容** —— 模型不产 reasoning（非思考模型）时
+     * 应当**整条不发**，而不是发一个空串：前端按"有没有收到过 reasoning"决定
+     * 要不要渲染思考区，发空串会长出一个空的折叠框。
+     *
+     * @param content 增量思考文本（**非空**；调用方负责只传非空片段）
+     */
+    default void reasoning(String content) {
+        // 默认空操作：见 javadoc
+    }
+
     /** `event: delta` —— 一小段增量正文。可发多次。 */
     void delta(String content);
 

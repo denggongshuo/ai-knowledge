@@ -28,6 +28,10 @@ const models = ref<ModelOption[]>([])
 const selectedModelId = ref<number | null>(null)
 const currentModel = computed(() => models.value.find((m) => m.id === selectedModelId.value) ?? null)
 
+// ---------------- 思考模式（T-D08） ----------------
+/** 是否**采集并显示**思考过程。默认开 —— 与后端"只认显式 false 才算关"同一条口径 */
+const reasoningEnabled = ref(true)
+
 async function loadModels() {
   const { list } = await sysApi.modelOptions('CHAT')
   models.value = list
@@ -436,9 +440,24 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
           } as Citation
         })
       },
+      onReasoning({ content }) {
+        const m = current()
+        if (!m) return
+        // 思考过程累积到独立字段 —— **不进 content**（否则会被当成答案正文，
+        // 引用角标解析也会误判）。首次收到时标记展开。
+        if (m.reasoning === undefined) m.reasoning = ''
+        m.reasoning += content
+        // 流式中保持展开，方便用户看到正在思考
+        m.reasoningCollapsed = false
+        void scrollToBottom()
+      },
       onDelta({ content }) {
         const m = current()
         if (m) {
+          // 正文开始 ⇒ 思考结束，自动折叠（用户需求：思考完自动折叠，然后显示正文）
+          if (m.reasoning !== undefined && !m.reasoningCollapsed) {
+            m.reasoningCollapsed = true
+          }
           m.content += content
           void scrollToBottom()
         }
@@ -460,6 +479,8 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
           // `T-804`：答案**实际引用**的那几条。
           // 空数组是真值（“这轮没引用任何资料”），不要用 `||` 吃掉它
           if (Array.isArray(data.citations)) m.citations = data.citations
+          // 收尾兜底：正文若是空的（例如只有思考），思考区也要折叠下来
+          if (m.reasoning !== undefined) m.reasoningCollapsed = true
         }
         sending.value = false
         void scrollToBottom()
@@ -474,7 +495,7 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
         ElMessage.error(msg)
       },
     },
-    { modelId: selectedModelId.value, attachmentIds, useVision },
+    { modelId: selectedModelId.value, attachmentIds, useVision, reasoning: reasoningEnabled.value },
   )
 }
 
@@ -545,6 +566,11 @@ onMounted(async () => {
           <el-icon><InfoFilled /></el-icon>
           切换模型将<b>开启新会话</b>，原会话保留在左侧列表
         </span>
+        <!-- 思考模式开关（T-D08）：默认开，关闭后前端不显示思考过程 -->
+        <span class="mb-think">
+          <span class="mb-think-label">思考模式</span>
+          <el-switch v-model="reasoningEnabled" size="small" inline-prompt active-text="开" inactive-text="关" />
+        </span>
         <span v-if="currentModel && !currentModel.capabilities.stream" class="mb-warn">该模型不支持流式，回答将一次性返回</span>
         <span v-if="currentModel && !currentModel.capabilities.supportSystemRole" class="mb-warn">不支持 system role，指令遵循可能变弱</span>
       </div>
@@ -601,6 +627,16 @@ onMounted(async () => {
                     </div>
                   </div>
                 </template>
+              </div>
+
+              <!-- 思考过程折叠区（T-D07/T-D08）：流式中展开，正文开始后自动折叠 -->
+              <div v-if="m.reasoning !== undefined" class="think-box">
+                <div class="think-head" @click="m.reasoningCollapsed = !m.reasoningCollapsed">
+                  <el-icon class="think-caret" :class="{ collapsed: m.reasoningCollapsed }"><CaretBottom /></el-icon>
+                  <span>{{ m.streaming && !m.content ? '正在思考…' : '已深度思考' }}</span>
+                  <span class="think-hint">{{ m.reasoningCollapsed ? '展开' : '收起' }}</span>
+                </div>
+                <pre v-show="!m.reasoningCollapsed" class="think-body">{{ m.reasoning }}</pre>
               </div>
 
               <!-- 答案正文（行内角标可点，`T-804` · 需求 07 §6.6） -->
@@ -847,6 +883,17 @@ onMounted(async () => {
 .mb-tip .el-icon {
   color: var(--el-color-primary);
 }
+.mb-think {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.mb-think-label {
+  font-size: 12px;
+}
+
 .mb-warn {
   font-size: 12px;
   color: var(--el-color-warning);
@@ -923,6 +970,44 @@ onMounted(async () => {
   font-family: var(--font);
   font-size: 14px;
 }
+.think-box {
+  margin-bottom: 8px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 6px;
+  background: var(--el-fill-color-lighter);
+  overflow: hidden;
+}
+.think-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.think-caret {
+  transition: transform 0.15s ease;
+}
+.think-caret.collapsed {
+  transform: rotate(-90deg);
+}
+.think-hint {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--el-color-primary);
+}
+.think-body {
+  margin: 0;
+  padding: 0 10px 8px 26px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--el-text-color-regular);
+}
+
 .cursor-blink {
   animation: blink 0.9s infinite;
   color: var(--el-color-primary);

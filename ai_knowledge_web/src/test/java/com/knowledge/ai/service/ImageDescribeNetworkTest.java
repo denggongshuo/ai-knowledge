@@ -351,7 +351,7 @@ class ImageDescribeNetworkTest extends ApiTestSupport {
         System.out.println("query = " + searchQuery);
 
         RecordingSink sink = new RecordingSink();
-        chatStreamService.chat(reader(), new ChatDtos.ChatRequest(searchQuery, null, null, null, null), sink);
+        chatStreamService.chat(reader(), new ChatDtos.ChatRequest(searchQuery, null, null, null, null, null), sink);
         System.out.println("问答事件序列 = " + sink.eventNames + " · 错误 = " + sink.lastError);
 
         Map<String, Object> trace = jdbcTemplate.queryForMap(

@@ -800,6 +800,20 @@ register('POST', '/api/chat/completions', async (req, res, ctx) => {
   const trace = buildTrace(rawChunks, graphUsed)
   res.write(`event: retrieval\ndata: ${JSON.stringify({ chunks: trace.chunks, trace, kbCount: 3 })}\n\n`)
 
+  // 1.5) reasoning 事件（T-D07/T-D08）：默认开，显式 reasoning:false 时不发
+  //      —— 前端据此渲染可折叠思考区，正文开始后自动折叠
+  if (ctx.body.reasoning !== false) {
+    const thinkFragments = [
+      '先看用户问题的关键词，判断需要检索哪类资料。',
+      '命中了几份相关文档，需要比对它们的相关度。',
+      '综合这些材料，组织一个准确的回答。',
+    ]
+    for (const frag of thinkFragments) {
+      res.write(`event: reasoning\ndata: ${JSON.stringify({ content: frag })}\n\n`)
+      await delay(160 + Math.floor(Math.random() * 80))
+    }
+  }
+
   // 2) delta 打字机
   const answer = preset ? preset.answer : DEFAULT_ANSWER
   const fragments = answer.split(/(?<=[。！？\n])/).filter(Boolean)

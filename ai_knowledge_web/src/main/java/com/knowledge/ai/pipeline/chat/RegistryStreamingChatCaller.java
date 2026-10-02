@@ -43,6 +43,16 @@ import java.util.function.Consumer;
 @RequiredArgsConstructor
 public class RegistryStreamingChatCaller implements StreamingChatCaller {
 
+    /**
+     * 思考过程在 {@code AssistantMessage.getMetadata()} 里的键名（`T-D07`）。
+     *
+     * <p>OpenAI 兼容供应商把 {@code reasoning_content} 放在 delta 的附加字段里，
+     * Spring AI 的 {@code ChunkMerger.mergeDeltas()} **不合并它**，但它会被收进
+     * {@code AssistantMessage.getMetadata()} —— 参考实现（{@code Demo1#streamWithReasoning}）
+     * 与 2026-10-02 实测（6 帧 reasoning）都指向这个键。
+     */
+    private static final String REASONING_KEY = "reasoningContent";
+
     private final ModelClientRegistry registry;
 
     /** `T-905` 的用量落点。见 {@link #recordUsage}。 */
@@ -70,6 +80,32 @@ public class RegistryStreamingChatCaller implements StreamingChatCaller {
      */
     @Override
     public Outcome stream(String prompt, List<ChatImage> images, Consumer<String> onDelta) {
+        return stream(prompt, images, onDelta, null);
+    }
+
+    /**
+     * 带 reasoning 的流式调用（`T-D07` · 用户 2026-10-02 需求）—— **生产实现的主入口**。
+     *
+     * <h3>reasoning 怎么取</h3>
+     * <p>OpenAI 兼容供应商把思考过程放在 delta 的 {@code reasoning_content} 附加字段里，
+     * Spring AI 把它收进 {@code AssistantMessage.getMetadata()}（键 {@link #REASONING_KEY}）。
+     * {@code textOf()} 只拿正文，所以思考要**另取一遍** —— 这也是 {@code Demo1} 的做法。
+     *
+     * <h3>🔴 为什么要"折成增量"，不能直接 append</h3>
+     * <p>实测里部分供应商每帧发的是**到目前为止的全量思考文本**（快照），而不是增量；
+     * 另一些发的是**真增量**。两者的现象在"只看最后一帧"时一模一样，但
+     * 直接 append 快照会让思考区里的文本**平方级重复**（第 n 帧把前 n-1 帧又写一遍）。
+     * 所以这里用 {@link #toReasoningDelta} 做判别：新值以旧快照为前缀 ⇒ 取后缀；
+     * 否则（真增量 / 供应商换了）⇒ 原样透传。**不猜供应商**，按数据本身判。
+     *
+     * <p>⚠️ {@code onReasoning} 为 {@code null} ⇒ 整条链路不取 reasoning（关闭思考模式时
+     * 调用方传 null），与"模型不产 reasoning"走同一条零事件路径。
+     *
+     * @param onReasoning 增量思考回调；{@code null} = 本轮不采集思考过程
+     */
+    @Override
+    public Outcome stream(String prompt, List<ChatImage> images,
+                          Consumer<String> onDelta, Consumer<String> onReasoning) {
         // 先取 spec 再取客户端：`activeSpec` 在未配置对话模型时**抛**
         // MODEL_NOT_CONFIGURED（硬失败，见 ModelClientRegistry 的兜底口径），
         // 与其拿到一个含混的空响应，不如让调用方立刻知道"没配模型"
@@ -79,8 +115,16 @@ public class RegistryStreamingChatCaller implements StreamingChatCaller {
         // 流里的每个 ChatResponse 都带着"到目前为止"的结果，而 usage 通常只挂在最后一帧
         // —— 所以留一份引用，循环结束后从它取元数据
         AtomicReference<ChatResponse> lastFrame = new AtomicReference<>();
+        // 思考过程的"到目前为止"快照，用于把累积式帧折成增量（见 toReasoningDelta）
+        StringBuilder reasoningSnapshot = new StringBuilder();
         for (ChatResponse response : request(client, prompt, images).stream().chatResponse().toIterable()) {
             lastFrame.set(response);
+            if (onReasoning != null) {
+                String delta = toReasoningDelta(reasoningOf(response), reasoningSnapshot);
+                if (delta != null && !delta.isEmpty()) {
+                    onReasoning.accept(delta);
+                }
+            }
             String piece = textOf(response);
             if (!piece.isEmpty()) {
                 onDelta.accept(piece);
@@ -96,6 +140,57 @@ public class RegistryStreamingChatCaller implements StreamingChatCaller {
         recordUsage(spec, outcome);
         return outcome;
     }
+
+    /**
+     * 从一帧里取**思考过程**（累积值或增量，取决于供应商）；没有则返回 {@code null}。
+     *
+     * <p>取不到不是错误：非思考模型、或思考模型这一帧恰好只有正文，都会走这里。
+     * **返回 null 而不是空串** —— 空串会让 {@link #toReasoningDelta} 多绕一圈，
+     * 也让"这帧到底有没有思考"变得不可判。
+     */
+    private static String reasoningOf(ChatResponse response) {
+        if (response == null || response.getResult() == null
+                || response.getResult().getOutput() == null) {
+            return null;
+        }
+        Object value = response.getResult().getOutput().getMetadata().get(REASONING_KEY);
+        return value == null ? null : String.valueOf(value);
+    }
+
+    /**
+     * 把"这一帧拿到的思考文本"折成**相对上一帧的增量**（{@code Demo1#toReasoningDelta} 的同一口径）。
+     *
+     * <ul>
+     *   <li>本帧为 {@code null} / 空 ⇒ 返回 {@code null}（这帧没有思考）</li>
+     *   <li>首次拿到 ⇒ 原样返回，并记入快照</li>
+     *   <li>本帧以旧快照为前缀 ⇒ 返回**新增后缀**（供应商在发累积快照）</li>
+     *   <li>否则 ⇒ 原样返回（供应商在发真增量；**不能**拿它跟旧快照拼，否则丢片段）</li>
+     * </ul>
+     *
+     * <p>⚠️ 快照**每次都更新**为本帧值。这样"先累积后增量"的混合供应商也能跟住 ——
+     * 只判前缀会在一帧真增量之后把快照留在旧值上，后续所有快照都会被误判成"真增量"。
+     */
+    private static String toReasoningDelta(String reasoning, StringBuilder snapshot) {
+        if (reasoning == null || reasoning.isEmpty()) {
+            return null;
+        }
+        if (snapshot.isEmpty()) {
+            snapshot.append(reasoning);
+            return reasoning;
+        }
+        String previous = snapshot.toString();
+        if (reasoning.startsWith(previous)) {
+            String delta = reasoning.substring(previous.length());
+            snapshot.setLength(0);
+            snapshot.append(reasoning);
+            return delta;
+        }
+        // 不是累积快照（真增量，或供应商换了）⇒ 原样透传，并更新快照
+        snapshot.setLength(0);
+        snapshot.append(reasoning);
+        return reasoning;
+    }
+
 
     /**
      * 组装这一次请求 —— 带图与不带图**唯一的差别在这里**。

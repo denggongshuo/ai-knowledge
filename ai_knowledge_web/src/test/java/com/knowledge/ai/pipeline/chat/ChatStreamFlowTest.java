@@ -476,7 +476,7 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
             RecordingSink sink = new RecordingSink();
             chatStreamService.chat(reader(),
                     new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
-                            List.of("999001"), Boolean.TRUE), sink);
+                            List.of("999001"), Boolean.TRUE, null), sink);
 
             assertThat(sink.error)
                     .as("🔴 **置灰不是约束** —— 前端那个按钮的 disabled 拦不住直接打端点的人。"
@@ -503,7 +503,7 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         RecordingSink sink = new RecordingSink();
         chatStreamService.chat(reader(),
                 new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
-                        List.of("999002"), Boolean.TRUE), sink);
+                        List.of("999002"), Boolean.TRUE, null), sink);
 
         // 能力闸在前、附件校验在后 —— 本仓种子的 capabilities 是 NULL（vision=false），
         // 所以这一条**先撞能力闸**。两条错误都"看起来正常"（都是 error 事件），
@@ -546,7 +546,7 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
             RecordingSink first = new RecordingSink();
             chatStreamService.chat(reader(),
                     new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null,
-                            List.of(attachmentId), Boolean.TRUE), first);
+                            List.of(attachmentId), Boolean.TRUE, null), first);
 
             assertThat(first.error).as("能力闸放行了就不该再报错").isNull();
             assertThat(first.done).isNotNull();
@@ -574,7 +574,7 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
             // 第二轮：同一会话，**不带图** ⇒ used_vision = 0（上一轮不受影响）
             RecordingSink second = new RecordingSink();
             chatStreamService.chat(reader(),
-                    new ChatDtos.ChatRequest("那 A-200 呢", sessionId, null, null, null), second);
+                    new ChatDtos.ChatRequest("那 A-200 呢", sessionId, null, null, null, null), second);
             assertThat(second.done.usedVision()).isFalse();
             assertThat(RetrievalTestStubs.LAST_IMAGES.get())
                     .as("缺省 useVision ⇒ 不带图")
@@ -624,10 +624,61 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
         assertThat(messages).as("user + assistant 两条都要在").isEqualTo(2);
     }
 
+    @Test
+    @DisplayName("T-D07 判据1：思考过程逐帧透传，且与正文 delta 分离")
+    void reasoningStreamsSeparatelyFromAnswer() {
+        kbId = insertKb("M14A_REASON");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元", "型号 A-200 单价 2400 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 2);
+
+        // 替身既吐思考（两句）又吐正文（一句多）
+        RetrievalTestStubs.streamStub =
+                RetrievalTestStubs.cannedWithReasoning("先看关键词。再比对文档。", "型号 A-100 单价 1800 元。");
+
+        RecordingSink sink = new RecordingSink();
+        chatStreamService.chat(reader(), ask("型号 A-100 的单价是多少"), sink);
+
+        // 思考按事件通道发出，而不是混进正文
+        assertThat(sink.reasonings).as("思考应逐帧发出且非空").isNotEmpty().allSatisfy(r -> assertThat(r).isNotBlank());
+        assertThat(sink.eventNames).contains("reasoning");
+        // 正文里绝不能出现思考文本
+        assertThat(String.join("", sink.deltas))
+                .as("思考不得混入正文 delta")
+                .doesNotContain("先看关键词")
+                .doesNotContain("再比对文档");
+        // 思考事件必须出现在 delta 之前（先想后答）
+        assertThat(sink.eventNames.indexOf("reasoning"))
+                .as("思考事件应在正文 delta 之前")
+                .isLessThan(sink.eventNames.indexOf("delta"));
+    }
+
+    @Test
+    @DisplayName("T-D08 判据5：显式关闭思考模式 ⇒ 零 reasoning 事件")
+    void reasoningDisabledEmitsNoReasoningEvents() {
+        kbId = insertKb("M14A_OFF");
+        long docId = insertDocWithChunks("报价单", "型号 A-100 单价 1800 元", "型号 A-200 单价 2400 元");
+        seedVectors(docId, 1);
+        awaitVectorsVisible("A-100 单价", 2);
+
+        RetrievalTestStubs.streamStub =
+                RetrievalTestStubs.cannedWithReasoning("这段思考不该被采集。", "型号 A-100 单价 1800 元。");
+
+        RecordingSink sink = new RecordingSink();
+        // reasoning=false ⇒ 编排把 onReasoning 传 null，替身即使有思考也不回调
+        chatStreamService.chat(reader(),
+                new ChatDtos.ChatRequest("型号 A-100 的单价是多少", null, null, null, null, Boolean.FALSE),
+                sink);
+
+        assertThat(sink.reasonings).as("关闭思考后不得有任何 reasoning 事件").isEmpty();
+        assertThat(sink.eventNames).doesNotContain("reasoning");
+        assertThat(sink.deltas).as("正文照常").isNotEmpty();
+    }
+
     // ==================== 夹具 ====================
 
     private static ChatDtos.ChatRequest ask(String question) {
-        return new ChatDtos.ChatRequest(question, null, null, null, null);
+        return new ChatDtos.ChatRequest(question, null, null, null, null, null);
     }
 
     /**
@@ -678,6 +729,7 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
 
         final List<String> eventNames = new ArrayList<>();
         final List<String> deltas = new ArrayList<>();
+        final List<String> reasonings = new ArrayList<>();
         ChatDtos.DoneEvent done;
         String error;
         boolean dieOnFirstDelta;
@@ -689,6 +741,15 @@ class ChatStreamFlowTest extends RetrievalFlowSupport {
             if (alive) {
                 eventNames.add("retrieval");
             }
+        }
+
+        @Override
+        public void reasoning(String content) {
+            if (!alive) {
+                return;
+            }
+            reasonings.add(content);
+            eventNames.add("reasoning");
         }
 
         @Override

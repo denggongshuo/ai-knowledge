@@ -11,6 +11,8 @@ import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -45,6 +47,16 @@ public class AsyncConfig {
      * **与上面两个池子都分开**，理由见 {@link #chatExecutor()}。
      */
     public static final String CHAT_EXECUTOR = "chatExecutor";
+
+    /**
+     * 问答 SSE 的**虚拟线程**执行器（`T-D07`）。
+     *
+     * <p>与 {@link #CHAT_EXECUTOR} 的区别：那个是有界池（core=4/max=8/queue=16），
+     * 排队时长任务会占死固定线程；虚拟线程按"每任务一条"给，生成再久也不占平台线程。
+     * ⚠️ **无界**：没有队列上限 ⇒ 过载时不再"当场拒绝"，而是并发上涨 ——
+     * 本批按用户指定技术方案落地，过载保护沿用上游模型侧的超时/限流。
+     */
+    public static final String CHAT_VIRTUAL_EXECUTOR = "chatVirtualExecutor";
 
     @Value("${app.async.core-pool-size:4}")
     private int corePoolSize;
@@ -184,9 +196,11 @@ public class AsyncConfig {
      *
      * <p>所以：**线程数按"同时在线的提问数"给，拒绝策略用 {@code AbortPolicy}**
      * —— 队列满时正确的反应是"尽早告诉用户"，而不是把压力偷偷转回请求线程。
-     * 被拒的那条由 {@code ChatController} 当场发一个 {@code error} 事件出去
-     * （见那里的注释：此时 emitter 还没 initialize，事件会堆进
-     * {@code earlySendAttempts}，初始化时重放）。
+     * ⚠️ `T-D07` 起问答**默认改走** {@link #CHAT_VIRTUAL_EXECUTOR}（虚拟线程 + Flux），
+     * 本池**保留作回退**（出事了把 {@code ChatController} 的 {@code @Qualifier} 改回本 bean 即可）。
+     * 它那套 {@code AbortPolicy} + 当场发 {@code error} 事件的行为，是 `S6-M05-C` 时代的设计，
+     * 在虚拟线程下**不适用**（虚拟线程无队列上限，不存在"拒绝"这条路径）。
+
      *
      * <p>⚠️ 与另两个池同一条纪律：**必须**带上身份传播的装饰器 —— 但这里要传的是
      * **两样**（traceId **和** {@code LoginUser}），所以不能用
@@ -209,6 +223,39 @@ public class AsyncConfig {
         log.info("问答线程池已就绪 core={} max={} queue={}", chatCorePoolSize, chatMaxPoolSize, chatQueueCapacity);
         return executor;
     }
+
+    /**
+     * 问答 SSE 的**虚拟线程**执行器（`T-D07`）。
+     *
+     * <h3>为什么另起一个，而不是把 {@link #chatExecutor()} 换掉</h3>
+     * <p>换掉会让"队列满 ⇒ 当场拒绝"那条既有行为消失（见 {@link #chatExecutor()} 的注释）。
+     * 虚拟线程执行器**没有队列上限**，不存在"拒绝"这条路径 —— 但它的代价是过载不再被挡在入口。
+     * 本批按用户指定的技术方案（`SseEmitter` → `Flux` + 虚拟线程）落地，
+     * 保留旧 bean 让"出事了退回旧执行器"是一次改名的距离。
+     *
+     * <h3>🔴 上下文必须手动搬运 —— 虚拟线程执行器没有 TaskDecorator</h3>
+     * <p>{@link ThreadPoolTaskExecutor#setTaskDecorator} 是那个类的 API；
+     * `Executors.newVirtualThreadPerTaskExecutor()` 返回的是 JDK 原生 {@link ExecutorService}，
+     * **没有装饰器可挂**。于是 LoginUser 与 traceId 的传播要**自己包一层**
+     * （{@link #chatContextPropagating}），否则身份在提交那一刻就丢了 ——
+     * 而丢法很安静：`require()` 抛 401、`userIdOrNull()` 返回 null 让数据范围悄悄放宽。
+     *
+     * <p>⚠️ 这里**不是**"提交时捕获一次就能省"的优化点：捕获必须在提交线程做，
+     * 恢复必须在工作线程做，两者是同一个包装函数的头尾。
+     */
+    @Bean(name = CHAT_VIRTUAL_EXECUTOR)
+    public Executor chatVirtualExecutor() {
+        // setName 让 jcmd / 线程转储里认得出：问答的虚拟线程一律叫 ak-chat-vt-*
+        ExecutorService delegate = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("ak-chat-vt-", 0).factory());
+        log.info("问答虚拟线程执行器已就绪（无队列上限）");
+        // 包一层：每条任务在提交线程捕获 LoginUser/traceId，在虚拟线程恢复并 finally 清理
+        // ⚠️ 这个 delegate **绝不能放进 try-with-resources** —— 那会在方法返回时立刻关掉它，
+        //    而返回出去的 lambda 还握着它，表现是每一次提问都 RejectedExecutionException。
+        return task -> delegate.execute(chatContextPropagating(task));
+
+    }
+
 
     /**
      * 把提交线程的 {@code traceId} **与登录身份**传给问答工作线程。

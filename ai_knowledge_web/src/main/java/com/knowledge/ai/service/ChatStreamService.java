@@ -155,6 +155,11 @@ public class ChatStreamService {
             } else {
                 generated = true;
                 long genStart = System.nanoTime();
+                // `T-D07`/`T-D08`：思考过程单独走 reasoning 通道。
+                // ⚠️ 关闭思考（request.reasoning()==false）时传 **null** —— 与"模型不产思考"
+                //    走同一条零事件路径（回调根本不取 reasoning），而不是"取到了再丢掉"，
+                //    这样"关了还漏一帧"在结构上不可能发生。
+                // ⚠️ 断开时同 delta：只是不再发，仍把这一轮跑完（耗时/用量要记全）
                 outcome = streamingChatCaller.stream(prompt(question, result.chunks()),
                         attachments.images(),
                         piece -> {
@@ -165,7 +170,17 @@ public class ChatStreamService {
                             if (sink.alive()) {
                                 sink.delta(piece);
                             }
-                        });
+                        },
+                        reasoningEnabled(request)
+                                ? thought -> {
+                                    // 思考**不进 answer**：它不参与引用角标解析，也不落库
+                                    //（本批范围：只做"显示 + 可折叠"）。
+                                    if (sink.alive()) {
+                                        sink.reasoning(thought);
+                                    }
+                                }
+                                : null);
+
                 llmMillis = elapsedMillis(genStart);
                 finishReason = outcome.finishReason();
                 // `T-804`：**角标只在"真的调过模型"的那条路上才有意义** ——
@@ -186,6 +201,18 @@ public class ChatStreamService {
                     citedRanks, attachments.usedVision());
         }
     }
+
+    /**
+     * 本轮是否**采集并下发思考过程**（`T-D08` · 用户 2026-10-02 需求：默认开、可关）。
+     *
+     * <p>⚠️ 只认显式的 {@code false} 才算关：{@code null}（前端没传 / 旧客户端）按**默认开**。
+     * 反过来写（"{@code TRUE} 才算开"）会让所有既有请求在升级后**悄悄失去思考过程** ——
+     * 而页面不会报错，只是思考区再也不出现。
+     */
+    private static boolean reasoningEnabled(ChatDtos.ChatRequest request) {
+        return request.reasoning() == null || request.reasoning();
+    }
+
 
     /**
      * 图片处理（`T-907` + `T-806` · 需求 `09` §4.9/§4.5/§4.7）—— **两条路的分岔点**。

@@ -209,6 +209,8 @@ export interface SSEHandlers {
     degraded?: boolean
   }) => void
   onRetrieval?: (data: { chunks: unknown[]; trace: unknown; kbCount: number }) => void
+  /** 思考过程增量（`T-D07`）。**与 `onDelta` 是两条通道**：前者渲染可折叠思考区，后者渲染正文 */
+  onReasoning?: (data: { content: string }) => void
   onDelta?: (data: { content: string }) => void
   onDone?: (data: {
     messageId: string
@@ -232,6 +234,8 @@ export interface ChatStreamOptions {
   attachmentIds?: string[]
   /** 本轮是否把原图直接传给对话模型（兜底，仅该轮生效） */
   useVision?: boolean
+  /** 是否采集/显示思考过程（`T-D08`）；不传 = 默认开（与后端"只认显式 false"同一条口径） */
+  reasoning?: boolean
 }
 
 /**
@@ -245,6 +249,8 @@ export async function chatStream(message: string, handlers: SSEHandlers, options
   if (options.modelId != null) body.modelId = options.modelId
   if (options.attachmentIds?.length) body.attachmentIds = options.attachmentIds
   if (options.useVision) body.useVision = true
+  // 只在**显式关闭**时发 reasoning:false —— 默认开交给后端口径，避免两端各定义一次默认
+  if (options.reasoning === false) body.reasoning = false
 
   const resp = await fetch(`${BASE}/chat/completions`, {
     method: 'POST',
@@ -275,6 +281,7 @@ export async function chatStream(message: string, handlers: SSEHandlers, options
           const data = JSON.parse(payload)
           if (event === 'attachment') handlers.onAttachment?.(data)
           else if (event === 'retrieval') handlers.onRetrieval?.(data)
+          else if (event === 'reasoning') handlers.onReasoning?.({ content: data.content ?? '' })
           else if (event === 'delta') handlers.onDelta?.({ content: data.content ?? '' })
           else if (event === 'done') handlers.onDone?.(data)
           else if (event === 'error') handlers.onError?.(data.message ?? '生成出错')

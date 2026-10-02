@@ -33,9 +33,11 @@ public final class ChatDtos {
      * @param modelId       对话模型 id；与会话绑定不一致时**服务端开新会话**（`G5-10`）
      * @param attachmentIds 图片附件 id；`T-512`（S6）之前**收下但不处理**
      * @param useVision     本轮是否把原图直接传给模型；同上，本批恒不生效
+     * @param reasoning     是否**采集并下发思考过程**（`T-D07`/`T-D08`）；{@code null} 视为 {@code true}（默认开）。
+     *                      ⚠️ 这只控制**是否下发 `event: reasoning`**，不改模型侧是否产生思考
      */
     public record ChatRequest(String message, Long sessionId, Long modelId,
-                              List<String> attachmentIds, Boolean useVision) {
+                              List<String> attachmentIds, Boolean useVision, Boolean reasoning) {
     }
 
     /**
@@ -107,6 +109,22 @@ public final class ChatDtos {
      */
     public record RetrievalEvent(List<ChunkRef> chunks, TraceWire trace, int kbCount) {
     }
+
+    /**
+     * §9 `event: reasoning`（`T-D07` 新增）—— 思考模型的一小段**思考过程**。
+     *
+     * <h3>与 {@code delta} 是两条通道，不是"带类型的 delta"</h3>
+     * <p>前端把思考渲染在**独立且可折叠**的区域，正文另起一处 —— 所以两者
+     * **必须分开**。若把 reasoning 塞进 `delta.content`，前端既折叠不了，
+     * 引用角标解析（{@link com.knowledge.ai.pipeline.chat.CitationParser}）
+     * 也会把思考里的 `[1]` 误当成引用。
+     *
+     * <p>⚠️ **模型不产思考时不发此事件**（不是发空串）—— 前端按"收到过没有"
+     * 决定要不要长出思考区，发空串会长出一个空折叠框。
+     */
+    public record ReasoningEvent(String content) {
+    }
+
 
     /** §9 `event: delta` —— 一小段增量正文。 */
     public record DeltaEvent(String content) {

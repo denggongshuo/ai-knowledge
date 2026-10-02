@@ -16,7 +16,7 @@ import com.knowledge.ai.service.ChatSessionService;
 import com.knowledge.ai.service.ChatStreamService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.core.task.TaskRejectedException;
+import tools.jackson.databind.ObjectMapper;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -28,10 +28,11 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.codec.ServerSentEvent;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -70,14 +71,6 @@ import java.util.concurrent.Executor;
 @RequestMapping("/api/chat")
 public class ChatController {
 
-    /**
-     * SSE 超时。
-     *
-     * <p>取值 5 分钟：一次问答含检索 + 生成，远超普通接口，但**不能设 0**
-     * （0 = 永不超时）—— 客户端异常消失时，那个请求线程会一直挂着。
-     * 5 分钟足够任何一次正常生成，又给"僵尸连接"留了一条回收路径。
-     */
-    private static final long SSE_TIMEOUT_MILLIS = 5 * 60 * 1000L;
 
     private final ChatStreamService chatStreamService;
 
@@ -87,8 +80,11 @@ public class ChatController {
 
     private final ChatFeedbackService chatFeedbackService;
 
-    /** 问答编排跑在这里，**不是**请求线程 —— 理由见 {@link #completions}。 */
-    private final Executor chatExecutor;
+    /** 问答编排跑在**虚拟线程**上（`T-D07`）—— 不再占平台线程。上下文由该执行器自行搬运。 */
+    private final Executor chatVirtualExecutor;
+
+    /** SSE 事件体的序列化 —— 复用容器里那个（与 HTTP 响应同一套 Jackson 配置）。 */
+    private final ObjectMapper objectMapper;
 
     /**
      * 显式构造器（**不用 `@RequiredArgsConstructor`**）：上面那个执行器有 3 个同类型的
@@ -101,12 +97,14 @@ public class ChatController {
                           ChatSessionService chatSessionService,
                           ChatAttachmentService chatAttachmentService,
                           ChatFeedbackService chatFeedbackService,
-                          @Qualifier(AsyncConfig.CHAT_EXECUTOR) Executor chatExecutor) {
+                          @Qualifier(AsyncConfig.CHAT_VIRTUAL_EXECUTOR) Executor chatVirtualExecutor,
+                          ObjectMapper objectMapper) {
         this.chatStreamService = chatStreamService;
         this.chatSessionService = chatSessionService;
         this.chatAttachmentService = chatAttachmentService;
         this.chatFeedbackService = chatFeedbackService;
-        this.chatExecutor = chatExecutor;
+        this.chatVirtualExecutor = chatVirtualExecutor;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -125,40 +123,46 @@ public class ChatController {
      * 「**必须**通过 SSE 提前给进度，否则用户盯着空白等」**从原理上没生效**，
      * `G5-7` 的实际效果为零，「流式生成」是错觉。
      *
-     * <p>所以现在：**先把 emitter 交给 Spring（方法立即返回），编排跑在
-     * {@link AsyncConfig#CHAT_EXECUTOR} 上**，每一帧在产生的那一刻就写出。
+     * <h3>为什么现在换成 {@code Flux<ServerSentEvent>}（`T-D07`）</h3>
+     * <p>`SseEmitter` 那条路要靠"方法立刻返回 + 另一个线程 send"才能不触发上面的重放，
+     * 断开检测也只能靠 {@code IOException} 猜。`Flux` 是 Spring MVC **原生支持**的返回类型
+     * （底层仍是异步 Servlet，**不需要 WebFlux 容器**）：订阅由容器建立，取消由容器触发，
+     * 逐帧写出与断开回收都成了框架的职责，不再是我们手写的一堆回调。
      *
-     * <p>事件序列见 {@link ChatStreamService}。跨线程的身份与 traceId 由
-     * {@code AsyncConfig.chatContextPropagating} 带过去。
+     * <h3>🔴 编排仍然跑在虚拟线程上，用 {@code Sinks} 桥到 Flux</h3>
+     * <p>{@code ChatStreamService} 是 1000+ 行命令式编排（JPA 阻塞 + 事务 + ThreadLocal），
+     * 响应式化它要把数据访问与事务边界全部重写 —— 收益为零，风险极大。所以这里用
+     * **单播 {@code Sinks.Many}**：编排在虚拟线程里照旧同步跑，每产生一个事件就
+     * {@code tryEmitNext}，Flux 那侧只管往外吐。{@code ChatSink} 抽象**一个字没改**。
+     *
+     * <h3>⚠️ 客户端断开仍必须落库（`G5-13`）</h3>
+     * <p>取消信号从 Flux 侧进来（{@code doOnCancel}），只把 sink **标记为死**、
+     * 停止后续发送；**编排照常跑完**，{@code finally} 里的打点与消息落库不受影响。
+     * 这是 `S6-M05-C` 那条 P0 的同一纪律，换成 Flux 后重新实现了一遍。
+     *
+     * <p>跨线程的身份与 traceId 由 {@link AsyncConfig#CHAT_VIRTUAL_EXECUTOR} 的包装搬运。
      */
     @PostMapping(value = "/completions", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter completions(@RequestBody ChatDtos.ChatRequest request) {
+    public Flux<ServerSentEvent<String>> completions(@RequestBody ChatDtos.ChatRequest request) {
         LoginUser user = LoginUserContext.require();
-        SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MILLIS);
-        EmitterSink sink = new EmitterSink(emitter);
+        // 单播 + 缓冲：只有一个订阅者（容器），且快产慢出时把事件排队而不是丢
+        Sinks.Many<ServerSentEvent<String>> sink = Sinks.many().unicast().onBackpressureBuffer();
+        ReactiveSink chatSink = new ReactiveSink(sink, objectMapper);
 
-        try {
-            chatExecutor.execute(() -> runChat(user, request, sink));
-        } catch (TaskRejectedException ex) {
-            // 队列满（`AbortPolicy`）。⚠️ 此刻 emitter **还没 initialize**，
-            // 所以下面两个事件会堆进 `earlySendAttempts`、在 initialize 时重放 ——
-            // 用户看到的是一条 error 事件。
-            // 这正是要的效果：不处理的话，用户盯着空白等满 5 分钟才超时，
-            // 而"没人在处理你的请求"这件事从头到尾不可见
-            log.warn("[问答] 问答队列已满，当场拒绝：userId={}", user.getUserId());
-            sink.error("当前提问并发较多，请稍后重试。");
-            sink.complete();
-        }
-        return emitter;
+        chatVirtualExecutor.execute(() -> runChat(user, request, chatSink));
+
+        return sink.asFlux()
+                // 客户端断开 / 取消：只止发送，不打断编排（编排照常跑完并落库）
+                .doOnCancel(() -> chatSink.markDead("客户端已断开"));
     }
 
     /**
-     * 一轮问答的**全部编排**，跑在 {@link AsyncConfig#CHAT_EXECUTOR} 的工作线程上。
+     * 一轮问答的**全部编排**，跑在 {@link AsyncConfig#CHAT_VIRTUAL_EXECUTOR} 的虚拟线程上。
      *
-     * <p>⚠️ 身份与 traceId 由 {@code AsyncConfig.chatContextPropagating} 带过来，
-     * 这里**不要**再自己 {@code set} 一遍 —— 两处都设，将来改一处就会漏一处。
+     * <p>⚠️ 身份与 traceId 由虚拟线程执行器的包装带过来，这里**不要**再自己 {@code set} 一遍 ——
+     * 两处都设，将来改一处就会漏一处。
      */
-    private void runChat(LoginUser user, ChatDtos.ChatRequest request, EmitterSink sink) {
+    private void runChat(LoginUser user, ChatDtos.ChatRequest request, ReactiveSink sink) {
         try {
             chatStreamService.chat(user, request, sink);
         } catch (RuntimeException ex) {
@@ -170,6 +174,7 @@ public class ChatController {
             sink.complete();
         }
     }
+
 
     // ==================================================================
     // T-802 余下半边（S5-M08-B）：会话列表 / 消息列表 / 删除 / 导出
@@ -324,40 +329,46 @@ public class ChatController {
     }
 
     /**
-     * 把 {@link ChatSink} 架到 {@link SseEmitter} 上。
+     * 把 {@link ChatSink} 架到 {@code Sinks.Many} 上（`T-D07`）。
      *
-     * <p>**核心职责是"客户端断开时不把异常放出去"**：`SseEmitter.send` 在连接已断时抛
-     * {@code IOException}，若让它冒泡，编排的 {@code finally}（打点落库 + 消息落库）
-     * 就跑不到 —— 而 `G5-13` 要的正是"每次提问都留痕"。
-     * 所以这里就地吞掉、把自己标记为已死，后续发送全部降级为 no-op。
+     * <h3>核心职责没变：客户端断开时不把异常放出去、仍让人把账记完</h3>
+     * <p>`SseEmitter` 时代是在 {@code send()} 抛 {@code IOException} 时就地吞掉
+     * （`S6-M05-C` 的 P0）。换成 {@code Sinks} 后**没有异常可吞**：
+     * {@code tryEmitNext} 只返回结果码，断了也不抛。断开信号改从两条来：
+     * <ol>
+     *   <li>{@code Flux#doOnCancel}（客户端取消订阅）→ {@link #markDead}；</li>
+     *   <li>{@code tryEmitNext} 返回非 {@code OK}（取消 / 终止）→ 也标记死。</li>
+     * </ol>
+     * 两条都只**停止发送**，绝不打断编排 —— {@code finally} 里的打点落库照跑，
+     * 这是 `G5-13`「每次提问都留痕」的要求。
+     *
+     * <h3>⚠️ 必须显式终止 sink</h3>
+     * <p>不像 {@code SseEmitter.complete()} 会自己关连接，{@code Sinks} 不说"完了"
+     * 那侧就永远不 {@code onComplete} —— 前端会一直等下去（`done` 事件发了也没用，
+     * fetch 的 reader 不返回 EOF）。所以 {@link #complete()} **无论活死都要发射终止信号**：
+     * 活着发 {@code tryEmitComplete}，死了发 {@code tryEmitError} 让 Flux 结束。
      */
-    private static final class EmitterSink implements ChatSink {
+    private static final class ReactiveSink implements ChatSink {
 
-        private final SseEmitter emitter;
+        private final Sinks.Many<ServerSentEvent<String>> sink;
+
+        private final ObjectMapper objectMapper;
 
         /**
          * 连接是否还活着。
          *
-         * <p>⚠️ **必须 `volatile`**：写它的是容器线程（超时/错误/完成回调），
-         * 读它的是编排线程（{@link ChatSink#alive()}）。
+         * <p>⚠️ **必须 `volatile`**：写它的是容器线程（`doOnCancel`），
+         * 读它的是编排所在虚拟线程（{@link ChatSink#alive()}）。
          */
         private volatile boolean alive = true;
 
-        EmitterSink(SseEmitter emitter) {
-            this.emitter = emitter;
-            // `S6-M05-C`：把"什么时候算死了"补齐。
-            // ⚠️ 改前 `alive` **只在 `send()` 抛异常时才翻** —— 于是"超时之后编排
-            // 还在往一条死连接上发"这条路径，要等到下一次 `send()` 才被发现；
-            // 而 SSE 超时是 5 分钟，中间完全可能一次 send 都没有。
-            // 事件本身不会丢（收尾落库照做，见 `complete()`），但"还在发"这件事
-            // 会一路假成功到下一次发送为止。
-            emitter.onTimeout(() -> markDead("已超时"));
-            emitter.onError(ex -> markDead("连接出错：" + ex.getMessage()));
-            // 正常完成也会回调它 —— 那时我们本来就说完了，所以只翻标志、不告警，
-            // 否则每一轮成功的问答都会留一条 WARN
-            emitter.onCompletion(() -> alive = false);
+        ReactiveSink(Sinks.Many<ServerSentEvent<String>> sink,
+                     ObjectMapper objectMapper) {
+            this.sink = sink;
+            this.objectMapper = objectMapper;
         }
 
+        /** 标记为死：只停发送，不影响编排继续跑完收尾。幂等。 */
         private void markDead(String why) {
             if (alive) {
                 alive = false;
@@ -382,6 +393,17 @@ public class ChatController {
         @Override
         public void attachment(ChatDtos.AttachmentEvent event) {
             send("attachment", event);
+        }
+
+        /**
+         * `event: reasoning`（`T-D07`）。
+         *
+         * <p>⚠️ **必须覆盖它** —— 理由同 {@link #attachment}：默认实现是空操作，
+         * 不覆盖的话思考过程收得到、编排里也拿得到，但**页面上一帧都看不到**。
+         */
+        @Override
+        public void reasoning(String content) {
+            send("reasoning", new ChatDtos.ReasoningEvent(content));
         }
 
         @Override
@@ -409,26 +431,38 @@ public class ChatController {
             if (!alive) {
                 return;
             }
+            String json;
             try {
-                emitter.send(SseEmitter.event().name(name)
-                        .data(data, MediaType.APPLICATION_JSON));
-            } catch (IOException | IllegalStateException ex) {
-                markDead("连接已断开：" + ex.getMessage());
+                json = objectMapper.writeValueAsString(data);
+            } catch (tools.jackson.core.JacksonException ex) {
+                // 序列化失败**不抛**：抛出去会打断编排收尾。记日志、丢这一帧
+                log.error("[问答] SSE 事件序列化失败，丢弃该帧：event={} err={}", name, ex.getMessage());
+                return;
+            }
+            Sinks.EmitResult result = sink.tryEmitNext(
+                    ServerSentEvent.<String>builder().event(name).data(json).build());
+            if (result.isFailure()) {
+                // 取消 / 已终止 —— 当成断开，后续不再发。⚠️ 不抛，编排要跑完
+                markDead("发射失败：" + result);
             }
         }
 
         /**
-         * 收尾。已断开时**不调** {@code complete()} —— 对一条已经断掉的连接调它只会再抛一次；
-         * 容器会在超时或连接关闭时自行回收。
+         * 收尾。**无论活死都要发射终止信号**，否则 Flux 不结束、前端 reader 不返回。
+         *
+         * <p>活着 ⇒ {@code tryEmitComplete}（正常结束）；
+         * 已死 ⇒ {@code tryEmitError}（把取消/异常态收口，让上游及时断开）。
          */
         void complete() {
-            if (!alive) {
-                return;
-            }
-            try {
-                emitter.complete();
-            } catch (RuntimeException ex) {
-                log.warn("[问答] SSE 收尾失败（不影响已完成的事件与落库）：{}", ex.getMessage());
+            if (alive) {
+                Sinks.EmitResult result = sink.tryEmitComplete();
+                if (result.isFailure()) {
+                    log.warn("[问答] SSE 收尾失败（不影响已完成的事件与落库）：{}", result);
+                }
+                alive = false;
+            } else {
+                // 已经断开 / 已终止：补一个 error 收口，避免 Flux 悬着
+                sink.tryEmitError(new IllegalStateException("SSE 连接已断开"));
             }
         }
     }

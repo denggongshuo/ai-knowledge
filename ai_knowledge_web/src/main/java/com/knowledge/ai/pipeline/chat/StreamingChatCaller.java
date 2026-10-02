@@ -75,6 +75,32 @@ public interface StreamingChatCaller {
     }
 
     /**
+     * 发一次提示词，**同时逐段回调思考过程（reasoning）与正文**（`T-D07` · 用户 2026-10-02 需求）。
+     *
+     * <h3>为什么再加一个默认方法，而不是给 {@link #stream(String, List, Consumer)} 加参数</h3>
+     * <p>同上面带图方法那条理由：改既有签名会牵动全部替身，而**多数调用点不关心思考过程**
+     * （只有问答要看）。默认实现把 reasoning 直接丢掉，委托给不带 reasoning 的既有方法 ——
+     * 于是既有替身与调用点**一个字都不用改**。
+     *
+     * <p>⚠️ **生产实现必须覆写它**（{@code RegistryStreamingChatCaller}），否则
+     * 思考模型产出的 reasoning 会被静默丢弃、页面永远看不到思考过程 ——
+     * 而其余一切正常（能出答案、能落库），属于"绿着绿着少一块"那一族。
+     *
+     * <p>⚠️ {@code onReasoning} 只收**非空增量**。实现方负责把"累积快照"折成增量
+     * （部分 OpenAI 兼容供应商每帧发的是**到目前为止的全量思考文本**，直接 append 会重复）。
+     *
+     * @param prompt      完整提示词
+     * @param images      原图（空 / {@code null} 等价于不带图）
+     * @param onDelta     每收到一段增量正文调用一次
+     * @param onReasoning 每收到一段增量思考调用一次（**非空**）；不关心就传 {@code null}
+     * @return 本次调用的元数据
+     */
+    default Outcome stream(String prompt, List<ChatImage> images,
+                           Consumer<String> onDelta, Consumer<String> onReasoning) {
+        return stream(prompt, images, onDelta);
+    }
+
+    /**
      * 一张原图。
      *
      * <h3>为什么带 {@code mime} 而不是让实现自己猜</h3>

@@ -239,17 +239,82 @@ public class RetrievalTestStubs {
      * <p>**按句切分而不是整段一次给**：`T-801` 的事件序列要验 `delta*`（可多次），
      * 一次性吐完的话"发了几个 delta"恒为 1，那条判据就退化成了摆设。
      */
-    public static com.knowledge.ai.pipeline.chat.StreamingChatCaller canned(String answer) {
-        return (prompt, onDelta) -> {
-            LAST_PROMPT = prompt;
-            for (String piece : answer.split("(?<=。)")) {
-                if (!piece.isEmpty()) {
-                    onDelta.accept(piece);
+    /**
+     * `T-D07`：既回思考过程、又回正文的替身。
+     *
+     * <p>思考与正文**按序交错**：先逐句发思考，再逐句发正文 —— 与真模型的
+     * "先想完再说"大致同形，也让"正文一开始就折叠思考区"这条前端判据有事可依。
+     */
+    public static com.knowledge.ai.pipeline.chat.StreamingChatCaller cannedWithReasoning(
+            String reasoning, String answer) {
+        return new com.knowledge.ai.pipeline.chat.StreamingChatCaller() {
+            @Override
+            public com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome stream(
+                    String prompt, java.util.function.Consumer<String> onDelta) {
+                LAST_PROMPT = prompt;
+                for (String piece : answer.split("(?<=。)")) {
+                    if (!piece.isEmpty()) {
+                        onDelta.accept(piece);
+                    }
                 }
+                return new com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome(
+                        7L, "stub-chat-model",
+                        new com.knowledge.ai.pipeline.chat.ChatDtos.TokenUsage(11, 22, 33), "stop");
             }
-            return new com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome(
-                    7L, "stub-chat-model",
-                    new com.knowledge.ai.pipeline.chat.ChatDtos.TokenUsage(11, 22, 33), "stop");
+
+            @Override
+            public com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome stream(
+                    String prompt, java.util.List<com.knowledge.ai.pipeline.chat.StreamingChatCaller.ChatImage> images,
+                    java.util.function.Consumer<String> onDelta,
+                    java.util.function.Consumer<String> onReasoning) {
+                LAST_PROMPT = prompt;
+                if (onReasoning != null) {
+                    for (String piece : reasoning.split("。")) {
+                        if (!piece.isEmpty()) {
+                            onReasoning.accept(piece);
+                        }
+                    }
+                }
+                for (String piece : answer.split("(?<=。)")) {
+                    if (!piece.isEmpty()) {
+                        onDelta.accept(piece);
+                    }
+                }
+                return new com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome(
+                        7L, "stub-chat-model",
+                        new com.knowledge.ai.pipeline.chat.ChatDtos.TokenUsage(11, 22, 33), "stop");
+            }
+        };
+    }
+
+    public static com.knowledge.ai.pipeline.chat.StreamingChatCaller canned(String answer) {
+        return new com.knowledge.ai.pipeline.chat.StreamingChatCaller() {
+            @Override
+            public com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome stream(
+                    String prompt, java.util.function.Consumer<String> onDelta) {
+                LAST_PROMPT = prompt;
+                for (String piece : answer.split("(?<=。)")) {
+                    if (!piece.isEmpty()) {
+                        onDelta.accept(piece);
+                    }
+                }
+                return new com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome(
+                        7L, "stub-chat-model",
+                        new com.knowledge.ai.pipeline.chat.ChatDtos.TokenUsage(11, 22, 33), "stop");
+            }
+
+            /**
+             * `T-D07`：**必须覆写四参版本** —— 编排现在走这条签名，若落到接口默认实现，
+             * 带图调用会直接抛 `UnsupportedOperationException`（那条默认实现刻意如此）。
+             * 本替身不关心思考，转发到三参版本即可（思考回调忽略）。
+             */
+            @Override
+            public com.knowledge.ai.pipeline.chat.StreamingChatCaller.Outcome stream(
+                    String prompt, java.util.List<com.knowledge.ai.pipeline.chat.StreamingChatCaller.ChatImage> images,
+                    java.util.function.Consumer<String> onDelta,
+                    java.util.function.Consumer<String> onReasoning) {
+                return stream(prompt, onDelta);
+            }
         };
     }
 
@@ -289,6 +354,20 @@ public class RetrievalTestStubs {
                 LAST_IMAGES.set(images == null ? 0 : images.size());
                 LAST_IMAGE_DETAIL = images == null ? java.util.List.of() : java.util.List.copyOf(images);
                 return streamStub.stream(prompt, onDelta);
+            }
+            /**
+             * `T-D07`：**必须覆写四参版本**，否则走接口默认实现 —— 那条路把 reasoning
+             * 直接丢掉，于是"关闭思考模式"的两侧（开/关）在用例里看起来一模一样，
+             * 判据就成了摆设。如实转发给 `streamStub`，让替身自己决定发不发思考。
+             */
+            @Override
+            public Outcome stream(String prompt, java.util.List<ChatImage> images,
+                                  java.util.function.Consumer<String> onDelta,
+                                  java.util.function.Consumer<String> onReasoning) {
+                STREAM_CALLS.incrementAndGet();
+                LAST_IMAGES.set(images == null ? 0 : images.size());
+                LAST_IMAGE_DETAIL = images == null ? java.util.List.of() : java.util.List.copyOf(images);
+                return streamStub.stream(prompt, images, onDelta, onReasoning);
             }
         };
     }
