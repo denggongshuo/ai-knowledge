@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # 应用基础配置
 # ============================================================
 spring:
@@ -106,7 +106,19 @@ spring:
       # 这正是想要的 —— 让"表结构与代码对不上"在启动时暴露，
       # 而不是等到某次查询才报 Unknown column。
       ddl-auto: validate
-    show-sql: true
+    # 🔴 `show-sql` 默认 **false**（2026-10-03 由 true 改来）。
+    #
+    # 为什么关掉：`ParseWorker` 每秒轮询一次 `sys_async_task`
+    # （select ... where status='PENDING' ... for update skip locked，见
+    # `SysAsyncTaskRepository#claim`）。开着 `show-sql` 时这条**空查询的心跳**
+    # 会把控制台刷满，而它恰恰是最没有排查价值的一条（查空返回、下秒再来）。
+    #
+    # ⚠️ **关掉不影响任何取证**：`DataScopeSqlEvidenceTest` / `KbModuleFlowTest`
+    # 抓 SQL 用的是「运行时把 `org.hibernate.SQL` 置 DEBUG + 挂 `ListAppender`」，
+    # **不依赖这个开关**（它们自己 `setLevel(Level.DEBUG)`）。
+    # 想看 SQL 时用环境变量临时打开即可（无需改文件、无需重打包）：
+    #     SPRING_JPA_SHOW_SQL=true
+    show-sql: ${SPRING_JPA_SHOW_SQL:false}
     properties:
       hibernate:
         format_sql: true
