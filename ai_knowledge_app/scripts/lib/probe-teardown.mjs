@@ -1143,7 +1143,8 @@ export async function teardownKbProbe(code) {
 
 /** 用户族探针（`e2e-audit-backfill` 那类）。幂等。 */
 export function teardownUserProbe(prefix) {
-  const loginLogs = mysqlCount(`select count(*) from sys_login_log where username like '${prefix}%';`)
+  // 🔴 常驻设施 probe.profile **绝不参与任何前缀清理** —— 名字虽以 probe. 开头，但它是 V6 点名的常驻联调账号（128 基线含它）。
+  const loginLogs = mysqlCount(`select count(*) from sys_login_log where username like '${prefix}%' and username <> 'probe.profile';`)
 
   // ⚠️ **必须在删 `sys_user` 之前**把 id 抓下来 —— 与 kb 族是同一条教训（`#136`/`#137`）：
   // 旧写法 `join sys_user u on u.id = t.user_id where u.username like ?`，
@@ -1154,7 +1155,8 @@ export function teardownUserProbe(prefix) {
 
   mysqlScalar(
     USER_ARTIFACTS.filter((a) => a.kind === 'sql-user' || a.kind === 'sql-date').map((a) => {
-      if (a.via === 'username') return `delete from ${a.table} where username like '${prefix}%';`
+      // 排除常驻设施 probe.profile（与 userIdsOf / loginLogs 同一保护）
+      if (a.via === 'username') return `delete from ${a.table} where username like '${prefix}%' and username <> 'probe.profile';`
       // `via: 'date'` 与用户无关，**必须排在上面那条 `userList === ''` 之前** ——
       // 否则"探针账号压根没建过"时会把它一起跳过，而当天的用量行照样留着
       // （那种漏最隐蔽：清理函数看着跑了，日报里却是探针的数字）
@@ -1187,7 +1189,7 @@ export function teardownUserProbe(prefix) {
  * 这是本批修的那条教训在用户族的同一个形状。
  */
 export function userIdsOf(prefix) {
-  return normalizeKeys(mysqlScalar(`select id from sys_user where username like '${prefix}%';`))
+  return normalizeKeys(mysqlScalar(`select id from sys_user where username like '${prefix}%' and username <> 'probe.profile';`))
 }
 
 // ---------------------------------------------------------------------------
