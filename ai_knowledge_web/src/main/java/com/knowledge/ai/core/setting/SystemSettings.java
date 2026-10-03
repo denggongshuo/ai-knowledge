@@ -85,6 +85,9 @@ public final class SystemSettings {
      * 让"迁移没跑成功"退化成"功能照旧"，而不是"图谱悄悄停了而没人知道"。
      * 每次兜底都会在 {@code SystemSettingService#snapshot()} 留一条 {@code warn}，
      * 所以它不会被静默吞掉。
+     *
+     * <p>⚠️ `T-D10`（2026-10-03）把**产品默认**翻成了关（`V44` 把行置 `false`），但**本兜底不动**：
+     * "产品默认关"与"缺配置时怎么退化"是两件事 —— 缺行仍是部署事故，仍应可见（warn）+ 不静默改行为。
      */
     public static final boolean DEFAULT_GRAPH_ENABLED = true;
 }

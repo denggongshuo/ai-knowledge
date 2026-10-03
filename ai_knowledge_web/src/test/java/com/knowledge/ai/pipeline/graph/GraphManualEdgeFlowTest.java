@@ -73,6 +73,9 @@ class GraphManualEdgeFlowTest extends RetrievalFlowSupport {
     /** 未命中行的 id（判据要它 —— 补边是"针对一条未命中问题"的动作）。 */
     private long missId;
 
+    /** 进本类之前开关的值 —— 收尾还原它（**不要硬编码 true**：产品默认已改为关，硬编码会把库改回开）。 */
+    private String graphSwitchBefore;
+
     /**
      * 本轮在 Neo4j 里碰过的 `docId`（收尾按它删边与 `(:Document)` 节点）。
      *
@@ -83,11 +86,10 @@ class GraphManualEdgeFlowTest extends RetrievalFlowSupport {
 
     @BeforeEach
     void setUp() {
-        jdbc.update("update sys_setting set setting_value = 'true'"
-                + " where setting_key = 'retrieval.graph-bypass-enabled'");
-        // `GraphEdgeService` 走 `DocAccessService#requireVisibleDoc`，而后者要
-        // `LoginUserContext.require()`（可见性是**按人**判的）。直调 Service 没有请求上下文，
-        // 必须自己装一个 —— 与 `DocSoftDeleteRecallFlowTest:96` 同一种做法。
+        graphSwitchBefore = jdbc.queryForObject(
+                "select setting_value from sys_setting where setting_key = 'retrieval.graph-bypass-enabled'", String.class);
+        // 本类要测「人工补边后能召回」⇒ 必须打开（不依赖别的类干不干净）
+        jdbc.update("update sys_setting set setting_value = 'true' where setting_key = 'retrieval.graph-bypass-enabled'");
         LoginUserContext.set(reader());
         resetProbeState();
         // 一条真实存在的未命中行（`sys_qa_miss` 是聚合表，手工插一行最直接 —— 它没有 trace 关联）
@@ -133,14 +135,13 @@ class GraphManualEdgeFlowTest extends RetrievalFlowSupport {
         }
         cleanProbeData();
         LoginUserContext.clear();
-        // 还原为种子的默认值，并**断言真的还原了**（同库跑批，单值模型）
-        jdbc.update("update sys_setting set setting_value = 'true'"
-                + " where setting_key = 'retrieval.graph-bypass-enabled'");
+        // 还原为**进入本类前的值**（不要再硬编码 true：产品默认已改为关）
+        jdbc.update("update sys_setting set setting_value = ? where setting_key = 'retrieval.graph-bypass-enabled'", graphSwitchBefore);
         assertThat(jdbc.queryForObject(
                 "select setting_value from sys_setting where setting_key = 'retrieval.graph-bypass-enabled'",
                 String.class))
-                .as("开关没还原成 true ⇒ 后面的批次会莫名其妙少走图谱")
-                .isEqualTo("true");
+                .as("开关没还原成进入本类前的值 ⇒ 会污染后面的批次")
+                .isEqualTo(graphSwitchBefore);
     }
 
     // ==================================================================

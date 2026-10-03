@@ -36,6 +36,9 @@ class GraphNeighborReaderTest extends DownloadTestSupport {
 
     private static final String START = "探针实体-起点";
 
+    /** 进本类前开关的值 —— 收尾还原它（不硬编码：产品默认已改为关）。 */
+    private String graphSwitchBefore;
+
     @Autowired
     private Driver driver;
 
@@ -53,6 +56,8 @@ class GraphNeighborReaderTest extends DownloadTestSupport {
      */
     @BeforeEach
     void enableGraphSwitch() {
+        graphSwitchBefore = jdbc.queryForObject(
+                "select setting_value from sys_setting where setting_key = 'retrieval.graph-bypass-enabled'", String.class);
         jdbc.update("update sys_setting set setting_value = 'true'"
                 + " where setting_key = 'retrieval.graph-bypass-enabled'");
     }
@@ -63,6 +68,10 @@ class GraphNeighborReaderTest extends DownloadTestSupport {
             session.run("MATCH (e:Entity) WHERE e.name STARTS WITH '探针实体-' DETACH DELETE e").consume();
         } catch (Exception ignored) {
             // 清不掉不该让用例失败：失败信息已经由断言给出
+        }
+        // 还原开关（本类 @BeforeEach 打开了它；不还原会污染后面的批次）
+        if (graphSwitchBefore != null) {
+            jdbc.update("update sys_setting set setting_value = ? where setting_key = 'retrieval.graph-bypass-enabled'", graphSwitchBefore);
         }
     }
 
