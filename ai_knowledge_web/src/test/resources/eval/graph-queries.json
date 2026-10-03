@@ -1,0 +1,37 @@
+{
+  "_note": "G9-4 图谱分题型 A/B 题集。单跳 9 / 多跳 7 / 聚合 8。golden 是金标分片 key（graph-corpus.json）。",
+  "_design": "多跳/聚合题的 golden chunk 正文**不含查询主要实体名** —— 向量/BM25 召不到，图谱经关系路径能到。这是 G9-4 能测出图谱收益的前提。",
+  "_types": {
+    "SINGLE": "单跳：查询实体所在 chunk 直接答（向量通常也能召到 ⇒ 期望持平）",
+    "MULTI": "多跳：答案在同一实体 2 跳邻居的 chunk 里（查询词不在该 chunk ⇒ 图谱独有）",
+    "AGGREGATE": "聚合：需把同一实体的多条邻居/路径聚齐（图谱多路召回）"
+  },
+  "queries": [
+    { "id": "G01", "type": "SINGLE", "query": "订单系统由谁担任负责人", "golden": ["sys-c1"], "mustNotRecall": [] },
+    { "id": "G02", "type": "SINGLE", "query": "支付系统由谁担任负责人", "golden": ["sys-c2"], "mustNotRecall": [] },
+    { "id": "G03", "type": "SINGLE", "query": "库存系统由谁担任负责人", "golden": ["sys-c3"], "mustNotRecall": [] },
+    { "id": "G04", "type": "SINGLE", "query": "订单系统依赖什么路由组件", "golden": ["cmp-c1"], "mustNotRecall": [] },
+    { "id": "G05", "type": "SINGLE", "query": "统一配置中心由哪个组负责", "golden": ["dpt-c1"], "mustNotRecall": [] },
+    { "id": "G06", "type": "SINGLE", "query": "对账引擎由哪个团队维护", "golden": ["cmp-c3"], "mustNotRecall": [] },
+    { "id": "G07", "type": "SINGLE", "query": "订单系统上周上线了什么优化", "golden": ["chg-c1"], "mustNotRecall": [] },
+    { "id": "G08", "type": "SINGLE", "query": "支付系统升级了什么渠道组件", "golden": ["chg-c2"], "mustNotRecall": [] },
+
+    { "id": "G09", "type": "MULTI", "query": "订单系统的负责人隶属于哪个部门", "golden": ["ppl-c1"], "mustNotRecall": [] },
+    { "id": "G10", "type": "MULTI", "query": "支付系统的负责人隶属于哪个部门", "golden": ["ppl-c2"], "mustNotRecall": [] },
+    { "id": "G11", "type": "MULTI", "query": "库存系统的负责人隶属于哪个部门", "golden": ["ppl-c3"], "mustNotRecall": [] },
+    { "id": "G12", "type": "MULTI", "query": "订单系统负责人负责的那个系统对账链路由哪个团队维护", "golden": ["dpt-c2"], "mustNotRecall": [] },
+    { "id": "G13", "type": "MULTI", "query": "库存系统所依赖组件的维护团队还负责哪些组件", "golden": ["dpt-c1"], "mustNotRecall": [] },
+    { "id": "G14", "type": "SINGLE", "query": "平台架构组夜间值班负责哪个核心系统", "golden": ["ops-c1"], "mustNotRecall": [] },
+    { "id": "G15", "type": "MULTI", "query": "支付系统负责人所属团队还维护哪个共用能力", "golden": ["dpt-c2"], "mustNotRecall": [] },
+    { "id": "G16", "type": "MULTI", "query": "服务订单系统的对账能力由哪个组负责", "golden": ["dpt-c2"], "mustNotRecall": [] },
+
+    { "id": "G17", "type": "AGGREGATE", "query": "平台架构组负责或值班的系统都有哪些", "golden": ["ops-c1", "dpt-c1"], "mustNotRecall": [] },
+    { "id": "G18", "type": "AGGREGATE", "query": "与订单系统存在直接关系的对象有哪些", "golden": ["sys-c1", "cmp-c1", "cmp-c3", "chg-c1"], "mustNotRecall": [] },
+    { "id": "G19", "type": "AGGREGATE", "query": "一致性哈希路由组件被哪些系统依赖", "golden": ["sys-c1", "cmp-c1"], "mustNotRecall": [] },
+    { "id": "G20", "type": "AGGREGATE", "query": "应用开发组负责的对象有哪些", "golden": ["dpt-c2", "ppl-c2"], "mustNotRecall": [] },
+    { "id": "G21", "type": "AGGREGATE", "query": "张伟参与负责的系统与组件有哪些", "golden": ["sys-c1", "ppl-c1"], "mustNotRecall": [] },
+    { "id": "G22", "type": "AGGREGATE", "query": "核心系统中负责人属于平台架构组的有哪些", "golden": ["ppl-c1", "ppl-c3"], "mustNotRecall": [] },
+    { "id": "G23", "type": "AGGREGATE", "query": "对账引擎相关的上游下游对象有哪些", "golden": ["cmp-c3", "dpt-c2"], "mustNotRecall": [] },
+    { "id": "G24", "type": "AGGREGATE", "query": "近期变更涉及的系统有哪些", "golden": ["chg-c1", "chg-c2"], "mustNotRecall": [] }
+  ]
+}

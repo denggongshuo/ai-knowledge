@@ -1,0 +1,251 @@
+{
+  "_note": "G9-4 图谱分题型验收 —— 关系型评测语料（A 方案：手写关系三元组）。与 corpus.json（表格型）并列，专测『图谱多跳/聚合召回收益』。",
+  "_design": [
+    "每个 chunk 首行/正文里必须**字面包含**它对应的实体名（否则 RelationAnchor 锚不上，边被丢弃）。",
+    "relations 里的 subject/object 必须在该 chunk 正文出现 —— 这里是「已锚定」形态，blockOrder 指块在该文档内的序号（0 起）。",
+    "多跳题的设计：答案所在 chunk 的正文**不含查询词**，只能经「查询实体 → 边 → 邻居实体 → 其所在 chunk」够到 ⇒ 向量/BM25 召不到，图谱能召回。",
+    "置信度 >= 0.6（GraphNeighborReader 的门槛）。"
+  ],
+  "documents": [
+    {
+      "docKey": "sys",
+      "title": "核心系统清单",
+      "chunks": [
+        {
+          "key": "sys-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "核心系统清单 > 概览",
+          "content": "订单系统承载全公司交易撮合，日均处理 300 万单。订单系统由张伟担任负责人，是公司最核心的交易链路系统。"
+        },
+        {
+          "key": "sys-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "核心系统清单 > 概览",
+          "content": "支付系统负责资金流转，对接三家银行渠道。支付系统由李娜担任负责人，任何交易异常都需要支付系统第一时间介入。"
+        },
+        {
+          "key": "sys-c3",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "核心系统清单 > 概览",
+          "content": "库存系统管理全仓库存与调拨。库存系统由王强担任负责人，与订单系统通过消息队列异步对账。"
+        }
+      ]
+    },
+    {
+      "docKey": "people",
+      "title": "系统负责人名册",
+      "chunks": [
+        {
+          "key": "ppl-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "负责人名册 > 研发中心",
+          "content": "张伟隶属于平台架构组，主攻稳定性与容量规划方向。"
+        },
+        {
+          "key": "ppl-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "负责人名册 > 研发中心",
+          "content": "李娜隶属于应用开发组，主攻渠道对接与结算逻辑方向。"
+        },
+        {
+          "key": "ppl-c3",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "负责人名册 > 研发中心",
+          "content": "王强隶属于平台架构组，主攻对账链路方向。"
+        }
+      ]
+    },
+    {
+      "docKey": "dept",
+      "title": "研发中心部门职责",
+      "chunks": [
+        {
+          "key": "dpt-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "部门职责 > 平台架构组",
+          "content": "平台架构组承担基础设施与中间件的选型评审，同时负责统一配置中心与一致性哈希路由组件。"
+        },
+        {
+          "key": "dpt-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "部门职责 > 应用开发组",
+          "content": "应用开发组负责业务系统的迭代交付，也维护对账引擎这一共用能力。"
+        }
+      ]
+    },
+    {
+      "docKey": "comp",
+      "title": "共用组件台账",
+      "chunks": [
+        {
+          "key": "cmp-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "组件台账 > 路由",
+          "content": "一致性哈希路由组件被订单系统与库存系统共同依赖，用于分片路由。"
+        },
+        {
+          "key": "cmp-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "组件台账 > 配置",
+          "content": "统一配置中心为全部核心系统提供动态配置下发。"
+        },
+        {
+          "key": "cmp-c3",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "组件台账 > 对账",
+          "content": "对账引擎由应用开发组维护，服务于交易类系统的每日对账。"
+        }
+      ]
+    },
+    {
+      "docKey": "change",
+      "title": "近期变更记录",
+      "chunks": [
+        {
+          "key": "chg-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "变更记录 > 订单系统",
+          "content": "订单系统上周上线了分片路由优化，本次变更影响下游的库存系统对账时效。"
+        },
+        {
+          "key": "chg-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "变更记录 > 支付系统",
+          "content": "支付系统升级了银行渠道 SDK，本次变更不影响订单系统的交易主链路。"
+        }
+      ]
+    },
+    {
+      "docKey": "ops",
+      "title": "值班与应急手册",
+      "chunks": [
+        {
+          "key": "ops-c1",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "应急手册 > 值班安排",
+          "content": "平台架构组负责订单系统与库存系统的夜间值班，应用开发组负责支付系统的夜间值班。"
+        },
+        {
+          "key": "ops-c2",
+          "chunkType": "PARAGRAPH",
+          "titlePath": "应急手册 > 升级流程",
+          "content": "任何核心系统变更都需要在变更窗口内执行，变更前需评估对下游系统的影响范围。"
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "docKey": "sys",
+      "key": "sys-c1",
+      "subject": "订单系统",
+      "predicate": "负责人",
+      "object": "张伟",
+      "confidence": 0.92
+    },
+    {
+      "docKey": "sys",
+      "key": "sys-c2",
+      "subject": "支付系统",
+      "predicate": "负责人",
+      "object": "李娜",
+      "confidence": 0.92
+    },
+    {
+      "docKey": "sys",
+      "key": "sys-c3",
+      "subject": "库存系统",
+      "predicate": "负责人",
+      "object": "王强",
+      "confidence": 0.9
+    },
+    {
+      "docKey": "people",
+      "key": "ppl-c1",
+      "subject": "张伟",
+      "predicate": "隶属于",
+      "object": "平台架构组",
+      "confidence": 0.9
+    },
+    {
+      "docKey": "people",
+      "key": "ppl-c2",
+      "subject": "李娜",
+      "predicate": "隶属于",
+      "object": "应用开发组",
+      "confidence": 0.9
+    },
+    {
+      "docKey": "people",
+      "key": "ppl-c3",
+      "subject": "王强",
+      "predicate": "隶属于",
+      "object": "平台架构组",
+      "confidence": 0.88
+    },
+    {
+      "docKey": "sys",
+      "key": "sys-c1",
+      "subject": "订单系统",
+      "predicate": "基于",
+      "object": "一致性哈希路由组件",
+      "confidence": 0.88
+    },
+    {
+      "docKey": "comp",
+      "key": "cmp-c1",
+      "subject": "库存系统",
+      "predicate": "依赖",
+      "object": "一致性哈希路由组件",
+      "confidence": 0.86
+    },
+    {
+      "docKey": "dpt",
+      "key": "dpt-c1",
+      "subject": "统一配置中心",
+      "predicate": "维护方",
+      "object": "平台架构组",
+      "confidence": 0.84
+    },
+    {
+      "docKey": "dpt",
+      "key": "dpt-c1",
+      "subject": "一致性哈希路由组件",
+      "predicate": "维护方",
+      "object": "平台架构组",
+      "confidence": 0.84
+    },
+    {
+      "docKey": "comp",
+      "key": "cmp-c3",
+      "subject": "对账引擎",
+      "predicate": "服务于",
+      "object": "订单系统",
+      "confidence": 0.82
+    },
+    {
+      "docKey": "dpt",
+      "key": "dpt-c2",
+      "subject": "对账引擎",
+      "predicate": "维护方",
+      "object": "应用开发组",
+      "confidence": 0.82
+    },
+    {
+      "docKey": "change",
+      "key": "chg-c1",
+      "subject": "订单系统",
+      "predicate": "影响",
+      "object": "库存系统",
+      "confidence": 0.8
+    },
+    {
+      "docKey": "ops",
+      "key": "ops-c1",
+      "subject": "订单系统",
+      "predicate": "夜间值班方",
+      "object": "平台架构组",
+      "confidence": 0.78
+    }
+  ]
+}
