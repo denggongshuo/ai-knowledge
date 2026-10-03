@@ -483,6 +483,8 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
           if (m.reasoning !== undefined) m.reasoningCollapsed = true
         }
         sending.value = false
+        // 本轮结束 → 刷新左侧列表（标题/条数/时间）。改前只在进页面时拉一次。
+        void refreshSessions()
         void scrollToBottom()
       },
       onError(msg) {
@@ -492,6 +494,8 @@ function runStream(text: string, attachmentIds: string[], useVision: boolean, ai
           m.content += `\n\n> ⚠️ ${msg}`
         }
         sending.value = false
+        // 失败也要刷新 —— 用户那条提问可能已经落库（会话/条数变了）
+        void refreshSessions()
         ElMessage.error(msg)
       },
     },
@@ -513,7 +517,84 @@ function sourceColor(s: string) {
 
 // ---------------- 会话列表（每项显示所用模型） ----------------
 const sessions = ref<ChatSessionItem[]>([])
-const activeSession = ref('s1')
+/**
+ * 当前打开的会话 id。空串 = 尚未选中任何历史会话（"新会话"态）。
+ *
+ * ⚠️ 改前初值是硬编码 `'s1'` —— 但那时**根本没有加载 s1 内容的代码**，
+ * 于是高亮指向 s1、右侧却显示欢迎语，两边从第一帧就不一致。现在初值空串，
+ * "没选会话"与"还没加载回来"都归到欢迎语，语义自洽（本批假设 1）。
+ */
+const activeSession = ref('')
+/** 会话消息加载中（防重复点击与竞态）。 */
+const sessionLoading = ref(false)
+
+/**
+ * 把后端 `ChatMessageItem` 映射为前端 `ChatMessage`。
+ *
+ * 字段逐字对齐 `ChatDtos.ChatMessageItem`
+ * （`id/role/content/createdAt/modelId/modelName/citations/attachments`）——
+ * 漏映射哪一个都会**静默丢**：`citations` 丢了角标不显示、`modelName` 丢了
+ * 归因那一行空掉，而页面照常渲染、不报错（正是本批要防的形状）。
+ */
+function toChatMessages(raw: unknown[]): ChatMessage[] {
+  return raw.map((r) => {
+    const m = r as {
+      id?: unknown; role?: unknown; content?: unknown; createdAt?: unknown
+      modelId?: unknown; modelName?: unknown; citations?: unknown
+    }
+    return {
+      id: String(m.id ?? ''),
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: typeof m.content === 'string' ? m.content : '',
+      createdAt: typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
+      modelId: typeof m.modelId === 'number' ? m.modelId : undefined,
+      modelName: typeof m.modelName === 'string' ? m.modelName : undefined,
+      citations: Array.isArray(m.citations) ? (m.citations as Citation[]) : undefined,
+    } satisfies ChatMessage
+  })
+}
+
+/**
+ * 打开一个历史会话：拉该会话的消息并回填右侧。
+ *
+ * <p>🔴 这就是本批修的 bug —— 改前模板的 `@click` 只写 `activeSession = s.id`，
+ * 高亮会变、`messages` 一动不动（`chatApi.messages` 从未被调用过）。
+ *
+ * <p>流式生成期间**禁止切换**（用户 2026-10-03 裁定）：生成中的答案还挂在
+ * `messages` 上，此刻替换整个数组会让它凭空消失。直接忽略点击并提示。
+ */
+async function openSession(s: ChatSessionItem) {
+  if (sending.value) {
+    ElMessage.warning('正在生成回答，请等本轮结束后再切换会话')
+    return
+  }
+  if (sessionLoading.value) return
+
+  activeSession.value = s.id
+  sessionLoading.value = true
+  try {
+    const { list } = await chatApi.messages(s.id)
+    const loaded = toChatMessages(list)
+    // 空会话（历史里一条消息都没有）→ 回落到欢迎语，而不是留一片空白
+    messages.value = loaded.length ? loaded : [{ ...WELCOME }]
+    await scrollToBottom()
+  } catch {
+    ElMessage.error('会话内容加载失败，请稍后重试')
+    // 失败**不**清空当前内容（比"白屏"更不容易让人以为数据没了）
+  } finally {
+    sessionLoading.value = false
+  }
+}
+
+/** 发送完成 / 失败后刷新左侧列表（标题、条数、时间）。改前只在进页面时拉一次。 */
+async function refreshSessions() {
+  try {
+    const { list } = await chatApi.sessions()
+    sessions.value = list
+  } catch {
+    // 列表刷新失败不清空既有列表（静默即可，别打断用户正在做的事）
+  }
+}
 
 onMounted(async () => {
   const [sessRes] = await Promise.all([chatApi.sessions(), loadModels()])
@@ -533,8 +614,8 @@ onMounted(async () => {
         v-for="s in sessions"
         :key="s.id"
         class="session-item"
-        :class="{ active: activeSession === s.id }"
-        @click="activeSession = s.id"
+        :class="{ active: activeSession === s.id, disabled: sending }"
+        @click="openSession(s)"
       >
         <div class="si-title">{{ s.title }}</div>
         <div class="si-meta">
@@ -828,6 +909,13 @@ onMounted(async () => {
 .session-item.active {
   background: var(--el-color-primary-light-9);
   border-left-color: var(--el-color-primary);
+}
+
+/* 流式生成期间禁止切换会话（用户 2026-10-03 裁定）：给出"不可点"的视觉，
+   与 `openSession()` 里的同一守卫配套 —— 光有守卫没有样式，用户会以为是自己点慢了。 */
+.session-item.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 .si-title {
   font-size: 13px;
