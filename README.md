@@ -103,7 +103,7 @@
 **前置**：JDK 25 · Maven 3.9+ · Node 22+ · Docker Desktop（Compose v2+）
 
 ```bash
-git clone <repo-url> ai-knowledge
+git clone https://gitee.com/shuogehaoshuai/kb_rag.git ai-knowledge
 cd ai-knowledge
 
 # ── ① 起基础设施（首次 Milvus 需要 1~2 分钟才 healthy，属正常）──────────
