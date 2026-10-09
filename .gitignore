@@ -24,6 +24,11 @@ temp/
 /AGENTS.md
 /.agents/
 
+# 2026-10-09 公开化：CLAUDE.md 与 .claude/ 已从版本库移除（历史一并清除）。
+# 它们含仓库内部约定与本机开发凭据汇总，只保留为**本地文件**，不再入库。
+/CLAUDE.md
+/.claude/
+
 # 本机 relay 排查脚本与代理抓包（scripts/claude-token-stats.py 等，全仓零引用）
 /scripts/
 
