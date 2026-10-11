@@ -94,3 +94,5 @@
 | `2026-10-03-S9-M14-D.md` | S9 · 阶段 M14-D（**`G9-6` 受控实验复核** —— 独立 Nginx 1.31.6 容器 + 非 `text/event-stream` 内容类型 + 「突发 256KB + 停顿 3s」场景，三组对照 `proxy_buffering on/off` **行为完全一致** ⇒ **坐实本机无区分度**，排除实验设计漏洞；⇒ 需上线环境复验） | ✅ 已完成 | 2026-10-03 |
 | `2026-10-03-关SQL日志刷屏.md` | 结项后配置小批（**关闭 `spring.jpa.show-sql`** —— 止住 `ParseWorker` 每秒轮询 `sys_async_task` 的 SQL 日志刷屏；`application.yml` 改默认 `false` + 留 `SPRING_JPA_SHOW_SQL` 环境变量开关 · `logback-spring.xml` 注释同步。🔴 **风险核实**：`DataScopeSqlEvidenceTest`/`KbModuleFlowTest` 抓 SQL 靠**自设 `Level.DEBUG`**、**不依赖 `show-sql`** ⇒ 定向 13/13 实证不受影响） | ✅ 已完成 | 2026-10-03 |
 | `2026-10-03-chat会话切换不换内容.md` | 结项后缺陷修复（**问答页「切换会话内容不变」** —— 根因：`ChatView.vue:537` 点击只改高亮 `activeSession`、**从不加载消息**；`chatApi.messages` 全仓零调用。**修法**：新增 `openSession()` 拉消息回填 + 发送后刷新列表 + 流式中禁止切换。🆕 `scripts/session-switch-check.mjs` **5/5**） | ✅ 已完成 | 2026-10-03 |
+
+| `2026-10-11-问答入口令牌桶限流.md` | 结项后加固小批（**问答入口令牌桶限流 20 QPS（可配）** —— 用户在 `AsyncConfig` 虚拟线程执行器处提出的过载保护。**全局**桶 · **yml 可配** `app.chat.rate-limit.qps` · 放 **`ChatController` 提交前**（才能干净返回 429）· **引入 Guava** `RateLimiter`。无 `T-xxx`） | 🟡 进行中 | — |
