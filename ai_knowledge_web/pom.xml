@@ -224,6 +224,24 @@
             <version>5.8.38</version>
         </dependency>
 
+        <!--
+          Guava：问答入口的**令牌桶限流**（`ChatController` 提交前，全局 20 QPS 可配）。
+
+          为什么引它：问答执行器（`chatVirtualExecutor`，`T-D07`）是**无界虚拟线程**，
+          没有过载保护；本批在入口加令牌桶。Guava 的 `RateLimiter` 是成熟的令牌桶实现，
+          API 极简（`create(qps)` + `tryAcquire()`），省掉手写并发正确性。
+
+          ⚠️ 为什么钉版本：Spring Boot 4.0.0 的 BOM **不管理** `com.google.guava:guava`
+          （它只管 `com.github.ben-manes.caffeine:guava`，那是别的坐标）。
+          不写版本会解析失败 ⇒ 显式钉 33.4.0-jre（JDK 25 实测可用）。
+          ⚠️ 本仓虽已引 Hutool，但 `hutool-all:5.8.38` **没有** RateLimiter 类（`jar tf` 零命中），替代不了。
+        -->
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>33.4.0-jre</version>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

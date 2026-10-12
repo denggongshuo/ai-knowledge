@@ -229,7 +229,9 @@ public class AsyncConfig {
      *
      * <h3>为什么另起一个，而不是把 {@link #chatExecutor()} 换掉</h3>
      * <p>换掉会让"队列满 ⇒ 当场拒绝"那条既有行为消失（见 {@link #chatExecutor()} 的注释）。
-     * 虚拟线程执行器**没有队列上限**，不存在"拒绝"这条路径 —— 但它的代价是过载不再被挡在入口。
+     * 虚拟线程执行器**没有队列上限**，不存在"拒绝"这条路径 —— 那个缺口由
+     * {@link com.knowledge.ai.core.async.ChatRateLimiter} 在**入口**补上
+     * （`ChatController#completions` 提交前取令牌，取不到就 429）；
      * 本批按用户指定的技术方案（`SseEmitter` → `Flux` + 虚拟线程）落地，
      * 保留旧 bean 让"出事了退回旧执行器"是一次改名的距离。
      *

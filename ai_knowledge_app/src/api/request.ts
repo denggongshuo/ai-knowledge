@@ -239,6 +239,26 @@ export interface ChatStreamOptions {
 }
 
 /**
+ * 非 2xx 的响应体 → 可展示文案。
+ *
+ * <p>🔴 **必须读体，不能只看状态码**：本仓的业务失败一律「HTTP 200 + 非 0 code」，
+ * 而**非 200 的那几个恰恰是入口层语义**（401 认证 / 403 权限 / 429 入口限流），
+ * 它们的 `message` 是后端按 `G4-3` 写好的「现象 + 下一步动作」。
+ * 只报「连接失败（429）」等于把一个用户看不懂的状态码糊到他脸上 ——
+ * 而入口限流那条最要紧的正是那句「请稍后重新发送」（用户此刻的直觉动作是**立刻重发**，
+ * 那恰好是限流最不想要的）。
+ */
+async function errorMessageOf(resp: Response): Promise<string> {
+  try {
+    const body = (await resp.json()) as { message?: string } | null
+    if (body?.message) return body.message
+  } catch {
+    // 不是 JSON（网关错误页 / 空体）—— 落到下面的兜底
+  }
+  return `连接失败（${resp.status}）`
+}
+
+/**
  * SSE 流式问答（chat completions）
  * fetch 流式读取 text/event-stream，按事件分发
  * 路径与《10-接口约定汇总》§9 一致：POST /api/chat/completions
@@ -261,7 +281,7 @@ export async function chatStream(message: string, handlers: SSEHandlers, options
     body: JSON.stringify(body),
   })
   if (!resp.ok || !resp.body) {
-    handlers.onError?.(`连接失败（${resp.status}）`)
+    handlers.onError?.(await errorMessageOf(resp))
     return
   }
 

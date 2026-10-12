@@ -1,9 +1,12 @@
 package com.knowledge.ai.controller;
 
 import com.knowledge.ai.config.AsyncConfig;
+import com.knowledge.ai.core.async.ChatRateLimiter;
 import com.knowledge.ai.core.audit.AuditLog;
 import com.knowledge.ai.core.audit.AuditModule;
 import com.knowledge.ai.core.audit.RiskLevel;
+import com.knowledge.ai.core.exception.BizException;
+import com.knowledge.ai.core.exception.ErrorCode;
 import com.knowledge.ai.core.model.ApiResponse;
 import com.knowledge.ai.core.security.LoginUser;
 import com.knowledge.ai.core.security.LoginUserContext;
@@ -87,6 +90,13 @@ public class ChatController {
     private final ObjectMapper objectMapper;
 
     /**
+     * 问答入口的全局令牌桶（`app.chat.rate-limit.qps`）。
+     *
+     * <p>它保护的是上面那个**无界**的虚拟线程执行器：没有它，过载会一路打到模型供应商。
+     */
+    private final ChatRateLimiter chatRateLimiter;
+
+    /**
      * 显式构造器（**不用 `@RequiredArgsConstructor`**）：上面那个执行器有 3 个同类型的
      * Bean，必须靠 {@code @Qualifier} 点名叫 {@link AsyncConfig#CHAT_EXECUTOR}。
      * 与 {@code AsyncTaskService} / {@code HybridRetriever} 两处的既有做法一致 ——
@@ -98,13 +108,15 @@ public class ChatController {
                           ChatAttachmentService chatAttachmentService,
                           ChatFeedbackService chatFeedbackService,
                           @Qualifier(AsyncConfig.CHAT_VIRTUAL_EXECUTOR) Executor chatVirtualExecutor,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper,
+                          ChatRateLimiter chatRateLimiter) {
         this.chatStreamService = chatStreamService;
         this.chatSessionService = chatSessionService;
         this.chatAttachmentService = chatAttachmentService;
         this.chatFeedbackService = chatFeedbackService;
         this.chatVirtualExecutor = chatVirtualExecutor;
         this.objectMapper = objectMapper;
+        this.chatRateLimiter = chatRateLimiter;
     }
 
     /**
@@ -141,10 +153,25 @@ public class ChatController {
      * 这是 `S6-M05-C` 那条 P0 的同一纪律，换成 Flux 后重新实现了一遍。
      *
      * <p>跨线程的身份与 traceId 由 {@link AsyncConfig#CHAT_VIRTUAL_EXECUTOR} 的包装搬运。
+     *
+     * <h3>入口限流（2026-10-12）</h3>
+     * <p>提交前先过全局令牌桶（{@link ChatRateLimiter}，`app.chat.rate-limit.qps`），
+     * 取不到令牌就抛 {@code CHAT_RATE_LIMITED} → **HTTP 429**。⚠️ 位置有两层讲究：
+     * <ul>
+     *   <li><b>必须在"提交到执行器"之前</b>：执行器是无界的，放进去就等于放行了；</li>
+     *   <li><b>也必须在"返回 Flux"之前</b>：本方法产的是 SSE，响应头一旦发出就再也写不了
+     *       JSON 错误体（连"200 带非 0 code"那条退路也没有）。只有在这里同步抛出，
+     *       {@code GlobalExceptionHandler} 才来得及把 429 作为普通响应写回去。</li>
+     * </ul>
      */
     @PostMapping(value = "/completions", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<ServerSentEvent<String>> completions(@RequestBody ChatDtos.ChatRequest request) {
         LoginUser user = LoginUserContext.require();
+        // 限流在鉴权之后：未登录的请求该拿 401，不该先消耗一个令牌（否则一个未登录的
+        // 刷子能把全站令牌吃光，而它连一次问答都不会发起）。
+        if (!chatRateLimiter.tryAcquire()) {
+            throw BizException.of(ErrorCode.CHAT_RATE_LIMITED);
+        }
         // 单播 + 缓冲：只有一个订阅者（容器），且快产慢出时把事件排队而不是丢
         Sinks.Many<ServerSentEvent<String>> sink = Sinks.many().unicast().onBackpressureBuffer();
         ReactiveSink chatSink = new ReactiveSink(sink, objectMapper);
