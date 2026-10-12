@@ -17,7 +17,7 @@ import {
 import { sysApi } from '@/api'
 // ⚠️ `Right` / `VlImpact` 两个 import 已随「更换嵌入模型」与 VL 影响量那两块一起删
 // （本版本不支持换嵌入 / 重建含图文档，页面上不再有它们的元素）
-import type { ModelConfigItem, ModelConfigResponse, ModelType, ModelUsage } from '@/types'
+import type { ModelConfigItem, ModelConfigResponse, ModelConfigSavePayload, ModelType, ModelUsage } from '@/types'
 
 // ---------------- 四类模型数据 ----------------
 const loading = ref(false)
@@ -171,15 +171,30 @@ async function removeModel(m: ModelConfigItem) {
 const editDialog = ref(false)
 const editMode = ref<'create' | 'edit'>('create')
 const saving = ref(false)
+/**
+ * 是否正在「更换」API Key。
+ *
+ * 默认只显示服务端现算的**掩码**（`sk-••••3f9a`），点「更换」才露出输入框 ——
+ * 与《09》§1.5「加密存储，保存后不再明文回显（带「更换」按钮）」的形态一致。
+ */
+const keyEditing = ref(false)
+
+/** 取消「更换」：清掉刚填的 key，回到掩码展示（留空 = 不修改）。 */
+function cancelKeyEdit() {
+  editForm.apiKey = ''
+  keyEditing.value = false
+}
 const editForm = reactive({
   id: 0,
   modelType: 'CHAT' as ModelType,
   displayName: '',
   protocol: 'OpenAI 兼容',
   baseUrl: '',
-  // ⚠️ 没有 `apiKey` / `keyChanged`：本批密钥**不落库**，表单不收也不发它，
-  // 只读展示服务端现算的掩码（见弹窗里 API Key 字段的注释）
+  // ⚠️ `apiKeyMasked` 是**只读展示**（服务端现算的脱敏串），`apiKey` 才是管理员新填的那把。
+  // `apiKey` 只在「更换」后才填，**留空 = 不修改**（不传就不会动库里已加密的密钥）。
+  // 密钥加密落库（2026-10-11）：明文只在这一程的请求体里出现，服务端加密后才存。
   apiKeyMasked: '',
+  apiKey: '',
   modelName: '',
   stream: true,
   vision: false,
@@ -205,6 +220,7 @@ function openCreate(type: ModelType) {
     protocol: 'OpenAI 兼容',
     baseUrl: '',
     apiKeyMasked: '',
+    apiKey: '',
     modelName: '',
     stream: type !== 'EMBEDDING' && type !== 'RERANK',
     vision: type === 'VL',
@@ -220,6 +236,7 @@ function openCreate(type: ModelType) {
     perCallPrice: null,
     note: '',
   })
+  keyEditing.value = false
   editDialog.value = true
 }
 
@@ -232,6 +249,8 @@ function openEdit(m: ModelConfigItem) {
     protocol: m.protocol,
     baseUrl: m.baseUrl,
     apiKeyMasked: m.apiKeyMasked,
+    // 一律留空：留空 = 不修改。填进来的才是"换 key"
+    apiKey: '',
     modelName: m.modelName,
     stream: m.capabilities.stream,
     vision: m.capabilities.vision,
@@ -247,6 +266,7 @@ function openEdit(m: ModelConfigItem) {
     perCallPrice: m.perCallPrice,
     note: m.note ?? '',
   })
+  keyEditing.value = false
   editDialog.value = true
 }
 
@@ -260,7 +280,7 @@ async function saveModel() {
   }
   saving.value = true
   try {
-    const payload: Partial<ModelConfigItem> & { modelType: ModelType } = {
+    const payload: ModelConfigSavePayload = {
       modelType: editForm.modelType,
       displayName: editForm.displayName,
       protocol: editForm.protocol,
@@ -283,6 +303,9 @@ async function saveModel() {
       outputPrice: editForm.billingUnit === 'PER_TOKEN' ? editForm.outputPrice : null,
       perCallPrice: editForm.billingUnit === 'PER_CALL' ? editForm.perCallPrice : null,
       note: editForm.note,
+      // 留空 = 不修改（后端按"空/不传即不动"处理）。只有真填了才把明文带上去，
+      // 服务端加密后才落库，响应里回的是掩码。
+      apiKey: editForm.apiKey.trim() || undefined,
     }
     if (editMode.value === 'create') {
       await sysApi.createModel(payload)
@@ -843,18 +866,28 @@ onMounted(async () => {
           <label>API Key</label>
           <div class="api-key-row">
             <!--
-              ⚠️ 本字段**只读**（S6-M09-A，用户 2026-09-18 裁定）。
-              密钥不落库，它始终来自运行环境的 `.env`（`CHAT_API_KEY` / `EMBEDDED_API_KEY` /
-              `RERANKER_API_KEY` / `VL_API_KEY`，按模型的类型取）。这里显示的是读取时从
-              环境变量**现算**的掩码 —— 不是库里的快照，所以换了 key 它立刻跟着变。
-              不提供「更换」入口是有意的：仓里没有通用加解密工具，做加密落库要连带解决
-              密钥轮换与历史密文兼容，而密钥最终还是放在 `.env` 里，安全性并未提高。
+              ⚠️ 密钥**加密落库**（2026-10-11 起）。此前（`S6-M09-A`，用户 2026-09-18 裁定）
+              它不落库、只从 `.env` 按类型取，页面是只读掩码 —— 那条裁定的原因是当时仓里
+              没有通用加解密工具，现在有了（`core/security/ModelKeyCipher`，AES-256-GCM）。
+              形态按《09》§1.5：默认只显示掩码，点「更换」才录入。
+              ⚠️ 这里显示的是**服务端现算的掩码**，不是明文；明文只在这一程的请求体里出现。
             -->
-            <el-input :model-value="editForm.apiKeyMasked || '未配置'" class="mono" disabled />
+            <el-input
+              v-if="keyEditing"
+              v-model="editForm.apiKey"
+              class="mono"
+              type="password"
+              show-password
+              :placeholder="editForm.apiKeyMasked ? `${editForm.apiKeyMasked}（留空 = 不修改）` : '请输入 API Key'"
+            />
+            <el-input v-else :model-value="editForm.apiKeyMasked || '未配置'" class="mono" disabled />
+            <el-button v-if="!keyEditing" size="small" @click="keyEditing = true">更换</el-button>
+            <el-button v-else size="small" @click="cancelKeyEdit">取消</el-button>
           </div>
           <div class="hint">
-            密钥由运维在服务端 <code>.env</code> 中配置（按模型类型取，如 <code>CHAT_API_KEY</code>），
-            本页面只读展示掩码、不接受录入
+            密钥由服务端<b>加密存储</b>（AES-256-GCM），保存后<b>不回显明文</b>，只展示掩码。
+            <template v-if="keyEditing">留空 = 不修改（保留原密钥）。</template>
+            改了 Base URL / API Key / 模型名后，原连接测试结论会失效，需<b>重新测试通过</b>才能启用（《09》§1.6）。
           </div>
         </div>
 

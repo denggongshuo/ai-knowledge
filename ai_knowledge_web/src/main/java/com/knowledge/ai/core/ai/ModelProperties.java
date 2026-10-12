@@ -2,6 +2,7 @@ package com.knowledge.ai.core.ai;
 
 import com.knowledge.ai.core.enums.ModelType;
 import lombok.Data;
+import lombok.ToString;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -53,6 +54,25 @@ public class ModelProperties {
 
     /** 对话温度。0.7 是问答场景的既有取值。 */
     private double chatTemperature = 0.7;
+
+    /**
+     * 模型 API Key **落库加密**的主密钥（{@code app.model.key-secret} ← {@code .env} 的
+     * {@code MODEL_KEY_SECRET}），由 {@link com.knowledge.ai.core.security.ModelKeyCipher} 消费。
+     *
+     * <p><b>为什么不复用 {@code JWT_SECRET}</b>：轮换 JWT 密钥是常见运维动作（它本来就是
+     * "让旧令牌全部失效"），而复用它会让**库里所有已加密的 API Key 同时解不开** ——
+     * 一个鉴权侧的动作不该顺手弄坏模型配置。两者解耦，各自轮换互不牵连。
+     *
+     * <p><b>为什么给空默认值</b>：见 `application.yml` 该行注释 —— 缺它时应用仍完全可用
+     * （密钥回退 `.env`），只是"在页面上保存 Key"被明确拒绝。缺就启动失败会把一次
+     * 与业务无关的配置遗漏放大成"系统起不来"。
+     *
+     * <p>⚠️ {@link ToString.Exclude} 不是装饰：本类是 {@code @Data}，不排除的话
+     * {@code toString()} 会把主密钥打出来（顺带说一句，{@link Endpoint} 里的 {@code apiKey}
+     * 同样有这个隐患，所以本类的实例**一律不要整对象进日志**）。
+     */
+    @ToString.Exclude
+    private String keySecret;
 
     /**
      * 按类型取端点。

@@ -396,6 +396,21 @@ export interface ModelConfigItem {
   note?: string
 }
 
+/**
+ * 新增 / 编辑模型的**请求体**（`POST` / `PUT /system/model/config`）。
+ *
+ * ⚠️ `apiKey` **只在请求体里存在**，不在 `ModelConfigItem` 上 —— 响应侧永远只有
+ * `apiKeyMasked`（掩码串）。密钥加密落库后不会回显明文，这是需求 §1.5 / §1.16 的验收项。
+ *
+ * 语义：**不传 / 空串 = 不改动**（表单上写「留空即不修改」）。只在管理员真的要换 key 时才带上，
+ * 否则每次改备注都会把密钥冲掉。
+ */
+export type ModelConfigSavePayload = Partial<ModelConfigItem> & {
+  modelType?: ModelType
+  /** 明文 API Key。服务端加密后落库；不传表示保留原密钥 */
+  apiKey?: string
+}
+
 /** 模型配置页统计卡 */
 export interface ModelStats {
   chatCount: number

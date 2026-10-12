@@ -7,11 +7,11 @@ import com.knowledge.ai.core.ai.ModelClientRegistry;
 import com.knowledge.ai.core.ai.ModelConfigDefaults;
 import com.knowledge.ai.core.ai.ModelConfigJson;
 import com.knowledge.ai.core.ai.ModelConfigSpec;
-import com.knowledge.ai.core.ai.ModelProperties;
 import com.knowledge.ai.core.enums.BillingUnit;
 import com.knowledge.ai.core.enums.ModelType;
 import com.knowledge.ai.core.exception.BizException;
 import com.knowledge.ai.core.exception.ErrorCode;
+import com.knowledge.ai.core.security.ModelKeyCipher;
 import com.knowledge.ai.dto.system.ModelConfigDtos;
 import com.knowledge.ai.entity.SysModelConfig;
 import com.knowledge.ai.entity.SysModelUsage;
@@ -47,8 +47,8 @@ import java.util.Map;
  * <h3>三条需求硬规则（都在《09》§1.6）</h3>
  * <ul>
  *   <li><b>必须先连接测试通过才能启用</b>（`G6-3`）—— {@link #activate} 的第一道闸；</li>
- *   <li><b>编辑后需重新测试</b> —— 改了 Base URL / 模型名就把 {@code last_test_ok} 归零，
- *       否则"改完还能启用"会让启用门槛形同虚设；</li>
+ *   <li><b>编辑后需重新测试</b> —— 改了 Base URL / **API Key** / 模型名就把 {@code last_test_ok}
+ *       归零，否则"改完还能启用"会让启用门槛形同虚设；</li>
  *   <li><b>当前启用的不可删除</b> —— 删掉它会让该类当场没有可用模型。</li>
  * </ul>
  *
@@ -73,7 +73,8 @@ public class ModelConfigService {
 
     private final ModelClientRegistry registry;
 
-    private final ModelProperties modelProperties;
+    /** 密钥加密落库（2026-10-11）。见 {@link #apiKeyMasked} 与 `applyEditable`。 */
+    private final ModelKeyCipher modelKeyCipher;
 
     /** `T-905` 的用量落点。见 {@link #usage()}。 */
     private final SysModelUsageRepository usageRepository;
@@ -456,12 +457,14 @@ public class ModelConfigService {
                             + "）；如需换类型，请新建成另一条");
         }
 
-        boolean testInvalidated = request.baseUrl() != null || request.modelName() != null;
+        boolean keyProvided = request.apiKey() != null && !request.apiKey().isBlank();
+        boolean testInvalidated = request.baseUrl() != null || request.modelName() != null || keyProvided;
         applyEditable(row, request);
         row.setUpdatedAt(LocalDateTime.now());
         if (testInvalidated) {
-            // 《09》§1.6「编辑后需重新测试」：改了端点或模型名，原测试结论不再说明任何事。
-            // ⚠️ 连 `last_test_at` 一起清 —— 只把 ok 置 false 会留下
+            // 《09》§1.6「编辑后需重新测试」：改了端点 / 模型名 / API Key，原测试结论不再说明任何事。
+            // ⚠️ API Key 也在这条里：拿旧 key 测出来的"通过"，对新 key 一个字节都不作数。
+            // 连 `last_test_at` 一起清 —— 只把 ok 置 false 会留下
             // "测过（有时间的）但没通过"的假象，而真相是"那次测试测的是旧配置"
             row.setLastTestOk(false);
             row.setLastTestAt(null);
@@ -620,7 +623,7 @@ public class ModelConfigService {
                 row.getDisplayName(),
                 row.getProtocol(),
                 row.getBaseUrl(),
-                apiKeyMasked(row.getModelType()),
+                apiKeyMasked(configSource.plaintextKeyOf(row)),
                 row.getModelName(),
                 row.getDimension(),
                 row.getNorm(),
@@ -643,20 +646,18 @@ public class ModelConfigService {
     }
 
     /**
-     * 该类型的密钥掩码。
+     * 密钥掩码（只露头 3 位与尾 4 位，如 {@code sk-••••••••••••3f9a}）。
      *
-     * <p>⚠️ **读取时现算**，不落库：密钥在 `.env` 里，落一列掩码快照意味着
-     * "换了 key 而掩码没变" —— 界面上显示的是一个已经不存在的 key 的尾巴。
+     * <p>⚠️ 入参是**明文密钥**，且只能来自 {@link DbModelConfigSource#plaintextKeyOf(SysModelConfig)}
+     * —— 那是全系统唯一的密钥解析点。掩码与实际调用共用它，才不会出现
+     * 「页面显示的是一把 key、真正发出去的是另一把」那种**看不见的失效**。
      *
      * <p>没有密钥时返回空串（前端按"未配置"渲染），而不是 {@code "sk-****"} 这种假掩码。
      */
-    private String apiKeyMasked(ModelType type) {
-        ModelProperties.Endpoint endpoint = modelProperties.endpointOf(type);
-        String key = endpoint == null ? null : endpoint.getApiKey();
+    private static String apiKeyMasked(String key) {
         if (key == null || key.isBlank()) {
             return "";
         }
-        // 只露头 3 位与尾 4 位（《09》§1.5 的示例是 `sk-••••••3f9a`）；
         // 太短的 key 一律全掩 —— 否则"掩码"本身就把整个 key 泄出去了
         if (key.length() <= 10) {
             return "••••••";
@@ -754,6 +755,12 @@ public class ModelConfigService {
         }
         if (request.note() != null) {
             row.setNote(request.note());
+        }
+        // API Key：**空 / 不传 = 不改动**（前端表单写的「留空即不修改」）。
+        // 若在每次编辑其它字段时顺手把密钥写回，管理员改个备注就会把 key 冲掉。
+        // 明文只在这里出现一瞬，立刻加密；落库的是 ModelKeyCipher 产出的密文。
+        if (request.apiKey() != null && !request.apiKey().isBlank()) {
+            row.setApiKeyCipher(modelKeyCipher.encrypt(request.apiKey().trim()));
         }
     }
 

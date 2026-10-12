@@ -1,6 +1,7 @@
 package com.knowledge.ai.core.ai;
 
 import com.knowledge.ai.core.enums.ModelType;
+import com.knowledge.ai.core.security.ModelKeyCipher;
 import com.knowledge.ai.entity.SysModelConfig;
 import com.knowledge.ai.repository.SysModelConfigRepository;
 import lombok.RequiredArgsConstructor;
@@ -11,6 +12,7 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * {@link ModelConfigSource} 的 **DB 实现**（`T-900`~`T-903`）—— 模型口径的真正来源。
@@ -33,14 +35,20 @@ import java.util.List;
  * **会被提前求值而把 Bean 整个跳过**（启动报 {@code No qualifying bean of type 'ModelConfigSource'}）。
  * 本批顺手订正了那句 javadoc，此处按实测结论用 {@code @Primary}。
  *
- * <h3>密钥仍然来自 `.env`（用户 2026-09-18 裁定）</h3>
- * <p>{@code api_key_cipher} 本批**恒为 {@code null}**（仓里没有通用加解密工具，也不打算为此引一个），
- * 所以密钥按**类型**从 {@code ModelProperties} 取。这与 `V1` 列注释写的
- * 「{@code NULL} = 用环境变量同名配置」是同一条语义。
+ * <h3>密钥从哪来（2026-10-11 起变了）</h3>
+ * <p>`S6-M09-A` 期间 {@code api_key_cipher} **恒为 {@code null}**，密钥一律按**类型**从
+ * {@code ModelProperties}（← `.env`）取。代价记在该计划 §9-9：新增一条指向别家供应商的模型时
+ * 密钥**无处可取**，只能借用同类型在 `.env` 的那一把。
  *
- * <p>⚠️ 已知边界：在页面上**新增一条指向别家供应商的模型**时，它的密钥**无处可取** ——
- * 只能借用同类型在 `.env` 里的那一把。本地部署（不需要 key）不受影响。
- * 这条限制登记在 `S6-M09-A` §9。
+ * <p>现在密钥**随行落库**（配置页录入 → {@link com.knowledge.ai.core.security.ModelKeyCipher}
+ * 加密成 {@code api_key_cipher}），取用时解密。优先级由 {@link #plaintextKeyOf} **一处**决定：
+ * <pre>
+ *   api_key_cipher 非空 且 能解密  → 用解密后的明文（在别家供应商的模型从此有救）
+ *   其余一切情况                  → 回退 .env 的同名配置（= V1 列注释写的「NULL = 用环境变量同名配置」）
+ * </pre>
+ * ⚠️ **这一处必须是唯一入口**：掩码（配置页显示）与实际调用如果各走一条路，
+ * 一旦密文解不开就会出现「页面显示的是一把 key、实际发出去的是另一把」——
+ * 与「页面显示已切换、实际仍打旧端点」同族的**看不见的失效**。
  */
 @Slf4j
 @Primary
@@ -51,6 +59,8 @@ public class DbModelConfigSource implements ModelConfigSource {
     private final SysModelConfigRepository repository;
 
     private final ModelProperties modelProperties;
+
+    private final ModelKeyCipher modelKeyCipher;
 
     /**
      * 某类型**当前启用**的那一条。
@@ -75,11 +85,11 @@ public class DbModelConfigSource implements ModelConfigSource {
             log.error("模型配置出现同类型双启用（唯一索引应已挡住）：type={} ids={} —— 取第一条，请人工核对",
                     type, active.stream().map(SysModelConfig::getId).toList());
         }
-        return List.of(toSpec(active.getFirst(), apiKeyOf(type)));
+        return List.of(toSpec(active.getFirst()));
     }
 
     /**
-     * **行 → spec**（含按类型取 `.env` 密钥）。
+     * **行 → spec**（含密钥解析，见 {@link #plaintextKeyOf}）。
      *
      * <p>公开是因为它还有第二个调用方：`T-903` 的连接测试要能对**未启用**的行
      * 也造一个客户端（"先测通过才能启用"——测的时候它还没启用）。
@@ -87,7 +97,30 @@ public class DbModelConfigSource implements ModelConfigSource {
      * 而那种漂移的表现是**测通了却调不通**。
      */
     public ModelConfigSpec specOf(SysModelConfig row) {
-        return toSpec(row, apiKeyOf(row.getModelType()));
+        return toSpec(row);
+    }
+
+    /**
+     * 一条配置**实际生效**的密钥明文 —— 全系统唯一的密钥解析点。
+     *
+     * <p>两个调用方：{@link #toSpec}（喂给客户端构造 ⇒ 真正发出去的那把）与
+     * `ModelConfigService#toItem`（算配置页上的掩码）。两者共用本方法，掩码才不会撒谎。
+     *
+     * <p>回退链见类注释。解密失败**不抛**、只记 ERROR：宁可让这条路继续用 `.env` 的旧密钥活着，
+     * 也不要因为一行密文读不出来就让整条问答链路报错 —— 但**绝不把密文当明文交出去**。
+     */
+    public String plaintextKeyOf(SysModelConfig row) {
+        String cipherText = row.getApiKeyCipher();
+        if (cipherText != null && !cipherText.isBlank()) {
+            Optional<String> plain = modelKeyCipher.decrypt(cipherText);
+            if (plain.isPresent() && !plain.get().isBlank()) {
+                return plain.get();
+            }
+            // ⚠️ 只报 id / type，不带密文本身（日志也是泄漏面）
+            log.error("模型配置 id={} 的 api_key_cipher 解密失败（主密钥可能已轮换），"
+                    + "本条回退到 .env 的同类密钥：type={}", row.getId(), row.getModelType());
+        }
+        return apiKeyOf(row.getModelType());
     }
 
     @Override
@@ -99,7 +132,7 @@ public class DbModelConfigSource implements ModelConfigSource {
     // 行 → spec
     // ==================================================================
 
-    private ModelConfigSpec toSpec(SysModelConfig row, String apiKey) {
+    private ModelConfigSpec toSpec(SysModelConfig row) {
         return new ModelConfigSpec(
                 // ⚠️ 这里是**数字字符串**（自增主键），而不是引导配置的 `bootstrap-chat`。
                 // 下游 `RegistryStreamingChatCaller#numericId` 因此能解析出数字 ⇒
@@ -108,7 +141,7 @@ public class DbModelConfigSource implements ModelConfigSource {
                 String.valueOf(row.getId()),
                 row.getModelType(),
                 row.getBaseUrl(),
-                apiKey,
+                plaintextKeyOf(row),
                 row.getModelName(),
                 // `version` 是**热更新的命门**：注册中心的缓存 key 是 `type|id|version`，
                 // 版本不随配置变 ⇒ 缓存 key 不变 ⇒ 页面上显示"已切换"而实际仍打旧端点。
@@ -126,7 +159,10 @@ public class DbModelConfigSource implements ModelConfigSource {
     }
 
     /**
-     * 按**类型**取环境变量里的密钥。
+     * 按**类型**取环境变量里的密钥 —— {@link #plaintextKeyOf} 的**回退分支**。
+     *
+     * <p>什么时候走到这里：① 该行的 {@code api_key_cipher} 为空（种子行、或管理员没在页面上填过）；
+     * ② 密文存在但解不开（主密钥轮换 / 密文被改）。
      *
      * <p>⚠️ 与 {@code BootstrapModelConfigSource} 有一处**刻意的不同**：
      * 那边"端点不全就不给出这条配置"，这边**不跳过**。

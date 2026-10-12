@@ -55,8 +55,9 @@ public final class ModelConfigDtos {
      * @param modelType     四类之一，**创建后不可修改**
      * @param protocol      接口协议，如「OpenAI 兼容」
      * @param apiKeyMasked  **脱敏后的 Key**，如 {@code sk-••••••••3f9a}。
-     *                      ⚠️ 本批密钥不落库（见 `S6-M09-A` §3.3），掩码由**读取时**从 `.env` 现算 ——
-     *                      不落一列快照：换了 key 而掩码没变就是撒谎
+     *                      ⚠️ 由**读取时现算**：先经 `DbModelConfigSource#plaintextKeyOf` 解析出
+     *                      明文（库里的密文 → 解密；没有密文 → `.env` 同名配置），再掩掉中间。
+     *                      不落一列掩码快照 —— 换了 key 而掩码没变就是撒谎
      * @param dimension     向量维度（仅 EMBEDDING）
      * @param metric        相似度度量（仅 EMBEDDING）
      * @param isActive      是否当前启用。同类型至多一条为真（库层唯一索引保证）
@@ -127,9 +128,23 @@ public final class ModelConfigDtos {
      * <p>{@code modelType} 在**新增**时必填且在**编辑**时不可改（《09》§1.5）。
      * 其余字段都可空 —— 编辑时前端只传改动的那些，服务层按"未传即不动"处理。
      *
-     * <p>⚠️ **请求体里没有 {@code apiKey}**：本批密钥不落库（`S6-M09-A` §3.3）。
-     * 前端表单上的 Key 输入框是只读掩码，文案指向运维改 `.env`。
-     * 将来真要做加密落库时，这个字段才加回来。
+     * <h3>{@code apiKey}：**只进得来、出不去**（2026-10-11 起）</h3>
+     * <p>{@code S6-M09-A` 期间这里没有 {@code apiKey}`（密钥不落库，见该计划 §3.3）。现在密钥
+     * **加密落库**（`ModelConfigService#applyEditable` → `ModelKeyCipher#encrypt` →
+     * {@code sys_model_config.api_key_cipher}），所以它加回来。
+     *
+     * <p>三条口径：
+     * <ul>
+     *   <li><b>空 / 不传 = 不改动</b>。前端表单「留空即不修改」，服务层据此不动那一列 ——
+     *       否则每次编辑别的字段都会把密钥冲掉；</li>
+     *   <li><b>它绝不回显</b>：响应侧是 {@link ModelConfigItem#apiKeyMasked}（掩码串）。
+     *       ⚠️ **不要**把 {@code apiKey} 加进 {@link ModelConfigItem} ——
+     *       `ModelConfigFlowTest#apiKeyNeverLeaks` 断言响应体里不出现这个字段名，
+     *       那条用例正是防这件事的哨兵；</li>
+     *   <li><b>本 record 不要整对象进日志</b>：record 的默认 {@code toString()} 含这个字段。</li>
+     * </ul>
+     *
+     * @param apiKey 明文 API Key。服务端加密后才落库，日志与响应里都不出现
      */
     public record SaveRequest(ModelType modelType,
                               String displayName,
@@ -148,7 +163,8 @@ public final class ModelConfigDtos {
                               BigDecimal perCallPrice,
                               String currency,
                               Integer sortOrder,
-                              String note) {
+                              String note,
+                              String apiKey) {
     }
 
     /** 新增结果（前端 {@code createModel} 的返回类型）。 */
@@ -177,9 +193,10 @@ public final class ModelConfigDtos {
      *
      * <h3>为什么它比 {@link ModelConfigItem} 少那么多字段</h3>
      * <p>因为它是**给普通用户看的**，而 {@code ModelConfigItem} 是给管理员看的。
-     * 需求 §1.14 对此的约束是「**不含密钥**」（本批连密钥都没落库，见 `#173`），
+     * 需求 §1.14 对此的约束是「**不含密钥**」，
      * 而更实际的一条是：问答页不需要知道 base URL、计费单价、批大小这些东西。
-     * 少发字段本身就是一种最小暴露面 —— 这与 `G6-5` 的"密钥不外泄"是同一条纪律的延伸。
+     * 少发字段本身就是一种最小暴露面 —— 这与 `G6-5` 的"密钥不外泄"是同一条纪律的延伸
+     * （密钥落库后**管理员侧也只回掩码**，这里连掩码都没有）。
      *
      * <p>⚠️ {@link #id} 是 {@code long}（前端类型 {@code number}），
      * 与 {@code ChatDtos} 里那些"字符串形式的 id"**不是一回事** ——

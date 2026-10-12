@@ -325,6 +325,94 @@ class ModelConfigFlowTest extends ApiTestSupport {
     }
 
     // ==================================================================
+    // API Key 加密落库（2026-10-11）
+    // ==================================================================
+
+    /**
+     * 本组验的三件事，每一件都对应一种**不会在编译期或启动期暴露**的坏结果：
+     * <ul>
+     *   <li>明文落了库 → 看一眼表就拿到密钥；</li>
+     *   <li>换 Key 不让人重测 → 行还是"测试通过"，启用后调用全挂；</li>
+     *   <li>编辑别的字段顺手把密钥冲掉 → 下一次调用突然 401。</li>
+     * </ul>
+     */
+    @Test
+    @DisplayName("密钥：落库的是密文（v1: 前缀 · 不含明文），响应只回掩码，且掩码来自解密后的明文")
+    void apiKeyIsEncryptedAtRest() {
+        String plain = "sk-test-" + java.util.UUID.randomUUID();
+        long id = createChatWithKey("带密钥的", plain);
+
+        String stored = apiKeyCipher(id);
+        assertThat(stored).as("落库的必须是密文，不是明文").isNotNull().isNotEqualTo(plain)
+                .startsWith("v1:").doesNotContain(plain);
+        assertThat(stored.length()).as("要装得进 VARCHAR(512)").isLessThanOrEqualTo(512);
+
+        var body = get("/api/system/model/config", token).assertOk("列表").body();
+        assertThat(body).as("明文绝不能出现在响应体里（§1.16 验收）").doesNotContain(plain);
+
+        // 🔴 断言掩码的头三位与尾四位 —— 掩码由**解密后的明文**算出（见 `toItem` →
+        // `DbModelConfigSource#plaintextKeyOf`），所以这一条同时证明了"服务端解得出这把 key"。
+        // 若把密文当明文喂给掩码函数，这里会是一串 base64 的头尾，当场红。
+        List<Map<String, Object>> chat = get("/api/system/model/config", token).assertOk("列表").data("$.chat");
+        String masked = chat.stream()
+                .filter(row -> row.get("id") != null && ((Number) row.get("id")).longValue() == id)
+                .map(row -> String.valueOf(row.get("apiKeyMasked")))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("新建的行应出现在 chat 列表里"));
+        assertThat(masked).as("只露头三位与尾四位").contains("•")
+                .startsWith(plain.substring(0, 3)).endsWith(plain.substring(plain.length() - 4));
+    }
+
+    @Test
+    @DisplayName("§1.6：改 API Key → 原测试结论失效（与改 BaseURL / 模型名同一条规则）")
+    void editingKeyInvalidatesTest() {
+        long id = createChatWithKey("要换密钥的", "sk-old-" + java.util.UUID.randomUUID());
+        forceTestOk(id);
+        assertThat(lastTestOk(id)).as("前置：先让它测过").isTrue();
+
+        var updated = put("/api/system/model/config/" + id,
+                Map.of("apiKey", "sk-new-" + java.util.UUID.randomUUID()), token).assertOk("换 Key");
+
+        assertThat((Boolean) updated.data("$.needRetest"))
+                .as("拿旧 key 测出来的「通过」，对新 key 一个字节都不作数").isTrue();
+        assertThat(lastTestOk(id)).isFalse();
+        assertThat(lastTestAt(id)).as("测试时间也要清，否则显示成「测过但没过」").isNull();
+    }
+
+    @Test
+    @DisplayName("留空 = 不修改：编辑别的字段不冲掉已存密钥；真填了才换掉")
+    void blankApiKeyKeepsStoredCipher() {
+        String plain = "sk-keep-" + java.util.UUID.randomUUID();
+        long id = createChatWithKey("保留密钥的", plain);
+        String before = apiKeyCipher(id);
+        assertThat(before).isNotNull();
+
+        put("/api/system/model/config/" + id, Map.of("note", "只改备注"), token).assertOk("改备注");
+        assertThat(apiKeyCipher(id)).as("不传 apiKey ⇒ 密钥原样保留（否则改个备注就把 key 冲了）")
+                .isEqualTo(before);
+
+        // 反过来：真填了要能换掉，且新密文与旧密文不同（随机 IV ⇒ 逐字不同）
+        put("/api/system/model/config/" + id,
+                Map.of("apiKey", "sk-rotated-" + java.util.UUID.randomUUID()), token).assertOk("换 Key");
+        assertThat(apiKeyCipher(id)).as("换 Key 后密文必须变").isNotEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("密文解不开时如实降级：接口不 500，回退 .env 密钥（只有 ERROR 日志）")
+    void undecryptableCipherDegradesInsteadOfFailing() {
+        long id = createChat("坏密文的");
+        jdbc.update("update sys_model_config set api_key_cipher = 'v1:bm90LXJlYWxseS1hLWNpcGhlcg==' "
+                + "where id = ?", id);
+
+        // 列表要能正常出（掩码退化成 .env 那把的掩码）
+        get("/api/system/model/config", token).assertOk("列表");
+        // 连接测试照常走（用回退的那把 key 真发一次请求）—— 成败都写回结论，但不许 500
+        var result = post("/api/system/model/config/" + id + "/test", null, token).assertOk("坏密文也能测");
+        assertThat((String) result.data("$.message")).as("G4-3：无论成败都要有可读结论").isNotBlank();
+        assertThat(lastTestOk(id)).isEqualTo((Boolean) result.data("$.ok"));
+    }
+
+    // ==================================================================
     // 审计 —— 四个写动作各留一条 HIGH
     // ==================================================================
 
@@ -384,6 +472,22 @@ class ModelConfigFlowTest extends ApiTestSupport {
     /** 直接把"测试通过"写到行上 —— 绕开真发请求，让启用门槛那几条判据与网络解耦。 */
     private void forceTestOk(long id) {
         jdbc.update("update sys_model_config set last_test_ok = 1, last_test_at = now() where id = ?", id);
+    }
+
+    /** 造一条**带 API Key** 的对话模型 —— 服务端会把它加密后落进 `api_key_cipher`。 */
+    private long createChatWithKey(String displayName, String apiKey) {
+        var created = post("/api/system/model/config",
+                Map.of("modelType", "CHAT", "displayName", displayName,
+                        "baseUrl", "https://example.test/v1", "modelName", "some-model",
+                        "apiKey", apiKey),
+                token).assertOk("新增 " + displayName);
+        return ((Number) created.data("$.id")).longValue();
+    }
+
+    /** 行上存的密钥密文（没配过则为 {@code null}）。 */
+    private String apiKeyCipher(long id) {
+        return jdbc.queryForObject(
+                "select api_key_cipher from sys_model_config where id = ?", String.class, id);
     }
 
     private boolean isActive(long id) {

@@ -1283,6 +1283,19 @@ function latencyOf(type: ModelType) {
   return type === 'CHAT' ? 420 : type === 'RERANK' ? 288 : type === 'VL' ? 1760 : 86
 }
 
+/**
+ * API Key 掩码 —— 与后端 `ModelConfigService#apiKeyMasked` 同形（前 3 位 + 后 4 位）。
+ *
+ * <p>真后端把明文加密落库、响应只回掩码；mock 没有加密这回事，所以这里**只保留掩码**：
+ * 请求体里的明文 `apiKey` 用完即弃，**绝不写回 item** —— 否则假数据里会躺着一把明文 key，
+ * 而"演示数据"是最容易被当成真的那种数据。
+ */
+function maskOfApiKey(key: unknown) {
+  if (typeof key !== 'string' || !key.trim()) return ''
+  const k = key.trim()
+  return k.length <= 10 ? '••••••' : k.slice(0, 3) + '••••••••••••' + k.slice(-4)
+}
+
 /** 当前启用的 VL 模型（供知识库配置页只读展示） */
 function activeVlModel() {
   const v = modelStore.vl.find((m) => m.isActive)
@@ -1316,7 +1329,7 @@ register('POST', '/api/system/model/config', async (req, res, ctx) => {
     displayName: String(body.displayName ?? '新模型'),
     protocol: String(body.protocol ?? 'OpenAI 兼容'),
     baseUrl: String(body.baseUrl ?? ''),
-    apiKeyMasked: 'sk-••••••••••••••••••••0000',
+    apiKeyMasked: maskOfApiKey(body.apiKey),
     modelName: String(body.modelName ?? ''),
     params: { temperature: 0.3, maxTokens: 2048, timeoutSec: 60, retries: 2 },
     capabilities: {
@@ -1347,7 +1360,12 @@ register('PUT', '/api/system/model/config/:id', async (req, res, ctx) => {
     json(res, 4040, null, '模型不存在')
     return
   }
-  Object.assign(item, ctx.body, { id: item.id, modelType: item.modelType })
+  const { apiKey, ...patch } = ctx.body as Record<string, unknown> & { apiKey?: unknown }
+  Object.assign(item, patch, { id: item.id, modelType: item.modelType })
+  // 明文 key 只用来现算掩码，**不写回 item**（真后端是加密落库，响应从来不回明文）
+  if (typeof apiKey === 'string' && apiKey.trim()) {
+    item.apiKeyMasked = maskOfApiKey(apiKey)
+  }
   // 改了 Base URL / Key / 模型名 → 原测试结论失效，必须重测才能再次启用
   item.lastTestOk = false
   json(res, 0, { id: item.id, saved: true, needRetest: true })

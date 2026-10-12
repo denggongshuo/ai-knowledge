@@ -21,19 +21,27 @@ import java.time.LocalDateTime;
  * <h3>这张表是「`.env` 唯一来源」时代的终结</h3>
  * <p>{@code S0`~`S5` 期间模型口径只有一处：{@code application.yml} 的 {@code app.model.*}
  * （← {@code .env}），由 {@code BootstrapModelConfigSource} 读。接上 DB 之后，
- * <b>DB 是"有哪些模型、用哪一条、参数与能力是什么"的真相源</b>，而 {@code .env}
- * 退化成**密钥来源**（见 {@link #apiKeyCipher}）。
+ * <b>DB 是"有哪些模型、用哪一条、参数与能力是什么"的真相源</b>，
+ * 而 {@code .env} 退化成**密钥的兜底来源**（见 {@link #apiKeyCipher}）。
  *
  * <p>⚠️ 这一条不是"锦上添花"：{@code ModelConfigSource} 换成 {@code @Primary} 的 DB 实现后，
  * 表空就等于**没有任何可用模型** ⇒ {@code ModelClientRegistry#activeSpec} 抛
  * {@code MODEL_NOT_CONFIGURED} ⇒ 问答 / 检索 / 解析全线不可用。
  * 所以 {@code ModelConfigSeeder} 与 DB 来源**必须同批合入**。
  *
- * <h3>{@link #apiKeyCipher} 当前恒为 {@code null}</h3>
- * <p>它是"加密后的 Key"，而仓里**没有任何通用加解密工具**，本批（用户 2026-09-18 裁定）
- * **不落 Key**：保持 {@code V1} 列注释定义的语义 —— {@code NULL} = 用环境变量同名配置。
- * 页面上的 Key 是只读掩码，掩码在**读取时从 `.env` 现算**
- * （刻意不落一列掩码快照：换了 key 而掩码没变就是撒谎）。
+ * <h3>{@link #apiKeyCipher}：2026-10-11 起真的会被写上东西</h3>
+ * <p>它存的是**加密后的 Key**（AES-256-GCM，见 {@code core/security/ModelKeyCipher}），
+ * 由配置页录入、服务端加密后落库；取用时在
+ * {@code DbModelConfigSource#plaintextKeyOf} 一处解密 —— 那是**唯一**的密钥解析点。
+ *
+ * <p>仍然保留 {@code V1} 列注释定义的兜底语义：{@code NULL} = 用环境变量同名配置。
+ * 于是有两类行天然走 `.env`：启动期种子落的四行（{@code ModelConfigSeeder} 写 `null`），
+ * 以及密文解不开的行（主密钥轮换 / 被人工改动）—— 后者会记 ERROR 并如实降级，
+ * **绝不把密文当明文交出去**。
+ *
+ * <p>页面上的 Key 是**只读掩码**，掩码同样由 `plaintextKeyOf` 现算
+ * （刻意不落一列掩码快照：换了 key 而掩码没变就是撒谎；而"掩码与实际调用各走一条路"
+ * 会出现"页面显示的是一把 key、真正发出去的是另一把"）。
  *
  * <h3>两个 JSON 列刻意是 {@code String}</h3>
  * <p>{@link #params} 与 {@link #capabilities} 存 JSON **串**，序列化 / 反序列化归 Service
@@ -81,9 +89,14 @@ public class SysModelConfig {
     private String baseUrl;
 
     /**
-     * 加密后的 API Key。<b>当前恒 {@code null}</b>（= 用环境变量同名配置）。
+     * 加密后的 API Key（AES-256-GCM，{@code "v1:" + Base64(IV‖密文‖tag)}）。
      *
-     * @see SysModelConfig 类注释「apiKeyCipher 当前恒为 null」
+     * <p>{@code null} / 空 = **用环境变量同名配置**（`V1` 列注释定义的语义；种子行恒为 null）；
+     * 解不开时也走这条回退，并记 ERROR。写入与解密都只在
+     * {@code ModelConfigService} 与 {@code DbModelConfigSource#plaintextKeyOf} 两处，
+     * 后者是全系统**唯一**的解析点。
+     *
+     * @see SysModelConfig 类注释「apiKeyCipher：2026-10-11 起真的会被写上东西」
      */
     @Column(name = "api_key_cipher", length = 512)
     private String apiKeyCipher;

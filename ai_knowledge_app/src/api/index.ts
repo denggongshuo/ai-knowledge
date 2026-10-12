@@ -1,5 +1,5 @@
 import { http, chatStream, type SSEHandlers } from './request'
-import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DocVersionDiff, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, RecycleType, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
+import type { ActiveUserStat, ApiResponse, AttachmentUploadResult, AuditLog, AuditLogDetail, ChatSessionItem, ChunkInfo, ChunkStat, DeptUsage, DocMeta, DocVersion, DocVersionDiff, DownloadRecord, DownloadTask, EmbeddingImpact, EmbeddingInfo, FeedbackStats, IndexTask, KbConfigForm, KbDocRow, KbHeat, KbQualityRanking, KnowledgeBase, MissQuestion, MissStatus, ModelConfigItem, ModelConfigResponse, ModelConfigSavePayload, ModelOption, ModelType, ModelUsage, NoticeCounts, NoticeItem, NoticeSetting, NoticeType, PageResult, ParentChunkRelation, ParseConfigView, ParseIssue, PendingItem, PermissionNode, QaOverview, RecycleItem, RecycleType, ReindexImpact, ReplayResult, RerankEffect, RetrievalOverview, RetrievalPipeline, RoleInfo, ScoreDistribution, SplitPresetDef, StorageQuota, TocItem, TopQuestion, TrendPoint, UsageOverview, UserInfo, VlImpact } from '@/types'
 
 /** 认证接口 */
 export const authApi = {
@@ -426,10 +426,10 @@ export const sysApi = {
   setGraphFeature: (enabled: boolean) =>
     http.put<{ enabled: boolean }>('/system/feature/graph', { enabled }),
   /** 新增一条（modelType 必填；EMBEDDING 不可新增）🚩 */
-  createModel: (body: Partial<ModelConfigItem> & { modelType: ModelType }) =>
+  createModel: (body: ModelConfigSavePayload) =>
     http.post<{ id: number; saved: boolean }>('/system/model/config', body),
   /** 编辑一条 🚩 */
-  updateModel: (id: number | string, body: Partial<ModelConfigItem>) =>
+  updateModel: (id: number | string, body: ModelConfigSavePayload) =>
     http.put<{ id: number; saved: boolean; needRetest: boolean }>(`/system/model/config/${id}`, body),
   /** 删除（当前启用不可删）🚩 */
   deleteModel: (id: number | string) => http.delete<{ id: number; deleted: boolean }>(`/system/model/config/${id}`),
