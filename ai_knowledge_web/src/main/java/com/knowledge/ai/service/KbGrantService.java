@@ -43,6 +43,9 @@ public class KbGrantService {
 
     private final DataScopeService dataScopeService;
 
+    /** 文档数**唯一**口径（2026-10-12）。授权页原来读 `sys_kb.doc_count` 那个示例常量。 */
+    private final KbCountReader kbCountReader;
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -57,11 +60,16 @@ public class KbGrantService {
         long safeSize = pageSize <= 0 ? 8 : Math.min(pageSize, 100);
         long safePage = page <= 0 ? 1 : page;
 
+        // 不选 doc_count：那一列是 V7 seed 的示例常量（全仓无人写），文档数一律现算，
+        // 与知识库列表 / 配额卡同一口径（见 KbCountReader）
         List<Object[]> kbs = entityManager.createNativeQuery(
-                        "select id, code, name, dept_id, doc_count, updated_at from sys_kb order by id")
+                        "select id, code, name, dept_id, updated_at from sys_kb order by id")
                 .setFirstResult((int) ((safePage - 1) * safeSize))
                 .setMaxResults((int) safeSize)
                 .getResultList();
+
+        Map<Long, KbCountReader.Counts> counts = kbCountReader.countsOf(
+                kbs.stream().map(kb -> ((Number) kb[0]).longValue()).toList());
 
         Map<Long, List<AdminDtos.RoleBrief>> rolesByKb = new HashMap<>();
         Map<Long, Integer> rankByKb = new HashMap<>();
@@ -88,8 +96,8 @@ public class KbGrantService {
                     kbId,
                     (String) kb[2],
                     departmentName(deptId),
-                    ((Number) kb[4]).longValue(),
-                    toTimeText(kb[5]),
+                    counts.getOrDefault(kbId, KbCountReader.Counts.ZERO).docCount(),
+                    toTimeText(kb[4]),
                     rolesByKb.getOrDefault(kbId, List.of()),
                     levelName(rankByKb.getOrDefault(kbId, 0))));
         }
@@ -105,8 +113,9 @@ public class KbGrantService {
     @Transactional(readOnly = true)
     @SuppressWarnings("unchecked")
     public AdminDtos.KbGrantDetail detail(long kbId) {
+        // 同上：doc_count 不取（示例常量），文档数现算
         Object[] kb = (Object[]) entityManager.createNativeQuery(
-                        "select name, dept_id, doc_count from sys_kb where id = :id")
+                        "select name, dept_id from sys_kb where id = :id")
                 .setParameter("id", kbId)
                 .getSingleResult();
 
@@ -149,7 +158,7 @@ public class KbGrantService {
         }
 
         return new AdminDtos.KbGrantDetail(kbId, (String) kb[0], departmentName(((Number) kb[1]).longValue()),
-                ((Number) kb[2]).longValue(), roles, levelName(maxRank), extraUsers);
+                kbCountReader.countOf(kbId).docCount(), roles, levelName(maxRank), extraUsers);
     }
 
     // ==================== 保存（PUT /kb/{kbId}/grants 🚩） ====================

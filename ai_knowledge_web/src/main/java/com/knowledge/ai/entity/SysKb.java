@@ -64,11 +64,16 @@ public class SysKb {
     @Column(name = "dept_id", nullable = false)
     private Long deptId;
 
-    @Column(name = "doc_count", nullable = false)
-    private Integer docCount;
-
-    @Column(name = "chunk_count", nullable = false)
-    private Integer chunkCount;
+    /*
+     * ⚠️ 这里原有 {@code doc_count} / {@code chunk_count} 两个字段，`V45` 连列一起删了
+     *    （2026-10-12）。它们是 `V7` seed 的**示例常量**，而**全仓没有任何代码写过它们** ⇒
+     *    读它等于回答一个永远不变的假数（库下 0 篇时说「128 篇」，与库内文档列表自相矛盾，
+     *    即 W3 的"双答案"）。
+     *
+     *    现在文档数 / 分片数一律由 {@link com.knowledge.ai.service.KbCountReader}
+     *    按 {@code sys_document} **现算**（五个消费方共用一处口径）。
+     *    **不要**再把它们加回来 —— 加回来就意味着要有人去维护它。
+     */
 
     /**
      * 库状态。取值是域内真值 {@code READY / INDEXING}（V7 建表注释、《01》§3），

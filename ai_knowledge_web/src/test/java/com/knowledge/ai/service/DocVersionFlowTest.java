@@ -316,10 +316,10 @@ class DocVersionFlowTest extends ApiTestSupport {
 
     private long insertKb(String code, boolean granted) {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, now(), now())
                         """, code, code);
         long id = dbLong("select id from sys_kb where code = ?", code);
         if (granted) {

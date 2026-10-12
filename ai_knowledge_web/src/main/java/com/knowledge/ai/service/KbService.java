@@ -85,9 +85,12 @@ public class KbService {
      * 字符串字面量所以行尾空格还在，但拼装侧仍显式写 {@code + " " +}：
      * B1 曾用 text block 写这段，text block 会剥掉行尾空白，拼出 {@code andEXISTS}
      * 这种只在真跑时才暴露的语法错（B1 计划 §8.1）。
+     *
+     * <p>⚠️ 2026-10-12：原第 5/6 列（{@code doc_count} / {@code chunk_count}）随 `V45` 删列
+     * 一并移出本 select，**其后所有列索引整体前移 2** —— 见 {@link #configRowOrDeny} 的新索引表。
      */
     private static final String CONFIG_SELECT = """
-            select k.id, k.name, k.code, k.description, k.dept_id, k.doc_count, k.chunk_count,
+            select k.id, k.name, k.code, k.description, k.dept_id,
                    k.status, k.created_at, k.updated_at, k.secret_level, k.business_domain,
                    k.custom_tags, k.split_policy_json, k.table_policy_json, k.retrieval_config_json,
                    k.reindex_required
@@ -103,6 +106,9 @@ public class KbService {
     private static final long REBUILD_CHUNKS_PER_MINUTE = 900L;
 
     private final DataScopeService dataScopeService;
+
+    /** 文档数 / 分片数的**唯一**口径（2026-10-12）。理由见 {@link KbCountReader}。 */
+    private final KbCountReader kbCountReader;
 
     private final ModelClientRegistry modelClientRegistry;
 
@@ -131,6 +137,21 @@ public class KbService {
      * 内存过滤在数据量上去之后是全表扫描，且一旦漏掉一个分支就是越权
      * （{@code DataScopeService} 类注释里那段话同样适用于这里）。
      *
+     * <h3>🔴 计数**现算**，不读 {@code sys_kb.doc_count}（2026-10-12 改）</h3>
+     * <p>本方法此前直接 select {@code sys_kb.doc_count / chunk_count} 原样回显。那两列是
+     * `V7__s2_kb_skeleton_and_grants.sql:28` 建表时 seed 的**示例常量**
+     * （128 / 42 / 316 …，合计正好 1246），而**全仓没有任何代码写过它们**
+     * （{@code setDocCount} 零调用、也没有 UPDATE 语句）—— 上传与删除文档都不会更新。
+     * 于是列表回答的是一个**永远不变**的数，而库内文档列表（{@code DocService#page}）
+     * 回答的是真数：库里有 0 篇文档时，列表说「128 篇」。这正是 W3 登记的"双答案"，
+     * 也是用户 2026-10-12 反馈「数据和真实情况对不上」的根因。
+     *
+     * <p>改为与 {@code DocService#page} **同源**：只数 {@code sys_document} 里未软删的行。
+     * 顺带治掉这一类问题 —— 上传文档后这里的数字会自己跟着涨，不需要谁去维护冗余列。
+     *
+     * <p>⚠️ 口径统一收在 {@link KbCountReader}（本方法、配置页、重建影响预估、授权页、
+     * 配额卡五处共用）—— 只改其中几处就会从"库内双答案"变成"跨页双答案"。
+     *
      * @param scope {@code all} / {@code mine}；{@code mine} = 我创建的（W5）。
      *              {@code null} / 其它值按 {@code all} 处理 —— 前端「全部」按钮传的就是 {@code all}。
      */
@@ -141,8 +162,8 @@ public class KbService {
         DataScopeService.ScopeCondition cond = dataScopeService.kbVisibility(user);
         Map<String, Object> params = new LinkedHashMap<>(cond.params());
 
-        StringBuilder sql = new StringBuilder(
-                "select k.id, k.name, k.doc_count, k.chunk_count from sys_kb k where ")
+        // 计数不在这条 SQL 里取：见方法注释。这里只取 id / name。
+        StringBuilder sql = new StringBuilder("select k.id, k.name from sys_kb k where ")
                 .append(cond.sql());
         StringBuilder countSql = new StringBuilder("select count(*) from sys_kb k where ")
                 .append(cond.sql());
@@ -180,13 +201,17 @@ public class KbService {
 
         long total = ((Number) countQuery.getSingleResult()).longValue();
         List<Object[]> rows = listQuery.getResultList();
+        List<Long> kbIds = new ArrayList<>(rows.size());
+        for (Object[] row : rows) {
+            kbIds.add(((Number) row[0]).longValue());
+        }
+        Map<Long, KbCountReader.Counts> counts = kbCountReader.countsOf(kbIds);
+
         List<KbDtos.KbBrief> list = new ArrayList<>(rows.size());
         for (Object[] row : rows) {
-            list.add(new KbDtos.KbBrief(
-                    ((Number) row[0]).longValue(),
-                    (String) row[1],
-                    ((Number) row[2]).longValue(),
-                    ((Number) row[3]).longValue()));
+            long id = ((Number) row[0]).longValue();
+            KbCountReader.Counts count = counts.getOrDefault(id, KbCountReader.Counts.ZERO);
+            list.add(new KbDtos.KbBrief(id, (String) row[1], count.docCount(), count.chunkCount()));
         }
         return new KbDtos.KbPage(list, total);
     }
@@ -255,11 +280,11 @@ public class KbService {
         params.put("now", now);
 
         Query insert = entityManager.createNativeQuery("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status, owner_id,
+                        insert into sys_kb (code, name, dept_id, status, owner_id,
                                             description, secret_level, business_domain, custom_tags,
                                             split_policy_json, table_policy_json, retrieval_config_json,
                                             created_at, updated_at)
-                        values (:code, :name, :deptId, 0, 0, :status, :ownerId,
+                        values (:code, :name, :deptId, :status, :ownerId,
                                 :description, :secretLevel, :businessDomain, :customTags,
                                 :splitPolicy, :tablePolicy, :retrievalConfig, :now, :now)
                         """);
@@ -293,19 +318,22 @@ public class KbService {
         LoginUser user = LoginUserContext.require();
         Object[] row = configRowOrDeny(kbId, user);
 
-        String status = (String) row[7];
+        String status = (String) row[5];
         KbDtos.KbConfigForm config = new KbDtos.KbConfigForm(
                 (String) row[1],
                 (String) row[2],
                 ((Number) row[4]).longValue(),
                 roleCodesOf(kbId),
-                (String) row[10],
-                (String) row[11],
+                (String) row[8],
+                (String) row[9],
                 (String) row[3],
-                parseTags((String) row[12]),
-                parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy()),
-                parseOr(row[14], KbDtos.TablePolicy.class, defaultTablePolicy()),
-                parseOr(row[15], KbDtos.RetrievalConfig.class, defaultRetrievalConfig()));
+                parseTags((String) row[10]),
+                parseOr(row[11], KbDtos.SplitPolicy.class, defaultSplitPolicy()),
+                parseOr(row[12], KbDtos.TablePolicy.class, defaultTablePolicy()),
+                parseOr(row[13], KbDtos.RetrievalConfig.class, defaultRetrievalConfig()));
+
+        // 文档数 / 分片数**现算**（`V45` 删掉了那两个示例列，口径见 KbCountReader）
+        KbCountReader.Counts counts = kbCountReader.countOf(kbId);
 
         return new KbDtos.KbConfig(
                 ((Number) row[0]).longValue(),
@@ -314,13 +342,13 @@ public class KbService {
                 (String) row[3],
                 departmentName(((Number) row[4]).longValue()),
                 ((Number) row[4]).longValue(),
-                ((Number) row[5]).longValue(),
-                ((Number) row[6]).longValue(),
+                counts.docCount(),
+                counts.chunkCount(),
                 status,
                 statusLabel(status),
-                toTimeText(row[8]),
-                toTimeText(row[9]),
-                asBoolean(row[16]),
+                toTimeText(row[6]),
+                toTimeText(row[7]),
+                asBoolean(row[14]),
                 roleCodesOf(kbId),
                 config,
                 embeddingInfo(),
@@ -386,7 +414,7 @@ public class KbService {
         LocalDateTime now = LocalDateTime.now();
         // reindex_required 是**粘性**的：本次改动不需要重建时**不清零** ——
         // 上一个改动留下的"脏"还没被 T-406（S4）清掉，清了就等于谎报索引是新的。
-        boolean reindexRequired = asBoolean(row[16]) || needReindex;
+        boolean reindexRequired = asBoolean(row[14]) || needReindex;
         Query update = entityManager.createNativeQuery("""
                         update sys_kb set name = :name, description = :description, dept_id = :deptId,
                                secret_level = :secretLevel, business_domain = :businessDomain,
@@ -439,10 +467,12 @@ public class KbService {
         Object[] row = configRowOrDeny(kbId, user);
 
         KbDtos.SplitPolicy newSplit = requireValidSplitPolicy(form.splitPolicy());
-        KbDtos.SplitPolicy oldSplit = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+        KbDtos.SplitPolicy oldSplit = parseOr(row[11], KbDtos.SplitPolicy.class, defaultSplitPolicy());
 
-        long docCount = ((Number) row[5]).longValue();
-        long chunkBefore = ((Number) row[6]).longValue();
+        // 基线现算（`V45` 删掉了 `sys_kb` 的两个示例列）—— 与列表 / 配额同一口径
+        KbCountReader.Counts counts = kbCountReader.countOf(kbId);
+        long docCount = counts.docCount();
+        long chunkBefore = counts.chunkCount();
         long stepOld = Math.max(1, oldSplit.chunkSize() - oldSplit.overlap());
         long stepNew = Math.max(1, newSplit.chunkSize() - newSplit.overlap());
         // 空库（chunkBefore = 0）就该返 0 —— 硬凑成 1 会让"这个库还没有文档"
@@ -464,9 +494,15 @@ public class KbService {
     /**
      * 全站配额（消费方是 S4 的 {@code DocDownloadView} 配额卡）。
      *
-     * <p>三个计数取自 {@code sys_kb} 的**冗余计数列**而不是实时统计文档表：
-     * 它们是建库/上传时维护的投影（B1 建库写 0），与列表页显示的同一口径，
-     * 不会出现"列表说 1246、配额说 0"这种同页矛盾。
+     * <p>{@code kbCount} = 未软删的库数；{@code docCount / chunkCount} 由
+     * {@link KbCountReader#totalsOfActiveKbs()} **现算**（只算未软删的库的未软删文档）。
+     *
+     * <h3>⚠️ 原文那句"取自冗余计数列的投影"是错的（2026-10-12 订正）</h3>
+     * <p>它的原文是「三个计数取自 {@code sys_kb} 的**冗余计数列**……它们是建库/上传时维护的
+     * 投影（B1 建库写 0），与列表页显示的同一口径」——**前半句不成立**：那两列**没有任何
+     * 写侧**（建库写死 `0,0` 之后再无人碰，`setDocCount` 全仓零调用），所以它们既不是
+     * "上传时维护"的，也谈不上是投影。它的"与列表页同一口径"倒是真的 —— 只不过**两边都是
+     * 读同一个假的示例常量**。现算之后两者仍然一致，但一致在**真值**上。
      *
      * <p>{@code monthTokens} 恒 0 —— 无来源表（B2 计划 §1 W-a）。
      */
@@ -474,16 +510,17 @@ public class KbService {
     public KbDtos.StorageQuota storageQuota() {
         // 软删的库不计入配额（`T-407`）：用户看到的用量应与列表里的库对得上 ——
         // 回收站里的库还在列表外，却把用量算进去，就是"数字对不上"的那类投诉
-        Object[] agg = (Object[]) entityManager.createNativeQuery("""
-                        select count(*), coalesce(sum(doc_count), 0), coalesce(sum(chunk_count), 0)
-                        from sys_kb
-                        where deleted_at is null
-                        """).getSingleResult();
+        long kbCount = ((Number) entityManager.createNativeQuery(
+                        "select count(*) from sys_kb where deleted_at is null")
+                .getSingleResult()).longValue();
+        // 🔴 文档数 / 分片数**现算**（2026-10-12）：原来 sum 的是 sys_kb 那两列示例常量
+        //    ⇒ 配额卡说"文档 1246 篇"而全库 0 行。口径见 KbCountReader（含"只算未软删的库"）。
+        KbCountReader.Counts counts = kbCountReader.totalsOfActiveKbs();
         return new KbDtos.StorageQuota(
                 humanSize(minioUsedBytes()),
-                ((Number) agg[0]).longValue(),
-                ((Number) agg[1]).longValue(),
-                ((Number) agg[2]).longValue(),
+                kbCount,
+                counts.docCount(),
+                counts.chunkCount(),
                 0L);
     }
 
@@ -502,8 +539,8 @@ public class KbService {
         LoginUser user = LoginUserContext.require();
         Object[] row = configRowOrDeny(kbId, user);
 
-        KbDtos.SplitPolicy split = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
-        KbDtos.TablePolicy table = parseOr(row[14], KbDtos.TablePolicy.class, defaultTablePolicy());
+        KbDtos.SplitPolicy split = parseOr(row[11], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+        KbDtos.TablePolicy table = parseOr(row[12], KbDtos.TablePolicy.class, defaultTablePolicy());
         KbDtos.EmbeddingInfo embedding = embeddingInfo();
         KbDtos.VlModelInfo vl = vlModelInfo();
 
@@ -560,10 +597,16 @@ public class KbService {
      *
      * <p><b>列索引表</b>（三处接口共用一份 select，改名/加列时一起看）：
      * <pre>
-     *   0 id  1 name  2 code  3 description  4 dept_id  5 doc_count  6 chunk_count  7 status
-     *   8 created_at  9 updated_at  10 secret_level  11 business_domain  12 custom_tags
-     *   13 split_policy_json  14 table_policy_json  15 retrieval_config_json  16 reindex_required
+     *   0 id  1 name  2 code  3 description  4 dept_id  5 status
+     *   6 created_at  7 updated_at  8 secret_level  9 business_domain  10 custom_tags
+     *   11 split_policy_json  12 table_policy_json  13 retrieval_config_json  14 reindex_required
      * </pre>
+     *
+     * <p>⚠️ 2026-10-12：原第 5/6 列（{@code doc_count} / {@code chunk_count}）随 `V45` 删列移出，
+     * **7 及以后的列整体前移 2**。文档数 / 分片数不再来自这张表 —— 需要它的两处
+     * （{@link #config} / {@link #impact}）各自调 {@link KbCountReader} 现算。
+     * 之所以不在这里"填好再返回"，是因为删列之后已经没有槽位可填，硬留一个占位列
+     * 反而会让人以为那两个数来自 SQL。
      *
      * @throws BizException 10043 库不存在 / 10022 求交不放行（② 部门在范围外，或 ③ 无任何授权）
      */
@@ -604,10 +647,10 @@ public class KbService {
                                           KbDtos.SplitPolicy split, KbDtos.TablePolicy table,
                                           KbDtos.RetrievalConfig retrieval, SecretLevel secret,
                                           List<String> oldRoles, List<String> newRoles) {
-        KbDtos.SplitPolicy oldSplit = parseOr(row[13], KbDtos.SplitPolicy.class, defaultSplitPolicy());
-        KbDtos.TablePolicy oldTable = parseOr(row[14], KbDtos.TablePolicy.class, defaultTablePolicy());
+        KbDtos.SplitPolicy oldSplit = parseOr(row[11], KbDtos.SplitPolicy.class, defaultSplitPolicy());
+        KbDtos.TablePolicy oldTable = parseOr(row[12], KbDtos.TablePolicy.class, defaultTablePolicy());
         KbDtos.RetrievalConfig oldRetrieval =
-                parseOr(row[15], KbDtos.RetrievalConfig.class, defaultRetrievalConfig());
+                parseOr(row[13], KbDtos.RetrievalConfig.class, defaultRetrievalConfig());
 
         List<ConfigChange> out = new ArrayList<>();
         // ---------- 基础信息（不影响索引）----------
@@ -635,9 +678,9 @@ public class KbService {
         add(out, "命中行窗口", oldTable.rowWindow(), table.rowWindow(), true);
 
         // ---------- 治理标签（不影响索引）----------
-        add(out, "密级", secretText((String) row[10]), secretText(secret.name()), false);
-        add(out, "业务域", (String) row[11], form.businessDomain(), false);
-        add(out, "自定义标签", parseTags((String) row[12]), form.customTags(), false);
+        add(out, "密级", secretText((String) row[8]), secretText(secret.name()), false);
+        add(out, "业务域", (String) row[9], form.businessDomain(), false);
+        add(out, "自定义标签", parseTags((String) row[10]), form.customTags(), false);
         // 可见角色排最后：它是本接口唯一会改授权的字段，也是本动作标高危的原因
         add(out, "可见角色", roleCodesOrdered(oldRoles), roleCodesOrdered(newRoles), false);
         return out;

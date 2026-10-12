@@ -96,8 +96,8 @@ class S2AuditFlowTest extends ApiTestSupport {
         // 连带 KbGrantFlowTest 的 selfScope/deptAndChild 变红）。故改用**临时库**取证。
         long kbId = 999_901L;
         jdbc.update("""
-                insert into sys_kb (id, code, name, dept_id, doc_count, chunk_count, status, created_at, updated_at)
-                values (?, 'kb_e2e_audit', '审计取证临时库', 1, 0, 0, 'READY', now(), now())
+                insert into sys_kb (id, code, name, dept_id, status, created_at, updated_at)
+                values (?, 'kb_e2e_audit', '审计取证临时库', 1, 'READY', now(), now())
                 """, kbId);
         try {
             Map<String, Object> body = new HashMap<>();

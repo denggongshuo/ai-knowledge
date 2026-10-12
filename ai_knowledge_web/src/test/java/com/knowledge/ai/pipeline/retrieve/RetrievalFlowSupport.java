@@ -152,10 +152,10 @@ public abstract class RetrievalFlowSupport {
      */
     protected long insertKb(String code, String secretLevel, String retrievalConfigJson) {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, retrieval_config_json, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', ?, '', 0, 1, ?, now(), now())
+                        values (?, ?, 1, 'READY', ?, '', 0, 1, ?, now(), now())
                         """, code, code, secretLevel, retrievalConfigJson);
         long id = jdbc.queryForObject("select id from sys_kb where code = ?", Long.class, code);
         createdKbIds.add(id);
@@ -209,8 +209,9 @@ public abstract class RetrievalFlowSupport {
                             """, docId, kbId, text,
                     com.knowledge.ai.core.text.ContentFingerprint.of(text), order++);
         }
-        jdbc.update("update sys_kb set doc_count = doc_count + 1, chunk_count = chunk_count + ? where id = ?",
-                chunkTexts.length, kbId);
+        // ⚠️ 2026-10-12 删掉了这里原来那句 `update sys_kb set doc_count/chunk_count + N`：
+        //    那是给"库的文档数/分片数"喂数的，而那两个数现在一律从 **`sys_document` 现货**算
+        //    （`KbCountReader`）—— 上面那条 insert 已经把 `chunk_count = chunkTexts.length` 写好。
         docIds.add(docId);
         return docId;
     }

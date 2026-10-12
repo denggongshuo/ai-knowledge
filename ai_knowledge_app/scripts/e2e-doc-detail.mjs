@@ -490,9 +490,9 @@ function sql(s) {
   mysqlScalar(s)
 }
 function buildFixtures() {
-  sql(`insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status, secret_level,
+  sql(`insert into sys_kb (code, name, dept_id, status, secret_level,
         business_domain, reindex_required, index_generation, created_at, updated_at)
-      values ('${KB_CODE}', '${KB_CODE}', 1, 1, 0, 'READY', 'INTERNAL', '', 0, 1, now(), now());`)
+      values ('${KB_CODE}', '${KB_CODE}', 1, 'READY', 'INTERNAL', '', 0, 1, now(), now());`)
   kbId = Number(mysqlScalar(`select id from sys_kb where code='${KB_CODE}';`))
   // 可见性求交认的是**授权行**（`DataScopeService#kbVisibility`），不是超管身份
   sql(`insert into sys_kb_grant (kb_id, principal_type, principal_id, level, created_at, updated_at)
@@ -535,8 +535,9 @@ function buildFixtures() {
   }
 
   topLevelCount = topLevel.length
+  // ⚠️ 2026-10-12：原来这里还有一句 `update sys_kb set chunk_count=...` —— 那列随 `V45` 删除，
+  //    库级分片数已改为按 `sys_document` 现算，所以只回填下面这一处即可。
   sql(`update sys_document set chunk_count=${topLevelCount} where id=${docId};`)
-  sql(`update sys_kb set chunk_count=${topLevel.length + childCount} where id=${kbId};`)
 
   // 两条解析任务：一条完成（74 秒）、一条失败（给具体原因）。
   // ⚠️ created_at 刻意不同：都用 now() 时先后不定，而"新→旧"是这条端点的真实口径。

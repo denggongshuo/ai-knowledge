@@ -481,10 +481,10 @@ class DocDetailFlowTest extends ApiTestSupport {
     /** 建探针库（只授权给 admin）+ 一篇含**全部块类型**的文档 + 两条解析任务。 */
     private void buildFixtures() {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, created_at, updated_at)
-                        values (?, ?, 1, 1, 0, 'READY', 'INTERNAL', '', 0, 1, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, now(), now())
                         """, KB_CODE, KB_CODE);
         kbId = dbLong("select id from sys_kb where code = ?", KB_CODE);
         // 可见性求交认的是**授权行**（DataScopeService#kbVisibility），不是超管身份
@@ -513,7 +513,9 @@ class DocDetailFlowTest extends ApiTestSupport {
             childCount++;
         }
 
-        jdbc.update("update sys_kb set chunk_count = ? where id = ?", rowCount(), kbId);
+        // ⚠️ 2026-10-12 删掉了这里原来那句 `update sys_kb set chunk_count = ?`：
+        //    那列随 `V45` 删除，库级分片数已改为按 `sys_document` 现算（`KbCountReader`）——
+        //    下面那句对 `sys_document.chunk_count` 的回填就是它的来源。
         jdbc.update("update sys_document set chunk_count = ?, table_total = 1, table_parsed = 1, "
                         + "image_total = 1, image_parsed = 1, pages_total = 5, pages_with_text = 4 where id = ?",
                 topLevelContents.size(), docId);

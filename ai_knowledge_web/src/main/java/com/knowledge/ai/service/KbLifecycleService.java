@@ -44,6 +44,9 @@ public class KbLifecycleService {
 
     private final EntityManager entityManager;
 
+    /** 文档数 / 分片数的**唯一**口径（2026-10-12）—— 只用在下面那句删除日志里。 */
+    private final KbCountReader kbCountReader;
+
     /**
      * 软删知识库：进回收站，保留 30 天。
      *
@@ -73,8 +76,12 @@ public class KbLifecycleService {
             throw BizException.of(ErrorCode.KB_NOT_FOUND);
         }
 
+        // ⚠️ 这里的文档数/分片数**现算**（2026-10-12）：原先读 `sys_kb.doc_count/chunk_count`，
+        //    而那两列是 V7 的示例常量、全仓无人写 ⇒ 日志会打出"文档=128"而库下 0 篇。
+        //    日志里的假数与页面上的假数一样有害：看日志的人会据此判断"删了多少"。
+        KbCountReader.Counts counts = kbCountReader.countOf(kbId);
         log.info("[删除知识库] kbId={} 名称={} 文档={} 分片={}（向量与文档保留，可恢复）",
-                kbId, row.name(), row.docCount(), row.chunkCount());
+                kbId, row.name(), counts.docCount(), counts.chunkCount());
         return new KbDtos.KbDeleted(row.id(), true, true, row.name());
     }
 
@@ -83,7 +90,7 @@ public class KbLifecycleService {
     Row requireActive(long kbId) {
         @SuppressWarnings("unchecked")
         List<Object[]> rows = entityManager.createNativeQuery("""
-                        select id, name, doc_count, chunk_count
+                        select id, name
                           from sys_kb
                          where id = :id and deleted_at is null
                         """)
@@ -93,10 +100,16 @@ public class KbLifecycleService {
             throw BizException.of(ErrorCode.KB_NOT_FOUND);
         }
         Object[] r = rows.getFirst();
-        return new Row(((Number) r[0]).longValue(), (String) r[1],
-                ((Number) r[2]).intValue(), ((Number) r[3]).intValue());
+        return new Row(((Number) r[0]).longValue(), (String) r[1]);
     }
 
-    record Row(long id, String name, int docCount, int chunkCount) {
+    /**
+     * 一个尚未删除的库的**最小身份**（id + 名称）。
+     *
+     * <p>⚠️ 刻意不带 {@code docCount / chunkCount}（2026-10-12 移除）：它们唯一的用途是上面那句
+     * 删除日志，而值取自 {@code sys_kb} 的示例常量 ⇒ 日志说谎。现在日志改调
+     * {@link KbCountReader} 现算，这个 record 也就没有理由再驮着两个假列。
+     */
+    record Row(long id, String name) {
     }
 }

@@ -322,8 +322,10 @@ public class DocService {
      * 库内文档列表（关键字 / 状态 / 解析质量三档筛选）。
      *
      * <p><b>{@code total} 与 {@code list} 同源</b>：两者都从 {@code sys_document} 实查
-     * —— 不是从 {@code sys_kb.doc_count} 那个示例冗余列读（那会造出"知识库列表说 128 篇、
+     * —— 不是从 {@code sys_kb} 那两个**示例计数列**读（它们会造出"知识库列表说 128 篇、
      * 这里说 0 篇"的双答案，见本批 §1 W3）。
+     * ⚠️ 2026-10-12：那两列已随 `V45` **删掉**，所有消费方改用
+     * {@code KbCountReader} 现算 —— 本方法本来就是这么做的，故未受影响。
      *
      * <p>口径是：<b>{@code total} = 该库文档总数（不带筛选）</b>，{@code displayed} = 本页条数。
      * 前端把 {@code total} 渲染成「共 N 篇」—— 那句说的是"这个库有多少篇"，

@@ -354,7 +354,8 @@ class DocUploadFlowTest extends ApiTestSupport {
         long displayed = ((Number) page.data("$.displayed")).longValue();
         List<Map<String, Object>> list = page.data("$.list");
 
-        assertThat(total).as("total 与 list 都从 sys_document 实查（不是 sys_kb.doc_count 那个示例列）")
+        assertThat(total).as("total 与 list 都从 sys_document 实查（不是 sys_kb 那两个示例计数列"
+                + "—— 它们已随 V45 删除）")
                 .isEqualTo(3);
         assertThat(list).hasSize(3);
         assertThat(displayed).isEqualTo(3);

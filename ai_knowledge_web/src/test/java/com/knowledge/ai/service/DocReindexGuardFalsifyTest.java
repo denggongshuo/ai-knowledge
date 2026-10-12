@@ -208,9 +208,9 @@ class DocReindexGuardFalsifyTest extends ApiTestSupport {
 
     private long insertKb(String code) {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status, secret_level,
+                        insert into sys_kb (code, name, dept_id, status, secret_level,
                                             business_domain, reindex_required, index_generation, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, now(), now())
                         """, code, code);
         long id = jdbc.queryForObject("select id from sys_kb where code = ?", Long.class, code);
         jdbc.update("""

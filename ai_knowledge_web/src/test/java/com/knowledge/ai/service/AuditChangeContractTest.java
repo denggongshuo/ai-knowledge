@@ -203,8 +203,8 @@ class AuditChangeContractTest extends ApiTestSupport {
         // 用临时库取证：新建一个没有任何授权的库 → before 侧两行都是"无"
         long kbId = 999_902L;
         jdbc.update("""
-                insert into sys_kb (id, code, name, dept_id, doc_count, chunk_count, status, created_at, updated_at)
-                values (?, 'kb_e2e_change', '变更对照临时库', 1, 0, 0, 'READY', now(), now())
+                insert into sys_kb (id, code, name, dept_id, status, created_at, updated_at)
+                values (?, 'kb_e2e_change', '变更对照临时库', 1, 'READY', now(), now())
                 """, kbId);
         try {
             Map<String, Object> body = new HashMap<>();

@@ -215,10 +215,10 @@ class GraphEvalTest {
     private void ingestCorpus() throws Exception {
         Corpus corpus = MAPPER.readValue(Files.readString(EVAL_DIR.resolve("graph-corpus.json")), Corpus.class);
         jdbc.update("""
-                insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                insert into sys_kb (code, name, dept_id, status,
                                     secret_level, business_domain, reindex_required,
                                     index_generation, retrieval_config_json, created_at, updated_at)
-                values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
+                values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
                 """, KB_CODE, KB_CODE,
                 "{\"rerankEnabled\":false,\"recallThreshold\":0.2,\"missThreshold\":0.3}");
         kbId = jdbc.queryForObject("select id from sys_kb where code = ?", Long.class, KB_CODE);

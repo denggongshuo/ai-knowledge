@@ -576,10 +576,10 @@ class RetrievalEvalTest {
     /** 建一个评测库（与 {@link #ingestCorpus} 同形，只是编码不同、且两组共用这一个）。 */
     private long insertEvalKb(String code) {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, retrieval_config_json, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
                         """, code, code, EVAL_RETRIEVAL_CONFIG);
         long id = jdbc.queryForObject("select id from sys_kb where code = ?", Long.class, code);
         jdbc.update("""
@@ -658,10 +658,10 @@ class RetrievalEvalTest {
         Corpus corpus = MAPPER.readValue(Files.readString(EVAL_DIR.resolve("corpus.json")), Corpus.class);
 
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, retrieval_config_json, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, 1, ?, now(), now())
                         """, KB_CODE, KB_CODE,
                 // ⚠️ rerankEnabled=false：本评测测的是**召回**。开着重排会把它变成
                 // "召回 + 重排"的联合效果，而两者的问题要分开定位

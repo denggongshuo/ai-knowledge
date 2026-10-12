@@ -304,10 +304,10 @@ class ReindexFlowTest {
 
     private long insertKb(String code) {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 1, 1, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 1, 1, now(), now())
                         """, code, code);
         long id = jdbc.queryForObject("select id from sys_kb where code = ?", Long.class, code);
         // 给探针库挂一条授权：`KbService.impact`（判据 2 的预估值来源）会走
@@ -341,11 +341,11 @@ class ReindexFlowTest {
                                                raw_content, order_no, page_no, created_at)
                         values (?, ?, 'PARAGRAPH', null, null, ?, 1, 1, now())
                         """, docId, kb, chunkText);
-        // 维护库上的计数：`sys_kb.chunk_count` 是 `impact` 算 `chunkAfter` 的**基准**
-        // （`chunkAfter = chunkBefore × stepOld / stepNew`），而 `chunkBefore = 0` 会走
-        // "空库返 0" 那条分支 —— 判据 2 就变成空断言了。
-        jdbc.update("update sys_kb set doc_count = doc_count + 1, chunk_count = chunk_count + 1 "
-                + "where id = ?", kb);
+        // ⚠️ 2026-10-12 删掉了这里原来那句 `update sys_kb set doc_count = doc_count + 1,
+        //    chunk_count = chunk_count + 1`。它当初是为了让 `impact` 的 `chunkBefore` 非 0
+        //    （否则走"空库返 0"分支，判据 2 变空断言）—— 而 `impact` 现在从 **`sys_document`
+        //    现货**算基线（见 `KbCountReader`），上面那条 insert 已经把 `chunk_count = 1` 写好了。
+        //    留着它就是"维护一列没人读的示例常量"，下一个人还会以为它是必需的前置。
         docIds.add(docId);
         return docId;
     }

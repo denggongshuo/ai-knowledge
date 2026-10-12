@@ -53,10 +53,10 @@ class ParseQualityFlowTest {
     @BeforeEach
     void setUp() {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, created_at, updated_at)
-                        values ('probe-pq', 'probe-pq', 1, 0, 0, 'READY', 'INTERNAL', '', 0, 1, now(), now())
+                        values ('probe-pq', 'probe-pq', 1, 'READY', 'INTERNAL', '', 0, 1, now(), now())
                         """);
         kbId = jdbc.queryForObject("select id from sys_kb where code = 'probe-pq'", Long.class);
     }

@@ -130,8 +130,8 @@ class KbGrantFlowTest extends ApiTestSupport {
         // 用临时库，避免污染 V7 种子（本接口是单值 level 模型，改现有库会拉平混合档位）
         long kbId = 999_902L;
         jdbc.update("""
-                insert into sys_kb (id, code, name, dept_id, doc_count, chunk_count, status, created_at, updated_at)
-                values (?, 'kb_g29_probe', 'G2-9 探针库', 1, 0, 0, 'READY', now(), now())
+                insert into sys_kb (id, code, name, dept_id, status, created_at, updated_at)
+                values (?, 'kb_g29_probe', 'G2-9 探针库', 1, 'READY', now(), now())
                 """, kbId);
         try {
             LoginUser liNa = user("li.na", DataScope.SELF, 2L);

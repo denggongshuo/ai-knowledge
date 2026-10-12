@@ -485,10 +485,10 @@ class DocRollbackFlowTest extends ApiTestSupport {
 
     private long insertKb() {
         jdbc.update("""
-                        insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status,
+                        insert into sys_kb (code, name, dept_id, status,
                                             secret_level, business_domain, reindex_required,
                                             index_generation, created_at, updated_at)
-                        values (?, ?, 1, 0, 0, 'READY', 'INTERNAL', '', 0, ?, now(), now())
+                        values (?, ?, 1, 'READY', 'INTERNAL', '', 0, ?, now(), now())
                         """, KB_CODE, KB_CODE, GENERATION);
         long id = dbLong("select id from sys_kb where code = ?", KB_CODE);
         jdbc.update("""

@@ -26,7 +26,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code sprint-delivery} §3 明写）。所以：
  * <ol>
  *   <li>所有写用例**自己建库**（{@code kb_probe_} 前缀）再改它，用完删；</li>
- *   <li>涉及演示库时**只读**（{@code storage-quota} 的 1246 / 38502 就是这么断言的）。</li>
+ *   <li>涉及演示库时**只读**（{@code storage-quota} 的库数/文档数就是这么断言的 ——
+ *       ⚠️ 2026-10-12 起文档数/分片数与 {@code sys_document} 现货比，**不再**与
+ *       《01》示例数据字典的 1246 / 38502 比，见 {@code storageQuotaMatchesDocuments}）。</li>
  * </ol>
  */
 class KbWriteFlowTest extends ApiTestSupport {
@@ -516,16 +518,21 @@ class KbWriteFlowTest extends ApiTestSupport {
                     .isZero();
             assertThat(((Number) impact.data("$.chunkBefore")).longValue()).isZero();
 
-            // ③ 单调性：拿一个有分片的演示库（只读，用 admin 的 ALL 范围）比两次不同 chunkSize
-            //    库 1 = 8240 分片、当前 chunkSize 512 / overlap 64（步长 448）
-            long wide = chunkAfterFor(1L, 1024, 128, token);
-            long narrow = chunkAfterFor(1L, 256, 32, token);
+            // ③ 单调性：先给探针库填**真文档**（分片合计 300），再比两次不同 chunkSize。
+            //    ⚠️ 2026-10-12 改：原先这里拿**演示库 1** 当基线，并断言
+            //    `chunkAfterFor(1L, 512, 64) == 8240` —— 那 8240 就是 `sys_kb.chunk_count` 里
+            //    seed 的示例常量。现算之后演示库的现值是 **0**，而估算模型是
+            //    `chunkAfter ≈ chunkBefore × 步长比` ⇒ 基线为 0 时恒 0，单调性无从验起。
+            //    说穿就是：那条判据过去靠**假数据**才有非零基线。现在改成自己造真数据。
+            insertProbeDocs(id, 300);
+            long wide = chunkAfterFor(id, 1024, 128, token);
+            long narrow = chunkAfterFor(id, 256, 32, token);
             assertThat(narrow)
                     .as("窗口减半 → 同样正文切出的分片必须变多（估算模型的方向性）")
                     .isGreaterThan(wide);
-            assertThat(chunkAfterFor(1L, 512, 64, token))
-                    .as("参数没变 → 估算值应等于现值本身")
-                    .isEqualTo(8240L);
+            assertThat(chunkAfterFor(id, 512, 64, token))
+                    .as("参数没变 → 估算值应等于现值本身（现值 = sys_document 的 chunk_count 合计）")
+                    .isEqualTo(300L);
         } finally {
             deleteKbByCode(code);
         }
@@ -536,8 +543,8 @@ class KbWriteFlowTest extends ApiTestSupport {
     // ==================================================================
 
     @Test
-    @DisplayName("T-408：配额与数据字典一致（8 库 / 1246 文档 / 38502 分片）")
-    void storageQuotaMatchesDictionary() {
+    @DisplayName("T-408：配额与 sys_document 现货一致（文档数/分片数不读示例冗余列）")
+    void storageQuotaMatchesDocuments() {
         String token = loginAsAdmin().data("$.accessToken");
         RawResponse quota = get("/api/kb/storage-quota", token).assertOk("配额");
 
@@ -545,14 +552,29 @@ class KbWriteFlowTest extends ApiTestSupport {
             assertThat((Object) quota.data("$." + field)).as("响应体缺 " + field).isNotNull();
         }
         assertThat(((Number) quota.data("$.kbCount")).longValue())
-                .as("《01》示例数据字典：8 个知识库")
+                .as("《01》示例数据字典：8 个知识库（这个数取自 sys_kb 的行数，本来就是真值）")
                 .isEqualTo(8);
+
+        // 🔴 2026-10-12 **改了这里的口径**：原先断言 `docCount == 1246` / `chunkCount == 38502`
+        //    （理由「与《01》示例数据字典一致」）。那两个数是 `V7:28` seed 在 `sys_kb` 上的
+        //    **示例常量**，而全仓没有任何代码写过它们 ⇒ 那条判据等于把"假的冗余列"冻成了
+        //    验收标准：**全库一篇文档都没有时它也绿**。
+        //    现在配额现算，判据改成"与 `sys_document` 现货一致"（不写死数字）。
+        //    反过来说：谁把实现改回读冗余列，这里立刻得到 1246 ≠ 现货而**转红**。
+        Long docs = jdbc.queryForObject("""
+                select count(*) from sys_document d join sys_kb k on k.id = d.kb_id
+                where d.deleted_at is null and k.deleted_at is null
+                """, Long.class);
+        Long chunks = jdbc.queryForObject("""
+                select coalesce(sum(d.chunk_count), 0) from sys_document d join sys_kb k on k.id = d.kb_id
+                where d.deleted_at is null and k.deleted_at is null
+                """, Long.class);
         assertThat(((Number) quota.data("$.docCount")).longValue())
-                .as("《01》：文档合计 1,246 篇")
-                .isEqualTo(1246);
+                .as("配额的文档数 = sys_document 现货（不是 sys_kb 的那 1246）")
+                .isEqualTo(docs);
         assertThat(((Number) quota.data("$.chunkCount")).longValue())
-                .as("《01》：分片合计 38,502 个")
-                .isEqualTo(38502);
+                .as("分片数与文档数同源（同一个 KbCountReader）")
+                .isEqualTo(chunks);
         assertThat((Object) quota.data("$.used"))
                 .as("used 是带单位的字符串，不是字节数（前端直接渲染）")
                 .isInstanceOf(String.class);
@@ -736,8 +758,36 @@ class KbWriteFlowTest extends ApiTestSupport {
     private void deleteKbByCode(String code) {
         List<Long> ids = jdbc.queryForList("select id from sys_kb where code = ?", Long.class, code);
         for (Long id : ids) {
+            // 文档先删：`impactShapeAndMonotonic` 会给探针库填真文档当估算基线
+            jdbc.update("delete from sys_chunk where kb_id = ?", id);
+            jdbc.update("delete from sys_document where kb_id = ?", id);
             jdbc.update("delete from sys_kb_grant where kb_id = ?", id);
             jdbc.update("delete from sys_kb where id = ?", id);
+        }
+    }
+
+    /**
+     * 给探针库填几篇**真文档**，`chunk_count` 合计等于 {@code totalChunks}。
+     *
+     * <p>分片基线只能来自 `sys_document` 现货（见 `KbCountReader`）—— 往 `sys_kb.chunk_count`
+     * 上写个数字已经不管用了（那是一列没人读的示例常量）。
+     */
+    private void insertProbeDocs(long kbId, int totalChunks) {
+        long ownerId = jdbc.queryForObject("select id from sys_user where username = ?",
+                Long.class, ADMIN);
+        int docs = 3;
+        int each = totalChunks / docs;
+        for (int i = 0; i < docs; i++) {
+            int chunks = i == docs - 1 ? totalChunks - each * (docs - 1) : each;
+            // md5 满足 I-8 去重键（kb_id, owner_id, md5）：32 位小写十六进制且互不相同
+            jdbc.update("""
+                            insert into sys_document (kb_id, owner_id, title, file_name, type, size_bytes, md5,
+                                                      storage_path, status, chunk_count, table_total, table_parsed,
+                                                      image_total, image_parsed, pages_total, pages_with_text,
+                                                      index_generation, created_at, updated_at)
+                            values (?, ?, ?, ?, 'MD', 1024, ?, 'probe/kb-write', 'READY', ?, 0, 0, 0, 0, 1, 1, 1, now(), now())
+                            """, kbId, ownerId, "预估基线文档 " + i, "estimate-" + i + ".md",
+                    String.format("%032x", kbId * 100 + i), chunks);
         }
     }
 

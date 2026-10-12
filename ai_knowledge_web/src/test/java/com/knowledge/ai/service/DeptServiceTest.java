@@ -49,8 +49,8 @@ class DeptServiceTest extends ApiTestSupport {
             // 重建一个同名部门并挂知识库，验证「有知识库被拒」
             deptId = createDept("G26临时部门A");
             jdbc.update("""
-                    insert into sys_kb (code, name, dept_id, doc_count, chunk_count, status, created_at, updated_at)
-                    values ('kb_g26_temp', 'G26临时知识库', ?, 0, 0, 'READY', now(), now())
+                    insert into sys_kb (code, name, dept_id, status, created_at, updated_at)
+                    values ('kb_g26_temp', 'G26临时知识库', ?, 'READY', now(), now())
                     """, deptId);
 
             final long probe = deptId;
