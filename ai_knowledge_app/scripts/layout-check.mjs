@@ -13,7 +13,10 @@
  *   （同源所以能读 contentDocument；--dump-dom 只序列化外层 DOM，所以结果要写回外层）
  *
  * 用法： node scripts/layout-check.mjs [--base=http://127.0.0.1:5173]
- * 前置： dev server 已在 `--base` 指定的地址运行（默认 5173，mock 模式）
+ * 前置： dev server 已在 `--base` 指定的地址运行（默认 5173，**mock 模式**）
+ *        ⚠️ 2026-10-11 起 dev 默认走**真后端**（`.env.development` = `VITE_USE_MOCK=false`）
+ *        ⇒ 要跑本闸必须先显式回到 mock：`VITE_USE_MOCK=true npm run dev`
+ *        （真后端模式下本闸会以 exit 2「前置不满足」退出，见 `lib/dev-server.mjs#requireMockMode`）
  *
  * 🔴 **退出码**：`0` 全过 · `1` 有路由的高度链断了 · `2` **前置不满足**（没跑任何路由）。
  * 分开的理由见 `lib/dev-server.mjs` 的模块头注（`#226`）。
@@ -27,7 +30,7 @@ import { probeDevServer, reportPrecondition, requireMockMode } from './lib/dev-s
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 
-/** `--base=http://host:port`，默认 mock 模式的 dev server（理由同 `render-check.mjs`）。 */
+/** `--base=http://host:port`，默认 mock 模式的 dev server（理由同 `render-check.mjs`；⚠️ 起 mock 现在要显式 `VITE_USE_MOCK=true`）。 */
 const arg = (name, fallback) =>
   (process.argv.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).slice(name.length + 3)
 const BASE = arg('base', 'http://localhost:5173')

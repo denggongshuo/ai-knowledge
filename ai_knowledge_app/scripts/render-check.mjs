@@ -5,6 +5,8 @@
  * 用法： node scripts/render-check.mjs [--base=http://127.0.0.1:5173]
  * 前置：
  *   1) dev server 已在 `--base` 指定的地址运行（**默认 5173，mock 模式**）
+ *      ⚠️ 2026-10-11 起 dev 默认走**真后端**（`.env.development` = `VITE_USE_MOCK=false`）
+ *      ⇒ 要跑本闸必须先显式回到 mock：`VITE_USE_MOCK=true npm run dev`
  *   2) 注入登录态用的 public/_selfcheck.html 由本脚本自动生成并在结束时清理
  *
  * 🔴 **退出码是有语义的（`#226`）**：
