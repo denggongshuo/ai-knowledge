@@ -4,7 +4,7 @@
 检索质量评测和运维分析。知识库常用的横向能力 —— 存储编排、鉴权与权限模型、多模型接入、
 审计与可观测 —— 都已就位，可以直接当知识库脚手架的起点用，也可以作为 RAG 落地的参考实现。
 
-后端 `Spring Boot 4.0` / `Java 25` / `Spring AI 2.0.1` · 前端 `Vue 3 + TypeScript` · Gitee 开源
+后端 `Spring Boot 4.0` / `Java 25` / `Spring AI 2.0.1` · 前端 `Vue 3 + TypeScript` · GitHub 开源
 
 ---
 
@@ -34,7 +34,7 @@
 **前置**：JDK 25 · Maven 3.9+ · Node 22+ · Docker Desktop（Compose v2+）
 
 ```bash
-git clone https://gitee.com/shuogehaoshuai/kb_rag.git ai-knowledge
+git clone https://github.com/denggongshuo/ai-knowledge.git ai-knowledge
 cd ai-knowledge
 
 # 1. 起基础设施（首次 Milvus 需要 1~2 分钟才 healthy，属正常）
